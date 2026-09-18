@@ -44,7 +44,7 @@ constexpr int kMaxBufs = 8;
 
 struct Push {
   u32 a[4];        // presented w, h; logical w, h
-  u32 b[4];        // rot, nviews, alpha, source base (words) | S << 24 | 1 << 31 (screen 0 composited)
+  u32 b[4];        // rot, nviews, alpha, source base (words) | S << 24 | 1 << 31 (a screen is composited: view.w names it)
   s32 rect[2][4];
   s32 view[2][4];
 };
@@ -83,7 +83,7 @@ struct GpuPresent::Impl {
   VkPhysicalDeviceMemoryProperties memprops{};
 
   struct Imported { VkImage img = VK_NULL_HANDLE; VkDeviceMemory mem = VK_NULL_HANDLE; VkImageView view = VK_NULL_HANDLE; VkDescriptorSet set[kSlots] = {VK_NULL_HANDLE, VK_NULL_HANDLE}; int fd = -1; u32 stride = 0; };
-  // The composite: the shared planes, a composited screen 0 per slot, and a
+  // The composite: the shared planes, a composited screen (engine A's) per slot, and a
   // descriptor set per slot rewritten each frame with that frame's layer.
   std::shared_ptr<Planes> planes;
   Buffer comp[kSlots];
@@ -96,6 +96,8 @@ struct GpuPresent::Impl {
   VkPipeline cpipe = VK_NULL_HANDLE;
   VkDescriptorSet cset[kSlots] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
   u64 composited = 0;   // frames that went through the composite
+  u64 presented = 0;    // frames presented by this display (the dump's clock)
+  int id = 0;           // which display (the dump's file name)
   Imported bufs[kMaxBufs];
   int nbufs = 0;
   u32 w = 0, h = 0;
@@ -237,17 +239,17 @@ struct GpuPresent::Impl {
     return true;
   }
 
-  // DS_GPU_COMP_DUMP=<file>: after frame 400's fence, write the composited
-  // screen 0 of that slot as a PPM and a census of the hi-res layer's alpha
-  // (debugging the composite's inputs).
+  // DS_GPU_COMP_DUMP=<file>: after presented frames 400-403's fences, write
+  // the composited screen of that slot as a PPM (when this frame composited)
+  // and the panel, per display (debugging the composite's inputs).
   u32 dump_scale = 0; const u32* dump_l3d = nullptr; size_t dump_l3d_words = 0;
   void maybe_dump(int slot) {
     static const char* env = std::getenv("DS_GPU_COMP_DUMP");
-    if (!env || (composited != 400 && composited != 401) || dump_scale == 0) return;
-    const std::string base = std::string(env) + (composited == 400 ? ".a" : ".b");
+    if (!env || presented < 400 || presented > 403) return;
+    const std::string base = std::string(env) + ".d" + std::to_string(id) + ".f" + std::to_string(presented) + (dump_scale ? "" : ".nocomp");
     const u32 W = 256 * dump_scale, H = 192 * dump_scale;
     const u32* px = static_cast<const u32*>(comp[slot].ptr);
-    if (FILE* f = std::fopen(base.c_str(), "wb")) {
+    if (FILE* f = dump_scale ? std::fopen(base.c_str(), "wb") : nullptr) {
       std::fprintf(f, "P6\n%u %u\n255\n", W, H);
       for (u32 i = 0; i < W * H; ++i) { const u32 c = px[i]; const unsigned char rgb[3] = {static_cast<unsigned char>(c >> 16), static_cast<unsigned char>(c >> 8), static_cast<unsigned char>(c)}; std::fwrite(rgb, 1, 3, f); }
       std::fclose(f);
@@ -323,6 +325,7 @@ std::unique_ptr<GpuPresent> GpuPresent::open(ScanoutOut& out, std::string* why) 
   auto fail = [&](const char* m) { if (why) *why = m; return nullptr; };
   std::unique_ptr<GpuPresent> self(new GpuPresent());
   self->d_ = std::make_unique<Impl>();
+  { static int next_id = 0; self->d_->id = next_id++; }
   Impl& d = *self->d_;
   d.dev = shared_device(why);
   if (!d.dev) return nullptr;
@@ -449,9 +452,10 @@ bool GpuPresent::reimport(ScanoutOut& out) {
 void GpuPresent::flush(ScanoutOut& out) { d_->retire(out); }
 
 bool GpuPresent::present(ScanoutOut& out, const u32* const fb[2], const View* views, int nviews, int rot, int lw, int lh, u8 inset_alpha,
-                         u64 hires, size_t hires_bytes, u32 scale, SDL_Rect drawn) {
+                         u64 hires, size_t hires_bytes, u32 scale, int hires_screen, SDL_Rect drawn) {
   Impl& d = *d_;
   const Api& a = *d.a;
+  ++d.presented;
   // The previous frame first: its fence, then its buffer to the tier. Only
   // then is a new buffer taken, so the tier's queue sees frames in order.
   auto now = [] { return static_cast<u64>(std::chrono::steady_clock::now().time_since_epoch().count()); };
@@ -472,11 +476,14 @@ bool GpuPresent::present(ScanoutOut& out, const u32* const fb[2], const View* vi
   d.dev->flush(d.src, static_cast<size_t>(slot) * kSlotWords * sizeof(u32), kSlotWords * sizeof(u32));
   u64 t3 = now(); d.t_upload += t3 - t2;
 
-  // Composite screen 0 on the GPU when this display shows it and the frame
+  // Composite engine A's screen on the GPU when this display shows it and the frame
   // has a GPU-drawn 3D layer; the planes are the core's, flushed here.
-  bool shows0 = false;
-  for (int v = 0; v < nviews; ++v) if (views[v].screen == 0 && views[v].shown) shows0 = true;
-  const bool do_comp = shows0 && hires != 0 && scale >= 1 && scale <= kMaxScale;
+  // The 3D layer belongs to whichever screen engine A drew this frame
+  // (hires_screen): a game that swaps the screens every frame, Spirit
+  // Tracks, flickered when it was always screen 0.
+  bool shows = false;
+  for (int v = 0; v < nviews; ++v) if (views[v].screen == hires_screen && views[v].shown) shows = true;
+  const bool do_comp = shows && hires != 0 && scale >= 1 && scale <= kMaxScale;
   if (do_comp) {
     d.dev->flush(d.planes->buf, 0, sizeof(u32) * kPlaneWords);
     VkDescriptorBufferInfo ci[4]{};
@@ -487,8 +494,8 @@ bool GpuPresent::present(ScanoutOut& out, const u32* const fb[2], const View* vi
     VkWriteDescriptorSet cw[4]{};
     for (u32 i = 0; i < 4; ++i) { cw[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; cw[i].dstSet = d.cset[slot]; cw[i].dstBinding = i + 1; cw[i].descriptorCount = 1; cw[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; cw[i].pBufferInfo = &ci[i]; }
     a.vkUpdateDescriptorSets(d.vk->dev, 4, cw, 0, nullptr);
-    d.dump_scale = scale;
   }
+  d.dump_scale = do_comp ? scale : 0;
 
   Push pc{};
   pc.a[0] = d.w; pc.a[1] = d.h; pc.a[2] = static_cast<u32>(lw); pc.a[3] = static_cast<u32>(lh);
@@ -507,7 +514,7 @@ bool GpuPresent::present(ScanoutOut& out, const u32* const fb[2], const View* vi
   pc.b[3] = static_cast<u32>(slot) * kSlotWords | (do_comp ? ((scale << 24) | 0x80000000u) : 0u);
   for (int v = 0; v < static_cast<int>(pc.b[1]); ++v) {
     pc.rect[v][0] = views[v].rect.x; pc.rect[v][1] = views[v].rect.y; pc.rect[v][2] = views[v].rect.w; pc.rect[v][3] = views[v].rect.h;
-    pc.view[v][0] = views[v].screen; pc.view[v][1] = views[v].shown ? 1 : 0; pc.view[v][2] = views[v].blends ? 1 : 0; pc.view[v][3] = 0;
+    pc.view[v][0] = views[v].screen; pc.view[v][1] = views[v].shown ? 1 : 0; pc.view[v][2] = views[v].blends ? 1 : 0; pc.view[v][3] = (do_comp && views[v].screen == hires_screen) ? 1 : 0;
   }
 
   VkCommandBuffer cb = d.cmd[slot];
@@ -528,7 +535,7 @@ bool GpuPresent::present(ScanoutOut& out, const u32* const fb[2], const View* vi
     // own writes before the present reads them.
     VkMemoryBarrier mb0{}; mb0.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER; mb0.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT; mb0.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
     a.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb0, 0, nullptr, 0, nullptr);
-    CompPush cp{scale, static_cast<u32>(slot) * kSlotWords, 0, 0};
+    CompPush cp{scale, static_cast<u32>(slot) * kSlotWords + static_cast<u32>(hires_screen) * kFrameWords, 0, 0};
     a.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, d.cpipe);
     a.vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, d.clayout, 0, 1, &d.cset[slot], 0, nullptr);
     a.vkCmdPushConstants(cb, d.clayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof cp, &cp);

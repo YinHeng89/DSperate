@@ -30,7 +30,7 @@ void main() {
     ivec4 r = pc.rect[v]; ivec4 vi = pc.view[v];
     if (vi.y == 0 || lx < r.x || ly < r.y || lx >= r.x + r.z || ly >= r.y + r.w) continue;
     uint s;
-    if (vi.x == 0 && (pc.b.w & 0x80000000u) != 0u) {
+    if (vi.w != 0) {   // the composited screen (engine A's)
       int S = int((pc.b.w >> 24) & 0x7Fu);
       int sx = (lx - r.x) * 256 * S / r.z, sy = (ly - r.y) * 192 * S / r.w;
       s = comp[uint(sy) * uint(256 * S) + uint(sx)];

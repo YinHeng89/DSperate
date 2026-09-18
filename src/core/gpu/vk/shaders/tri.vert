@@ -13,11 +13,12 @@ layout(location = 0) flat out uint v_poly;
 layout(location = 1) out vec3 v_rgb;                 // 9-bit vertex colour, perspective-correct
 layout(location = 2) out vec2 v_st;                  // 12.4 texture coordinates, perspective-correct
 layout(location = 3) noperspective out float v_z;    // the DS z, linear across the screen (Z-buffer mode)
-layout(location = 4) out float v_w;                  // the DS w, perspective-correct (W-buffer mode)
+layout(location = 4) out float v_w;                  // the DS w, perspective-correct (fog / attribution)
+layout(location = 5) out float v_zp;                 // the DS depth again, perspective-correct: the W-buffer record
 void main() {
   GpuPoly p = polys[uint(gl_InstanceIndex)];
   uint tri = uint(gl_VertexIndex) / 3u, k = uint(gl_VertexIndex) % 3u;
-  if (tri + 2u >= p.nverts) { gl_Position = vec4(2.0, 2.0, 0.0, 1.0); v_poly = 0u; v_rgb = vec3(0); v_st = vec2(0); v_z = 0.0; v_w = 1.0; return; }
+  if (tri + 2u >= p.nverts) { gl_Position = vec4(2.0, 2.0, 0.0, 1.0); v_poly = 0u; v_rgb = vec3(0); v_st = vec2(0); v_z = 0.0; v_w = 1.0; v_zp = 0.0; return; }
   uint vi = k == 0u ? 0u : tri + k;
   GpuVert vt = verts[p.first_vert + vi];
   float W = 256.0 * float(pc.f.scale), H = 192.0 * float(pc.f.scale);
@@ -37,15 +38,24 @@ void main() {
   if (p.ybot == p.ytop) oy = (vi == 1u || vi == 2u) ? 1.0 : 0.0;
   float x = (float(vt.sx) + ox) / W * 2.0 - 1.0, y = (float(vt.sy) + oy) / H * 2.0 - 1.0;
   float z = clamp(float(vt.z), 0.0, 16777215.0);
-  // Z-buffer: z / w after the divide is z / 2^24, linear in screen space.
-  // W-buffer: a constant numerator gives 1 / w, monotonic in w, so the
-  // depth test runs GREATER against it (nearer = larger).
+  // Z-buffer: z / w after the divide is z / 2^24, linear in screen space,
+  // as the DS interpolates it.
+  // W-buffer: vt.z is ALREADY the depth the DS compares -- w normalised per
+  // polygon to its own 16-bit range (gpu3d.cpp wshifted), NOT the
+  // interpolation w in vt.w, which polygons of a different w size do not
+  // share (1 / vt.w put Spirit Tracks' hills in front of its train). The DS
+  // interpolates it perspective-correctly, i.e. its reciprocal is linear on
+  // the screen: a constant numerator over vt.z gives the hardware exactly
+  // that, and the test runs GREATER (nearer = larger). Shadow volumes sit
+  // within a few hundred units of the ground they fall on; a linear z here
+  // put their depth-fail region in the wrong place.
   bool wbuf = (pc.f.flags & DS_FF_WBUFFER) != 0u;
-  float zc = wbuf ? 1.0 : (z / 16777215.0) * w;
+  float zc = wbuf ? (1.0 / max(z, 1.0)) * w : (z / 16777215.0) * w;
   gl_Position = vec4(x * w, y * w, zc, w);
   v_poly = uint(gl_InstanceIndex);
   v_rgb = vec3(float(vt.r), float(vt.g), float(vt.b));
   v_st = vec2(float(vt.s), float(vt.t));
   v_z = z;
+  v_zp = z;
   v_w = float(vt.w);
 }

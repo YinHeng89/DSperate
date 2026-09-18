@@ -1893,7 +1893,7 @@ sdl_ready:
         if (dual_window) display2.present();
         set_scale_targets(target, false);
       } else {
-        { size_t hb = 0; ds::u32 hs = 1; const ds::u64 hh = nds.gpu.frame_hires(&hb, &hs); display.set_gpu_layer(hh, hb, hs); display2.set_gpu_layer(hh, hb, hs); }
+        { size_t hb = 0; ds::u32 hs = 1; int hsc = 0; const ds::u64 hh = nds.gpu.frame_hires(&hb, &hs, &hsc); display.set_gpu_layer(hh, hb, hs, hsc); display2.set_gpu_layer(hh, hb, hs, hsc); }
         display.draw(fb);
         if (dual_window) display2.draw(fb);
       }
@@ -4451,7 +4451,7 @@ sdl_ready:
         // limit until the overlays get their own plane: on a 3D line the
         // composite takes the exported planes, so an OSD label or the save
         // flash drawn into screen 0's copy does not show there.
-        { size_t hb = 0; ds::u32 hs = 1; const ds::u64 hh = nds.gpu.frame_hires(&hb, &hs); display.set_gpu_layer(hh, hb, hs); display2.set_gpu_layer(hh, hb, hs); }
+        { size_t hb = 0; ds::u32 hs = 1; int hsc = 0; const ds::u64 hh = nds.gpu.frame_hires(&hb, &hs, &hsc); display.set_gpu_layer(hh, hb, hs, hsc); display2.set_gpu_layer(hh, hb, hs, hsc); }
         display.draw(fb);
         if (dual_window) display2.draw(fb);
       }

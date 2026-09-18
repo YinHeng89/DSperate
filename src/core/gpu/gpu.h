@@ -225,9 +225,12 @@ public:
   // 1) -- otherwise the composite takes the finished pixels. Engine A only.
   struct LayerExport { u32* top = nullptr; u32* second = nullptr; u32* meta = nullptr; u32* win = nullptr; u32* line = nullptr; u32* mbright = nullptr; };
   void set_layer_export(const LayerExport& e) { layer_ = e; engine[0].set_layer_export(e.top, e.second, e.meta, e.win); }
-  // The hi-res 3D layer the display lines of this frame read (0 when the
-  // frame was drawn by the CPU raster): for the present stage's composite.
-  u64 frame_hires(size_t* bytes, u32* scale) const { if (bytes) *bytes = ref3d_.hires_bytes; if (scale) *scale = ref3d_.scale; return ref3d_.hires; }
+  // The hi-res 3D layer the display lines of the frame just finished read (0
+  // when the CPU raster drew it): for the present stage's composite. Latched
+  // at begin_frame, which runs at line 0 before run_frame returns.
+  // `screen`: the screen engine A (the one with the 3D layer) displayed on
+  // this frame -- POWCNT1 bit 15, which Spirit Tracks flips every frame.
+  u64 frame_hires(size_t* bytes, u32* scale, int* screen = nullptr) const { if (bytes) *bytes = shown_hires_bytes_; if (scale) *scale = shown_scale_; if (screen) *screen = layer_screen_; return shown_hires_; }
   // Both screens or neither: pass a null `px` to go back to fb_.
   void set_scale_target(int screen, const ScaleTarget& t) { scale_[screen] = t; if (scale_[screen].y_hi == 0) scale_[screen].y_hi = t.h; }
   // Run a whole DS-resolution image through the scanline scaler, for a
@@ -443,6 +446,8 @@ private:
   // that is ~1.1 ms a frame off the emulation thread with two panels.
   struct StashedLine { u32 line; int screen; alignas(16) u32 px[SCREEN_W]; };
   LayerExport layer_;
+  int layer_screen_ = 0;   // engine A's screen on the frame's first line (frame_hires)
+  u64 shown_hires_ = 0; size_t shown_hires_bytes_ = 0; u32 shown_scale_ = 1;   // the layer of the frame whose lines were just output (begin_frame latches it)
   StashedLine bscale_[SCREEN_H];
   u32  bscale_n_ = 0;                   // lines stashed for the job being built / in flight
   bool bscale_defer_ = false;           // output_engine stashes engine B's line instead of scaling it

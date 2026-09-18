@@ -166,9 +166,10 @@ flag, B = fog flag) plus depth.
 
 What it does that Mali punishes, and the Vulkan shape that avoids it:
 - `gl_FragDepth` for W-buffered polygons kills early-Z. Compute the DS depth
-  in the VERTEX shader for both modes (W-buffer depth is linear in 1/w, so
-  a perspective-correct interpolation of w through `gl_Position.w` gives it)
-  and keep fixed-function depth.
+  in the VERTEX shader for both modes and keep fixed-function depth. The
+  W-buffer value is NOT 1 / vt.w: the DS compares w normalised per polygon
+  to its own 16-bit range (`gpu3d.cpp` wshifted, carried in vt.z), so it is
+  `1 / vt.z` with a GREATER test -- see "W-buffer depth" below.
 - One draw call per translucent polygon with stencil state churn. Keep
   the id rule in the stencil but bake it into the pipeline state and draw
   runs of same-state polygons; `VK_EXT_rasterization_order_attachment_access`
@@ -294,8 +295,8 @@ depth plane) and a D32 depth buffer, then copies into the compute path's
 `out[]`/`depth`/`attr` buffers -- so the final pass (fog, edge marking), the
 output contract, `FrameRef`, the A/B harness and the host see exactly what
 the compute passes gave them. The opaque prefix is one draw with the
-hardware depth test in submission order (LESS on z, or GREATER on 1/w for
-W-buffer frames, chosen by `GpuFrame::flags`); the translucent tail is drawn
+hardware depth test in submission order (LESS on z, or GREATER on 1 / the
+normalised w for W-buffer frames, chosen by `GpuFrame::flags`); the translucent tail is drawn
 in runs by depth-write bit with the DS blend and the equal-id rule in the
 fragment stage, reading the attachments it writes -- ordered per pixel by
 `VK_EXT_rasterization_order_attachment_access` on libmali, or behind a
@@ -442,3 +443,31 @@ stencil per scanline when a run begins; whole-frame is the approximation.
 Host A/B, stencil off -> on: Spirit Tracks 4.78 M -> 4.54 M differing
 pixels over 300 frames, Dragon Ball 12006 -> 11905 (the rest is the usual
 rounding residual). `DS_VK_TRI_NOSTENCIL=1` measures without.
+
+## W-buffer depth and the swapped screen (2026-09-18)
+
+Spirit Tracks on the panel showed the hills in front of the train and the
+shadows as spikes. Two bugs, both found with `--gpu-ab-dump` on the host
+(`tools/compare_frames.py --png`) and `DS_GPU_DUMP_AT=x,y`:
+
+1. **The W-buffer depth was 1 / vt.w.** vt.w is the interpolation w; the DS
+   compares `wshifted` (gpu3d.cpp:1292), w normalised per polygon to its own
+   16-bit range, which travels in vt.z. Polygons of a different w size do
+   not share a scale, so 1 / vt.w ranked the hills (w ~5500, z = 16 w) in
+   front of the train (w ~37000, z = w). Now `gl_Position.z = w / vt.z`
+   (perspective-correct, exactly the DS's hyperbolic interpolation of W),
+   GREATER, cleared to 1 / clear_depth, and the depth format prefers
+   D32_SFLOAT_S8 (24 fixed bits of 1 / 40000 resolve ~100 DS units; the
+   shadow volumes sit within a few hundred of the ground). Frame 399 of
+   st-intro: 32851 -> 12559 differing pixels, the rest texel rounding.
+2. **The GPU composite was one frame ahead and always on screen 0.**
+   `Gpu::begin_frame` runs at line 0 BEFORE run_frame returns, so the
+   frontend read the coming frame's 3D layer against the finished frame's
+   planes; and Spirit Tracks flips POWCNT1 bit 15 every frame (30 Hz
+   alternation through display capture), so engine A's layer belongs to a
+   different screen each frame. Both panels showed the same scene,
+   alternating. `frame_hires` now returns the layer latched at begin_frame
+   plus engine A's screen; `GpuPresent::present` composites that screen
+   (`view.w` in present.comp names it, composite.comp reads that screen's
+   fb). Verified by `DS_GPU_COMP_DUMP` (now per display and presented
+   frame, 400-403): four consecutive frames, both panels steady.

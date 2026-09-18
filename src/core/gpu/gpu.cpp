@@ -548,6 +548,10 @@ void Gpu::begin_frame() {
   //
   // This is after the capture bits are known, which is why it is here and
   // not at the top of the function.
+  // The frame whose display lines were just output keeps its layer for the
+  // frontend: run_frame returns from line 0 AFTER this, so ref3d_ already
+  // names the coming frame when the frontend asks (frame_hires).
+  shown_hires_ = ref3d_.hires; shown_hires_bytes_ = ref3d_.hires_bytes; shown_scale_ = ref3d_.scale;
   ref3d_ = nds_.gpu3d.frame_ref(defer_3d_ && !capture_on_ && !capture_recent_ && !run_fifo_);
   update_phase();
   // Frameskip, for this frame's display lines: what the raster at line 215
@@ -788,6 +792,7 @@ void Gpu::output_engine(int e, u32 line) {
     if (e == 0) {
       const u32 mode = (en.dispcnt() >> 16) & 3;
       if (layer_.line) {
+        if (line == 0) layer_screen_ = screen;
         layer_.line[line] = (en.bldcnt() & 0xFFFFu) | ((en.eva() & 0x1Fu) << 16) | ((en.evb() & 0x1Fu) << 21) | ((en.evy() & 0x1Fu) << 26);
         layer_.mbright[line] = static_cast<u32>(en.master_bright()) | ((mode == 1 && en.line_exported()) ? (1u << 31) : 0u);
       }

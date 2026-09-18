@@ -175,7 +175,7 @@ struct Raster::Impl {
 // attachments as input attachments (ordered per pixel with
 // VK_EXT_rasterization_order_attachment_access, else behind a per-polygon
 // barrier), and six pipelines: the opaque prefix and the translucent tail,
-// each for the Z-buffer (LESS on z) and W-buffer (GREATER on 1/w) modes, the
+// each for the Z-buffer (LESS on z) and W-buffer (GREATER on 1 / depth) modes, the
 // tail with and without the depth write.
 bool Raster::tri_setup(Impl& d, Device& dev, std::string* why) {
   const Api& a = *d.api;
@@ -285,7 +285,9 @@ bool Raster::tri_setup(Impl& d, Device& dev, std::string* why) {
   }
   {
     // A stencil for the shadow volumes where the driver has one with the depth.
-    const VkFormat cands[] = {VK_FORMAT_D24_UNORM_S8_UINT, VK_FORMAT_D32_SFLOAT_S8_UINT};
+    // Float depth first: the W-buffer test runs on 1 / depth (tri.vert), and
+    // 24 fixed bits of 1 / 40000 resolve only ~100 DS depth units there.
+    const VkFormat cands[] = {VK_FORMAT_D32_SFLOAT_S8_UINT, VK_FORMAT_D24_UNORM_S8_UINT};
     for (VkFormat f : cands) {
       VkFormatProperties fp{}; if (a.vkGetPhysicalDeviceFormatProperties) a.vkGetPhysicalDeviceFormatProperties(vk->phys, f, &fp);
       if (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) { d.ds_format = f; d.stencil = true; break; }
@@ -355,7 +357,7 @@ bool Raster::tri_setup(Impl& d, Device& dev, std::string* why) {
     VkPipelineRasterizationStateCreateInfo rs{}; rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO; rs.polygonMode = VK_POLYGON_MODE_FILL; rs.cullMode = VK_CULL_MODE_NONE; rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE; rs.lineWidth = 1.f;
     VkPipelineMultisampleStateCreateInfo ms{}; ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO; ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
     VkPipelineDepthStencilStateCreateInfo dss{}; dss.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
-    dss.depthTestEnable = VK_TRUE; dss.depthWriteEnable = depth_write ? VK_TRUE : VK_FALSE; dss.depthCompareOp = wbuf ? VK_COMPARE_OP_GREATER : VK_COMPARE_OP_LESS;
+    dss.depthTestEnable = VK_TRUE; dss.depthWriteEnable = depth_write ? VK_TRUE : VK_FALSE; dss.depthCompareOp = wbuf ? VK_COMPARE_OP_GREATER : VK_COMPARE_OP_LESS;   // W-buffer: GREATER on 1 / depth (tri.vert)
     if (kind == 1) {
       // The mask: no colour, no depth, the stencil set where the depth test fails.
       dss.depthWriteEnable = VK_FALSE; dss.stencilTestEnable = VK_TRUE;
@@ -779,7 +781,7 @@ bool Raster::submit(u32 npoly, u32 nvert, u32 ntexels, const GpuFrame& frame) {
     cv[0].color.uint32[0] = frame.clear_color;
     cv[1].color.uint32[0] = frame.clear_attr;
     cv[2].color.uint32[0] = frame.clear_depth;
-    cv[3].depthStencil.depth = wbuf ? 0.f : static_cast<float>(frame.clear_depth) / 16777215.f;
+    cv[3].depthStencil.depth = wbuf ? 1.f / static_cast<float>(std::max<u32>(frame.clear_depth, 1)) : static_cast<float>(frame.clear_depth) / 16777215.f;
     cv[3].depthStencil.stencil = 0;
     VkRenderPassBeginInfo rb{};
     rb.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;

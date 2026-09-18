@@ -9,6 +9,7 @@ layout(location = 1) in vec3 v_rgb;
 layout(location = 2) in vec2 v_st;
 layout(location = 3) noperspective in float v_z;
 layout(location = 4) in float v_w;
+layout(location = 5) in float v_zp;
 layout(location = 0) out uint o_col;     // the 3D layer record: RGB666 + alpha5 << 24
 layout(location = 1) out uint o_attr;    // the attribute plane the final pass reads
 layout(location = 2) out uint o_z;       // the depth plane (DS z, or w in W-buffer mode)
@@ -33,6 +34,6 @@ Frag shade_fragment(GpuPoly p) {
   bool front = (p.flags & DS_PF_FRONTFACING) != 0u;
   o.polyattr = (p.attr & 0x3F008000u) | (front ? 0u : (1u << 4));
   bool wbuf = (pc.f.flags & DS_FF_WBUFFER) != 0u;
-  o.depth = uint(clamp(round(wbuf ? v_w : v_z), 0.0, 16777215.0));
+  o.depth = uint(clamp(round(wbuf ? v_zp : v_z), 0.0, 16777215.0));   // W-depth is perspective-correct on the DS, z linear
   return o;
 }

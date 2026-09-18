@@ -40,6 +40,15 @@ for f in "$DIR"/src/frontend/sdl/shaders/*.comp; do
   esac
   if command -v spirv-val >/dev/null 2>&1; then spirv-val "$out"; fi
 done
+for f in "$SRC"/*.vert "$SRC"/*.frag; do
+  [ -e "$f" ] || continue
+  out="${f%.*}_${f##*.}.spv"
+  case "$GV" in
+    *glslc) "$GV" -O --target-env=vulkan1.1 "-I$INC" "$f" -o "$out" ;;
+    *)      "$GV" -V --target-env vulkan1.1 "-I$INC" "$f" -o "$out" >/dev/null ;;
+  esac
+  if command -v spirv-val >/dev/null 2>&1; then spirv-val "$out"; fi
+done
 for f in "$SRC"/*.comp; do
   out="${f%.comp}.spv"
   case "$GV" in
