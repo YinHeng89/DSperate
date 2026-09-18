@@ -1,7 +1,11 @@
 // Shared by tri_opaque.frag and tri_tail.frag: the per-fragment shading of
 // the triangle path, through ds_shade.glsl's arithmetic.
 layout(std430, binding = 0) readonly buffer Polys  { GpuPoly polys[]; };
-layout(std430, binding = 3) readonly buffer Texels { uint texels[]; };
+// The texel arena as a uniform texel buffer: on Mali a texelFetch goes
+// through the texture cache where an SSBO load goes through load/store, and
+// the fragment stage was 3.5 ms of a 5.9 ms fence wait at 2x (Golden Sun).
+#define DS_TEXEL_BUFFER 1
+layout(binding = 3) uniform usamplerBuffer texels_tb;
 layout(std430, binding = 5) readonly buffer Post   { GpuPost ps; };
 layout(push_constant) uniform PC { GpuFrame f; } pc;
 layout(location = 0) flat in uint v_poly;
@@ -19,7 +23,7 @@ Frag shade_fragment(GpuPoly p) {
   Frag o;
   uint blendmode = (p.attr >> 4) & 3u;
   uint polyalpha = (p.attr >> 16) & 0x1Fu;
-  bool textured = (p.flags & DS_PF_TEXTURED) != 0u;
+  bool textured = (p.flags & DS_PF_TEXTURED) != 0u && (pc.f.flags & DS_FF_NOTEX) == 0u;   // DS_FF_NOTEX: attribution
   o.src = shade_pixel(p, blendmode, polyalpha, textured,
                       int(round(v_rgb.r)), int(round(v_rgb.g)), int(round(v_rgb.b)),
                       int(floor(v_st.x + 0.01)), int(floor(v_st.y + 0.01)));

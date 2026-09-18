@@ -146,7 +146,8 @@ public:
     u64 upload_ns = 0, wait_line_ns = 0, wait_frame_ns = 0, wait_forced_ns = 0;
     u64 submit_ns = 0;        // of upload_ns: Raster::submit itself (command recording and the queue submits)
     u64 job_lat_ns = 0, job_lat_max_ns = 0, stalls = 0;
-    u64 edge_frames = 0, fog_frames = 0;   // frames dispatched with DISP3DCNT edge marking / fog on (which scenes exercise the final pass)   // the job thread's wake-up latency (Pending -> Running); stalls = line waits over 50 ms
+    u64 edge_frames = 0, fog_frames = 0;
+    u64 polys_textured = 0, polys_may_alpha = 0, polys_alpha = 0;   // textured polygons; whose format could carry alpha 0; whose texture actually does   // frames dispatched with DISP3DCNT edge marking / fog on (which scenes exercise the final pass)   // the job thread's wake-up latency (Pending -> Running); stalls = line waits over 50 ms
     u64 wait_forced_n = 0, texel_words = 0;
     u64 span_rows = 0;        // rows the span table held, summed
     // The order-free prefix (vk_layout.h GpuFrame::first_ordered): how much

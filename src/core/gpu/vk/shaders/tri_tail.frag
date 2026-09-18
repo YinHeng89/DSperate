@@ -11,6 +11,7 @@
 #include "tri_frag_common.glsl"
 layout(input_attachment_index = 0, set = 1, binding = 0) uniform usubpassInput in_col;
 layout(input_attachment_index = 1, set = 1, binding = 1) uniform usubpassInput in_attr;
+layout(input_attachment_index = 2, set = 1, binding = 2) uniform usubpassInput in_z;
 layout(input_attachment_index = 3, set = 1, binding = 3) uniform usubpassInput in_sh;
 void main() {
   GpuPoly p = polys[v_poly];
@@ -35,5 +36,10 @@ void main() {
   if ((dattr & (1u << 15)) == 0u) attr &= ~(1u << 15);
   o_col = alpha_blend(pc.f.dispcnt, f.src, dcol, f.alpha);
   o_attr = attr;
-  o_z = f.depth;
+  // The DS depth record moves only when the polygon writes depth (attribute
+  // bit 11); the fixed-function depth buffer already obeys that, and this
+  // plane must too or the final pass fogs a translucent pixel at ITS depth
+  // rather than at the depth of what it was blended over (Golden Sun's
+  // mist over fogged terrain: dark, hard-edged).
+  o_z = (p.attr & 0x800u) != 0u ? f.depth : subpassLoad(in_z).r;
 }

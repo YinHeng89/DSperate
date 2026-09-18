@@ -25,6 +25,7 @@ Spirv shader_tri_vert();     // the triangle path: polygons as fans through the 
 Spirv shader_tri_opaque();   // ... its opaque-prefix fragment stage
 Spirv shader_tri_tail();     // ... and the ordered translucent tail
 Spirv shader_downsample();
+Spirv shader_tri_pre();      // the depth prepass: alpha test only (DS_VK_TRI_PREPASS)
 Spirv shader_tri_mask();     // the shadow-mask draw: the run id into the shadow plane where the depth test fails
 Spirv shader_tri_flat();     // attribution: the opaque draw with a constant colour   // the native plane from the hi-res layer (S >= 2)
 

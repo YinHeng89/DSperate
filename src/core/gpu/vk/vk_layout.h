@@ -188,6 +188,11 @@ struct GpuFrame {
 #define DS_FF_FACE_BACK  0x4u  // the triangle path's opaque draw, back-facing polygons only (tri.vert collapses the rest)
 #define DS_FF_FACE_FRONT 0x8u  // ... front-facing only: drawn second, LESS_OR_EQUAL, so a front face at the depth of an opaque back-facing pixel wins (Renderer3D::depth_pass mode 1)
 #define DS_FF_RUN_SHIFT 16u  // bits 16-31: the shadow-mask run this draw belongs to (the shadow plane holds run ids; see vk_raster.cpp)
+#define DS_FF_ONLY_PLAIN 0x40u  // the triangle path: draw only polygons WITHOUT DS_PF_TEX_ALPHA (the depth prepass and its EQUAL shaded pass)
+#define DS_FF_ONLY_ALPHA 0x80u  // ... only polygons WITH it (drawn after, with the normal test: they never went through the prepass)
+#define DS_FF_SORTED   0x100u  // the triangle path: this draw's instance i is polygon order[i] (the opaque prefix near to far)
+#define DS_FF_TEX0     0x20u  // attribution (DS_VK_TRI_TEX0=1): every texel fetch reads the polygon's first texel (the fetch without its cache misses)
+#define DS_FF_NOTEX    0x10u  // attribution (DS_VK_TRI_NOTEX=1): shade every polygon as untextured
 #define DS_FF_IDCOLOUR 0x2u  // debugging (DS_VK_TRI_IDCOL=1): the opaque draw writes the polygon INDEX as its colour (r = i & 63, g = i >> 6 & 63, b = i >> 12 & 63)
 
 // Render state too large for the push constants: the fog table, the edge

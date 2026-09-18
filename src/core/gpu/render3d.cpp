@@ -4103,7 +4103,12 @@ bool Renderer3D::gpu_dispatch(const Polygon* const* polys, u32 npoly) {
       o.flags |= DS_PF_TEXTURED;
       // Whether any texel can carry alpha 0 (see DS_PF_TEX_ALPHA). Formats 1
       // and 6 carry graded alpha and make the polygon translucent anyway.
-      if ((p.texparam & (1u << 29)) || fmt == 5 || fmt == 7) o.flags |= DS_PF_TEX_ALPHA;
+      // The format could carry alpha 0 (bit 29, formats 5 and 7); the cache
+      // knows whether this texture actually does.
+      const bool may_alpha = (p.texparam & (1u << 29)) || fmt == 5 || fmt == 7;
+      if (may_alpha) ++gpu_stats_.polys_may_alpha;
+      if (may_alpha && r.transparent) { o.flags |= DS_PF_TEX_ALPHA; ++gpu_stats_.polys_alpha; }
+      ++gpu_stats_.polys_textured;
     }
 
     // The same bounding box the binning shader will use. Counting it here is
@@ -4154,6 +4159,10 @@ bool Renderer3D::gpu_dispatch(const Polygon* const* polys, u32 npoly) {
   for (u32 i = 0; i < npoly; ++i) if (!polys[i]->degenerate) { if (polys[i]->wbuffer) f.flags |= DS_FF_WBUFFER; break; }
   static const bool idcol = std::getenv("DS_VK_TRI_IDCOL") != nullptr;   // debugging: which polygon owns a pixel (read the A/B dump's colour)
   if (idcol) f.flags |= DS_FF_IDCOLOUR;
+  static const bool notex = std::getenv("DS_VK_TRI_NOTEX") != nullptr;   // attribution: the fragment stage without its texel fetch
+  if (notex) f.flags |= DS_FF_NOTEX;
+  static const bool tex0 = std::getenv("DS_VK_TRI_TEX0") != nullptr;    // attribution: the fetch from one address
+  if (tex0) f.flags |= DS_FF_TEX0;
   f.scale = vk_raster_->scale();
   f.dispcnt = dispcnt_;
   if (dispcnt_ & (1u << 5)) ++gpu_stats_.edge_frames;
@@ -4190,6 +4199,8 @@ void Renderer3D::gpu_compare(const u32* cpu, const u32* gpu) {
   gpu_stats_.ab_pixels += bad;
   if (bad > gpu_stats_.ab_worst) gpu_stats_.ab_worst = bad;
   if (gpu_stats_.ab_first_frame < 0) gpu_stats_.ab_first_frame = static_cast<s32>(nds_.frame_count);
+  static const bool ab_list = std::getenv("DS_GPU_AB_LIST") != nullptr;   // one line per differing frame: its NDS frame number and index in the dump
+  if (ab_list) std::fprintf(stderr, "gpu A/B: dump index %llu = nds frame %llu, %u pixels differ\n", static_cast<unsigned long long>(gpu_stats_.ab_bad - 1), static_cast<unsigned long long>(nds_.frame_count), bad);
   gpu_ab_write(ab_ref_, cpu);
   gpu_ab_write(ab_cand_, gpu);
 }

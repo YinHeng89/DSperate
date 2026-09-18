@@ -22,7 +22,12 @@ uint sample_tex(GpuPoly p, int s, int t) {
   else       s = clamp(s, 0, w - 1);
   if (rep_t) { if (flp_t && (t & h) != 0) t = (h - 1) - (t & (h - 1)); else t &= h - 1; }
   else       t = clamp(t, 0, h - 1);
+#ifdef DS_TEXEL_BUFFER
+  if ((pc.f.flags & DS_FF_TEX0) != 0u) return texelFetch(texels_tb, int(p.tex_offset)).r;   // attribution
+  return texelFetch(texels_tb, int(p.tex_offset + uint(t * w + s))).r;   // the texture cache's path, not load/store (the triangle path)
+#else
   return texels[p.tex_offset + uint(t * w + s)];
+#endif
 }
 
 // 15-bit colour channel -> 6 bits: bits 1-5 of the field, +1 when non-zero.

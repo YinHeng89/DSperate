@@ -657,3 +657,53 @@ Tracks pays 0.5 ms of median for it. Kept as an opt-in
 (`DS_VK_CPU_DOWNSAMPLE=1`) for a host with CPU to spare; the GPU dispatch
 stays the default. The Golden Sun 2x fence wait of 5.9 ms is the real
 problem and it is raster time, not the passes around it.
+
+## The fragment stage at 2x (2026-09-18): attribution, prepass, sort, and a fog bug
+
+Device, dual window, 2x triangle path, work ms median and the raster's
+fence wait at line 0 (the GPU time the emulation thread waits for):
+
+| variant | gsdd | etody (p90) | st |
+| --- | --- | --- | --- |
+| baseline | 20.0 / 5.9 | 5.4 (19.3) / 2.0 | 17.3 / 0.5 |
+| flat shading (no texel, constant colour) | 16.4 / 1.6 | 5.5 (8.5) / 0.1 | 15.4 / 0.1 |
+| no translucent tail | 16.8 / 3.0 | 5.5 (18.2) / 1.5 | 17.1 / 0.3 |
+| no texel fetch, arithmetic kept | 16.5 / 2.6 | 5.4 (8.9) / 0.1 | 16.0 / 0.1 |
+| texel fetch via uniform texel buffer | 20.1 / 6.2 | 5.4 (19.5) / 2.0 | 17.3 / 0.6 |
+| texel fetch from one address | 19.4 / 5.5 | 5.4 (18.9) / 1.9 | 17.2 / 0.4 |
+| depth prepass, alpha-blind (wrong holes) | 16.3 / 2.6 | 5.4 (8.5) / 0.1 | 16.0 / 0.2 |
+| depth prepass, alpha-tested by format | 22.1 / 7.4 | 5.5 (20.5) / 2.2 | 18.5 / 1.5 |
+| exact transparent flag + hybrid prepass | 20.8 / 5.9 | 5.4 (19.0) / 1.8 | 16.6 / 0.15 |
+| opaque prefix sorted near to far | 21.6 / 6.3 | 5.5 (19.1) / 2.0 | 17.4 / 0.6 |
+
+Readings:
+- The texel FETCH is ~3.6 of Golden Sun's 5.9 ms and the arithmetic ~1 ms;
+  the fetch mechanism (SSBO load, texel buffer, one address) barely matters,
+  so it is the NUMBER of fetches: overdraw times fragments.
+- Half of it is the translucent tail (3.0 of 5.9 with the tail off), which
+  is order-dependent: no prepass, no sort, no early-Z can touch it.
+- A depth prepass only pays for polygons whose texture has no transparent
+  texel; an alpha-tested polygon has to fetch in the prepass too, so it
+  costs baseline + 1. The texture cache now scans each decoded texture once
+  (`Ref::transparent`) and the raster flags only those: st had 99 % of its
+  polygons flagged by format and 7 % actually transparent; gsdd 7 % / 7 %;
+  etody 47 % / 47 %. The hybrid prepass (plain polygons prepassed and shaded
+  at EQUAL, alpha-tested ones drawn after with the normal test) is a win
+  on st only; `DS_VK_TRI_PREPASS=1` keeps it opt-in (its inexactness: the
+  equal-depth tie goes to the later polygon).
+- Sorting the prefix near to far did nothing on any scene: Mali does not
+  early-reject behind a shader that discards, and the vertex read-back from
+  write-combined memory cost the job thread ~1 ms. Opt-in `DS_VK_TRI_SORT`.
+- Found on the way, from the user's report of Golden Sun's mist showing
+  hard, dark borders: the tail wrote the DS depth RECORD for every
+  fragment, depth write bit or not, so the final pass fogged a translucent
+  pixel at its own near depth instead of the fogged terrain's behind it.
+  Fixed (tri_tail.frag keeps the record when bit 11 is clear): gsdd A/B
+  7.63 M -> 7.04 M differing pixels over 440 frames, the mist matches.
+
+Where that leaves 2x on the RG DS Plus: gsdd needs ~4 ms it does not have,
+all of it fragments (tail 3, prefix shading 2.3 minus what a prepass wins,
+0.7 fixed). Levers left: a leaner fragment shader (per-polygon constants
+as flat varyings instead of the polys[] load per fragment, fewer input
+attachment reads, variants per blend mode), the translucent tail at a
+lower resolution (inexact, allowed), or the auto cap.

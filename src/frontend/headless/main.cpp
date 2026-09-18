@@ -1067,6 +1067,8 @@ int main(int argc, char** argv) {
       std::fprintf(stderr, "gpu raster: %llu frames drawn, %llu not dispatched%s%s; %llu with edge marking, %llu with fog\n",
                    (unsigned long long)g.frames, (unsigned long long)g.failed,
                    g.last_fail ? " -- last: " : "", g.last_fail ? g.last_fail : "", (unsigned long long)g.edge_frames, (unsigned long long)g.fog_frames);
+      std::fprintf(stderr, "gpu raster: textured polygons %llu, of which %llu could carry alpha 0 by format and %llu actually do\n",
+                   (unsigned long long)g.polys_textured, (unsigned long long)g.polys_may_alpha, (unsigned long long)g.polys_alpha);
     if (gpu_ab) {
       if (!g.ab_checked)
         std::fprintf(stderr, "gpu A/B: nothing compared -- no frame reached the GPU raster\n");

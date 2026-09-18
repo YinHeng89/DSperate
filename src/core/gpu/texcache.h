@@ -47,7 +47,7 @@ public:
   // it lives and `version` counts its decodes, so a consumer keeping its own
   // copy (the GPU raster's texel arena) can tell whether the copy it holds is
   // still this texture. texels is null when the cache is disabled.
-  struct Ref { const u32* texels = nullptr; u32 words = 0; u32 id = 0; u32 version = 0; };
+  struct Ref { const u32* texels = nullptr; u32 words = 0; u32 id = 0; u32 version = 0; bool transparent = false; };   // transparent: some texel has alpha 0 (scanned once per decode)
   Ref lookup_ref(const VramMap& vm, u32 fmt, u32 base, u32 width, u32 height, u32 texpal, u32 alpha0);
   void clear();
   bool enabled() const { return enabled_; }
@@ -63,6 +63,7 @@ private:
     std::vector<u32> texels;
     u64 validated = 0, used = 0; // frames
     u32 id = 0, version = 0;     // identity and decode count, for Ref
+    bool transparent = false;    // any texel with alpha 0: the exact alpha-test gate (the GPU raster's DS_PF_TEX_ALPHA)
     u32 gen = 0, banks = 0;      // VramMap generation the copy was last known current at, and the banks behind the ranges then
     u64 sig = 0;                 // VramMap::block_signature of the ranges then
   };

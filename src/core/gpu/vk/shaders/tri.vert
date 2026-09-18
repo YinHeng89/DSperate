@@ -8,6 +8,7 @@
 #include "vk_layout.h"
 layout(std430, binding = 0) readonly buffer Polys { GpuPoly polys[]; };
 layout(std430, binding = 1) readonly buffer Verts { GpuVert verts[]; };
+layout(std430, binding = 13) readonly buffer Order { uint order[]; };   // the opaque prefix near to far (DS_FF_SORTED)
 layout(push_constant) uniform PC { GpuFrame f; } pc;
 layout(location = 0) flat out uint v_poly;
 layout(location = 1) out vec3 v_rgb;                 // 9-bit vertex colour, perspective-correct
@@ -16,7 +17,8 @@ layout(location = 3) noperspective out float v_z;    // the DS z, linear across 
 layout(location = 4) out float v_w;                  // the DS w, perspective-correct (fog / attribution)
 layout(location = 5) out float v_zp;                 // the DS depth again, perspective-correct: the W-buffer record
 void main() {
-  GpuPoly p = polys[uint(gl_InstanceIndex)];
+  uint pi = (pc.f.flags & DS_FF_SORTED) != 0u ? order[uint(gl_InstanceIndex)] : uint(gl_InstanceIndex);
+  GpuPoly p = polys[pi];
   uint tri = uint(gl_VertexIndex) / 3u, k = uint(gl_VertexIndex) % 3u;
   // The opaque prefix is drawn twice, back faces (LESS) then front faces
   // (LESS_OR_EQUAL): the DS lets a front-facing polygon take an opaque
@@ -25,7 +27,9 @@ void main() {
   // whichever was drawn first without it.
   uint face = pc.f.flags & (DS_FF_FACE_BACK | DS_FF_FACE_FRONT);
   bool front = (p.flags & DS_PF_FRONTFACING) != 0u;
-  if (tri + 2u >= p.nverts || (face == DS_FF_FACE_BACK && front) || (face == DS_FF_FACE_FRONT && !front)) { gl_Position = vec4(2.0, 2.0, 0.0, 1.0); v_poly = 0u; v_rgb = vec3(0); v_st = vec2(0); v_z = 0.0; v_w = 1.0; v_zp = 0.0; return; }
+  bool talpha = (p.flags & DS_PF_TEX_ALPHA) != 0u;
+  bool skip_alpha = ((pc.f.flags & DS_FF_ONLY_PLAIN) != 0u && talpha) || ((pc.f.flags & DS_FF_ONLY_ALPHA) != 0u && !talpha);
+  if (tri + 2u >= p.nverts || skip_alpha || (face == DS_FF_FACE_BACK && front) || (face == DS_FF_FACE_FRONT && !front)) { gl_Position = vec4(2.0, 2.0, 0.0, 1.0); v_poly = 0u; v_rgb = vec3(0); v_st = vec2(0); v_z = 0.0; v_w = 1.0; v_zp = 0.0; return; }
   uint vi = k == 0u ? 0u : tri + k;
   GpuVert vt = verts[p.first_vert + vi];
   float W = 256.0 * float(pc.f.scale), H = 192.0 * float(pc.f.scale);
@@ -59,7 +63,7 @@ void main() {
   bool wbuf = (pc.f.flags & DS_FF_WBUFFER) != 0u;
   float zc = wbuf ? (1.0 / max(z, 1.0)) * w : (z / 16777215.0) * w;
   gl_Position = vec4(x * w, y * w, zc, w);
-  v_poly = uint(gl_InstanceIndex);
+  v_poly = pi;
   v_rgb = vec3(float(vt.r), float(vt.g), float(vt.b));
   v_st = vec2(float(vt.s), float(vt.t));
   v_z = z;
