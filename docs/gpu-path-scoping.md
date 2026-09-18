@@ -471,3 +471,43 @@ shadows as spikes. Two bugs, both found with `--gpu-ab-dump` on the host
    (`view.w` in present.comp names it, composite.comp reads that screen's
    fb). Verified by `DS_GPU_COMP_DUMP` (now per display and presented
    frame, 400-403): four consecutive frames, both panels steady.
+
+## Edge marking and the facing rule on the triangle path (2026-09-18)
+
+- **Edge marking** ran (the final pass is shared with the compute path) but
+  never marked: it tests bits 0-3 of the attribute record, the span
+  raster's edge flags, and the triangle shaders wrote none. Every opaque
+  pixel now carries 0xF and the neighbour id + depth test alone decides,
+  as melonDS's GL renderer does. Spirit Tracks' character outlines appear
+  (frame 400 of st-intro, before/after crops in the session record).
+  Scenes that use it: st (every frame, with fog); gsdd has fog only;
+  etody/mlbis/sm64/meteos neither (new "with edge marking / with fog"
+  counters in the headless stats).
+- **Depth mode 1** (`Renderer3D::depth_pass`): a front-facing polygon takes
+  an opaque back-facing pixel at EQUAL depth. Without it the pixel column
+  where a side face and a front face share a vertical edge went to
+  whichever was drawn first (a dark 1 px line right of the train's wheel,
+  x=206 rows 45-76 of frame 399). The opaque prefix is now two instanced
+  draws over the same range: back faces with LESS, then front faces with
+  LESS_OR_EQUAL (GREATER / GREATER_OR_EQUAL in W-buffer mode); tri.vert
+  collapses the polygons of the other facing from `GpuFrame::flags`
+  (DS_FF_FACE_BACK/FRONT pushed between the draws). Front-over-front at
+  equal depth now goes to the later polygon where the DS keeps the earlier
+  (same surface in practice). Device cost: none measurable (st 1x 15.1 ms,
+  gsdd 15.3). Equal-depth mode (attr bit 14, +-0x200 tolerance) is still
+  LESS.
+- `DS_VK_TRI_IDCOL=1` colours every opaque pixel by polygon index (r = i &
+  63, g = i >> 6, b = i >> 12) so an A/B dump names the owner of a pixel;
+  with `DS_GPU_DUMP_AT=x,y` that is the whole diagnosis loop.
+
+## GPU-side stalls (2026-09-18, OPEN)
+
+Single frames of 270-976 ms at random points (about one per 25 s at 1x,
+three per 25 s at 2x on st). The new stall report (line waits over 50 ms)
+shows the job thread woke within 0.1 ms and uploaded in 1-2 ms every
+time: the fence itself took the whole stall, i.e. the GPU frame completed
+late. No kernel messages, no page-reclaim counters moving, compute mode
+not yet caught in the act. Suspects: kbase's completion workqueue starved
+by the process's SCHED_RR threads until RT throttling (950 ms / 1 s -- the
+magnitude fits), tiler-heap regrowth through GPU page faults (fits "more
+at 2x"). Measured next: emu.realtime=off.

@@ -150,7 +150,7 @@ struct Raster::Impl {
   bool alias = false;
   VkFramebuffer fb3[3] = {VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE};
   VkDescriptorSet set_in3[3] = {VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE};
-  VkPipeline            pipe_op[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};            // [wbuffer]
+  VkPipeline            pipe_op[2][2] = {{VK_NULL_HANDLE, VK_NULL_HANDLE}, {VK_NULL_HANDLE, VK_NULL_HANDLE}};   // [wbuffer][front-facing: equal depth passes]
   VkPipeline            pipe_tail[2][2] = {{VK_NULL_HANDLE, VK_NULL_HANDLE}, {VK_NULL_HANDLE, VK_NULL_HANDLE}};   // [wbuffer][depth write]
   // Shadow volumes: a mask polygon marks the stencil where its depth test
   // FAILS (the volume's interior), a shadow polygon draws only there.
@@ -345,7 +345,7 @@ bool Raster::tri_setup(Impl& d, Device& dev, std::string* why) {
   d.fb = d.fb3[0];
 
   // Pipelines. Compile time is 13-45 ms each on the G52; six of them, at startup.
-  auto pipeline = [&](VkShaderModule fs, bool wbuf, bool depth_write, VkPipeline* out, int kind = 0) {
+  auto pipeline = [&](VkShaderModule fs, bool wbuf, bool depth_write, VkPipeline* out, int kind = 0, bool equal_passes = false) {
     VkPipelineShaderStageCreateInfo st[2]{};
     st[0].sType = st[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     st[0].stage = VK_SHADER_STAGE_VERTEX_BIT; st[0].module = d.mod_tv; st[0].pName = "main";
@@ -357,7 +357,7 @@ bool Raster::tri_setup(Impl& d, Device& dev, std::string* why) {
     VkPipelineRasterizationStateCreateInfo rs{}; rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO; rs.polygonMode = VK_POLYGON_MODE_FILL; rs.cullMode = VK_CULL_MODE_NONE; rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE; rs.lineWidth = 1.f;
     VkPipelineMultisampleStateCreateInfo ms{}; ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO; ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
     VkPipelineDepthStencilStateCreateInfo dss{}; dss.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
-    dss.depthTestEnable = VK_TRUE; dss.depthWriteEnable = depth_write ? VK_TRUE : VK_FALSE; dss.depthCompareOp = wbuf ? VK_COMPARE_OP_GREATER : VK_COMPARE_OP_LESS;   // W-buffer: GREATER on 1 / depth (tri.vert)
+    dss.depthTestEnable = VK_TRUE; dss.depthWriteEnable = depth_write ? VK_TRUE : VK_FALSE; dss.depthCompareOp = wbuf ? (equal_passes ? VK_COMPARE_OP_GREATER_OR_EQUAL : VK_COMPARE_OP_GREATER) : (equal_passes ? VK_COMPARE_OP_LESS_OR_EQUAL : VK_COMPARE_OP_LESS);   // W-buffer: GREATER on 1 / depth (tri.vert)
     if (kind == 1) {
       // The mask: no colour, no depth, the stencil set where the depth test fails.
       dss.depthWriteEnable = VK_FALSE; dss.stencilTestEnable = VK_TRUE;
@@ -378,7 +378,8 @@ bool Raster::tri_setup(Impl& d, Device& dev, std::string* why) {
     return a.vkCreateGraphicsPipelines(vk->dev, VK_NULL_HANDLE, 1, &gpi, nullptr, out) == VK_SUCCESS;
   };
   for (int wb = 0; wb < 2; ++wb) {
-    if (!pipeline(d.mod_tof, wb != 0, true, &d.pipe_op[wb])) return fail("opaque pipeline");
+    if (!pipeline(d.mod_tof, wb != 0, true, &d.pipe_op[wb][0])) return fail("opaque pipeline");
+    if (!pipeline(d.mod_tof, wb != 0, true, &d.pipe_op[wb][1], 0, true)) return fail("opaque front-facing pipeline");
     for (int wr = 0; wr < 2; ++wr) if (!pipeline(d.mod_ttf, wb != 0, wr != 0, &d.pipe_tail[wb][wr])) return fail("tail pipeline");
     if (d.stencil) {
       if (!pipeline(d.mod_tof, wb != 0, false, &d.pipe_mask[wb], 1)) return fail("mask pipeline");
@@ -793,8 +794,18 @@ bool Raster::submit(u32 npoly, u32 nvert, u32 ntexels, const GpuFrame& frame) {
     stamp(cb, 4);
     static const bool no_opaque = std::getenv("DS_VK_TRI_NOOPAQUE") != nullptr;   // attribution: the pass with nothing drawn
     if ((st & 2) && !no_opaque && frame.first_ordered) {
-      a.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, d.pipe_op[wbuf ? 1 : 0]);
+      // Back faces, then front faces with equal depth passing (depth_pass
+      // mode 1); the flag in the push constant tells tri.vert which to keep.
+      GpuFrame fpass = frame;
+      fpass.flags = frame.flags | DS_FF_FACE_BACK;
+      a.vkCmdPushConstants(cb, d.layout_g, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(GpuFrame), &fpass);
+      a.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, d.pipe_op[wbuf ? 1 : 0][0]);
       a.vkCmdDraw(cb, 24, frame.first_ordered, 0, 0);
+      fpass.flags = frame.flags | DS_FF_FACE_FRONT;
+      a.vkCmdPushConstants(cb, d.layout_g, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(GpuFrame), &fpass);
+      a.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, d.pipe_op[wbuf ? 1 : 0][1]);
+      a.vkCmdDraw(cb, 24, frame.first_ordered, 0, 0);
+      a.vkCmdPushConstants(cb, d.layout_g, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(GpuFrame), &frame);
     }
     stamp(cb, 5);
     // The tail in runs of one depth-write setting; shadow masks and shadow

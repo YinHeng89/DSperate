@@ -1064,9 +1064,9 @@ int main(int argc, char** argv) {
                        double(pns[0] + pns[1] + pns[2] + pns[3] + pns[4]) * k, (unsigned long long)pf);
         } }
     }
-      std::fprintf(stderr, "gpu raster: %llu frames drawn, %llu not dispatched%s%s\n",
+      std::fprintf(stderr, "gpu raster: %llu frames drawn, %llu not dispatched%s%s; %llu with edge marking, %llu with fog\n",
                    (unsigned long long)g.frames, (unsigned long long)g.failed,
-                   g.last_fail ? " -- last: " : "", g.last_fail ? g.last_fail : "");
+                   g.last_fail ? " -- last: " : "", g.last_fail ? g.last_fail : "", (unsigned long long)g.edge_frames, (unsigned long long)g.fog_frames);
     if (gpu_ab) {
       if (!g.ab_checked)
         std::fprintf(stderr, "gpu A/B: nothing compared -- no frame reached the GPU raster\n");

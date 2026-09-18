@@ -2976,6 +2976,7 @@ void Renderer3D::render(const Gpu3D& gx) {
       gpu_frame_prev_ = true;
       gpu_frame_ = true;
       display_ ^= 1;
+      gpu_job_.t_pending.store(static_cast<u64>(std::chrono::steady_clock::now().time_since_epoch().count()), std::memory_order_relaxed);
       gpu_job_set(GpuJobSync::Pending);
       return;
     } else if (const auto t0 = std::chrono::steady_clock::now(); !gpu_dispatch(polys, npoly)) {
@@ -3341,7 +3342,15 @@ void Renderer3D::sync_line(const FrameRef& f, s32 y) {
     while (b + 1 < f.nbins && y >= f.bin_y[b + 1]) ++b;
     const auto t0 = std::chrono::steady_clock::now();
     f.gpu->wait_band(b);
-    gpu_stats_.wait_line_ns += static_cast<u64>((std::chrono::steady_clock::now() - t0).count());
+    const u64 wns = static_cast<u64>((std::chrono::steady_clock::now() - t0).count());
+    gpu_stats_.wait_line_ns += wns;
+    if (wns > 50'000'000) {
+      // A stall: say whether the job thread was late to run (scheduling) or
+      // the GPU was slow to finish (the device).
+      ++gpu_stats_.stalls;
+      std::fprintf(stderr, "gpu raster: STALL frame %llu line %d -- waited %.1f ms for the GPU frame; job thread woke after %.2f ms, uploaded in %.2f ms\n",
+                   static_cast<unsigned long long>(nds_.frame_count), y, wns / 1e6, gpu_job_last_lat_ns_ / 1e6, gpu_job_last_upload_ns_ / 1e6);
+    }
     return;
   }
 #endif
@@ -3785,8 +3794,15 @@ void Renderer3D::gpu_thread_main() {
       gpu_job_.state.store(GpuJobSync::Running, std::memory_order_release);
     }
     const auto t0 = std::chrono::steady_clock::now();
+    {
+      const u64 lat = static_cast<u64>(t0.time_since_epoch().count()) - gpu_job_.t_pending.load(std::memory_order_relaxed);
+      gpu_stats_.job_lat_ns += lat;
+      if (lat > gpu_stats_.job_lat_max_ns) gpu_stats_.job_lat_max_ns = lat;
+      gpu_job_last_lat_ns_ = lat;
+    }
     const bool ok = gpu_dispatch(gpu_job_polys_.data(), gpu_job_n_);
     const u64 ns = static_cast<u64>((std::chrono::steady_clock::now() - t0).count());
+    gpu_job_last_upload_ns_ = ns;
     gpu_stats_.upload_ns += ns;
     if (prof::enabled) prof::add_ns(prof::GPU_UPLOAD, ns);
     if (ok) {
@@ -4118,8 +4134,12 @@ bool Renderer3D::gpu_dispatch(const Polygon* const* polys, u32 npoly) {
   f.opaque_rows = use_vis ? opaque_rows : 0;
   f.nrows = nrows;
   for (u32 i = 0; i < npoly; ++i) if (!polys[i]->degenerate) { if (polys[i]->wbuffer) f.flags |= DS_FF_WBUFFER; break; }
+  static const bool idcol = std::getenv("DS_VK_TRI_IDCOL") != nullptr;   // debugging: which polygon owns a pixel (read the A/B dump's colour)
+  if (idcol) f.flags |= DS_FF_IDCOLOUR;
   f.scale = vk_raster_->scale();
   f.dispcnt = dispcnt_;
+  if (dispcnt_ & (1u << 5)) ++gpu_stats_.edge_frames;
+  if (dispcnt_ & (1u << 7)) ++gpu_stats_.fog_frames;
   f.alpha_ref = rs_->alpha_ref;
   // Exactly what clear_line() fills the ring with for a solid clear. The
   // bitmap rear plane is gated off, so this is the only case that reaches here.

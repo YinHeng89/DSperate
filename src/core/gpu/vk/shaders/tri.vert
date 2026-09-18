@@ -18,7 +18,14 @@ layout(location = 5) out float v_zp;                 // the DS depth again, pers
 void main() {
   GpuPoly p = polys[uint(gl_InstanceIndex)];
   uint tri = uint(gl_VertexIndex) / 3u, k = uint(gl_VertexIndex) % 3u;
-  if (tri + 2u >= p.nverts) { gl_Position = vec4(2.0, 2.0, 0.0, 1.0); v_poly = 0u; v_rgb = vec3(0); v_st = vec2(0); v_z = 0.0; v_w = 1.0; v_zp = 0.0; return; }
+  // The opaque prefix is drawn twice, back faces (LESS) then front faces
+  // (LESS_OR_EQUAL): the DS lets a front-facing polygon take an opaque
+  // back-facing pixel at equal depth (Renderer3D::depth_pass mode 1), and
+  // the column where a side face and a front face share an edge went to
+  // whichever was drawn first without it.
+  uint face = pc.f.flags & (DS_FF_FACE_BACK | DS_FF_FACE_FRONT);
+  bool front = (p.flags & DS_PF_FRONTFACING) != 0u;
+  if (tri + 2u >= p.nverts || (face == DS_FF_FACE_BACK && front) || (face == DS_FF_FACE_FRONT && !front)) { gl_Position = vec4(2.0, 2.0, 0.0, 1.0); v_poly = 0u; v_rgb = vec3(0); v_st = vec2(0); v_z = 0.0; v_w = 1.0; v_zp = 0.0; return; }
   uint vi = k == 0u ? 0u : tri + k;
   GpuVert vt = verts[p.first_vert + vi];
   float W = 256.0 * float(pc.f.scale), H = 192.0 * float(pc.f.scale);

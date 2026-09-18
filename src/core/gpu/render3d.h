@@ -141,6 +141,8 @@ public:
     // so exposes the whole remaining latency with no slack to hide it in.
     u64 upload_ns = 0, wait_line_ns = 0, wait_frame_ns = 0, wait_forced_ns = 0;
     u64 submit_ns = 0;        // of upload_ns: Raster::submit itself (command recording and the queue submits)
+    u64 job_lat_ns = 0, job_lat_max_ns = 0, stalls = 0;
+    u64 edge_frames = 0, fog_frames = 0;   // frames dispatched with DISP3DCNT edge marking / fog on (which scenes exercise the final pass)   // the job thread's wake-up latency (Pending -> Running); stalls = line waits over 50 ms
     u64 wait_forced_n = 0, texel_words = 0;
     u64 span_rows = 0;        // rows the span table held, summed
     // The order-free prefix (vk_layout.h GpuFrame::first_ordered): how much
@@ -663,8 +665,10 @@ public:
     std::mutex m;
     std::condition_variable cv;
     std::atomic<u32> state{Idle};
+    std::atomic<u64> t_pending{0};   // steady_clock ns when the job was handed over (the thread's wake-up latency)
     bool quit = false;
   };
+  u64 gpu_job_last_lat_ns_ = 0, gpu_job_last_upload_ns_ = 0;   // the last job's wake-up latency and upload time (the stall report)
   struct FrameRef {
     const u32* out = nullptr;
     u64 gen = 0;

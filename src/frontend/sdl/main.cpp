@@ -4721,6 +4721,7 @@ sdl_ready:
                      static_cast<unsigned long long>(g.frames), double(g.upload_ns) / n / 1e6, double(g.submit_ns) / n / 1e6,
                      double(g.wait_line_ns + g.wait_frame_ns + g.wait_forced_ns) / n / 1e6,
                      double(g.wait_line_ns) / n / 1e6, double(g.wait_frame_ns) / n / 1e6, double(g.wait_forced_ns) / n / 1e6);
+        std::fprintf(stderr, "gpu raster: job thread wake-up latency %.3f ms mean, %.1f ms max; %llu stalls over 50 ms\n", double(g.job_lat_ns) / n / 1e6, double(g.job_lat_max_ns) / 1e6, static_cast<unsigned long long>(g.stalls));
         std::fprintf(stderr, "gpu raster: per frame -- order-free prefix %.0f polygons (%.0f K span rows), ordered tail %.0f covering %.0f K px\n",
                      double(g.opaque_polys) / n, double(g.opaque_rows) / n / 1024.0, double(g.tail_polys) / n, double(g.tail_area) / n / 1024.0);
 
