@@ -152,6 +152,12 @@ struct Raster::Impl {
   VkDescriptorSet set_in3[3] = {VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE};
   VkPipeline            pipe_op[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};            // [wbuffer]
   VkPipeline            pipe_tail[2][2] = {{VK_NULL_HANDLE, VK_NULL_HANDLE}, {VK_NULL_HANDLE, VK_NULL_HANDLE}};   // [wbuffer][depth write]
+  // Shadow volumes: a mask polygon marks the stencil where its depth test
+  // FAILS (the volume's interior), a shadow polygon draws only there.
+  VkPipeline            pipe_mask[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};                                              // [wbuffer]
+  VkPipeline            pipe_shadow[2][2] = {{VK_NULL_HANDLE, VK_NULL_HANDLE}, {VK_NULL_HANDLE, VK_NULL_HANDLE}};   // [wbuffer][depth write]
+  VkFormat              ds_format = VK_FORMAT_D32_SFLOAT;
+  bool                  stencil = false;
   struct Img { VkImage img = VK_NULL_HANDLE; VkDeviceMemory mem = VK_NULL_HANDLE; VkImageView view = VK_NULL_HANDLE; };
   Img img_col, img_attr, img_z, img_d;
   Img img_col3[3];
@@ -259,10 +265,10 @@ bool Raster::tri_setup(Impl& d, Device& dev, std::string* why) {
     VkFormatProperties fp{}; if (a.vkGetPhysicalDeviceFormatProperties) a.vkGetPhysicalDeviceFormatProperties(vk->phys, VK_FORMAT_R32_UINT, &fp);
     const bool linear_ok = (fp.linearTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) != 0 && std::getenv("DS_VK_TRI_COPY") == nullptr;
     if (std::getenv("DS_VK_LIST_EXT") && a.vkGetPhysicalDeviceFormatProperties) {
-      const VkFormat fmts[] = {VK_FORMAT_R32_UINT, VK_FORMAT_R8G8B8A8_UINT, VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_R32_SFLOAT, VK_FORMAT_R16G16_UINT};
-      const char* names[] = {"R32_UINT", "R8G8B8A8_UINT", "R8G8B8A8_UNORM", "B8G8R8A8_UNORM", "R32_SFLOAT", "R16G16_UINT"};
-      for (int i = 0; i < 6; ++i) { VkFormatProperties f2{}; a.vkGetPhysicalDeviceFormatProperties(vk->phys, fmts[i], &f2);
-        std::fprintf(stderr, "vk: %-15s linear features %08x (colour attachment %s, input %s)  optimal %08x\n", names[i], f2.linearTilingFeatures, (f2.linearTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) ? "yes" : "no", (f2.linearTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) ? "yes" : "no", f2.optimalTilingFeatures); }
+      const VkFormat fmts[] = {VK_FORMAT_R32_UINT, VK_FORMAT_R8G8B8A8_UINT, VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_R32_SFLOAT, VK_FORMAT_R16G16_UINT, VK_FORMAT_D24_UNORM_S8_UINT, VK_FORMAT_D32_SFLOAT_S8_UINT, VK_FORMAT_S8_UINT};
+      const char* names[] = {"R32_UINT", "R8G8B8A8_UINT", "R8G8B8A8_UNORM", "B8G8R8A8_UNORM", "R32_SFLOAT", "R16G16_UINT", "D24_UNORM_S8", "D32_SFLOAT_S8", "S8_UINT"};
+      for (int i = 0; i < 9; ++i) { VkFormatProperties f2{}; a.vkGetPhysicalDeviceFormatProperties(vk->phys, fmts[i], &f2);
+        std::fprintf(stderr, "vk: %-15s linear features %08x (colour attachment %s, input %s)  optimal %08x (depth/stencil attachment %s)\n", names[i], f2.linearTilingFeatures, (f2.linearTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) ? "yes" : "no", (f2.linearTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) ? "yes" : "no", f2.optimalTilingFeatures, (f2.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) ? "yes" : "no"); }
     }
     d.alias = linear_ok;
     if (d.alias) for (int i = 0; i < 3 && d.alias; ++i) d.alias = alias_image(d.out[i], d.img_col3[i]);
@@ -277,7 +283,16 @@ bool Raster::tri_setup(Impl& d, Device& dev, std::string* why) {
     if (!make_image(VK_FORMAT_R32_UINT, cu, VK_IMAGE_ASPECT_COLOR_BIT, d.img_attr)) return fail("attribute attachment");
     if (!make_image(VK_FORMAT_R32_UINT, cu, VK_IMAGE_ASPECT_COLOR_BIT, d.img_z)) return fail("depth plane attachment");
   }
-  if (!make_image(VK_FORMAT_D32_SFLOAT, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, VK_IMAGE_ASPECT_DEPTH_BIT, d.img_d)) return fail("depth buffer");
+  {
+    // A stencil for the shadow volumes where the driver has one with the depth.
+    const VkFormat cands[] = {VK_FORMAT_D24_UNORM_S8_UINT, VK_FORMAT_D32_SFLOAT_S8_UINT};
+    for (VkFormat f : cands) {
+      VkFormatProperties fp{}; if (a.vkGetPhysicalDeviceFormatProperties) a.vkGetPhysicalDeviceFormatProperties(vk->phys, f, &fp);
+      if (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) { d.ds_format = f; d.stencil = true; break; }
+    }
+    if (std::getenv("DS_VK_TRI_NOSTENCIL")) { d.ds_format = VK_FORMAT_D32_SFLOAT; d.stencil = false; }
+  }
+  if (!make_image(d.ds_format, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, d.stencil ? (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT) : VK_IMAGE_ASPECT_DEPTH_BIT, d.img_d)) return fail("depth buffer");
   {
     VkDescriptorSetLayout l3[3] = {d.dsl_in, d.dsl_in, d.dsl_in};
     VkDescriptorSetAllocateInfo dsa3{}; dsa3.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO; dsa3.descriptorPool = d.pool; dsa3.descriptorSetCount = 3; dsa3.pSetLayouts = l3;
@@ -300,7 +315,8 @@ bool Raster::tri_setup(Impl& d, Device& dev, std::string* why) {
     at[i].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE; at[i].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
     at[i].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED; at[i].finalLayout = VK_IMAGE_LAYOUT_GENERAL;
   }
-  at[3] = at[0]; at[3].format = VK_FORMAT_D32_SFLOAT; at[3].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE; at[3].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+  at[3] = at[0]; at[3].format = d.ds_format; at[3].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE; at[3].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+  at[3].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; at[3].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
   VkAttachmentReference cr[3] = {{0, VK_IMAGE_LAYOUT_GENERAL}, {1, VK_IMAGE_LAYOUT_GENERAL}, {2, VK_IMAGE_LAYOUT_GENERAL}};
   VkAttachmentReference ir[2] = {{0, VK_IMAGE_LAYOUT_GENERAL}, {1, VK_IMAGE_LAYOUT_GENERAL}};
   VkAttachmentReference dr{3, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
@@ -327,7 +343,7 @@ bool Raster::tri_setup(Impl& d, Device& dev, std::string* why) {
   d.fb = d.fb3[0];
 
   // Pipelines. Compile time is 13-45 ms each on the G52; six of them, at startup.
-  auto pipeline = [&](VkShaderModule fs, bool wbuf, bool depth_write, VkPipeline* out) {
+  auto pipeline = [&](VkShaderModule fs, bool wbuf, bool depth_write, VkPipeline* out, int kind = 0) {
     VkPipelineShaderStageCreateInfo st[2]{};
     st[0].sType = st[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     st[0].stage = VK_SHADER_STAGE_VERTEX_BIT; st[0].module = d.mod_tv; st[0].pName = "main";
@@ -340,7 +356,18 @@ bool Raster::tri_setup(Impl& d, Device& dev, std::string* why) {
     VkPipelineMultisampleStateCreateInfo ms{}; ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO; ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
     VkPipelineDepthStencilStateCreateInfo dss{}; dss.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
     dss.depthTestEnable = VK_TRUE; dss.depthWriteEnable = depth_write ? VK_TRUE : VK_FALSE; dss.depthCompareOp = wbuf ? VK_COMPARE_OP_GREATER : VK_COMPARE_OP_LESS;
-    VkPipelineColorBlendAttachmentState cba[3]{}; for (auto& c : cba) c.colorWriteMask = 0xF;
+    if (kind == 1) {
+      // The mask: no colour, no depth, the stencil set where the depth test fails.
+      dss.depthWriteEnable = VK_FALSE; dss.stencilTestEnable = VK_TRUE;
+      dss.front.compareOp = VK_COMPARE_OP_ALWAYS; dss.front.failOp = VK_STENCIL_OP_KEEP; dss.front.passOp = VK_STENCIL_OP_KEEP; dss.front.depthFailOp = VK_STENCIL_OP_REPLACE;
+      dss.front.compareMask = 0xFF; dss.front.writeMask = 0xFF; dss.front.reference = 1; dss.back = dss.front;
+    } else if (kind == 2) {
+      // The shadow: only where the stencil is set.
+      dss.stencilTestEnable = VK_TRUE;
+      dss.front.compareOp = VK_COMPARE_OP_EQUAL; dss.front.failOp = VK_STENCIL_OP_KEEP; dss.front.passOp = VK_STENCIL_OP_KEEP; dss.front.depthFailOp = VK_STENCIL_OP_KEEP;
+      dss.front.compareMask = 0xFF; dss.front.writeMask = 0; dss.front.reference = 1; dss.back = dss.front;
+    }
+    VkPipelineColorBlendAttachmentState cba[3]{}; for (auto& c : cba) c.colorWriteMask = kind == 1 ? 0u : 0xFu;
     VkPipelineColorBlendStateCreateInfo cbs{}; cbs.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO; cbs.attachmentCount = 3; cbs.pAttachments = cba;
     if (d.roaa) cbs.flags = VK_PIPELINE_COLOR_BLEND_STATE_CREATE_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_BIT_EXT;
     VkGraphicsPipelineCreateInfo gpi{}; gpi.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO; gpi.stageCount = 2; gpi.pStages = st;
@@ -351,6 +378,10 @@ bool Raster::tri_setup(Impl& d, Device& dev, std::string* why) {
   for (int wb = 0; wb < 2; ++wb) {
     if (!pipeline(d.mod_tof, wb != 0, true, &d.pipe_op[wb])) return fail("opaque pipeline");
     for (int wr = 0; wr < 2; ++wr) if (!pipeline(d.mod_ttf, wb != 0, wr != 0, &d.pipe_tail[wb][wr])) return fail("tail pipeline");
+    if (d.stencil) {
+      if (!pipeline(d.mod_tof, wb != 0, false, &d.pipe_mask[wb], 1)) return fail("mask pipeline");
+      for (int wr = 0; wr < 2; ++wr) if (!pipeline(d.mod_ttf, wb != 0, wr != 0, &d.pipe_shadow[wb][wr], 2)) return fail("shadow pipeline");
+    }
   }
   return true;
 }
@@ -547,7 +578,7 @@ std::unique_ptr<Raster> Raster::create(Device& dev, std::string* why) {
       // The host lays out the list as it does for the visibility pass: the
       // real order-free prefix, and only the tail binned.
       self->vis_ = true;
-      std::fprintf(stderr, "gpu raster: triangle path at %ux, ordered attachment access %s, %s\n", self->scale_, d.roaa ? "on" : "OFF (a barrier per tail polygon)", d.alias ? "attachments aliased on the buffers" : "attachments copied into the buffers");
+      std::fprintf(stderr, "gpu raster: triangle path at %ux, ordered attachment access %s, %s, %s\n", self->scale_, d.roaa ? "on" : "OFF (a barrier per tail polygon)", d.alias ? "attachments aliased on the buffers" : "attachments copied into the buffers", d.stencil ? "stencil shadows" : "NO stencil (shadows not drawn)");
     }
   }
 
@@ -749,6 +780,7 @@ bool Raster::submit(u32 npoly, u32 nvert, u32 ntexels, const GpuFrame& frame) {
     cv[1].color.uint32[0] = frame.clear_attr;
     cv[2].color.uint32[0] = frame.clear_depth;
     cv[3].depthStencil.depth = wbuf ? 0.f : static_cast<float>(frame.clear_depth) / 16777215.f;
+    cv[3].depthStencil.stencil = 0;
     VkRenderPassBeginInfo rb{};
     rb.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
     rb.renderPass = d.rp; rb.framebuffer = d.fb3[back]; rb.renderArea = {{0, 0}, {W, H}}; rb.clearValueCount = 4; rb.pClearValues = cv;
@@ -766,14 +798,27 @@ bool Raster::submit(u32 npoly, u32 nvert, u32 ntexels, const GpuFrame& frame) {
     // The tail in runs of one depth-write setting; shadow masks and shadow
     // polygons are not drawn (no stencil on this path yet).
     const GpuPoly* gp = static_cast<const GpuPoly*>(d.polys.ptr);
-    const u32 skip = DS_PF_SHADOW_MASK | DS_PF_SHADOW;
     static const bool no_tail = std::getenv("DS_VK_TRI_NOTAIL") != nullptr;   // attribution: leave the translucent tail out
+    // Runs of one kind (translucent, shadow mask, shadow) and one depth-write
+    // setting. A run of masks starts by clearing the stencil -- the DS clears
+    // it per scanline when a run begins; whole-frame is the approximation.
+    auto kind_of = [&](const GpuPoly& p) { return (p.flags & DS_PF_SHADOW_MASK) ? 1 : (p.flags & DS_PF_SHADOW) ? 2 : 0; };
     for (u32 i = frame.first_ordered; (st & 2) && !no_tail && i < npoly;) {
-      if (gp[i].flags & skip) { ++i; continue; }
+      const int kind = kind_of(gp[i]);
       const bool wr = (gp[i].attr & 0x800u) != 0u;
       u32 j = i + 1;
-      while (j < npoly && !(gp[j].flags & skip) && ((gp[j].attr & 0x800u) != 0u) == wr) ++j;
-      a.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, d.pipe_tail[wbuf ? 1 : 0][wr ? 1 : 0]);
+      while (j < npoly && kind_of(gp[j]) == kind && ((gp[j].attr & 0x800u) != 0u) == wr) ++j;
+      if (kind != 0 && !d.stencil) { i = j; continue; }   // no stencil on this driver: shadows are not drawn
+      if (kind == 1) {
+        VkClearAttachment ca{}; ca.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT; ca.clearValue.depthStencil.stencil = 0;
+        VkClearRect cr{}; cr.rect = {{0, 0}, {W, H}}; cr.layerCount = 1;
+        a.vkCmdClearAttachments(cb, 1, &ca, 1, &cr);
+        a.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, d.pipe_mask[wbuf ? 1 : 0]);
+        a.vkCmdDraw(cb, 24, j - i, 0, i);
+        i = j;
+        continue;
+      }
+      a.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, kind == 2 ? d.pipe_shadow[wbuf ? 1 : 0][wr ? 1 : 0] : d.pipe_tail[wbuf ? 1 : 0][wr ? 1 : 0]);
       if (d.roaa) a.vkCmdDraw(cb, 24, j - i, 0, i);
       else for (u32 k = i; k < j; ++k) {
         a.vkCmdDraw(cb, 24, 1, 0, k);

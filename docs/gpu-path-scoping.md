@@ -429,3 +429,16 @@ dispatch at line 215 and the first display line. So `video.internal_res`
 stays a per-game choice for now; the plan's auto cap (drop to 1x after N
 over-budget fence waits) is the follow-up, and the fragment stage is the
 remaining GPU lever (flat shading measured 2.2 ms cheaper on Golden Sun).
+
+## Shadow volumes on the triangle path (2026-09-18)
+
+The depth attachment is D24_UNORM_S8 (or D32_S8) where the driver has it;
+a run of mask polygons clears the stencil and draws with no colour and no
+depth write, setting the stencil where its depth test FAILS (the volume's
+interior); a run of shadow polygons draws with the stencil test EQUAL and
+the shadow's own id rule in `tri_tail.frag` (against the destination's
+translucent id when it has one, else its opaque id). The DS clears its
+stencil per scanline when a run begins; whole-frame is the approximation.
+Host A/B, stencil off -> on: Spirit Tracks 4.78 M -> 4.54 M differing
+pixels over 300 frames, Dragon Ball 12006 -> 11905 (the rest is the usual
+rounding residual). `DS_VK_TRI_NOSTENCIL=1` measures without.
