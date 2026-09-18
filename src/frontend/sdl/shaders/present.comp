@@ -1,0 +1,36 @@
+#version 450
+// The GPU present stage (docs/gpu-path-scoping.md, P1): one invocation per
+// PANEL pixel of the scanout buffer, imported into Vulkan as an image. The
+// core writes its two 256x192 frames; this lays them out, scales, rotates
+// and blends the PiP inset -- everything the CPU scanline scaler did -- so
+// no panel-sized pixel passes through the CPU. First cut: nearest scaling;
+// the box filter, grid, bilinear and chunky follow as P4.
+layout(local_size_x = 16, local_size_y = 8) in;
+layout(binding = 0, rgba8) uniform writeonly image2D dst;
+layout(std430, binding = 1) readonly buffer Src { uint src[]; };   // slot base + screen * 49152 + y * 256 + x, 0xAARRGGBB
+layout(push_constant) uniform P {
+  uvec4 a;        // presented w, h; logical w, h
+  uvec4 b;        // rotation (0/90/180/270), nviews, inset alpha 0..255, source base (words)
+  ivec4 rect[2];  // x, y, w, h in the logical frame, draw order
+  ivec4 view[2];  // screen, shown, blends (inset), unused
+} pc;
+void main() {
+  uvec2 p = gl_GlobalInvocationID.xy;
+  if (p.x >= pc.a.x || p.y >= pc.a.y) return;
+  int lw = int(pc.a.z), lh = int(pc.a.w), px = int(p.x), py = int(p.y), lx, ly;
+  // The same convention as Display::rotate_out's transposes.
+  if (pc.b.x == 90u)       { lx = py;          ly = lh - 1 - px; }
+  else if (pc.b.x == 180u) { lx = lw - 1 - px; ly = lh - 1 - py; }
+  else if (pc.b.x == 270u) { lx = lw - 1 - py; ly = px; }
+  else                     { lx = px;          ly = py; }
+  vec3 c = vec3(0.0);
+  for (int v = 0; v < int(pc.b.y); ++v) {
+    ivec4 r = pc.rect[v]; ivec4 vi = pc.view[v];
+    if (vi.y == 0 || lx < r.x || ly < r.y || lx >= r.x + r.z || ly >= r.y + r.w) continue;
+    int sx = (lx - r.x) * 256 / r.z, sy = (ly - r.y) * 192 / r.w;
+    uint s = src[pc.b.w + uint(vi.x) * 49152u + uint(sy) * 256u + uint(sx)];
+    vec3 col = vec3(float((s >> 16) & 255u), float((s >> 8) & 255u), float(s & 255u)) / 255.0;
+    c = (vi.z != 0 && pc.b.z < 255u) ? mix(c, col, float(pc.b.z) / 255.0) : col;
+  }
+  imageStore(dst, ivec2(p), vec4(c, 1.0));
+}

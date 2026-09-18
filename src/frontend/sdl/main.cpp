@@ -157,6 +157,8 @@ const char* kUsage =
     "  --fbdev / --no-fbdev  present straight through /dev/fb0 (the mali-fbdev SDL2 of the\n"
     "                  H700 handhelds; the default is auto: when that SDL2 has a mali driver\n"
     "                  and fb0 answers). video.fbdev\n"
+    "  --gpu-present   lay out and scale the picture on the GPU, into the scanout\n"
+    "                  buffer (Vulkan dma-buf import; opt-in). video.gpu_present\n"
     "  --no-audio      run without sound\n"
     "  --volume N      0..100\n"
     "  --audio-buffer X  how much sound is held ahead: auto (the default) or milliseconds;\n"
@@ -910,7 +912,7 @@ struct VideoSetup {
   ds::sdl::Display::Layout layout;
   std::vector<ds::sdl::Display::Mode> layout_cycle;
   // Boot-only, see above.
-  bool   use_disp = false, use_fbdev = false;
+  bool   use_disp = false, use_fbdev = false, gpu_present = false;
   int    bottom_display = 1;
 };
 
@@ -1002,6 +1004,7 @@ bool parse_video(const ds::sdl::Config& cfg, VideoSetup& vs) {
 // The set_* calls and the open itself. Split from parse_video so a settings
 // change can close the windows and come back through here with new values.
 bool open_displays(const VideoSetup& vs, ds::sdl::Display& display, ds::sdl::Display& display2) {
+  display.set_gpu_present(vs.gpu_present); display2.set_gpu_present(vs.gpu_present);
   if (vs.dual_window) {
     display.set_chunky(vs.chunky != 0, vs.chunky_cell); display2.set_chunky(vs.chunky != 0, vs.chunky_cell);
     display.set_grid_strength(vs.linear ? 0.0 : vs.grid_s); display2.set_grid_strength(vs.linear ? 0.0 : vs.grid_s);
@@ -1212,6 +1215,8 @@ int main(int argc, char** argv) {
     else if (flag("--no-disp")) cli.set("video.disp", "false");
     else if (flag("--fbdev")) cli.set("video.fbdev", "true");
     else if (flag("--no-fbdev")) cli.set("video.fbdev", "false");
+    else if (flag("--gpu-present")) cli.set("video.gpu_present", "true");
+    else if (flag("--no-gpu-present")) cli.set("video.gpu_present", "false");
     else if (flag("--no-audio")) cli.set("audio.enabled", "false");
     else if (arg("--volume")) cli.set("audio.volume", argv[++i]);
     else if (arg("--audio-buffer")) cli.set("audio.buffer_size", argv[++i]);
@@ -1287,7 +1292,7 @@ int main(int argc, char** argv) {
     // section 5 item 8). --interp and --lockstep still pick the reference.
   }
   auto apply_cli = [&] { for (const char* k : {"paths.bios9", "paths.bios7", "paths.firmware", "video.scale", "video.dual_window", "video.layout", "video.screen", "video.pip_alpha", "video.dominant_ratio", "video.dominant_threshold", "video.integer_scale",
-                                              "video.fullscreen", "video.linear", "video.lcd_grid", "video.chunky", "video.chunky_threshold", "video.chunky_cell", "video.seam", "video.disp", "video.fbdev", "video.vsync", "audio.enabled", "audio.volume",
+                                              "video.fullscreen", "video.linear", "video.lcd_grid", "video.chunky", "video.chunky_threshold", "video.chunky_cell", "video.seam", "video.disp", "video.fbdev", "video.gpu_present", "video.vsync", "audio.enabled", "audio.volume",
                                               "audio.mic", "emu.jit", "emu.quantum", "emu.speed", "emu.limiter", "emu.pacing", "audio.buffer_size", "audio.latency_frames", "emu.timing_oc", "emu.gx_worker", "emu.cpu_tuning", "emu.fast_load", "emu.frameskip", "emu.frameskip_mode", "emu.frameskip_capture", "video.aa", "emu.autosave_png", "emu.autoload", "cheevos.enabled", "cheevos.token_file", "cheevos.username"}) if (cli.has(k)) cfg.set(k, cli.str(k)); };
   apply_cli();
   const std::string bios9 = cfg.str("paths.bios9"), bios7 = cfg.str("paths.bios7");
@@ -1641,6 +1646,11 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "chunky %s: the display-engine tier draws chunky cells in the scaler as their mean; using mean\n", cfg.str("video.chunky").c_str());
     chunky = 2;
   }
+
+  // The GPU present stage (gpu_present.h): opt-in while it is measured
+  // (docs/gpu-path-scoping.md P1); Display falls back to the scanline
+  // scaler when the tier has no dma-buf or the driver cannot import one.
+  { const std::string g = cfg.str("video.gpu_present"); vs.gpu_present = g == "true" || g == "on" || g == "1"; }
 
   // The fbdev tier (display_fbdev.h) owns fb0 the same way. auto takes it
   // only where SDL2 was built with the mali video driver -- the BaseOS

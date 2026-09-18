@@ -31,6 +31,15 @@ else
   exit 1
 fi
 
+for f in "$DIR"/src/frontend/sdl/shaders/*.comp; do
+  [ -e "$f" ] || continue
+  out="${f%.comp}.spv"
+  case "$GV" in
+    *glslc) "$GV" -O --target-env=vulkan1.1 "$f" -o "$out" ;;
+    *)      "$GV" -V --target-env vulkan1.1 "$f" -o "$out" >/dev/null ;;
+  esac
+  if command -v spirv-val >/dev/null 2>&1; then spirv-val "$out"; fi
+done
 for f in "$SRC"/*.comp; do
   out="${f%.comp}.spv"
   case "$GV" in

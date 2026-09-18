@@ -160,11 +160,18 @@ std::unique_ptr<Device> Device::create(std::string* why) {
   d.api.vkEnumerateDeviceExtensionProperties(d.phys, nullptr, &ne, nullptr);
   std::vector<VkExtensionProperties> exts(ne);
   d.api.vkEnumerateDeviceExtensionProperties(d.phys, nullptr, &ne, exts.data());
-  bool has_atomic64_ext = false;
+  bool has_atomic64_ext = false, has_fd = false, has_dmabuf = false, has_modifier = false, has_fmtlist = false, has_foreign = false;
   for (const auto& e : exts) {
     if (!std::strcmp(e.extensionName, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME)) d.has_host_import = true;
     if (!std::strcmp(e.extensionName, VK_KHR_SHADER_ATOMIC_INT64_EXTENSION_NAME)) has_atomic64_ext = true;
+    if (!std::strcmp(e.extensionName, VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME)) has_fd = true;
+    if (!std::strcmp(e.extensionName, VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME)) has_dmabuf = true;
+    if (!std::strcmp(e.extensionName, VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME)) has_modifier = true;
+    if (!std::strcmp(e.extensionName, VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME)) has_fmtlist = true;
+    if (!std::strcmp(e.extensionName, VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME)) has_foreign = true;
   }
+  self->limits_.dmabuf_import = has_fd && has_dmabuf;
+  self->limits_.drm_modifier = self->limits_.dmabuf_import && has_modifier && has_fmtlist;
   // 64-bit buffer atomics: the extension (or 1.2, where it is core) plus the
   // feature bits actually being set, and shaderInt64 alongside, since the
   // key the shader builds is a 64-bit integer before it is an atomic.
@@ -202,6 +209,10 @@ std::unique_ptr<Device> Device::create(std::string* why) {
   std::vector<const char*> want;
   if (d.has_host_import) want.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
   if (self->limits_.int64_atomics && has_atomic64_ext) want.push_back(VK_KHR_SHADER_ATOMIC_INT64_EXTENSION_NAME);
+  // dma-buf import for the present stage; every one optional.
+  if (self->limits_.dmabuf_import) { want.push_back(VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME); want.push_back(VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME); }
+  if (self->limits_.drm_modifier) { want.push_back(VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME); want.push_back(VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME); }
+  if (self->limits_.dmabuf_import && has_foreign) want.push_back(VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME);
   // Enable exactly the two features the raster uses and nothing else the
   // query happened to return.
   VkPhysicalDeviceShaderAtomicInt64Features en64{};

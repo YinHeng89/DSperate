@@ -112,6 +112,13 @@ public:
     // GPU timestamps on the compute queue: nanoseconds per tick, 0 when the
     // queue has none. DS_VK_TIMING=1 stamps every dispatch with them.
     double timestamp_period_ns = 0;
+    // dma-buf IMPORT (VK_KHR_external_memory_fd + VK_EXT_external_memory_dma_buf):
+    // the frontend's scanout buffers can be bound as images the GPU writes
+    // (docs/gpu-path-scoping.md P0.1). drm_modifier says the LINEAR layout can
+    // be stated explicitly (VK_EXT_image_drm_format_modifier); without it the
+    // importer falls back to VK_IMAGE_TILING_LINEAR.
+    bool dmabuf_import = false;
+    bool drm_modifier = false;
   };
   const Limits& limits() const { return limits_; }
 

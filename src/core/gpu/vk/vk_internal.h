@@ -40,7 +40,10 @@ namespace ds::gpu::vk {
   F(vkCmdDispatch) F(vkCmdPipelineBarrier) F(vkCmdFillBuffer) \
   F(vkCreateFence) F(vkDestroyFence) F(vkResetFences) F(vkWaitForFences) \
   F(vkCreateQueryPool) F(vkDestroyQueryPool) F(vkCmdResetQueryPool) F(vkCmdWriteTimestamp) F(vkGetQueryPoolResults) \
-  F(vkQueueSubmit)
+  F(vkQueueSubmit) \
+  F(vkCreateImage) F(vkDestroyImage) F(vkGetImageMemoryRequirements) F(vkBindImageMemory) \
+  F(vkCreateImageView) F(vkDestroyImageView) F(vkGetImageSubresourceLayout) \
+  F(vkGetMemoryFdPropertiesKHR) F(vkGetPhysicalDeviceImageFormatProperties2)
 
 #define DS_VK_FNS DS_VK_FNS_CORE DS_VK_FNS_PIPE
 

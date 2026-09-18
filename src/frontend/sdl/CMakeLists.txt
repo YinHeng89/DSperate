@@ -27,3 +27,14 @@ if(DSPERATE_NET)
   target_link_libraries(dsperate PRIVATE dsperate_net)
   target_compile_definitions(dsperate PRIVATE DSPERATE_NET=1)
 endif()
+# The GPU present stage (gpu_present.cpp): real when the core was built with
+# the Vulkan device layer, a stub whose open() declines otherwise. Its SPIR-V
+# is tracked beside the shader (tools/gen_shaders.sh) and linked with .incbin.
+target_sources(dsperate PRIVATE gpu_present.cpp)
+if(DSPERATE_VULKAN AND DSPERATE_VULKAN_INCLUDE)
+  target_include_directories(dsperate PRIVATE ${DSPERATE_VULKAN_INCLUDE})
+  set_property(SOURCE gpu_present.cpp APPEND PROPERTY COMPILE_DEFINITIONS
+               DSPERATE_PRESENT_SHADER_DIR="${CMAKE_CURRENT_SOURCE_DIR}/shaders")
+  set_property(SOURCE gpu_present.cpp APPEND PROPERTY OBJECT_DEPENDS
+               "${CMAKE_CURRENT_SOURCE_DIR}/shaders/present.spv")
+endif()

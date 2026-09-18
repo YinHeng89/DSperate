@@ -43,7 +43,8 @@ public:
   // to retire before its own can be issued. begin_frame() blocks only when
   // all three are taken, so an emulation frame longer than a refresh
   // borrows from the next one instead of presenting a whole refresh late.
-  static constexpr int BUFS = 3;
+  static constexpr int BUFS = 4;   // the array; nbufs_ is the count in use (default 3; 4 under the GPU present stage)
+  static constexpr int DEFAULT_BUFS = 3;
 
   // False if any precondition is missing (not the KMSDRM video driver, no
   // usable connector for this display, the window is not the size of the
@@ -59,7 +60,8 @@ public:
 
   int width() const override { return w_; }
   int height() const override { return h_; }
-  int bufs() const override { return BUFS; }
+  int bufs() const override { return nbufs_; }
+  void set_bufs(int n) { nbufs_ = n < 2 ? 2 : n > BUFS ? BUFS : n; }
   int current() const override { return cur_; }
 
   // Hands out a free buffer, waiting for a flip to retire only when none
@@ -68,6 +70,7 @@ public:
   // extending its present.
   u32* begin_frame() override;
   bool dmabuf_plane(int buf, DmabufPlane& out) const override;
+  void set_gpu_writes(bool on) override { gpu_writes_ = on; }
   void end_frame() override;      // flip now, or queue behind the pending flip; does not wait
   void flush() override;          // wait until no flip is queued behind a pending one
 
@@ -96,6 +99,8 @@ private:
   int display_ = 0;
   int w_ = 0, h_ = 0;
   Buf bufs_[BUFS];
+  int nbufs_ = DEFAULT_BUFS;
+  bool gpu_writes_ = false;
   int cur_ = -1;                  // buffer handed out by begin_frame()
   int on_screen_ = -1;            // buffer the CRTC is scanning out
   int pending_ = -1;              // buffer whose flip has not completed

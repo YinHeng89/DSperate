@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // DSperate - Nintendo DS emulator. Copyright (C) 2026 DSperate contributors.
 #pragma once
+#include "frontend/sdl/gpu_present.h"
 #include "core/gpu/gpu.h"
 #include "core/types.h"
 #include "display_disp.h"
@@ -182,6 +183,13 @@ public:
     for (int i = 0; i < nviews_; ++i) if (views_[i].screen == screen) return views_[i].rect.w >= need * static_cast<int>(SCREEN_W);
     return true;
   }
+  // The GPU present stage (gpu_present.h): on a dma-buf scanout tier, the
+  // core writes 256x192 frames and a compute dispatch lays them out into
+  // the tier's buffer, imported into Vulkan. Replaces the scanline scaler
+  // wherever the import works; falls back to it where it does not. Set
+  // before open().
+  void set_gpu_present(bool on) { gpu_wanted_ = on; }
+  bool gpu_present() const { return gpu_ != nullptr; }
   // Present straight through /dev/fb0 (display_fbdev.h): the scanline path
   // writes panel-sized frames into fb0's own buffers. Set before open().
   void set_fbdev(bool on) { fbdev_wanted_ = on; }
@@ -249,7 +257,7 @@ public:
   void present();
   // After a present that no further frame follows (the pause menu): make
   // sure the scanout tier has put it on its way. See ScanoutOut::flush.
-  void flush() { if (out_) out_->flush(); }
+  void flush() { if (gpu_ && out_) gpu_->flush(*out_); if (out_) out_->flush(); }
 
   // Where the frontend drew on the canvas this frame, so it can be cleaned up
   // before that buffer is used again. The scanout tiers keep several buffers
@@ -320,6 +328,10 @@ private:
   int               disp_divisor_ = 1;   // the divisor build_source_scale chose, restored after a page
   bool              page_ = false;
   std::unique_ptr<ScanoutOut> out_;     // tier 1; null on the surface tier
+  bool              gpu_wanted_ = false;
+  std::unique_ptr<GpuPresent> gpu_;     // the GPU present stage on top of out_; null otherwise
+  bool try_gpu_present();               // after out_ opened: import its buffers, switch draw() over
+  void draw_gpu(const u32* const fb[SCREENS]);
   SDL_Surface*      surf_ = nullptr;    // window surface; owned by SDL
   bool              margins_dirty_ = true;
   u32               out_clean_ = 0;       // scanout buffers (by index) whose letterbox is cleared

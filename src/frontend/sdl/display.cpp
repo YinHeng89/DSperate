@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+#include "frontend/sdl/gpu_present.h"
 #include "display.h"
 #include "display_wl.h"
 
@@ -285,10 +286,12 @@ bool Display::open(const char* title, int scale, bool fullscreen, bool linear, b
       int ow = 0, oh = 0;
       SDL_GetWindowSize(win_, &ow, &oh);
       auto dr = std::make_unique<DrmOut>();
+      if (gpu_wanted_) dr->set_bufs(DrmOut::DEFAULT_BUFS + 1);
       if (dr->open(win_, ow, oh, display_index_)) {
         out_ = std::move(dr);
         layout();
         build_scale();
+        if (try_gpu_present()) return true;
         std::fprintf(stderr, "video: kms scanout, %s driver, scanline scaling, rot %d\n", vd, rot_);
         return true;
       }
@@ -308,10 +311,12 @@ bool Display::open(const char* title, int scale, bool fullscreen, bool linear, b
         int ow = 0, oh = 0;
         output_size(ow, oh);   // the presented size, whatever the rotation
         auto dm = std::make_unique<DmabufOut>();
+        if (gpu_wanted_) dm->set_bufs(DmabufOut::DEFAULT_BUFS + 1);
         if (dm->open(win_, ow, oh, only_screen_ >= 0 ? display_index_ : -1)) out_ = std::move(dm);
         else if (dm_required) { std::fprintf(stderr, "DS_DMABUF=1 but the dmabuf path failed\n"); return false; }
       }
       if (!scaled_) rot_ = 0;
+      if (out_ && try_gpu_present()) return true;
       std::fprintf(stderr, "video: %s, %s driver, scanline scaling, rot %d\n",
                    out_ ? "dmabuf" : "window surface", SDL_GetCurrentVideoDriver(), rot_);
       return true;
@@ -364,6 +369,8 @@ bool Display::open(const char* title, int scale, bool fullscreen, bool linear, b
 
 void Display::close() {
   if (disp_) { disp_->close(); disp_.reset(); }
+  if (gpu_ && out_) gpu_->flush(*out_);
+  gpu_.reset();
   if (out_) { out_->close(); out_.reset(); }
   frame_px_ = nullptr;
   surf_ = nullptr;   // owned by SDL, freed with the window
@@ -481,7 +488,46 @@ void Display::place(const Layout& layout_, int w, int h, View views_[SCREENS], I
   }
 }
 
+bool Display::try_gpu_present() {
+  if (!gpu_wanted_ || !out_) return false;
+  std::string why;
+  gpu_ = GpuPresent::open(*out_, &why);
+  if (!gpu_) { std::fprintf(stderr, "video.gpu_present: %s; scanline scaling instead\n", why.c_str()); return false; }
+  // The core writes its 256x192 frames (the draw() path); the layout stays
+  // in the logical frame and the GPU maps it onto the panel.
+  scaled_ = false;
+  out_->set_gpu_writes(true);
+  layout();
+  std::fprintf(stderr, "video: %s scanout, %s driver, GPU present on %s, rot %d\n",
+               std::strcmp(SDL_GetCurrentVideoDriver(), "KMSDRM") == 0 ? "kms" : "dmabuf", SDL_GetCurrentVideoDriver(), gpu_->device_name().c_str(), rot_);
+  return true;
+}
+
+void Display::draw_gpu(const u32* const fb[SCREENS]) {
+  // A configure resized the window: the tier's buffers and our imports follow.
+  int w = 0, h = 0;
+  SDL_GetWindowSize(win_, &w, &h);
+  if (w != out_->width() || h != out_->height()) {
+    if (!out_->reopen(win_, w, h) || !gpu_->reimport(*out_)) {
+      std::fprintf(stderr, "video: GPU present lost on resize; scanline scaling from here\n");
+      gpu_.reset();
+      scaled_ = true;
+      margins_dirty_ = true;
+      layout();
+      build_scale();
+      return;   // this frame is dropped; the next takes begin_frame()
+    }
+    layout();
+  }
+  int lw = 0, lh = 0;
+  out_size(lw, lh);
+  GpuPresent::View v[SCREENS];
+  for (int i = 0; i < nviews_; ++i) v[i] = GpuPresent::View{views_[i].screen, views_[i].rect, views_[i].shown, !views_[i].direct};
+  gpu_->present(*out_, fb, v, nviews_, rot_, lw, lh, inset_alpha_);
+}
+
 void Display::draw(const u32* const fb[SCREENS]) {
+  if (gpu_) { draw_gpu(fb); return; }
   if (disp_) {
     // Whatever the frontend drew (or stopped drawing) goes to the overlay
     // layer with this frame, so the two reach the panel together.

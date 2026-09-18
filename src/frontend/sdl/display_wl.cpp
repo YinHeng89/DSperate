@@ -162,8 +162,8 @@ bool DmabufOut::open(SDL_Window* win, int w, int h, int output_index) {
   (void)output_index;
 #endif
 
-  for (Buf& b : bufs_)
-    if (!alloc_buf(b)) { close(); return false; }
+  for (int i = 0; i < nbufs_; ++i)
+    if (!alloc_buf(bufs_[i])) { close(); return false; }
   wl_display_roundtrip_queue(dpy_, q_);   // surface any create_immed protocol error now, not mid-game
 
   // Fullscreen and opaque are two of the three scanout conditions (the third
@@ -186,7 +186,7 @@ void DmabufOut::close() {
 }
 
 bool DmabufOut::dmabuf_plane(int buf, DmabufPlane& out) const {
-  if (buf < 0 || buf >= BUFS || bufs_[buf].fd < 0) return false;
+  if (buf < 0 || buf >= nbufs_ || bufs_[buf].fd < 0) return false;
   out.fd = bufs_[buf].fd; out.offset = 0; out.stride_bytes = static_cast<u32>(w_) * 4;
   out.width = static_cast<u32>(w_); out.height = static_cast<u32>(h_); out.fourcc = FMT_XRGB8888;
   return true;
@@ -196,11 +196,11 @@ u32* DmabufOut::begin_frame() {
   if (dead_) return nullptr;
   for (;;) {
     wl_display_dispatch_queue_pending(dpy_, q_);
-    for (int i = 0; i < BUFS; ++i)
+    for (int i = 0; i < nbufs_; ++i)
       if (!bufs_[i].busy) {
         cur_ = i;
         // CPU writes into a dmabuf are bracketed; see dmaheap::sync_begin_write.
-        dmaheap::sync_begin_write(bufs_[i].fd);
+        if (!gpu_writes_) dmaheap::sync_begin_write(bufs_[i].fd);
         return bufs_[i].px;
       }
     // All buffers pending: wait for a release. This is where the display's
@@ -219,7 +219,7 @@ void DmabufOut::end_frame() {
   Buf& b = bufs_[cur_];
   // Everything drawn this frame has to be visible to the compositor and to
   // the display controller before the buffer is handed over.
-  dmaheap::sync_end_write(b.fd);
+  if (!gpu_writes_) dmaheap::sync_end_write(b.fd);
   b.busy = true;
   wl_surface_attach(surf_, b.wb, 0, 0);
   wl_surface_damage(surf_, 0, 0, w_, h_);

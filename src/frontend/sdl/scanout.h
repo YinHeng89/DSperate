@@ -63,6 +63,10 @@ public:
   // dma-buf (fbdev), and the caller keeps scaling on the CPU.
   struct DmabufPlane { int fd = -1; u32 offset = 0, stride_bytes = 0, width = 0, height = 0; u32 fourcc = 0; };
   virtual bool dmabuf_plane(int buf, DmabufPlane& out) const { (void)buf; (void)out; return false; }
+  // The GPU writes the buffers from here on (through dmabuf_plane()): the
+  // CPU-write cache bracket (DMA_BUF_IOCTL_SYNC, a clean of the whole
+  // buffer -- ~0.5 ms for 3 MB) is then pointless and skipped.
+  virtual void set_gpu_writes(bool on) { (void)on; }
 };
 
 } // namespace ds::sdl

@@ -186,3 +186,44 @@ coverage (so the 1x GPU path stays the compute raster where exactness at 1x
 matters) and anti-aliasing's coverage stack (the DS AA is an edge-coverage
 blend; at hi-res the resolution itself is the anti-aliasing, and the
 frontend defaults `video.aa` off anyway).
+
+## P1 — the GPU present stage: LANDED (`--gpu-present` / `video.gpu_present`, opt-in)
+
+`src/frontend/sdl/gpu_present.{h,cpp}` + `shaders/present.comp`. On a
+DmabufOut/DrmOut tier the tier's CMA buffers are imported as LINEAR images
+(`ScanoutOut::dmabuf_plane`), the core writes its 256x192 frames (the
+`draw()` path, no ScaleTarget), and one compute dispatch per frame lays
+out, scales (nearest), rotates and blends the inset into the buffer, which
+the tier presents unchanged. Pipelined one deep: the fence wait and the
+tier's `end_frame()` for frame N happen at the start of frame N+1. Two
+things had to follow: the tier rotates one more buffer under the GPU stage
+(`set_bufs`), and it skips the dma-buf sync ioctls (`set_gpu_writes`) --
+the END|WRITE clean of a 3 MB buffer was 0.5 ms per panel, needless when
+the GPU wrote it.
+
+Device, SDL `--dual-window`, `DS_FRAME_STATS=1`, same binary, flag on/off,
+both orders. **`work ms` = emulation + present** (the `frame ms` line
+excludes present, which is where this stage's own cost lands):
+
+| scene | governor | GPU present, work median (over budget) | CPU scaler |
+| --- | --- | --- | --- |
+| Spirit Tracks | performance | **18.6-18.9 (50 %)** | 21.1 (88-91 %) |
+| NSMB | performance | **12.7-12.9 (1.3-2.6 %)** | 14.9-15.3 (12-13 %) |
+| Golden Sun | performance | 19.4-19.8 (96 %) | 19.7-20.1 (96 %) |
+| NSMB | ondemand | **12.8-13.3 (5-11 %)** | 15.4 (16 %) |
+
+Per display per frame the stage costs: retire 0.08-0.15 ms (fence +
+end_frame), begin_frame ~0.01, upload (two 192 KB memcpys into
+write-combine + flush) 0.2, record + submit 0.13-0.17. GPU time per panel
+~1.25 ms (P0.1), never waited for. Golden Sun does not move because its
+frame is the emulation thread with the scaler already off it.
+
+Checked by eye on the device (grim): dual window, single window, rotation
+90 on both panels, the PiP inset with `--pip-alpha 128` (translucent), the
+FPS overlay. Left for later: the pause menu and notices take the DS-space
+path on this tier (`canvas_capable()` is false, as on the SDL_Renderer
+tier), so they come out at DS resolution -- a panel-resolution overlay
+plane is the follow-up; the box filter / grid / bilinear / chunky tables
+are P4; nearest here is `floor(x * 256 / w)`, not the CPU's run table, so
+a run boundary can differ by a pixel (allowed on the GPU path; P4 adopts
+the tables).
