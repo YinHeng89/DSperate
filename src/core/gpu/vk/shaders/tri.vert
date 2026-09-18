@@ -28,14 +28,14 @@ void main() {
   // pixel xend's centre is inside too; rows need no push. Without this the
   // rightmost column of every polygon was missing.
   float cx = 0.5 * float(p.xmin + p.xmax);
-  float ox = float(vt.sx) > cx ? 1.0 : 0.0;   // 0 on the left, 1 on the right: the edge lands on the boundary of the pixel it names
+  float ox = float(vt.sx) > cx ? 0.501 : 0.5;   // attributes sampled where the DS samples them (the pixel centre is the DS integer position); the right side a hair past the centre so the inclusive last column is covered
   float oy = 0.5;
   // A polygon with no width or no height is a line to the DS -- one column,
   // or one row -- and zero area to a triangle rasteriser. Give it the pixel:
   // the second and third vertices step across, whichever way it winds.
-  if (p.xmax == p.xmin) ox = (vi == 1u || vi == 2u) ? 1.0 : 0.0;
+  if (p.xmax == p.xmin) ox = (vi == 1u || vi == 2u) ? 1.001 : 0.0;
   if (p.ybot == p.ytop) oy = (vi == 1u || vi == 2u) ? 1.0 : 0.0;
-  float x = (float(vt.sx) + ox + 0.001) / W * 2.0 - 1.0, y = (float(vt.sy) + oy) / H * 2.0 - 1.0;
+  float x = (float(vt.sx) + ox) / W * 2.0 - 1.0, y = (float(vt.sy) + oy) / H * 2.0 - 1.0;
   float z = clamp(float(vt.z), 0.0, 16777215.0);
   // Z-buffer: z / w after the divide is z / 2^24, linear in screen space.
   // W-buffer: a constant numerator gives 1 / w, monotonic in w, so the

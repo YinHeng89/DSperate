@@ -303,22 +303,27 @@ per-polygon barrier on drivers without it (RADV). Not yet: shadow masks and
 shadow polygons (skipped), edge flags (edge marking marks nothing), the
 mode-1 back-facing depth rule, anti-aliasing (gated as before).
 
-Fill rules that had to be learnt from the picture, with the numbers on
-Etrian's replay (700 frames, 488 rasterised; the count is pixels that differ
-from the software raster, mostly one 6-bit step in textured areas):
-- vertices at (sx, sy + 0.5), the polygon's right-side vertices pushed one
-  pixel out: the DS span is inclusive of xend, a triangle excludes the
-  centre on its right edge; without the push the last column of every
-  polygon was missing (5.0 M -> 6.1 M pixels but the right picture; pushing
-  0.5 leaves the column empty, 1.5 over-covers, extrapolating the attributes
-  along with the push shifts texels: 6.8 M and wrong corners);
-- texture coordinates TRUNCATE (12.4 >> 4, as the DS), colours ROUND: a
-  102-pixel quad stretched across ONE texel column (the menu panels, s 22.0
-  -> 23.0) flips onto the edge texel columns early under rounding -- the
-  "vertical cut" -- and truncating colours too measured worse (7.0 M);
+Fill and sampling rules that had to be learnt from the picture (user's eye on
+the Etrian menu, `tools/compare_frames.py` and a thresholded red overlay of
+the differing pixels), with the count of pixels differing from the software
+raster over Etrian's replay (700 frames, 488 rasterised):
+- vertices at the pixel centre, (sx + 0.5, sy + 0.5): that is where the DS
+  evaluates a pixel's attributes (its integer position), so texture rows and
+  columns land where the CPU puts them; the right-side vertices a hair
+  (0.001 px) further so the inclusive last column of the span is covered
+  (a whole-pixel push covers it too but stretches the attributes: shifted
+  glyphs, wrong corners);
+- texture coordinates TRUNCATE (12.4 >> 4, as the DS) with a 0.01-unit bias
+  before the floor; colours ROUND. The menu panels stretch ONE texel column
+  across 102 pixels (s 22.0 -> 23.0) and step t by exactly 16.0 a row, so
+  rounding flipped columns onto the edge texel early (the "vertical cut")
+  and float error floored 15.9999 onto the row above (the one-row shift in
+  the text);
 - zero-width / zero-height polygons get a pixel of extent (a line to the DS).
-`DS_GPU_DUMP_AT=x,y` prints the polygons over a pixel, which is how the
-stretched quad was found.
+Measured along the way: round everything 5.0 M pixels but the cut; floor
+everything 7.0 M; whole-pixel push 6.1 M; final 5.0 M with 249 of 488
+frames differing and the menu clean. `DS_GPU_DUMP_AT=x,y` prints the
+polygons over a pixel, which is how the stretched quad was found.
 
 Device (SDL, dual window, GPU present on, work median, both orders):
 

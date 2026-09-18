@@ -21,11 +21,14 @@ Frag shade_fragment(GpuPoly p) {
   bool textured = (p.flags & DS_PF_TEXTURED) != 0u;
   o.src = shade_pixel(p, blendmode, polyalpha, textured,
                       int(round(v_rgb.r)), int(round(v_rgb.g)), int(round(v_rgb.b)),
-                      int(floor(v_st.x)), int(floor(v_st.y)));
+                      int(floor(v_st.x + 0.01)), int(floor(v_st.y + 0.01)));
   // Colours round (measured closer to the DS's fixed-point interpolation);
   // texture coordinates TRUNCATE, as the DS's 12.4 >> 4 does -- a quad that
   // stretches one texel column across a hundred pixels (Etrian's menu panels,
-  // s 22.0 -> 23.0) otherwise flips to the edge texel columns early.
+  // s 22.0 -> 23.0) otherwise flips to the edge texel columns early. The
+  // 0.01 (a hundredth of a 1/16 texel) absorbs float error at exact texel
+  // boundaries: the same panels step t by exactly 16.0 a row, and 15.9999
+  // floored onto the row above -- the one-row shift in the menu text.
   o.alpha = o.src >> 24;
   bool front = (p.flags & DS_PF_FRONTFACING) != 0u;
   o.polyattr = (p.attr & 0x3F008000u) | (front ? 0u : (1u << 4));
