@@ -31,6 +31,8 @@
 #endif
 
 namespace ds::gpu {
+std::atomic<unsigned> g_gpu_stalls{0};
+
 
 #if DSPERATE_NEON
 // The A64-only NEON intrinsics the kernels use, in both spellings.
@@ -3348,6 +3350,7 @@ void Renderer3D::sync_line(const FrameRef& f, s32 y) {
       // A stall: say whether the job thread was late to run (scheduling) or
       // the GPU was slow to finish (the device).
       ++gpu_stats_.stalls;
+      g_gpu_stalls.fetch_add(1, std::memory_order_relaxed);
       std::fprintf(stderr, "gpu raster: STALL frame %llu line %d -- waited %.1f ms for the GPU frame; job thread woke after %.2f ms, uploaded in %.2f ms\n",
                    static_cast<unsigned long long>(nds_.frame_count), y, wns / 1e6, gpu_job_last_lat_ns_ / 1e6, gpu_job_last_upload_ns_ / 1e6);
     }
@@ -4013,6 +4016,13 @@ bool Renderer3D::gpu_dispatch(const Polygon* const* polys, u32 npoly) {
     static const bool dump_on = std::getenv("DS_GPU_DUMP_AT") != nullptr;
     static int dump_x = -1, dump_y = -1;
     if (dump_on && dump_x < 0) std::sscanf(std::getenv("DS_GPU_DUMP_AT"), "%d,%d", &dump_x, &dump_y);
+    // DS_GPU_DUMP_FRAME=N: every polygon of NDS frame N (a GPU stall on one frame).
+    static const long dump_frame = std::getenv("DS_GPU_DUMP_FRAME") ? std::atol(std::getenv("DS_GPU_DUMP_FRAME")) : -1;
+    if (dump_frame >= 0 && static_cast<long>(nds_.frame_count) == dump_frame) {
+      std::fprintf(stderr, "[dumpf] poly %u attr %08x texparam %08x flags tr%d wb%d n%u ytop %d ybot %d:", i, p.attr, p.texparam, p.translucent ? 1 : 0, p.wbuffer ? 1 : 0, p.nverts, p.ytop, p.ybot);
+      for (u32 j = 0; j < p.nverts; ++j) { const Vertex& v = gx_->vertex(p.vtx[j]); std::fprintf(stderr, " (%d,%d s%d t%d w%d z%d)", v.sx, v.sy, v.tex[0], v.tex[1], p.w[j], p.z[j]); }
+      std::fprintf(stderr, "\n");
+    }
     if (dump_on) {
       s32 bx0 = 0x7FFFFFFF, bx1 = -0x7FFFFFFF;
       for (u32 j = 0; j < p.nverts; ++j) { const s32 sx = gx_->vertex(p.vtx[j]).sx; if (sx < bx0) bx0 = sx; if (sx > bx1) bx1 = sx; }

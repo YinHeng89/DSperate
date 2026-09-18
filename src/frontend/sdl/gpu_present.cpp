@@ -8,6 +8,7 @@
 
 #if DSPERATE_VULKAN
 #include "core/gpu/vk/vk_internal.h"
+#include "core/gpu/render3d.h"
 
 #include <chrono>
 #include <unistd.h>
@@ -245,7 +246,19 @@ struct GpuPresent::Impl {
   u32 dump_scale = 0; const u32* dump_l3d = nullptr; size_t dump_l3d_words = 0;
   void maybe_dump(int slot) {
     static const char* env = std::getenv("DS_GPU_COMP_DUMP");
-    if (!env || presented < 400 || presented > 403) return;
+    static const u64 from = std::getenv("DS_GPU_COMP_DUMP_FROM") ? std::strtoull(std::getenv("DS_GPU_COMP_DUMP_FROM"), nullptr, 10) : 400;   // first presented frame to dump
+    static const u64 count = std::getenv("DS_GPU_COMP_DUMP_COUNT") ? std::strtoull(std::getenv("DS_GPU_COMP_DUMP_COUNT"), nullptr, 10) : 4;
+    // DS_GPU_COMP_DUMP_ON_STALL=1: instead of a fixed window, the frames
+    // presented after each GPU stall report (the frame that stalled is the
+    // one being presented now).
+    static const bool on_stall = std::getenv("DS_GPU_COMP_DUMP_ON_STALL") != nullptr;
+    static unsigned seen_stalls = 0; static u64 dump_until = 0;
+    if (on_stall) {
+      const unsigned st = ds::gpu::g_gpu_stalls.load(std::memory_order_relaxed);
+      if (st != seen_stalls) { seen_stalls = st; dump_until = presented + count; }
+      if (!env || presented >= dump_until) return;
+    } else
+    if (!env || presented < from || presented >= from + count) return;
     const std::string base = std::string(env) + ".d" + std::to_string(id) + ".f" + std::to_string(presented) + (dump_scale ? "" : ".nocomp");
     const u32 W = 256 * dump_scale, H = 192 * dump_scale;
     const u32* px = static_cast<const u32*>(comp[slot].ptr);

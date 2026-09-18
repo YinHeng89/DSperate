@@ -21,6 +21,10 @@
 namespace ds { struct NDS; }
 
 namespace ds::gpu {
+// Set by the GPU raster when a line wait stalls (the stall report): the
+// number of stalls so far, for a frontend that wants to dump the frames
+// around one (DS_GPU_COMP_DUMP_ON_STALL).
+extern std::atomic<unsigned> g_gpu_stalls;
 
 namespace vk { class Device; class Raster; }
 

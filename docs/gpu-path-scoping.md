@@ -510,4 +510,20 @@ late. No kernel messages, no page-reclaim counters moving, compute mode
 not yet caught in the act. Suspects: kbase's completion workqueue starved
 by the process's SCHED_RR threads until RT throttling (950 ms / 1 s -- the
 magnitude fits), tiler-heap regrowth through GPU page faults (fits "more
-at 2x"). Measured next: emu.realtime=off.
+at 2x").
+
+Later the same day: with the GPU devfreq governor set to `performance`
+(800 MHz) the stall came on EVERY run at the SAME frame (st 2x: nds frame
+986, three runs; gsdd 1x: frame 271) -- and frame 986 holds FIVE polygons
+(the sky screen), so the GPU was not slow on our work, its completion was
+held. Then, with a rebuilt binary carrying the stall-triggered panel dump,
+the same command did not stall in two 1500-frame runs; nor did four
+ondemand runs, nor two with emu.realtime=off. Panels around frame 986
+(both displays, ten frames) are consistent: no edge-marking or composite
+transition. Tools left in place: `DS_GPU_COMP_DUMP=<f>
+DS_GPU_COMP_DUMP_ON_STALL=1 [DS_GPU_COMP_DUMP_COUNT=n]` dumps both panels
+for the frames presented after each stall report; `DS_GPU_DUMP_FRAME=N`
+prints every polygon of NDS frame N; `DS_GPU_COMP_DUMP_FROM/COUNT` set a
+fixed window. Verdict so far: a driver-side hold of GPU job completion,
+timing-dependent, not content-dependent and not the frame limiter (the
+wait is inside the raster's fence at line 0).
