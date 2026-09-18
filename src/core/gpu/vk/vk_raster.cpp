@@ -5,6 +5,9 @@
 #include <string>
 #include <chrono>
 #include "core/gpu/vk/vk_raster.h"
+#include <array>
+#include <atomic>
+#include <vector>
 
 #include "core/gpu/vk/vk_internal.h"
 #include "core/gpu/vk/vk_shaders.h"
@@ -110,6 +113,9 @@ struct Raster::Impl {
   // reduction (downsample.comp), which is what the CPU reads. At S = 1 they
   // alias out[] (the same Buffer, not allocated twice).
   Buffer out_nat[3];
+  bool cpu_down = false;                                   // S >= 2: the native plane is reduced on the CPU (reduce_line), not by downsample.comp
+  std::vector<u32> nat[3];                                 // the CPU-built native planes, one per slot
+  std::array<std::atomic<u8>, 192> nat_done[3]{};          // per slot: which lines are reduced for the frame the slot holds
   VkShaderModule mod_down = VK_NULL_HANDLE;
   VkPipeline pipe_down = VK_NULL_HANDLE;
   Buffer host_textures;      // an imported arena, when one is ever bound
@@ -423,8 +429,13 @@ std::unique_ptr<Raster> Raster::create(Device& dev, std::string* why) {
   for (int i = 0; i < 3; ++i) {
     d.out[i] = dev.alloc(out_bytes, Access::CpuRead);
     if (!d.out[i]) return set_why("3D layer allocation failed");
-    if (self->scale_ > 1) { d.out_nat[i] = dev.alloc(256 * 192 * sizeof(u32), Access::CpuRead); if (!d.out_nat[i]) return set_why("native layer allocation failed"); }
-    else d.out_nat[i] = d.out[i];
+    // Measured a LOSS on the device (docs/gpu-path-scoping.md): the dispatch
+    // is ~0.15 ms of GPU, the strided gather lands on the thread that reads
+    // the line -- st 2x +0.5 ms median. Opt-in for a host with CPU to spare.
+    d.cpu_down = self->scale_ > 1 && std::getenv("DS_VK_CPU_DOWNSAMPLE");
+    if (self->scale_ > 1 && !d.cpu_down) { d.out_nat[i] = dev.alloc(256 * 192 * sizeof(u32), Access::CpuRead); if (!d.out_nat[i]) return set_why("native layer allocation failed"); }
+    else d.out_nat[i] = d.out[i];   // (binding 12 must name a buffer; with cpu_down it is never read)
+    if (d.cpu_down) d.nat[i].assign(256 * 192, 0u);
   }
   // Everything the CPU writes and never reads back. Write-combine is the
   // right side of the 35x cliff for these.
@@ -575,6 +586,7 @@ std::unique_ptr<Raster> Raster::create(Device& dev, std::string* why) {
       // real order-free prefix, and only the tail binned.
       self->vis_ = true;
       std::fprintf(stderr, "gpu raster: triangle path at %ux, ordered attachment access %s, %s, %s\n", self->scale_, d.roaa ? "on" : "OFF (a barrier per tail polygon)", d.alias ? "attachments aliased on the buffers" : "attachments copied into the buffers", d.stencil ? "shadows through the shadow plane" : "shadows OFF");
+      if (self->scale_ > 1) std::fprintf(stderr, "gpu raster: native plane %s\n", d.cpu_down ? "reduced on the CPU a line at a time (DS_VK_CPU_DOWNSAMPLE)" : "by downsample.comp on the GPU");
     }
   }
 
@@ -745,6 +757,7 @@ bool Raster::submit(u32 npoly, u32 nvert, u32 ntexels, const GpuFrame& frame) {
   const int st = stages();
   const u32 back = static_cast<u32>(d.gen % 3);
   const u32 rows = DS_TILES_Y / d.bands;
+  if (d.cpu_down) for (auto& f : d.nat_done[back]) f.store(0, std::memory_order_relaxed);   // this slot now holds a new frame
 
   // A stamp after a dispatch, at the bottom of the pipe, closes it: the
   // passes are serialised by barriers, so the interval to the stamp before
@@ -874,7 +887,7 @@ bool Raster::submit(u32 npoly, u32 nvert, u32 ntexels, const GpuFrame& frame) {
       a.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
     }
     }
-    if (scale_ > 1 && !(d.post_frame && (st & 10) == 10)) {
+    if (scale_ > 1 && !d.cpu_down && !(d.post_frame && (st & 10) == 10)) {
       a.vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, d.layout, 0, 1, &d.set[back], 0, nullptr);
       a.vkCmdPushConstants(cb, d.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(GpuFrame), &frame);
       a.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, d.pipe_down);
@@ -993,7 +1006,7 @@ bool Raster::submit(u32 npoly, u32 nvert, u32 ntexels, const GpuFrame& frame) {
     a.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, d.pipe_post);
     const u32 px = 256 * scale_ * 192 * scale_;
     a.vkCmdDispatch(cb, (px + 63) / 64, 1, 1);
-    if (scale_ > 1) {
+    if (scale_ > 1 && !d.cpu_down) {
       VkMemoryBarrier mb2{}; mb2.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER; mb2.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT; mb2.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
       a.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb2, 0, nullptr, 0, nullptr);
       a.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, d.pipe_down);
@@ -1107,11 +1120,31 @@ void Raster::wait_band(u32 b) {
 }
 
 const u32* Raster::output() const {
-  return static_cast<const u32*>(d_->out_nat[(d_->gen + 2) % 3].ptr);
+  const u32 s = (d_->gen + 2) % 3;
+  return d_->cpu_down ? d_->nat[s].data() : static_cast<const u32*>(d_->out_nat[s].ptr);
 }
 
 const u32* Raster::output_prev() const {
-  return static_cast<const u32*>(d_->out_nat[(d_->gen + 1) % 3].ptr);
+  const u32 s = (d_->gen + 1) % 3;
+  return d_->cpu_down ? d_->nat[s].data() : static_cast<const u32*>(d_->out_nat[s].ptr);
+}
+
+void Raster::reduce_line(const u32* nat, u32 y) {
+  Impl& d = *d_;
+  if (!d.cpu_down || y >= 192) return;
+  u32 s = 0;
+  while (s < 3 && d.nat[s].data() != nat) ++s;
+  if (s == 3) return;   // not one of ours (a CPU frame)
+  if (d.nat_done[s][y].load(std::memory_order_acquire)) return;
+  const u32 S = scale_, W = 256 * S;
+  const u32* src = static_cast<const u32*>(d.out[s].ptr) + static_cast<size_t>(y) * S * W;
+  u32* dst = d.nat[s].data() + static_cast<size_t>(y) * 256;
+  for (u32 x = 0; x < 256; ++x) dst[x] = src[x * S];   // the top-left subpixel, as downsample.comp took it
+  d.nat_done[s][y].store(1, std::memory_order_release);
+}
+
+void Raster::reduce_all(const u32* nat) {
+  for (u32 y = 0; y < 192; ++y) reduce_line(nat, y);
 }
 
 u64 Raster::output_hires_handle() const { return d_->out[(d_->gen + 2) % 3].handle; }

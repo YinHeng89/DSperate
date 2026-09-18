@@ -142,6 +142,19 @@ public:
   // N-1 is still in flight and N has yet to be submitted.
   const u32* output() const;
   const u32* output_prev() const;
+  // At S >= 2 the native plane output() names is built on the CPU, a line at
+  // a time as the composite asks for it: the top-left subpixel of each SxS
+  // block of the hi-res layer (what downsample.comp did on the GPU). The
+  // capture-heavy scenes are the ones with the emulation thread at its
+  // limit, and this takes a dispatch and a barrier off the GPU frame they
+  // wait for at line 0; the copy itself is 256 strided loads a line. Call
+  // after sync_line (the hi-res rows must be finished and invalidated);
+  // idempotent, any thread. reduce_all for the whole plane (save states,
+  // the A/B). Opt-in (DS_VK_CPU_DOWNSAMPLE=1): on the RG DS Plus it measured
+  // a loss -- the gather lands on the reading thread and the dispatch it
+  // saves is ~0.15 ms of a 6 ms fence wait (docs/gpu-path-scoping.md).
+  void reduce_line(const u32* nat, u32 y);
+  void reduce_all(const u32* nat);
 
   // GPU time per pass, summed over the frames read back so far, when
   // DS_VK_TIMING=1 and the queue has timestamps. Read after wait(): a

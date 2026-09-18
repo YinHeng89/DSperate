@@ -3012,6 +3012,7 @@ void Renderer3D::render(const Gpu3D& gx) {
       build_edges();
       render_band(0, 192, gdst);
       vk_raster_->wait();
+      vk_raster_->reduce_all(vk_raster_->output());
       gpu_compare(gdst, vk_raster_->output());
       display_ ^= 1;
       return;
@@ -4227,6 +4228,7 @@ void Renderer3D::gpu_snapshot_output() {
   gpu_job_wait_done();
   if (gpu_job_fallback_) return;   // already in out_[display_]
   vk_raster_->wait();
+  vk_raster_->reduce_all(vk_raster_->output());
   std::memcpy(out_[display_].data(), vk_raster_->output(), 256 * 192 * sizeof(u32));
 #endif
 }

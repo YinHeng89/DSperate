@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // DSperate - Nintendo DS emulator. Copyright (C) 2026 DSperate contributors.
 #include "core/gpu/gpu3d.h"
+#if DSPERATE_VULKAN
+#include "core/gpu/vk/vk_raster.h"
+#endif
 #include "core/div64.h"
 #include "core/host_cores.h"
 #include "core/state/state.h"
@@ -1542,6 +1545,9 @@ void Gpu3D::sync_raster() { renderer_.sync_all(); }
 
 const u32* Gpu3D::line(const Renderer3D::FrameRef& f, u32 y) {
   renderer_.sync_line(f, static_cast<s32>(y));
+#if DSPERATE_VULKAN
+  if (f.gpu && f.scale > 1) f.gpu->reduce_line(f.out, y);   // the native plane, built as it is read
+#endif
   const u32* raw = f.line(y);
   const u32 xpos = render_xpos_;
   if (xpos == 0) return raw;

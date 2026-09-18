@@ -634,3 +634,26 @@ heavy scenes (gsdd, st) under either governor, and nothing on nsmb/etody.
 So the default stays RR 5 + irq avoid; turning real-time off is a valid
 "no root" fallback that costs about a millisecond and a half where it
 matters.
+
+### Native plane on the CPU at S >= 2: measured, a loss (2026-09-18)
+
+The idea: capture-heavy scenes are the ones with the emulation thread at its
+limit, so take the downsample dispatch (hi-res layer -> native plane for the
+CPU composite and display capture) off the GPU frame they wait for at line
+0 and gather the top-left subpixels on the CPU a line at a time as the
+composite reads them (`Raster::reduce_line`, byte-identical to
+downsample.comp over 402 frames). Device, 2x, dual window, two passes:
+
+| scene | GPU downsample median / p90 / fence | CPU reduce median / p90 / fence |
+| --- | --- | --- |
+| gsdd | 19.7-19.9 / 22.7-23.6 / 5.95 ms | 19.8-20.1 / 22.7-22.9 / 5.81 ms |
+| etody | 5.4-5.5 / 19.3 / 1.96 | 5.6 / 19.1 / 1.94 |
+| st | 17.2-17.4 / 18.9-19.0 / 0.42-0.52 | 17.8-18.0 / 19.7-20.1 / 0.57-0.58 |
+
+The dispatch was worth ~0.15 ms of GPU time; the gather (256 strided loads
+of host-cached hi-res memory per line) lands on the thread reading the
+line, which on a capturing frame is the emulation thread, and Spirit
+Tracks pays 0.5 ms of median for it. Kept as an opt-in
+(`DS_VK_CPU_DOWNSAMPLE=1`) for a host with CPU to spare; the GPU dispatch
+stays the default. The Golden Sun 2x fence wait of 5.9 ms is the real
+problem and it is raster time, not the passes around it.
