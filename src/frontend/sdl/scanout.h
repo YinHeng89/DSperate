@@ -54,6 +54,15 @@ public:
   // that presents once and then stops -- the pause menu -- or the frame
   // sits queued until the next present. A no-op elsewhere.
   virtual void flush() {}
+
+  // The dma-buf behind buffer `buf` (0..bufs()-1), for a GPU present stage
+  // that imports the tier's buffers and writes them itself (docs/
+  // gpu-path-scoping.md P0.1: libmali imports a CMA fd as a LINEAR image and
+  // the display sees the GPU's writes with no sync ioctl). The fd stays
+  // owned by the tier; the importer dup()s it. False on a tier with no
+  // dma-buf (fbdev), and the caller keeps scaling on the CPU.
+  struct DmabufPlane { int fd = -1; u32 offset = 0, stride_bytes = 0, width = 0, height = 0; u32 fourcc = 0; };
+  virtual bool dmabuf_plane(int buf, DmabufPlane& out) const { (void)buf; (void)out; return false; }
 };
 
 } // namespace ds::sdl

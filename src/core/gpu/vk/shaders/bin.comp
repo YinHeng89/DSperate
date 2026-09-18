@@ -1,0 +1,75 @@
+#version 450
+// glslc enables this implicitly; glslangValidator needs it spelled out.
+#extension GL_GOOGLE_include_directive : require
+// Binning pass: build each tile's polygon list, IN DRAW ORDER.
+//
+// One invocation per tile, scanning the polygon list from the start -- not
+// one invocation per polygon appending atomically to the tiles it touches.
+// The atomic version is the obvious shape and it is what this was, but it
+// hands the raster a shuffled list, and draw order decides translucency and
+// polygon ids on the DS. The raster then had to sort: an insertion sort on
+// one thread of a 256-thread workgroup, O(m^2) in the tile's polygon count,
+// with the other 255 invocations stalled at the barrier behind it. For a tile
+// holding a hundred polygons that is ten thousand serial iterations, 192
+// times a frame.
+//
+// Scanning in order costs this pass more -- every tile reads every polygon's
+// header, rather than every polygon reading its own once -- but they are the
+// same 64 bytes read by all 192 invocations at the same moment, which is the
+// case a cache is for. And it makes the list arrive sorted, which deletes the
+// sort, the cull and the shared list from the raster entirely.
+//
+// Overflow is recorded, never absorbed. A tile that would exceed
+// DS_TILE_POLYS sets `overflow`, the host sees it and draws the whole frame
+// on the CPU -- the GPU path is either right or absent. (The host also checks
+// this itself while uploading, which is what lets a frame be refused before
+// anything is submitted; this is the backstop.)
+#define DS_GLSL 1
+#include "vk_layout.h"
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer Polys { GpuPoly polys[]; };
+layout(std430, binding = 2)          buffer Tiles {
+  uint count[DS_TILE_COUNT];
+  uint overflow;
+  uint pad_[3];
+  uint list[DS_TILE_COUNT * DS_TILE_POLYS];
+  // Alongside the polygon index, what the raster needs to reach its span row
+  // without loading the whole 64-byte polygon first: the row index for
+  // scanline y is bias + y, and yrng says which scanlines have one at all.
+  // The binning pass has the polygon in hand already, so this costs it
+  // nothing and spares the raster a global load per pixel per polygon.
+  uint bias[DS_TILE_COUNT * DS_TILE_POLYS];
+  uint yrng[DS_TILE_COUNT * DS_TILE_POLYS];
+} tiles;
+layout(push_constant) uniform Push { GpuFrame f; } pc;
+
+void main() {
+  uint t = gl_GlobalInvocationID.x;
+  if (t >= uint(DS_TILE_COUNT)) return;
+
+  int w = int(DS_TILE_W) * int(pc.f.scale), h = int(DS_TILE_H) * int(pc.f.scale);
+  int tx0 = int(t % uint(DS_TILES_X)) * w, tx1 = tx0 + w - 1;
+  int ty0 = int(t / uint(DS_TILES_X)) * h, ty1 = ty0 + h - 1;
+
+  uint m = 0u;
+  uint base = t * uint(DS_TILE_POLYS);
+  // Only the ordered tail is binned: the prefix before first_ordered was
+  // drawn by the visibility pass and never needs a per-pixel loop.
+  for (uint p = pc.f.first_ordered; p < pc.f.npoly; ++p) {
+    GpuPoly poly = polys[p];
+    if (poly.nverts < 3u) continue;
+    // The bounds come from the host, which has the vertices to hand while it
+    // is already walking them for the upload.
+    if (poly.ytop > ty1 || poly.ybot < ty0 || poly.xmax < tx0 || poly.xmin > tx1) continue;
+    if (m < uint(DS_TILE_POLYS)) {
+      tiles.list[base + m] = p;
+      int ry0 = max(poly.ytop, 0), ry1 = min(poly.ybot, int(192u * pc.f.scale) - 1);
+      tiles.bias[base + m] = poly.row_base - uint(ry0);
+      tiles.yrng[base + m] = uint(ry0) | (uint(ry1) << 8);
+    } else atomicOr(tiles.overflow, 1u);
+    ++m;
+  }
+  tiles.count[t] = min(m, uint(DS_TILE_POLYS));
+}

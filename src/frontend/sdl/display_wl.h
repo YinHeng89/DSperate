@@ -69,6 +69,7 @@ public:
   // compositor if all are pending, which is the vsync). Null on protocol
   // error; the caller falls back.
   u32* begin_frame() override;
+  bool dmabuf_plane(int buf, DmabufPlane& out) const override;
   void end_frame() override;       // attach + damage + commit + flush
 
   // Public for the C listener table; not part of the interface.

@@ -67,6 +67,7 @@ public:
   // than in end_frame() so it overlaps the frame's emulation instead of
   // extending its present.
   u32* begin_frame() override;
+  bool dmabuf_plane(int buf, DmabufPlane& out) const override;
   void end_frame() override;      // flip now, or queue behind the pending flip; does not wait
   void flush() override;          // wait until no flip is queued behind a pending one
 

@@ -1,0 +1,7 @@
+#version 450
+// glslc enables this implicitly; glslangValidator needs it spelled out.
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+// The raster seeded from the visibility pass's keys: see raster_body.glsl.
+#define DS_VIS 1
+#include "raster_body.glsl"

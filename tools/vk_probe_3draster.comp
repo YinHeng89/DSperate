@@ -1,0 +1,67 @@
+#version 450
+// The 3D pixel pipeline as it would actually be written, replacing the
+// random-gather stand-in in vk_probe_fill.comp.
+//
+// The correction that matters: texcache.h decodes every texture once into
+// ONE 32-bit word per texel ("the span kernels sample with a single load per
+// texel"), so a DS texture sample is a single load from a small, hot, spatially
+// coherent working set -- not the dependent chain over megabytes the earlier
+// shader measured. DS textures are a few KB and reused every frame, and
+// neighbouring pixels sample neighbouring texels, so this models a 128x128
+// decoded texture (64 KB) walked coherently.
+//
+// Per covered pixel, per polygon: interpolate s/t, one texel load, a depth
+// read + compare, and a colour read-modify-write. `work` is OVERDRAW -- how
+// many polygons cover this pixel -- which is the knob that actually scales
+// on a DS scene, rather than an invented per-pixel loop count.
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(std430, binding = 0) readonly buffer Tex   { uint texels[]; };
+layout(std430, binding = 1)          buffer Frame { uint fb[]; };
+layout(push_constant) uniform Push {
+  uint w; uint h; uint work; uint y0; uint rows; uint bgs; uint diverge;
+} pc;
+
+const uint TEX = 128u;            // decoded texture edge, texels
+
+void main() {
+  uvec2 p = gl_GlobalInvocationID.xy;
+  if (p.x >= pc.w || p.y >= pc.h) return;
+
+  uint idx = p.y * pc.w + p.x;
+  uint color = 0x1F000000u;
+  uint depth = 0x00FFFFFFu;
+  uint overdraw = max(pc.work, 1u);
+
+  for (uint poly = 0u; poly < overdraw; ++poly) {
+    // Perspective-correct s/t along the span (span_attrs5n's job, done per
+    // pixel here): cheap ALU, which is what it is on the CPU side too.
+    uint sh = poly * 37u;
+    uint s = (p.x + sh) & (TEX - 1u);
+    uint t = (p.y + sh * 3u) & (TEX - 1u);
+
+    // One load, coherent: neighbouring invocations hit neighbouring texels.
+    uint texel = texels[(t * TEX + s) & (uint(texels.length()) - 1u)];
+
+    // Depth test, then the colour read-modify-write the pixel stack does.
+    // Back to front: each polygon is NEARER than the last, so every one
+    // passes the depth test and writes. That is the worst case, and the one
+    // translucent DS geometry actually takes -- the earlier version had
+    // polygon 0 win every time, which made iterations 1..n dead code and
+    // measured nothing.
+    uint z = 0x00800000u - poly * 0x00010000u + ((texel >> 16) & 0xFFu);
+    if (z < depth) {
+      depth = z;
+      uint a = (texel >> 24) & 0x1Fu;
+      if (a == 31u) color = texel;
+      else {
+        uint sr = texel & 0x3Fu, sg = (texel >> 8) & 0x3Fu, sb = (texel >> 16) & 0x3Fu;
+        uint dr = color & 0x3Fu, dg = (color >> 8) & 0x3Fu, db = (color >> 16) & 0x3Fu;
+        color = ((sr * a + dr * (31u - a)) / 31u)
+              | (((sg * a + dg * (31u - a)) / 31u) << 8)
+              | (((sb * a + db * (31u - a)) / 31u) << 16)
+              | 0x1F000000u;
+      }
+    }
+  }
+  fb[idx] = color;
+}

@@ -185,6 +185,13 @@ void DmabufOut::close() {
   dpy_ = nullptr; surf_ = nullptr; q_ = nullptr; cur_ = -1; dead_ = false;
 }
 
+bool DmabufOut::dmabuf_plane(int buf, DmabufPlane& out) const {
+  if (buf < 0 || buf >= BUFS || bufs_[buf].fd < 0) return false;
+  out.fd = bufs_[buf].fd; out.offset = 0; out.stride_bytes = static_cast<u32>(w_) * 4;
+  out.width = static_cast<u32>(w_); out.height = static_cast<u32>(h_); out.fourcc = FMT_XRGB8888;
+  return true;
+}
+
 u32* DmabufOut::begin_frame() {
   if (dead_) return nullptr;
   for (;;) {

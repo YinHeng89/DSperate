@@ -1,0 +1,71 @@
+#version 450
+// P0.4: the pre-resolved 2D/3D composite at output scale S.
+//
+// The CPU 2D engines keep drawing at native resolution and hand over what
+// `resolve16_full` already produces per line -- top, second, ids, kind,
+// alpha, window -- plus the per-line BLDCNT/EVA/EVB/EVY. The GPU then does
+// only what `kern::composite_line` does, one invocation per OUTPUT pixel,
+// with the 3D layer sampled at full resolution and the 2D planes at x/S,y/S.
+// Same data shape and ALU as the real thing; the numbers are what matter.
+layout(local_size_x = 16, local_size_y = 8) in;
+layout(std430, binding = 0) readonly buffer Top    { uint top[]; };      // 256x192 RGB666
+layout(std430, binding = 1) readonly buffer Second { uint second[]; };   // 256x192
+layout(std430, binding = 2) readonly buffer Meta   { uint meta[]; };     // 256x192: id | kind<<8 | alpha<<16 | sid<<24
+layout(std430, binding = 3) readonly buffer Win    { uint win[]; };      // 256x192 (low byte)
+layout(std430, binding = 4) readonly buffer Line   { uint lp[]; };       // 192: bldcnt | eva<<16 | evb<<21 | evy<<26
+layout(std430, binding = 5) readonly buffer L3D    { uint l3d[]; };      // (256S)x(192S) RGB666 + alpha5<<24
+layout(std430, binding = 6) writeonly buffer Out   { uint dst[]; };      // (256S)x(192S)
+layout(push_constant) uniform Push { uint scale; uint flags; } pc;
+
+const uint K_3D = 1u, K_OBJ_SEMI = 2u, K_OBJ_BITMAP = 3u;
+
+uint blend2(uint a, uint b, uint ea, uint eb) {
+  uint r  = (((a & 0x3Fu) * ea) + ((b & 0x3Fu) * eb) + 0x8u) >> 4;
+  uint g  = ((((a & 0x3F00u) * ea) + ((b & 0x3F00u) * eb) + 0x800u) >> 4) & 0x7F00u;
+  uint bl = ((((a & 0x3F0000u) * ea) + ((b & 0x3F0000u) * eb) + 0x80000u) >> 4) & 0x7F0000u;
+  return min(r, 0x3Fu) | min(g, 0x3F00u) | min(bl, 0x3F0000u);
+}
+uint blend3d(uint a, uint b) {
+  uint eva = ((a >> 24) & 0x1Fu) + 1u, evb = 32u - eva;
+  if (eva == 32u) return a & 0xFFFFFFu;
+  uint r  = (((a & 0x3Fu) * eva) + ((b & 0x3Fu) * evb) + 0x10u) >> 5;
+  uint g  = ((((a & 0x3F00u) * eva) + ((b & 0x3F00u) * evb) + 0x1000u) >> 5) & 0x7F00u;
+  uint bl = ((((a & 0x3F0000u) * eva) + ((b & 0x3F0000u) * evb) + 0x100000u) >> 5) & 0x7F0000u;
+  return min(r, 0x3Fu) | min(g, 0x3F00u) | min(bl, 0x3F0000u);
+}
+uint brighten(uint v, uint f) { uint rb = v & 0x3F003Fu, g = v & 0x3F00u;
+  rb += (((0x3F003Fu - rb) * f + 0x080008u) >> 4) & 0x3F003Fu; g += (((0x3F00u - g) * f + 0x800u) >> 4) & 0x3F00u; return rb | g; }
+uint darken(uint v, uint f) { uint rb = v & 0x3F003Fu, g = v & 0x3F00u;
+  rb -= ((rb * f + 0x070007u) >> 4) & 0x3F003Fu; g -= ((g * f + 0x700u) >> 4) & 0x3F00u; return rb | g; }
+
+void main() {
+  uvec2 p = gl_GlobalInvocationID.xy;
+  uint W = 256u * pc.scale, H = 192u * pc.scale;
+  if (p.x >= W || p.y >= H) return;
+  uint nx = p.x / pc.scale, ny = p.y / pc.scale, ni = ny * 256u + nx;
+  uint a = top[ni], b = second[ni], m = meta[ni];
+  uint t1 = m & 0xFFu, kind = (m >> 8) & 0xFFu, talpha = (m >> 16) & 0xFFu, t2 = ((m >> 24) & 0xFFu) << 8;
+  uint l = lp[ny], bldcnt = l & 0xFFFFu, eva = (l >> 16) & 0x1Fu, evb = (l >> 21) & 0x1Fu, evy = (l >> 26) & 0x1Fu;
+  // The 3D substitution: where the 2D engine selected BG0-as-3D, the real
+  // pixel comes from the hi-res layer; alpha 0 promotes the second record.
+  if (kind == K_3D) {
+    uint px3 = l3d[p.y * W + p.x];
+    if (((px3 >> 24) & 0x1Fu) == 0u) { a = b; kind = 0u; t1 = t2 >> 8; }
+    else a = px3;
+  }
+  uint effect = (bldcnt >> 6) & 3u;
+  uint o = a;
+  if ((kind == K_OBJ_SEMI || kind == K_OBJ_BITMAP) && (bldcnt & t2) != 0u) {
+    uint ea = kind == K_OBJ_BITMAP ? talpha : eva; uint eb = kind == K_OBJ_BITMAP ? 16u - ea : evb;
+    o = blend2(a, b, ea, eb);
+  } else if (kind == K_3D && (bldcnt & t2) != 0u) {
+    o = blend3d(a, b);
+  } else if ((bldcnt & t1) != 0u && (win[ni] & 0x20u) != 0u) {
+    if (effect == 1u) { if ((bldcnt & t2) != 0u) o = blend2(a, b, eva, evb); }
+    else if (effect == 2u) o = brighten(a, evy);
+    else if (effect == 3u) o = darken(a, evy);
+  }
+  // 6->8 bit expansion, as output_line does, so the result is the panel word.
+  uint r = (o & 0x3Fu) << 2, g = ((o >> 8) & 0x3Fu) << 2, bl = ((o >> 16) & 0x3Fu) << 2;
+  dst[p.y * W + p.x] = 0xFF000000u | (r | (r >> 6)) << 16 | (g | (g >> 6)) << 8 | (bl | (bl >> 6));
+}
