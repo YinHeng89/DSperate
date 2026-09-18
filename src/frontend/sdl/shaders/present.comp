@@ -8,9 +8,10 @@
 layout(local_size_x = 16, local_size_y = 8) in;
 layout(binding = 0, rgba8) uniform writeonly image2D dst;
 layout(std430, binding = 1) readonly buffer Src { uint src[]; };   // slot base + screen * 49152 + y * 256 + x, 0xAARRGGBB
+layout(std430, binding = 2) readonly buffer Comp { uint comp[]; };  // the composited screen 0 at S x, when b.w bit 31 is set
 layout(push_constant) uniform P {
   uvec4 a;        // presented w, h; logical w, h
-  uvec4 b;        // rotation (0/90/180/270), nviews, inset alpha 0..255, source base (words)
+  uvec4 b;        // rotation (0/90/180/270), nviews, inset alpha 0..255, source base (words) | S << 24 | 1 << 31 when screen 0 is the composited buffer
   ivec4 rect[2];  // x, y, w, h in the logical frame, draw order
   ivec4 view[2];  // screen, shown, blends (inset), unused
 } pc;
@@ -27,8 +28,15 @@ void main() {
   for (int v = 0; v < int(pc.b.y); ++v) {
     ivec4 r = pc.rect[v]; ivec4 vi = pc.view[v];
     if (vi.y == 0 || lx < r.x || ly < r.y || lx >= r.x + r.z || ly >= r.y + r.w) continue;
-    int sx = (lx - r.x) * 256 / r.z, sy = (ly - r.y) * 192 / r.w;
-    uint s = src[pc.b.w + uint(vi.x) * 49152u + uint(sy) * 256u + uint(sx)];
+    uint s;
+    if (vi.x == 0 && (pc.b.w & 0x80000000u) != 0u) {
+      int S = int((pc.b.w >> 24) & 0x7Fu);
+      int sx = (lx - r.x) * 256 * S / r.z, sy = (ly - r.y) * 192 * S / r.w;
+      s = comp[uint(sy) * uint(256 * S) + uint(sx)];
+    } else {
+      int sx = (lx - r.x) * 256 / r.z, sy = (ly - r.y) * 192 / r.w;
+      s = src[(pc.b.w & 0xFFFFFFu) + uint(vi.x) * 49152u + uint(sy) * 256u + uint(sx)];
+    }
     vec3 col = vec3(float((s >> 16) & 255u), float((s >> 8) & 255u), float(s & 255u)) / 255.0;
     c = (vi.z != 0 && pc.b.z < 255u) ? mix(c, col, float(pc.b.z) / 255.0) : col;
   }

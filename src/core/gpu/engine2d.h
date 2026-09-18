@@ -104,6 +104,19 @@ public:
   // bits 24-28, alpha 0 = transparent); nullptr when there is no 3D output.
   void set_3d_line(const Pixel* line) { line3d_ = line; }
 
+  // The GPU composite's input (docs/gpu-path-scoping.md P2c). While set, a
+  // line whose 3D layer is present takes the full select and, before the
+  // colour effects, copies what resolve16_full produced -- top, second, the
+  // ids, kind, alpha and the window byte -- into these 256x192 planes at its
+  // row; the CPU composite still runs, so output() and capture are as they
+  // were. meta packs top_id | kind << 8 | alpha << 16 | second_id << 24.
+  void set_layer_export(u32* top, u32* second, u32* meta, u32* win) { exp_top_ = top; exp_second_ = second; exp_meta_ = meta; exp_win_ = win; }
+  bool line_exported() const { return line_exported_; }   // the last render_line() wrote its planes
+  u32 bldcnt() const { return bldcnt_; }
+  u32 eva() const { return eva_; }
+  u32 evb() const { return evb_; }
+  u32 evy() const { return evy_; }
+
   u32 dispcnt() const { return dispcnt_; }   // render side
   void debug_dump(u32 line);   // stderr dump of register/latch state and a rendered line (debug builds of the headless frontend)
   void debug_outhash(u32 line);   // DS_DEBUG_OUTHASH: per-frame / per-line output hashes
@@ -224,6 +237,9 @@ private:
   alignas(16) std::array<u8, 256> top_id_{}, top_kind_{}, top_alpha_{}, second_id_{};
   alignas(16) std::array<Pixel, 256> out_{};
   const Pixel* line3d_ = nullptr;
+  u32* exp_top_ = nullptr; u32* exp_second_ = nullptr; u32* exp_meta_ = nullptr; u32* exp_win_ = nullptr;
+  bool line_exported_ = false;
+  void export_planes(u32 line);
 
 
   // Helpers.

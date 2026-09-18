@@ -46,6 +46,11 @@ public:
   // Internal resolution. 1 for P1; P2 raises it, and everything downstream
   // (the composite) has to agree, which is why it is not a free knob.
   u32 scale() const { return scale_; }
+  // The hi-res layer (256S x 192S records) of the frame output() belongs to,
+  // as an opaque VkBuffer handle for the present stage's composite. At S = 1
+  // it is the same buffer output() maps.
+  u64 output_hires_handle() const;
+  size_t output_hires_bytes() const;
 
   // Whether the order-free prefix goes through the visibility pass
   // (vis.comp / resolve.comp) rather than the ordered loop. Needs 64-bit

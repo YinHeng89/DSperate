@@ -787,6 +787,10 @@ void Gpu::output_engine(int e, u32 line) {
     // brightness, 6->8 bit expansion); the others build the line first.
     if (e == 0) {
       const u32 mode = (en.dispcnt() >> 16) & 3;
+      if (layer_.line) {
+        layer_.line[line] = (en.bldcnt() & 0xFFFFu) | ((en.eva() & 0x1Fu) << 16) | ((en.evb() & 0x1Fu) << 21) | ((en.evy() & 0x1Fu) << 26);
+        layer_.mbright[line] = static_cast<u32>(en.master_bright()) | ((mode == 1 && en.line_exported()) ? (1u << 31) : 0u);
+      }
       if (mode == 1) kern::active::output_line(en.output(), en.master_bright(), dst);
       else if (mode >= 2) output_a(line, dst);      // VRAM / FIFO display: expanded inside
       else { output_a(line, dst); expand_colours(dst); }

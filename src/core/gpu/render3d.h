@@ -671,6 +671,9 @@ public:
     u32 nbins = 0;
     vk::Raster* gpu = nullptr;
     GpuJobSync* job = nullptr;   // a fallback frame still being drawn on the GPU job thread
+    u64 hires = 0;               // the GPU frame's hi-res layer (opaque VkBuffer), for the present stage's composite
+    size_t hires_bytes = 0;
+    u32 scale = 1;
     std::array<s32, MAX_BINS + 1> bin_y{};
     const u32* line(u32 y) const { return out + y * 256; }
   };

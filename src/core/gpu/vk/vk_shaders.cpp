@@ -30,6 +30,8 @@ DS_INCBIN(ds_vk_raster_vis, "raster_vis.spv");
 DS_INCBIN(ds_vk_tri_vert, "tri_vert.spv");
 DS_INCBIN(ds_vk_tri_opaque, "tri_opaque_frag.spv");
 DS_INCBIN(ds_vk_tri_tail, "tri_tail_frag.spv");
+DS_INCBIN(ds_vk_downsample, "downsample.spv");
+DS_INCBIN(ds_vk_tri_flat, "tri_flat_frag.spv");
 
 namespace ds::gpu::vk {
 
@@ -66,5 +68,9 @@ Spirv shader_raster_vis() {
 Spirv shader_tri_vert()   { return { reinterpret_cast<const u32*>(ds_vk_tri_vert_data),   static_cast<size_t>(ds_vk_tri_vert_end - ds_vk_tri_vert_data) }; }
 Spirv shader_tri_opaque() { return { reinterpret_cast<const u32*>(ds_vk_tri_opaque_data), static_cast<size_t>(ds_vk_tri_opaque_end - ds_vk_tri_opaque_data) }; }
 Spirv shader_tri_tail()   { return { reinterpret_cast<const u32*>(ds_vk_tri_tail_data),   static_cast<size_t>(ds_vk_tri_tail_end - ds_vk_tri_tail_data) }; }
+
+Spirv shader_downsample() { return { reinterpret_cast<const u32*>(ds_vk_downsample_data), static_cast<size_t>(ds_vk_downsample_end - ds_vk_downsample_data) }; }
+
+Spirv shader_tri_flat() { return { reinterpret_cast<const u32*>(ds_vk_tri_flat_data), static_cast<size_t>(ds_vk_tri_flat_end - ds_vk_tri_flat_data) }; }
 
 } // namespace ds::gpu::vk

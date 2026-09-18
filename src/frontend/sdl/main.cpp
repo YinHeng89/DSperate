@@ -1241,6 +1241,7 @@ int main(int argc, char** argv) {
     else if (flag("--no-aa")) cli.set("video.aa", "false");
     else if (flag("--gpu-raster")) cli.set("video.gpu_raster", "true");
     else if (flag("--no-gpu-raster")) cli.set("video.gpu_raster", "false");
+    else if (arg("--internal-res")) cli.set("video.internal_res", argv[++i]);
     // The two halves of Timing OC separately: they pull in opposite directions
     // on Golden Sun, so the bundled flag reads flat while neither half is.
     else if (flag("--help")) { std::fputs(kUsage, stderr); return 0; }
@@ -1296,7 +1297,7 @@ int main(int argc, char** argv) {
   }
   auto apply_cli = [&] { for (const char* k : {"paths.bios9", "paths.bios7", "paths.firmware", "video.scale", "video.dual_window", "video.layout", "video.screen", "video.pip_alpha", "video.dominant_ratio", "video.dominant_threshold", "video.integer_scale",
                                               "video.fullscreen", "video.linear", "video.lcd_grid", "video.chunky", "video.chunky_threshold", "video.chunky_cell", "video.seam", "video.disp", "video.fbdev", "video.gpu_present", "video.vsync", "audio.enabled", "audio.volume",
-                                              "audio.mic", "emu.jit", "emu.quantum", "emu.speed", "emu.limiter", "emu.pacing", "audio.buffer_size", "audio.latency_frames", "emu.timing_oc", "emu.gx_worker", "emu.cpu_tuning", "emu.fast_load", "emu.frameskip", "emu.frameskip_mode", "emu.frameskip_capture", "video.aa", "video.gpu_raster", "video.gpu_defer", "emu.autosave_png", "emu.autoload", "cheevos.enabled", "cheevos.token_file", "cheevos.username"}) if (cli.has(k)) cfg.set(k, cli.str(k)); };
+                                              "audio.mic", "emu.jit", "emu.quantum", "emu.speed", "emu.limiter", "emu.pacing", "audio.buffer_size", "audio.latency_frames", "emu.timing_oc", "emu.gx_worker", "emu.cpu_tuning", "emu.fast_load", "emu.frameskip", "emu.frameskip_mode", "emu.frameskip_capture", "video.aa", "video.gpu_raster", "video.gpu_defer", "video.internal_res", "emu.autosave_png", "emu.autoload", "cheevos.enabled", "cheevos.token_file", "cheevos.username"}) if (cli.has(k)) cfg.set(k, cli.str(k)); };
   apply_cli();
   const std::string bios9 = cfg.str("paths.bios9"), bios7 = cfg.str("paths.bios7");
   // The DSi's own firmware, for a session that is a DSi from the start, unless
@@ -1724,6 +1725,14 @@ sdl_ready:
     vs.bottom_display = vd && !std::strcmp(vd, "KMSDRM") ? 0 : 1;
   }
   if (!open_displays(vs, display, display2)) { SDL_Quit(); return 1; }
+  // The GPU composite's planes: registered once a GPU present stage exists
+  // (the pointers are the process's one plane buffer, so a re-open keeps them).
+  auto register_layer_export = [&] {
+    if (!display.gpu_present() && !display2.gpu_present()) return;
+    const auto p = ds::sdl::GpuPresent::layer_ptrs();
+    if (p.top) nds.gpu.set_layer_export(ds::gpu::Gpu::LayerExport{p.top, p.second, p.meta, p.win, p.line, p.mbright});
+  };
+  register_layer_export();
   // A single-screen layout shows one screen: the core skips the other's
   // engine (Gpu::set_screen_visible). Every other layout, and dual-window,
   // shows both.
@@ -1884,6 +1893,7 @@ sdl_ready:
         if (dual_window) display2.present();
         set_scale_targets(target, false);
       } else {
+        { size_t hb = 0; ds::u32 hs = 1; const ds::u64 hh = nds.gpu.frame_hires(&hb, &hs); display.set_gpu_layer(hh, hb, hs); display2.set_gpu_layer(hh, hb, hs); }
         display.draw(fb);
         if (dual_window) display2.draw(fb);
       }
@@ -1994,6 +2004,9 @@ sdl_ready:
   // worth printing once at startup rather than swallowing: on a device with
   // no driver the emulator runs exactly as before.
   if (cfg.flag("video.gpu_raster", false)) {
+    // video.internal_res: the triangle path's internal resolution (1..4). The
+    // raster reads it as DS_VK_SCALE at creation; an explicit environment wins.
+    if (!std::getenv("DS_VK_SCALE")) { const int ir = std::atoi(cfg.str("video.internal_res", "1").c_str()); if (ir >= 2 && ir <= 4) setenv("DS_VK_SCALE", std::to_string(ir).c_str(), 1); }
     std::string why;
     const bool on = nds.gpu3d.renderer().set_gpu_raster(true, &why);
     std::fprintf(stderr, "gpu raster: %s%s%s\n", on ? "on" : "OFF -- software raster",
@@ -2513,6 +2526,7 @@ sdl_ready:
       return false;
     }
     apply_visibility();
+    register_layer_export();
     // A new window has forgotten that a text page is on it: the display-engine
     // tier suspends its chunky divisor while the menu is up, and without this
     // the menu would come back with its glyphs merged.
@@ -4430,6 +4444,11 @@ sdl_ready:
           if (fb[i] == nds.gpu.framebuffer(i)) { std::memcpy(flash_fb[i].data(), fb[i], flash_fb[i].size() * 4); fb[i] = flash_fb[i].data(); }
           draw_flash(ds_canvas(const_cast<u32*>(fb[i])), flash_alpha);
         }
+        // The frame's GPU 3D layer for the present stage's composite. Known
+        // limit until the overlays get their own plane: on a 3D line the
+        // composite takes the exported planes, so an OSD label or the save
+        // flash drawn into screen 0's copy does not show there.
+        { size_t hb = 0; ds::u32 hs = 1; const ds::u64 hh = nds.gpu.frame_hires(&hb, &hs); display.set_gpu_layer(hh, hb, hs); display2.set_gpu_layer(hh, hb, hs); }
         display.draw(fb);
         if (dual_window) display2.draw(fb);
       }

@@ -340,3 +340,49 @@ with the real tail, the three attachments and the copies, and the A/B run
 draws on the CPU beside it; the compositor's fence wait is 0.1-0.6 ms
 against the compute raster's 6.5-8. The first GPU 3D path that is never
 slower than the software one here, and it idles the three band workers.
+
+## P2c + P3 hi-res — the GPU composite and `--internal-res N`: LANDED (opt-in)
+
+- Core: `Engine2D::set_layer_export` / `export_planes` -- a 3D line takes the
+  full select and copies `resolve16_full`'s top, second, ids, kind, alpha
+  and window into 256x192 planes the frontend owns; `Gpu::LayerExport` adds
+  the per-line BLDCNT word and MASTER_BRIGHT with bit 31 = exported. The
+  CPU composite still runs, so `fb_`, capture and states are untouched.
+- Raster: `DS_VK_SCALE` / `video.internal_res` scales the triangle path's
+  coordinates on upload; `out[]` is the hi-res layer and `downsample.comp`
+  makes the native plane the CPU reads (top-left subpixel; at S=2 the A/B
+  against the software raster matches S=1 to within a few pixels).
+  `FrameRef` carries the frame's hi-res buffer; `Gpu::frame_hires` hands it
+  to the frontend, which is what keeps the composite on the frame the
+  display lines used rather than the one the raster submitted at line 215.
+- Frontend: `shaders/composite.comp` (kern::composite_line with the hi-res
+  3D pixel substituted, then master brightness and the 6->8 expansion) runs
+  in the present stage's command buffer before `present.comp`, which samples
+  screen 0 from the composited buffer at S x. Verified by reading the tier's
+  own panel buffer back at frame 400 (`DS_GPU_COMP_DUMP`): the Etrian logo at
+  1024x768 composited at 2x. (Screenshots timed with `grim` caught the
+  intro's fades and showed black; the readback is the tool.)
+
+Known limits: an OSD label or the save flash drawn into screen 0's copy does
+not show on 3D lines (the composite takes the planes) until the overlays get
+their own plane; the composite at S>1 chooses the layer beneath by the
+native pixel's kind, so a hi-res 3D silhouette over 2D is native-res-exact
+only at the pixel level.
+
+Cost, the thing to fix next (device, headless, `DS_VK_TIMING=1`, GPU ms):
+
+| gsdd | full | flat fragment | nothing drawn | nothing drawn, no copies |
+| --- | --- | --- | --- | --- |
+| 1x | 6.6 | 4.3 | 2.9 | **0.9** |
+| 2x | 8.8 | 5.7 | | |
+
+| etody 1x | full 2.2 | flat 2.2 | nothing drawn 2.0 |
+
+The three image-to-buffer copies of the attachments cost ~1.9 ms a frame at
+1x (a tiled-to-linear conversion the driver does slowly), which is most of
+Etrian's whole pass and a third of Golden Sun's; the real fragment stage is
+2.2 ms on Golden Sun over the flat one, and the tail is free. Next: render
+into LINEAR images aliased on the buffers' memory (no copies), then the
+fragment stage. Timestamps inside the render pass read zero on this tiler,
+so attribution is by leaving parts out (`DS_VK_TRI_NOTAIL`, `_NOOPAQUE`,
+`_NOCOPY`, `DS_VK_TRI_FLAT`).

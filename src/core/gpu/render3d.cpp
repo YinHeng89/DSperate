@@ -3309,6 +3309,9 @@ Renderer3D::FrameRef Renderer3D::frame_ref(bool allow_defer) const {
     if (!allow_defer) ++gpu_stats_.defer_no_caller; else ++gpu_stats_.defer_no_prev;
     f.out = vk_raster_->output();
     f.gpu = vk_raster_.get();
+    f.hires = vk_raster_->output_hires_handle();
+    f.hires_bytes = vk_raster_->output_hires_bytes();
+    f.scale = vk_raster_->scale();
     f.nbins = vk_raster_->frame_bands();
     if (f.nbins > MAX_BINS) f.nbins = MAX_BINS;
     for (u32 i = 0; i <= f.nbins; ++i) f.bin_y[i] = vk_raster_->band_line(i);
@@ -3959,8 +3962,12 @@ bool Renderer3D::gpu_dispatch(const Polygon* const* polys, u32 npoly) {
     o.nverts = p.nverts;
     o.attr = p.attr;
     o.texparam = p.texparam;
-    o.ytop = p.ytop;
-    o.ybot = p.ybot;
+    // The triangle path draws at S times the resolution: its coordinates are
+    // scaled here (the span table and the shadow runs stay native; the
+    // triangle path reads neither).
+    const s32 S = static_cast<s32>(vk_raster_->scale());
+    o.ytop = p.ytop * S;
+    o.ybot = p.ybot * S;
     o.vtop = p.vtop;
     o.vbot = p.vbot;
     o.flags = (p.translucent ? DS_PF_TRANSLUCENT : 0u) |
@@ -4002,13 +4009,13 @@ bool Renderer3D::gpu_dispatch(const Polygon* const* polys, u32 npoly) {
     for (u32 j = 0; j < p.nverts; ++j) {
       const Vertex& v = gx_->vertex(p.vtx[j]);
       GpuVert& d = gv[nv + j];
-      d.sx = v.sx; d.sy = v.sy;
+      d.sx = v.sx * S; d.sy = v.sy * S;
       d.z = p.z[j]; d.w = p.w[j];
       d.r = v.fcol[0]; d.g = v.fcol[1]; d.b = v.fcol[2];
       d.s = v.tex[0]; d.t = v.tex[1];
       d.pad_[0] = d.pad_[1] = d.pad_[2] = 0;
-      if (v.sx < xmin) xmin = v.sx;
-      if (v.sx > xmax) xmax = v.sx;
+      if (d.sx < xmin) xmin = d.sx;
+      if (d.sx > xmax) xmax = d.sx;
     }
     o.xmin = xmin; o.xmax = xmax;
     nv += p.nverts;

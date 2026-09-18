@@ -523,7 +523,7 @@ void Display::draw_gpu(const u32* const fb[SCREENS]) {
   out_size(lw, lh);
   GpuPresent::View v[SCREENS];
   for (int i = 0; i < nviews_; ++i) v[i] = GpuPresent::View{views_[i].screen, views_[i].rect, views_[i].shown, !views_[i].direct};
-  gpu_->present(*out_, fb, v, nviews_, rot_, lw, lh, inset_alpha_);
+  gpu_->present(*out_, fb, v, nviews_, rot_, lw, lh, inset_alpha_, gpu_layer_, gpu_layer_bytes_, gpu_layer_scale_);
 }
 
 void Display::draw(const u32* const fb[SCREENS]) {

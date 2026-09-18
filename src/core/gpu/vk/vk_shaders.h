@@ -24,6 +24,8 @@ Spirv shader_raster_vis();   // raster pass seeded from the visibility pass (nee
 Spirv shader_tri_vert();     // the triangle path: polygons as fans through the hardware rasteriser
 Spirv shader_tri_opaque();   // ... its opaque-prefix fragment stage
 Spirv shader_tri_tail();     // ... and the ordered translucent tail
+Spirv shader_downsample();
+Spirv shader_tri_flat();     // attribution: the opaque draw with a constant colour   // the native plane from the hi-res layer (S >= 2)
 
 } // namespace ds::gpu::vk
 

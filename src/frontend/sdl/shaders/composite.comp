@@ -1,0 +1,72 @@
+#version 450
+// The 2D/3D composite at the internal resolution (P2c). Engine A's resolved
+// planes come from the CPU at native resolution (Engine2D::export_planes),
+// the 3D layer from the triangle path at S times that; every output pixel
+// runs kern::composite_line with the hi-res 3D pixel substituted, then the
+// master brightness and the 6 -> 8 bit expansion of Gpu::output_engine. A
+// line that was not exported (no 3D, or not display mode 1) is the finished
+// pixels the core wrote. At S = 1 this is the CPU composite bit for bit.
+layout(local_size_x = 16, local_size_y = 8) in;
+layout(std430, binding = 1) readonly buffer Src    { uint fb[]; };      // the finished DS frames (slot base + screen * 49152)
+layout(std430, binding = 2) readonly buffer Planes { uint pl[]; };      // top | second | meta | win (49152 each) | line[192] | mbright[192]
+layout(std430, binding = 3) readonly buffer L3D    { uint l3d[]; };     // 256S x 192S RGB666 + alpha5 << 24
+layout(std430, binding = 4) writeonly buffer Dst   { uint dst[]; };     // 256S x 192S 0xAARRGGBB
+layout(push_constant) uniform P { uint scale; uint fb_base; uint dispcnt3d; uint pad; } pc;
+
+const uint P_TOP = 0u, P_SECOND = 49152u, P_META = 98304u, P_WIN = 147456u, P_LINE = 196608u, P_MB = 196800u;
+const uint K_OBJ_SEMI = 1u, K_OBJ_BITMAP = 2u, K_3D = 3u;
+
+uint blend2(uint a, uint b, uint ea, uint eb) {
+  uint r  = (((a & 0x3Fu) * ea) + ((b & 0x3Fu) * eb) + 0x8u) >> 4;
+  uint g  = ((((a & 0x3F00u) * ea) + ((b & 0x3F00u) * eb) + 0x800u) >> 4) & 0x7F00u;
+  uint bl = ((((a & 0x3F0000u) * ea) + ((b & 0x3F0000u) * eb) + 0x80000u) >> 4) & 0x7F0000u;
+  return min(r, 0x3Fu) | min(g, 0x3F00u) | min(bl, 0x3F0000u);
+}
+uint blend3d(uint a, uint b) {
+  uint eva = ((a >> 24) & 0x1Fu) + 1u, evb = 32u - eva;
+  if (eva == 32u) return a & 0xFFFFFFu;
+  uint r  = (((a & 0x3Fu) * eva) + ((b & 0x3Fu) * evb) + 0x10u) >> 5;
+  uint g  = ((((a & 0x3F00u) * eva) + ((b & 0x3F00u) * evb) + 0x1000u) >> 5) & 0x7F00u;
+  uint bl = ((((a & 0x3F0000u) * eva) + ((b & 0x3F0000u) * evb) + 0x100000u) >> 5) & 0x7F0000u;
+  return min(r, 0x3Fu) | min(g, 0x3F00u) | min(bl, 0x3F0000u);
+}
+uint brighten(uint v, uint f, uint bias) { uint rb = v & 0x3F003Fu, g = v & 0x3F00u;
+  rb += ((((0x3F003Fu - rb) * f) + (bias * 0x010001u)) >> 4) & 0x3F003Fu; g += ((((0x3F00u - g) * f) + (bias * 0x000100u)) >> 4) & 0x3F00u; return rb | g; }
+uint darken(uint v, uint f, uint bias) { uint rb = v & 0x3F003Fu, g = v & 0x3F00u;
+  rb -= (((rb * f) + (bias * 0x010001u)) >> 4) & 0x3F003Fu; g -= (((g * f) + (bias * 0x000100u)) >> 4) & 0x3F00u; return rb | g; }
+
+void main() {
+  uvec2 p = gl_GlobalInvocationID.xy;
+  uint S = pc.scale, W = 256u * S, H = 192u * S;
+  if (p.x >= W || p.y >= H) return;
+  uint nx = p.x / S, ny = p.y / S, ni = ny * 256u + nx;
+  uint mb = pl[P_MB + ny];
+  if ((mb & 0x80000000u) == 0u) { dst[p.y * W + p.x] = fb[pc.fb_base + ni]; return; }
+  uint a = pl[P_TOP + ni], b = pl[P_SECOND + ni], m = pl[P_META + ni];
+  uint t1 = m & 0xFFu, kind = (m >> 8) & 0xFFu, talpha = (m >> 16) & 0xFFu, t2 = ((m >> 24) & 0xFFu) << 8;
+  uint l = pl[P_LINE + ny], bldcnt = l & 0xFFFFu, eva = (l >> 16) & 0x1Fu, evb = (l >> 21) & 0x1Fu, evy = (l >> 26) & 0x1Fu;
+  if (kind == K_3D) {
+    uint px3 = l3d[p.y * W + p.x];
+    if (((px3 >> 24) & 0x1Fu) == 0u) { a = b; kind = 0u; t1 = t2 >> 8; }   // transparent at this subpixel: the layer beneath
+    else a = px3;
+  }
+  uint effect = (bldcnt >> 6) & 3u;
+  uint o = a;
+  if ((kind == K_OBJ_SEMI || kind == K_OBJ_BITMAP) && (bldcnt & t2) != 0u) {
+    uint ea = kind == K_OBJ_BITMAP ? talpha : eva; uint eb = kind == K_OBJ_BITMAP ? 16u - ea : evb;
+    o = blend2(a, b, ea, eb);
+  } else if (kind == K_3D && (bldcnt & t2) != 0u) {
+    o = blend3d(a, b);
+  } else if ((bldcnt & t1) != 0u && (pl[P_WIN + ni] & 0x20u) != 0u) {
+    if (effect == 1u) { if ((bldcnt & t2) != 0u) o = blend2(a, b, eva, evb); }
+    else if (effect == 2u) o = brighten(a, evy, 0x8u);
+    else if (effect == 3u) o = darken(a, evy, 0x7u);
+  }
+  o &= 0xFFFFFFu;
+  // Master brightness (kern::master_brightness), then expand_colours.
+  uint mode = (mb >> 14) & 3u, factor = min(mb & 0x1Fu, 16u);
+  if (mode == 1u) { uint rb = o & 0x3F003Fu, g = o & 0x3F00u; rb += ((((0x3F003Fu - rb) * factor) >> 4) & 0x3F003Fu); g += ((((0x3F00u - g) * factor) >> 4) & 0x3F00u); o = rb | g; }
+  else if (mode == 2u) { uint rb = o & 0x3F003Fu, g = o & 0x3F00u; rb -= ((((rb * factor) + (0xFu * 0x010001u)) >> 4) & 0x3F003Fu); g -= ((((g * factor) + (0xFu * 0x000100u)) >> 4) & 0x3F00u); o = rb | g; }
+  uint v = ((o & 0x3Fu) << 18) | ((o & 0x3F00u) << 2) | ((o & 0x3F0000u) >> 14);
+  dst[p.y * W + p.x] = v | ((v & 0xC0C0C0u) >> 6) | 0xFF000000u;
+}
