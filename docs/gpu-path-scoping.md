@@ -604,3 +604,33 @@ compute dispatch with no tiler, and its software raster wants every core.
 `fully_backed_gpf_memory` (the kbase module parameter that would remove the
 faults) is read-only on ROCKNIX. The stencil-vs-shadow-plane bisect above
 was chasing noise; the shadow plane stays because it is simpler.
+
+### Real-time on/off and the CPU governor on the GPU path (2026-09-18)
+
+Device, dual window, 1x triangle path, quantum 0, work ms; two passes each
+(second pass = clean: the first real-time-off pass of gsdd and st ran
+without the default config's cpu_tuning = overclock, vsync and limiter).
+"RT" = SCHED_RR 5 with emu.gpu_irq_avoid; "off" = emu.realtime = off, where
+the pacer's ondemand handling (busy wait under a polling governor) is the
+only thing keeping the clock up.
+
+| governor | scene | RT median / p90 / p99 | off median / p90 / p99 |
+| --- | --- | --- | --- |
+| performance | gsdd | 15.3 / 16.8 / 21.2 | 16.8 / 19.7 / 23.8 |
+| performance | st | 15.7 / 18.7 / 21.1 | 16.3 / 18.1 / 21.0 |
+| performance | nsmb | 14.0 / 16.4 / 19.0 | 14.3 / 16.9 / 20.1 |
+| performance | etody | 5.2 / 8.3 / 18.6 | 6.0 / 8.4 / 18.7 |
+| ondemand | gsdd | 15.6 / 17.9 / 22.0 | 16.8 / 19.4 / 24.3 |
+| ondemand | st | 16.0 / 18.9 / 21.5 | 16.9 / 19.8 / 23.9 |
+| ondemand | nsmb | 14.2 / 16.6 / 19.4 | 14.4 / 17.1 / 20.8 |
+| ondemand | etody | 5.4 / 9.0 / 18.7 | 5.4 / 8.8 / 19.2 |
+
+No GPU stall in 32 runs (one 1-frame report in the first RT gsdd... st run,
+under 100 ms). Two answers: (1) ondemand with the pacer's busy wait is
+within 0.2-0.4 ms of performance on every scene under RT -- the lessened
+CPU load of the GPU path does not let the governor clock down on us; (2)
+real-time still buys 0.6-1.5 ms of median and 2-3 ms of p90 on the two
+heavy scenes (gsdd, st) under either governor, and nothing on nsmb/etody.
+So the default stays RR 5 + irq avoid; turning real-time off is a valid
+"no root" fallback that costs about a millisecond and a half where it
+matters.
