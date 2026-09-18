@@ -32,22 +32,27 @@ void main() {
   if (tri + 2u >= p.nverts || skip_alpha || (face == DS_FF_FACE_BACK && front) || (face == DS_FF_FACE_FRONT && !front)) { gl_Position = vec4(2.0, 2.0, 0.0, 1.0); v_poly = 0u; v_rgb = vec3(0); v_st = vec2(0); v_z = 0.0; v_w = 1.0; v_zp = 0.0; return; }
   uint vi = k == 0u ? 0u : tri + k;
   GpuVert vt = verts[p.first_vert + vi];
-  float W = 256.0 * float(pc.f.scale), H = 192.0 * float(pc.f.scale);
+  // The native-resolution tail (DS_FF_TAIL1X): the vertices were scaled by
+  // S at upload; back to 1x here, exactly (integers times S).
+  bool tail1x = (pc.f.flags & DS_FF_TAIL1X) != 0u;
+  float S = tail1x ? float(pc.f.scale) : 1.0;
+  float W = 256.0 * float(pc.f.scale) / S, H = 192.0 * float(pc.f.scale) / S;
   float w = max(float(vt.w), 1.0);
   // The DS fill: a span covers [xstart, xend] INCLUSIVE and rows [ytop, ybot)
   // exclusive. A vertex on the polygon's left sits on its pixel's left edge
   // (the centre x+0.5 is inside), one on the right is pushed a pixel out so
   // pixel xend's centre is inside too; rows need no push. Without this the
   // rightmost column of every polygon was missing.
-  float cx = 0.5 * float(p.xmin + p.xmax);
-  float ox = float(vt.sx) > cx ? 0.501 : 0.5;   // attributes sampled where the DS samples them (the pixel centre is the DS integer position); the right side a hair past the centre so the inclusive last column is covered
+  float cx = 0.5 * float(p.xmin + p.xmax) / S;
+  float sxf = float(vt.sx) / S, syf = float(vt.sy) / S;
+  float ox = sxf > cx ? 0.501 : 0.5;   // attributes sampled where the DS samples them (the pixel centre is the DS integer position); the right side a hair past the centre so the inclusive last column is covered
   float oy = 0.5;
   // A polygon with no width or no height is a line to the DS -- one column,
   // or one row -- and zero area to a triangle rasteriser. Give it the pixel:
   // the second and third vertices step across, whichever way it winds.
   if (p.xmax == p.xmin) ox = (vi == 1u || vi == 2u) ? 1.001 : 0.0;
   if (p.ybot == p.ytop) oy = (vi == 1u || vi == 2u) ? 1.0 : 0.0;
-  float x = (float(vt.sx) + ox) / W * 2.0 - 1.0, y = (float(vt.sy) + oy) / H * 2.0 - 1.0;
+  float x = (sxf + ox) / W * 2.0 - 1.0, y = (syf + oy) / H * 2.0 - 1.0;
   float z = clamp(float(vt.z), 0.0, 16777215.0);
   // Z-buffer: z / w after the divide is z / 2^24, linear in screen space,
   // as the DS interpolates it.

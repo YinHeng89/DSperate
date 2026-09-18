@@ -38,7 +38,7 @@ constexpr size_t kTilesBytes =
 constexpr size_t kTilesHeader = sizeof(u32) * DS_TILE_COUNT + sizeof(u32) * 4;
 
 enum Binding { B_POLYS = 0, B_VERTS = 1, B_TILES = 2, B_TEXELS = 3, B_OUT = 4,
-               B_POST = 5, B_DEPTH = 6, B_ATTR = 7, B_SHCLEAR = 8, B_ROWS = 9, B_KEYS = 10, B_ROWPOLY = 11, B_OUTNAT = 12, B_ORDER = 13, B_COUNT = 14 };
+               B_POST = 5, B_DEPTH = 6, B_ATTR = 7, B_SHCLEAR = 8, B_ROWS = 9, B_KEYS = 10, B_ROWPOLY = 11, B_OUTNAT = 12, B_ORDER = 13, B_NATATTR = 14, B_NATZ = 15, B_TOUCH = 16, B_COUNT = 17 };
 
 // DS_VK_VIS: 0 sends the whole list through the ordered loop, as before the
 // visibility pass existed. Attribution and a safety valve, not a feature: the
@@ -104,6 +104,14 @@ struct Raster::Impl {
 
   Buffer polys, verts, tiles, texels, post, shclear, rows;
   Buffer keys;               // the visibility pass's per-pixel owner keys, 64-bit
+  // The native-resolution tail (S >= 2): the prefix's records shrunk to 1x,
+  // the tail drawn on them, the touched pixels expanded back (see submit).
+  Buffer nat_attr, nat_z, touch;
+  VkRenderPass rp1 = VK_NULL_HANDLE;
+  VkFramebuffer fb1[3] = {VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE};
+  VkDescriptorSet set_in1[3] = {VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE};
+  VkPipeline pipe_tail1 = VK_NULL_HANDLE, pipe_mask1 = VK_NULL_HANDLE, pipe_expand = VK_NULL_HANDLE;
+  bool nat_tail = false;
   Buffer order;              // the triangle path's draw order of the opaque prefix: polygon indices sorted near to far (tri.vert, DS_FF_SORTED)
   std::vector<u32> order_idx; std::vector<u32> order_key;   // the sort's scratch
   Buffer rowpoly;            // each span row's polygon, written by the host with the table layout
@@ -167,6 +175,7 @@ struct Raster::Impl {
   VkPipeline            pipe_tail[2][2] = {{VK_NULL_HANDLE, VK_NULL_HANDLE}, {VK_NULL_HANDLE, VK_NULL_HANDLE}};   // [wbuffer][depth write]
   // Shadow volumes: a mask polygon marks the stencil where its depth test
   // FAILS (the volume's interior), a shadow polygon draws only there.
+  VkShaderModule        mod_expand = VK_NULL_HANDLE;
   VkPipeline            pipe_pre[2][2] = {{VK_NULL_HANDLE, VK_NULL_HANDLE}, {VK_NULL_HANDLE, VK_NULL_HANDLE}};   // DS_VK_TRI_PREPASS: depth-only prefix [wbuffer][front]
   VkPipeline            pipe_op_eq[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};   // ... then the shaded prefix at EQUAL depth, no depth write
   VkShaderModule        mod_flat = VK_NULL_HANDLE;
@@ -177,7 +186,8 @@ struct Raster::Impl {
   VkFormat              ds_format = VK_FORMAT_D32_SFLOAT;
   bool                  stencil = false;   // shadows drawn (the name is historical: the stencil attachment is gone, see tri_mask.frag)
   struct Img { VkImage img = VK_NULL_HANDLE; VkDeviceMemory mem = VK_NULL_HANDLE; VkImageView view = VK_NULL_HANDLE; };
-  Img img_col, img_attr, img_z, img_d, img_sh;   // img_sh: the shadow plane (R32_UINT run ids), colour attachment 3
+  Img img_col, img_attr, img_z, img_d, img_sh;
+  Img img_nat_col3[3], img_nat_attr, img_nat_z, img_touch, img_sh1;   // the native tail's 1x attachments: aliased on out_nat[i], nat_attr, nat_z, touch; the shadow plane its own   // img_sh: the shadow plane (R32_UINT run ids), colour attachment 3
   Img img_col3[3];
 
   u64  gen = 0;              // frames submitted; the buffer is gen % 3
@@ -237,7 +247,7 @@ bool Raster::tri_setup(Impl& d, Device& dev, std::string* why) {
   d.set_in = got[3];
   for (int i = 0; i < 3; ++i) {
     VkDescriptorBufferInfo bi[B_COUNT]{};
-    const Buffer* src[B_COUNT] = {&d.polys, &d.verts, &d.tiles, &d.texels, &d.out[i], &d.post, &d.depth, &d.attr, &d.shclear, &d.rows, &d.keys, &d.rowpoly, &d.out_nat[i], &d.order};
+    const Buffer* src[B_COUNT] = {&d.polys, &d.verts, &d.tiles, &d.texels, &d.out[i], &d.post, &d.depth, &d.attr, &d.shclear, &d.rows, &d.keys, &d.rowpoly, &d.out_nat[i], &d.order, &d.nat_attr, &d.nat_z, &d.touch};
     VkWriteDescriptorSet w[B_COUNT]{};
     for (u32 b = 0; b < B_COUNT; ++b) {
       bi[b].buffer = vk_buf(*src[b]); bi[b].range = VK_WHOLE_SIZE;
@@ -249,8 +259,9 @@ bool Raster::tri_setup(Impl& d, Device& dev, std::string* why) {
   }
 
   VkPhysicalDeviceMemoryProperties mp{}; a.vkGetPhysicalDeviceMemoryProperties(vk->phys, &mp);
-  auto make_image = [&](VkFormat fmt, VkImageUsageFlags usage, VkImageAspectFlags aspect, Impl::Img& o) {
-    VkImageCreateInfo ii{}; ii.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO; ii.imageType = VK_IMAGE_TYPE_2D; ii.format = fmt; ii.extent = {W, H, 1};
+  auto make_image = [&](VkFormat fmt, VkImageUsageFlags usage, VkImageAspectFlags aspect, Impl::Img& o, u32 iw = 0, u32 ih = 0) {
+    if (!iw) { iw = W; ih = H; }
+    VkImageCreateInfo ii{}; ii.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO; ii.imageType = VK_IMAGE_TYPE_2D; ii.format = fmt; ii.extent = {iw, ih, 1};
     ii.mipLevels = 1; ii.arrayLayers = 1; ii.samples = VK_SAMPLE_COUNT_1_BIT; ii.tiling = VK_IMAGE_TILING_OPTIMAL; ii.usage = usage;
     ii.sharingMode = VK_SHARING_MODE_EXCLUSIVE; ii.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     if (a.vkCreateImage(vk->dev, &ii, nullptr, &o.img) != VK_SUCCESS) return false;
@@ -270,15 +281,16 @@ bool Raster::tri_setup(Impl& d, Device& dev, std::string* why) {
   // the buffer itself and the three copies (1.9 ms a frame on the G52, a
   // tiled-to-linear conversion) go away. Needs the format to render linear,
   // the driver's row pitch to be ours, and a memory type both can share.
-  auto alias_image = [&](const Buffer& buf, Impl::Img& o) {
+  auto alias_image = [&](const Buffer& buf, Impl::Img& o, u32 iw = 0, u32 ih = 0) {
+    if (!iw) { iw = W; ih = H; }
     VkImageCreateInfo ii{}; ii.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO; ii.imageType = VK_IMAGE_TYPE_2D; ii.format = VK_FORMAT_R32_UINT;
-    ii.extent = {W, H, 1}; ii.mipLevels = 1; ii.arrayLayers = 1; ii.samples = VK_SAMPLE_COUNT_1_BIT; ii.tiling = VK_IMAGE_TILING_LINEAR;
+    ii.extent = {iw, ih, 1}; ii.mipLevels = 1; ii.arrayLayers = 1; ii.samples = VK_SAMPLE_COUNT_1_BIT; ii.tiling = VK_IMAGE_TILING_LINEAR;
     ii.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT; ii.sharingMode = VK_SHARING_MODE_EXCLUSIVE; ii.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     if (a.vkCreateImage(vk->dev, &ii, nullptr, &o.img) != VK_SUCCESS) return false;
     VkMemoryRequirements mr{}; a.vkGetImageMemoryRequirements(vk->dev, o.img, &mr);
     VkImageSubresource sr{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0}; VkSubresourceLayout lay{}; a.vkGetImageSubresourceLayout(vk->dev, o.img, &sr, &lay);
-    if (lay.offset != 0 || lay.rowPitch != static_cast<VkDeviceSize>(W) * 4 || mr.size > buf.size) {
-      std::fprintf(stderr, "gpu raster: linear alias refused -- offset %llu pitch %llu (ours %u) size %llu (buffer %zu) typebits %x\n", (unsigned long long)lay.offset, (unsigned long long)lay.rowPitch, W * 4, (unsigned long long)mr.size, buf.size, mr.memoryTypeBits);
+    if (lay.offset != 0 || lay.rowPitch != static_cast<VkDeviceSize>(iw) * 4 || mr.size > buf.size) {
+      std::fprintf(stderr, "gpu raster: linear alias refused -- offset %llu pitch %llu (ours %u) size %llu (buffer %zu) typebits %x\n", (unsigned long long)lay.offset, (unsigned long long)lay.rowPitch, iw * 4, (unsigned long long)mr.size, buf.size, mr.memoryTypeBits);
       a.vkDestroyImage(vk->dev, o.img, nullptr); o.img = VK_NULL_HANDLE; return false;
     }
     if (a.vkBindImageMemory(vk->dev, o.img, reinterpret_cast<VkDeviceMemory>(buf.memory), 0) != VK_SUCCESS) { std::fprintf(stderr, "gpu raster: linear alias refused -- bind failed\n"); a.vkDestroyImage(vk->dev, o.img, nullptr); o.img = VK_NULL_HANDLE; return false; }
@@ -365,15 +377,76 @@ bool Raster::tri_setup(Impl& d, Device& dev, std::string* why) {
   }
   d.fb = d.fb3[0];
 
+  // The native-resolution tail: a second pass at 1x on images aliased on
+  // the shrunk planes (colour = the native plane itself), loading what the
+  // shrink wrote, plus its own shadow plane and a "touched" plane that
+  // expand.comp reads. Only at S >= 2, only with the aliasing (the planes
+  // must be the buffers the compute passes see).
+  // Measured on the device (docs/gpu-path-scoping.md): gsdd 2x fence wait
+  // 6.6 -> 5.7 ms, etody 2.1 -> 3.1 (its tail is small and the shrink and
+  // expand passes are not), st and nsmb neutral. Opt-in until the two
+  // compute passes are cheaper (DS_VK_TRI_NATIVE_TAIL=1).
+  d.nat_tail = scale_ > 1 && d.alias && !d.cpu_down && std::getenv("DS_VK_TRI_NATIVE_TAIL");
+  if (d.nat_tail) {
+    bool ok = true;
+    for (int i = 0; i < 3 && ok; ++i) ok = alias_image(d.out_nat[i], d.img_nat_col3[i], 256, 192);
+    ok = ok && alias_image(d.nat_attr, d.img_nat_attr, 256, 192) && alias_image(d.nat_z, d.img_nat_z, 256, 192) && alias_image(d.touch, d.img_touch, 256, 192);
+    ok = ok && make_image(VK_FORMAT_R32_UINT, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT, VK_IMAGE_ASPECT_COLOR_BIT, d.img_sh1, 256, 192);
+    if (!ok) { std::fprintf(stderr, "gpu raster: native tail unavailable (1x aliases); the tail stays at %ux\n", scale_); d.nat_tail = false; }
+  }
+  if (d.nat_tail) {
+    VkDescriptorSetLayout l3[3] = {d.dsl_in, d.dsl_in, d.dsl_in};
+    VkDescriptorSetAllocateInfo dsa3{}; dsa3.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO; dsa3.descriptorPool = d.pool; dsa3.descriptorSetCount = 3; dsa3.pSetLayouts = l3;
+    if (a.vkAllocateDescriptorSets(vk->dev, &dsa3, d.set_in1) != VK_SUCCESS) return fail("1x input attachment sets");
+    for (int k = 0; k < 3; ++k) {
+      VkDescriptorImageInfo di[4]{};
+      di[0].imageView = d.img_nat_col3[k].view; di[1].imageView = d.img_nat_attr.view; di[2].imageView = d.img_nat_z.view; di[3].imageView = d.img_sh1.view;
+      for (auto& x : di) x.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+      VkWriteDescriptorSet w[4]{};
+      for (u32 i = 0; i < 4; ++i) { w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[i].dstSet = d.set_in1[k]; w[i].dstBinding = i; w[i].descriptorCount = 1; w[i].descriptorType = VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT; w[i].pImageInfo = &di[i]; }
+      a.vkUpdateDescriptorSets(vk->dev, 4, w, 0, nullptr);
+    }
+    // Five colour attachments: colour, attribute, depth record (loaded: the
+    // shrink wrote them), the shadow plane and the touched plane (cleared).
+    VkAttachmentDescription at1[5]{};
+    for (u32 i = 0; i < 5; ++i) {
+      at1[i].format = VK_FORMAT_R32_UINT; at1[i].samples = VK_SAMPLE_COUNT_1_BIT;
+      at1[i].loadOp = i < 3 ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR; at1[i].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+      at1[i].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE; at1[i].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+      at1[i].initialLayout = i < 3 ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED; at1[i].finalLayout = VK_IMAGE_LAYOUT_GENERAL;
+    }
+    at1[3].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    VkAttachmentReference cr1[5] = {{0, VK_IMAGE_LAYOUT_GENERAL}, {1, VK_IMAGE_LAYOUT_GENERAL}, {2, VK_IMAGE_LAYOUT_GENERAL}, {3, VK_IMAGE_LAYOUT_GENERAL}, {4, VK_IMAGE_LAYOUT_GENERAL}};
+    VkAttachmentReference ir1[4] = {{0, VK_IMAGE_LAYOUT_GENERAL}, {1, VK_IMAGE_LAYOUT_GENERAL}, {2, VK_IMAGE_LAYOUT_GENERAL}, {3, VK_IMAGE_LAYOUT_GENERAL}};
+    VkSubpassDescription sp1{};
+    sp1.flags = d.roaa ? VK_SUBPASS_DESCRIPTION_RASTERIZATION_ORDER_ATTACHMENT_COLOR_ACCESS_BIT_EXT : 0u;
+    sp1.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    sp1.inputAttachmentCount = 4; sp1.pInputAttachments = ir1;
+    sp1.colorAttachmentCount = 5; sp1.pColorAttachments = cr1;
+    VkSubpassDependency dep1{};
+    dep1.srcSubpass = 0; dep1.dstSubpass = 0;
+    dep1.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT; dep1.dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    dep1.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT; dep1.dstAccessMask = VK_ACCESS_INPUT_ATTACHMENT_READ_BIT;
+    dep1.dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT;
+    VkRenderPassCreateInfo rpi1{}; rpi1.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO; rpi1.attachmentCount = 5; rpi1.pAttachments = at1; rpi1.subpassCount = 1; rpi1.pSubpasses = &sp1; rpi1.dependencyCount = 1; rpi1.pDependencies = &dep1;
+    if (a.vkCreateRenderPass(vk->dev, &rpi1, nullptr, &d.rp1) != VK_SUCCESS) return fail("1x render pass");
+    for (int k = 0; k < 3; ++k) {
+      VkImageView views[5] = {d.img_nat_col3[k].view, d.img_nat_attr.view, d.img_nat_z.view, d.img_sh1.view, d.img_touch.view};
+      VkFramebufferCreateInfo fbi{}; fbi.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO; fbi.renderPass = d.rp1; fbi.attachmentCount = 5; fbi.pAttachments = views; fbi.width = 256; fbi.height = 192; fbi.layers = 1;
+      if (a.vkCreateFramebuffer(vk->dev, &fbi, nullptr, &d.fb1[k]) != VK_SUCCESS) return fail("1x framebuffer");
+    }
+  }
+
   // Pipelines. Compile time is 13-45 ms each on the G52; six of them, at startup.
-  auto pipeline = [&](VkShaderModule fs, bool wbuf, bool depth_write, VkPipeline* out, int kind = 0, bool equal_passes = false, bool equal_only = false) {
+  auto pipeline = [&](VkShaderModule fs, bool wbuf, bool depth_write, VkPipeline* out, int kind = 0, bool equal_passes = false, bool equal_only = false, bool at1x = false) {
+    const u32 PW = at1x ? 256u : W, PH = at1x ? 192u : H;
     VkPipelineShaderStageCreateInfo st[2]{};
     st[0].sType = st[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     st[0].stage = VK_SHADER_STAGE_VERTEX_BIT; st[0].module = d.mod_tv; st[0].pName = "main";
     st[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; st[1].module = fs; st[1].pName = "main";
     VkPipelineVertexInputStateCreateInfo vin{}; vin.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
     VkPipelineInputAssemblyStateCreateInfo ia{}; ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO; ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-    VkViewport vp{0.f, 0.f, static_cast<float>(W), static_cast<float>(H), 0.f, 1.f}; VkRect2D sc{{0, 0}, {W, H}};
+    VkViewport vp{0.f, 0.f, static_cast<float>(PW), static_cast<float>(PH), 0.f, 1.f}; VkRect2D sc{{0, 0}, {PW, PH}};
     VkPipelineViewportStateCreateInfo vps{}; vps.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO; vps.viewportCount = 1; vps.pViewports = &vp; vps.scissorCount = 1; vps.pScissors = &sc;
     VkPipelineRasterizationStateCreateInfo rs{}; rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO; rs.polygonMode = VK_POLYGON_MODE_FILL; rs.cullMode = VK_CULL_MODE_NONE; rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE; rs.lineWidth = 1.f;
     VkPipelineMultisampleStateCreateInfo ms{}; ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO; ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
@@ -388,11 +461,13 @@ bool Raster::tri_setup(Impl& d, Device& dev, std::string* why) {
     VkPipelineColorBlendAttachmentState cba[4]{};
     for (u32 i = 0; i < 4; ++i) cba[i].colorWriteMask = (i == 3) == (kind == 1) ? 0xFu : 0u;   // the mask writes the shadow plane alone; everything else never touches it
     if (kind == 3) for (auto& c : cba) c.colorWriteMask = 0u;   // the depth prepass writes no colour
-    VkPipelineColorBlendStateCreateInfo cbs{}; cbs.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO; cbs.attachmentCount = 4; cbs.pAttachments = cba;
+    VkPipelineColorBlendAttachmentState cba1[5]{};
+    if (at1x) { for (u32 i = 0; i < 4; ++i) cba1[i] = cba[i]; cba1[4].colorWriteMask = kind == 0 ? 0xFu : 0u; dss.depthTestEnable = VK_FALSE; dss.depthWriteEnable = VK_FALSE; }   // the touched plane: the tail writes it, the mask does not; no depth attachment
+    VkPipelineColorBlendStateCreateInfo cbs{}; cbs.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO; cbs.attachmentCount = at1x ? 5 : 4; cbs.pAttachments = at1x ? cba1 : cba;
     if (d.roaa) cbs.flags = VK_PIPELINE_COLOR_BLEND_STATE_CREATE_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_BIT_EXT;
     VkGraphicsPipelineCreateInfo gpi{}; gpi.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO; gpi.stageCount = 2; gpi.pStages = st;
     gpi.pVertexInputState = &vin; gpi.pInputAssemblyState = &ia; gpi.pViewportState = &vps; gpi.pRasterizationState = &rs; gpi.pMultisampleState = &ms;
-    gpi.pDepthStencilState = &dss; gpi.pColorBlendState = &cbs; gpi.layout = d.layout_g; gpi.renderPass = d.rp;
+    gpi.pDepthStencilState = &dss; gpi.pColorBlendState = &cbs; gpi.layout = d.layout_g; gpi.renderPass = at1x ? d.rp1 : d.rp;
     return a.vkCreateGraphicsPipelines(vk->dev, VK_NULL_HANDLE, 1, &gpi, nullptr, out) == VK_SUCCESS;
   };
   for (int wb = 0; wb < 2; ++wb) {
@@ -401,6 +476,10 @@ bool Raster::tri_setup(Impl& d, Device& dev, std::string* why) {
     for (int wr = 0; wr < 2; ++wr) if (!pipeline(d.mod_ttf, wb != 0, wr != 0, &d.pipe_tail[wb][wr])) return fail("tail pipeline");
   }
   if (!pipeline(d.mod_tmf, false, false, &d.pipe_mask, 1)) return fail("mask pipeline");
+  if (d.nat_tail) {
+    if (!pipeline(d.mod_ttf, false, false, &d.pipe_tail1, 0, false, false, true)) return fail("1x tail pipeline");
+    if (!pipeline(d.mod_tmf, false, false, &d.pipe_mask1, 1, false, false, true)) return fail("1x mask pipeline");
+  }
   d.prepass = std::getenv("DS_VK_TRI_PREPASS") != nullptr;   // experiment: shade each opaque pixel once
   if (d.prepass) {
     if (!shader(shader_tri_pre(), &d.mod_flat)) return fail("prepass shader");
@@ -459,8 +538,13 @@ std::unique_ptr<Raster> Raster::create(Device& dev, std::string* why) {
     // is ~0.15 ms of GPU, the strided gather lands on the thread that reads
     // the line -- st 2x +0.5 ms median. Opt-in for a host with CPU to spare.
     d.cpu_down = self->scale_ > 1 && std::getenv("DS_VK_CPU_DOWNSAMPLE");
-    if (i == 0) { d.order = dev.alloc(sizeof(u32) * DS_MAX_POLYS, Access::CpuWrite); if (!d.order) return set_why("order buffer allocation failed"); }
-    if (self->scale_ > 1 && !d.cpu_down) { d.out_nat[i] = dev.alloc(256 * 192 * sizeof(u32), Access::CpuRead); if (!d.out_nat[i]) return set_why("native layer allocation failed"); }
+    if (i == 0) {
+      d.order = dev.alloc(sizeof(u32) * DS_MAX_POLYS, Access::CpuWrite); if (!d.order) return set_why("order buffer allocation failed");
+      const size_t nat_bytes = 256 * 192 * sizeof(u32) + 16384;   // the alias slack, as out_bytes
+      d.nat_attr = dev.alloc(nat_bytes, Access::CpuWrite); d.nat_z = dev.alloc(nat_bytes, Access::CpuWrite); d.touch = dev.alloc(nat_bytes, Access::CpuWrite);
+      if (!d.nat_attr || !d.nat_z || !d.touch) return set_why("native tail plane allocation failed");
+    }
+    if (self->scale_ > 1 && !d.cpu_down) { d.out_nat[i] = dev.alloc(256 * 192 * sizeof(u32) + 16384, Access::CpuRead); if (!d.out_nat[i]) return set_why("native layer allocation failed"); }
     else d.out_nat[i] = d.out[i];   // (binding 12 must name a buffer; with cpu_down it is never read)
     if (d.cpu_down) d.nat[i].assign(256 * 192, 0u);
   }
@@ -546,6 +630,7 @@ std::unique_ptr<Raster> Raster::create(Device& dev, std::string* why) {
   if (!pipeline(d.mod_bin, &d.pipe_bin)) return set_why("bin pipeline failed to compile");
   if (!pipeline(d.mod_raster, &d.pipe_raster)) return set_why("raster pipeline failed to compile");
   if (!pipeline(d.mod_post, &d.pipe_post)) return set_why("final pass pipeline failed to compile");
+  if (self->scale_ > 1) { if (!shader(shader_expand(), &d.mod_expand) || !pipeline(d.mod_expand, &d.pipe_expand)) return set_why("expand pipeline failed to compile"); }
   if (!pipeline(d.mod_span, &d.pipe_span)) return set_why("span pipeline failed to compile");
   if (self->scale_ > 1) {
     if (!shader(shader_downsample(), &d.mod_down)) return set_why("downsample.spv rejected by the driver");
@@ -560,12 +645,12 @@ std::unique_ptr<Raster> Raster::create(Device& dev, std::string* why) {
   psz[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
   psz[0].descriptorCount = B_COUNT * 6;
   psz[1].type = VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT;
-  psz[1].descriptorCount = 16;   // four input attachments per set, three sets (set_in3)
+  psz[1].descriptorCount = 32;   // four input attachments per set, three sets (set_in3) and three more for the native tail (set_in1)
   psz[2].type = VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER;
   psz[2].descriptorCount = 4;    // the texel view in each graphics set
   VkDescriptorPoolCreateInfo dpi{};
   dpi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-  dpi.maxSets = 10;
+  dpi.maxSets = 16;
   dpi.poolSizeCount = 3;
   dpi.pPoolSizes = psz;
   if (a.vkCreateDescriptorPool(vk->dev, &dpi, nullptr, &d.pool) != VK_SUCCESS)
@@ -585,7 +670,7 @@ std::unique_ptr<Raster> Raster::create(Device& dev, std::string* why) {
   for (int i = 0; i < 3; ++i) {
     VkDescriptorBufferInfo bi[B_COUNT]{};
     const Buffer* src[B_COUNT] = {&d.polys, &d.verts, &d.tiles, &d.texels, &d.out[i],
-                                  &d.post, &d.depth, &d.attr, &d.shclear, &d.rows, &d.keys, &d.rowpoly, &d.out_nat[i], &d.order};
+                                  &d.post, &d.depth, &d.attr, &d.shclear, &d.rows, &d.keys, &d.rowpoly, &d.out_nat[i], &d.order, &d.nat_attr, &d.nat_z, &d.touch};
     VkWriteDescriptorSet w[B_COUNT]{};
     for (u32 b = 0; b < B_COUNT; ++b) {
       bi[b].buffer = vk_buf(*src[b]);
@@ -615,7 +700,7 @@ std::unique_ptr<Raster> Raster::create(Device& dev, std::string* why) {
       // real order-free prefix, and only the tail binned.
       self->vis_ = true;
       std::fprintf(stderr, "gpu raster: triangle path at %ux, ordered attachment access %s, %s, %s\n", self->scale_, d.roaa ? "on" : "OFF (a barrier per tail polygon)", d.alias ? "attachments aliased on the buffers" : "attachments copied into the buffers", d.stencil ? "shadows through the shadow plane" : "shadows OFF");
-      if (self->scale_ > 1) std::fprintf(stderr, "gpu raster: native plane %s\n", d.cpu_down ? "reduced on the CPU a line at a time (DS_VK_CPU_DOWNSAMPLE)" : "by downsample.comp on the GPU");
+      if (self->scale_ > 1) std::fprintf(stderr, "gpu raster: native plane %s; translucent tail at %s\n", d.cpu_down ? "reduced on the CPU a line at a time (DS_VK_CPU_DOWNSAMPLE)" : "by downsample.comp on the GPU", d.nat_tail ? "1x (native)" : "full resolution");
     }
   }
 
@@ -911,6 +996,9 @@ bool Raster::submit(u32 npoly, u32 nvert, u32 ntexels, const GpuFrame& frame) {
     };
     u32 run = 0;
     GpuFrame ftail = frame;
+    auto record_tail = [&](bool at1x) {
+    const u32 base_flags = frame.flags | (at1x ? DS_FF_TAIL1X : 0u);
+    if (at1x) { ftail.flags = base_flags; a.vkCmdPushConstants(cb, d.layout_g, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(GpuFrame), &ftail); }
     for (u32 i = frame.first_ordered; (st & 2) && !no_tail && i < npoly;) {
       const int kind = kind_of(gp[i]);
       const bool wr = (gp[i].attr & 0x800u) != 0u;
@@ -919,20 +1007,55 @@ bool Raster::submit(u32 npoly, u32 nvert, u32 ntexels, const GpuFrame& frame) {
       if (kind != 0 && (!d.stencil || no_shadow_draw)) { i = j; continue; }   // shadows off
       if ((kind == 1 && no_mask) || (kind == 2 && no_shadow)) { i = j; continue; }
       if (kind == 1 && !mask_as_tail) {
-        ftail.flags = frame.flags | (++run << DS_FF_RUN_SHIFT);
+        ftail.flags = base_flags | (++run << DS_FF_RUN_SHIFT);
         a.vkCmdPushConstants(cb, d.layout_g, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(GpuFrame), &ftail);
-        a.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, d.pipe_mask);
+        a.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, at1x ? d.pipe_mask1 : d.pipe_mask);
         a.vkCmdDraw(cb, 24, j - i, 0, i);
         if (!d.roaa) barrier();   // the shadows read what the masks wrote
         i = j;
         continue;
       }
-      a.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, d.pipe_tail[wbuf ? 1 : 0][wr ? 1 : 0]);
+      a.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, at1x ? d.pipe_tail1 : d.pipe_tail[wbuf ? 1 : 0][wr ? 1 : 0]);
       if (d.roaa) a.vkCmdDraw(cb, 24, j - i, 0, i);
       else for (u32 k = i; k < j; ++k) { a.vkCmdDraw(cb, 24, 1, 0, k); barrier(); }
       i = j;
     }
+    };
+    if (!d.nat_tail) record_tail(false);
     a.vkCmdEndRenderPass(cb);
+    if (d.nat_tail) {
+      // The native-resolution tail. Pass A (above) left the prefix in the
+      // hi-res attachments, which are the buffers: shrink them to the 1x
+      // planes, draw the tail there, expand what it touched back.
+      VkMemoryBarrier mb{}; mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+      mb.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT; mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+      a.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+      GpuFrame fsh = frame; fsh.flags = frame.flags | DS_FF_SHRINK3;
+      a.vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, d.layout, 0, 1, &d.set[back], 0, nullptr);
+      a.vkCmdPushConstants(cb, d.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(GpuFrame), &fsh);
+      a.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, d.pipe_down);
+      a.vkCmdDispatch(cb, (256 * 192 + 63) / 64, 1, 1);
+      mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT; mb.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_INPUT_ATTACHMENT_READ_BIT;
+      a.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+      VkClearValue cv1[5]{};
+      cv1[3].color.uint32[0] = 0xFFFFFFFFu;   // the shadow plane: no run yet
+      cv1[4].color.uint32[0] = 0;             // nothing touched yet
+      VkRenderPassBeginInfo rb1{};
+      rb1.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+      rb1.renderPass = d.rp1; rb1.framebuffer = d.fb1[back]; rb1.renderArea = {{0, 0}, {256, 192}}; rb1.clearValueCount = 5; rb1.pClearValues = cv1;
+      a.vkCmdBeginRenderPass(cb, &rb1, VK_SUBPASS_CONTENTS_INLINE);
+      VkDescriptorSet gs1[2] = {d.set_g[back], d.set_in1[back]};
+      a.vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, d.layout_g, 0, 2, gs1, 0, nullptr);
+      record_tail(true);
+      a.vkCmdEndRenderPass(cb);
+      mb.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT; mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+      a.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+      a.vkCmdPushConstants(cb, d.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(GpuFrame), &frame);
+      a.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, d.pipe_expand);
+      a.vkCmdDispatch(cb, (W * H + 63) / 64, 1, 1);
+      mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT; mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+      a.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    }
     if (d.alias) {
       // The attachments ARE the buffers: hand the writes to the host, the
       // final pass and the downsample.

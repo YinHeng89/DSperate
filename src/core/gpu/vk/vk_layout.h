@@ -191,6 +191,8 @@ struct GpuFrame {
 #define DS_FF_ONLY_PLAIN 0x40u  // the triangle path: draw only polygons WITHOUT DS_PF_TEX_ALPHA (the depth prepass and its EQUAL shaded pass)
 #define DS_FF_ONLY_ALPHA 0x80u  // ... only polygons WITH it (drawn after, with the normal test: they never went through the prepass)
 #define DS_FF_SORTED   0x100u  // the triangle path: this draw's instance i is polygon order[i] (the opaque prefix near to far)
+#define DS_FF_TAIL1X   0x200u  // the translucent tail drawn at native resolution on the shrunk planes (tri.vert divides positions by scale; tri_tail.frag depth-tests in the shader)
+#define DS_FF_SHRINK3  0x400u  // downsample.comp: shrink the attribute and depth records too (before the native tail)
 #define DS_FF_TEX0     0x20u  // attribution (DS_VK_TRI_TEX0=1): every texel fetch reads the polygon's first texel (the fetch without its cache misses)
 #define DS_FF_NOTEX    0x10u  // attribution (DS_VK_TRI_NOTEX=1): shade every polygon as untextured
 #define DS_FF_IDCOLOUR 0x2u  // debugging (DS_VK_TRI_IDCOL=1): the opaque draw writes the polygon INDEX as its colour (r = i & 63, g = i >> 6 & 63, b = i >> 12 & 63)

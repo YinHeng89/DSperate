@@ -34,6 +34,7 @@ DS_INCBIN(ds_vk_downsample, "downsample.spv");
 DS_INCBIN(ds_vk_tri_flat, "tri_flat_frag.spv");
 DS_INCBIN(ds_vk_tri_mask, "tri_mask_frag.spv");
 DS_INCBIN(ds_vk_tri_pre, "tri_pre_frag.spv");
+DS_INCBIN(ds_vk_expand, "expand.spv");
 
 namespace ds::gpu::vk {
 
@@ -73,6 +74,7 @@ Spirv shader_tri_tail()   { return { reinterpret_cast<const u32*>(ds_vk_tri_tail
 
 Spirv shader_downsample() { return { reinterpret_cast<const u32*>(ds_vk_downsample_data), static_cast<size_t>(ds_vk_downsample_end - ds_vk_downsample_data) }; }
 
+Spirv shader_expand() { return { reinterpret_cast<const u32*>(ds_vk_expand_data), static_cast<size_t>(ds_vk_expand_end - ds_vk_expand_data) }; }
 Spirv shader_tri_pre() { return { reinterpret_cast<const u32*>(ds_vk_tri_pre_data), static_cast<size_t>(ds_vk_tri_pre_end - ds_vk_tri_pre_data) }; }
 Spirv shader_tri_mask() { return { reinterpret_cast<const u32*>(ds_vk_tri_mask_data), static_cast<size_t>(ds_vk_tri_mask_end - ds_vk_tri_mask_data) }; }
 Spirv shader_tri_flat() { return { reinterpret_cast<const u32*>(ds_vk_tri_flat_data), static_cast<size_t>(ds_vk_tri_flat_end - ds_vk_tri_flat_data) }; }

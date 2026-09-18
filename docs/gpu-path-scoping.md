@@ -707,3 +707,32 @@ all of it fragments (tail 3, prefix shading 2.3 minus what a prepass wins,
 as flat varyings instead of the polys[] load per fragment, fewer input
 attachment reads, variants per blend mode), the translucent tail at a
 lower resolution (inexact, allowed), or the auto cap.
+
+### The translucent tail at native resolution (2026-09-18): built, opt-in
+
+At S >= 2 the frame can run as: pass A (hi-res, the opaque prefix), a
+shrink dispatch (colour, attribute and depth records to 1x planes, top-left
+subpixel; downsample.comp with DS_FF_SHRINK3), pass B (1x, on images
+aliased on those planes: the tail, masks and shadows with tri.vert dividing
+positions by S and tri_tail.frag depth-testing in the shader against the
+depth record, with the mode-1 rule and the equal-depth tolerance; a
+"touched" plane marks what it wrote), an expand dispatch (touched parents
+back into the hi-res planes), then the final pass and the native
+downsample as before. Host A/B of the native plane: unchanged (st 5.409 M
+vs 5.408 M, gsdd 7.038 M vs 7.039 M). Device, 2x, dual window, two passes:
+
+| scene | full-resolution tail median / fence | native tail median / fence |
+| --- | --- | --- |
+| gsdd | 20.8-21.4 / 6.6 | 20.4-20.9 / 5.7 |
+| etody | 5.5 / 2.1 | 5.7 / 3.1 |
+| st | 17.4 / 0.6 | 17.7 / 0.5 |
+| nsmb | 14.6 / 0.16 | 14.3 / 0.11 |
+
+The tail's fragments were a quarter as many, but the shrink and expand
+passes (one read of three hi-res planes, one conditional write of three)
+cost about a millisecond, which is the whole gain on Golden Sun and a loss
+on Etrian, whose tail was cheap. Opt-in (`DS_VK_TRI_NATIVE_TAIL=1`) until
+the passes are cheaper: expand only inside the tail's bounding rows, or
+fold the shrink into pass A's store. The user's next step is a like-for-
+like DraStic comparison (its --benchmark from matching save states) before
+deciding how much further 2x is worth pushing.

@@ -17,6 +17,7 @@ layout(location = 5) in float v_zp;
 layout(location = 0) out uint o_col;     // the 3D layer record: RGB666 + alpha5 << 24
 layout(location = 1) out uint o_attr;    // the attribute plane the final pass reads
 layout(location = 2) out uint o_z;       // the depth plane (DS z, or w in W-buffer mode)
+layout(location = 4) out uint o_touch;   // the native tail pass (DS_FF_TAIL1X): 1 where the tail wrote the pixel, for expand.comp (no such attachment in the hi-res pass: the write is dropped)
 #include "ds_shade.glsl"
 struct Frag { uint src; uint alpha; uint polyattr; uint depth; };
 Frag shade_fragment(GpuPoly p) {

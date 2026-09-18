@@ -20,6 +20,19 @@ void main() {
   if ((p.flags & DS_PF_SHADOW) != 0u && subpassLoad(in_sh).r != (pc.f.flags >> DS_FF_RUN_SHIFT)) discard;
   Frag f = shade_fragment(p);
   if (f.alpha <= pc.f.alpha_ref) discard;
+  if ((pc.f.flags & DS_FF_TAIL1X) != 0u) {
+    // No depth buffer in the native tail pass: the DS test against the depth
+    // record, with its rules -- equal passes for a front-facing polygon over
+    // an opaque back-facing pixel (mode 1); the equal-depth mode (attribute
+    // bit 14) passes within its tolerance (+-0x200 in Z mode, +-0xFF in W).
+    uint dz = subpassLoad(in_z).r, da = subpassLoad(in_attr).r;
+    bool front = (p.flags & DS_PF_FRONTFACING) != 0u;
+    bool pass;
+    if ((p.attr & (1u << 14)) != 0u) { uint tol = (pc.f.flags & DS_FF_WBUFFER) != 0u ? 0xFFu : 0x200u; pass = (dz > f.depth ? dz - f.depth : f.depth - dz) <= tol; }
+    else pass = (front && (da & 0x00400010u) == 0x00000010u) ? f.depth <= dz : f.depth < dz;
+    if (!pass) discard;
+    o_touch = 1u;
+  }
   if (f.alpha == 31u) { o_col = f.src; o_attr = f.polyattr; o_z = f.depth; return; }
   uint dattr = subpassLoad(in_attr).r;
   uint dcol = subpassLoad(in_col).r;
