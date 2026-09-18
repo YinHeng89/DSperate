@@ -219,7 +219,7 @@ write-combine + flush) 0.2, record + submit 0.13-0.17. GPU time per panel
 frame is the emulation thread with the scaler already off it.
 
 Checked by eye on the device (grim): dual window, single window, rotation
-90 on both panels, the PiP inset with `--pip-alpha 128` (translucent), the
+90 on both panels, the PiP inset (its alpha blend still to be checked with `--pip-alpha 0.5`; 128 clamps to opaque), the
 FPS overlay. Left for later: the pause menu and notices take the DS-space
 path on this tier (`canvas_capable()` is false, as on the SDL_Renderer
 tier), so they come out at DS resolution -- a panel-resolution overlay
@@ -227,3 +227,18 @@ plane is the follow-up; the box filter / grid / bilinear / chunky tables
 are P4; nearest here is `floor(x * 256 / w)`, not the CPU's run table, so
 a run boundary can differ by a pixel (allowed on the GPU path; P4 adopts
 the tables).
+
+## P2a — the compute raster transplanted onto main: LANDED (`--gpu-raster`, opt-in)
+
+The gpu-raster branch's hooks (`gpu_supported`, `gpu_dispatch`, the seam
+after the texcache resolve, `FrameRef::gpu`, the A/B harness `--gpu-ab`,
+the `video.gpu_raster` knob which still implies `emu.timing_oc`) applied
+onto main by three-way merge; three conflicts in `Renderer3D::render`, all
+the branch's supersets of main's profiling lines. Gates: scene hashes of
+etody and mlbis (300 frames) identical to main with the knobs off; host
+A/B identical; device A/B Golden Sun 340/340 identical, Etrian Odyssey 14
+of 388 frames differ by 26 pixels (the branch's known seam residual).
+GPU times on the device in A/B mode (CPU drawing beside it): etody 4.4 ms,
+gsdd 10.5. Not yet changed: the upload still runs on the emulation thread
+(P2b moves it), and the branch's deferred-composite knob came along
+(`video.gpu_defer`, measured worthless there; left off).

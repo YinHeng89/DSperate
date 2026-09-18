@@ -275,6 +275,13 @@ private:
   u16 master_bright_g_[2] = {0, 0};   // guest-visible; the engines hold the render-side value
   u32 capcnt_ = 0;
   bool capture_on_ = false;
+public:
+  // video.gpu_defer: show the GPU's frame one later than it is drawn, so the
+  // compositor never waits for it. See the note in begin_frame.
+  void set_defer_3d(bool on) { defer_3d_ = on; }
+  bool defer_3d() const { return defer_3d_; }
+private:
+  bool defer_3d_ = false;
   std::array<u16, 16> fifo_{};
   u8 fifo_rd_ = 0, fifo_wr_ = 0;
   alignas(16) std::array<u16, 256> fifo_line_{};

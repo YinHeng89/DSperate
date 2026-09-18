@@ -188,7 +188,7 @@ public:
   // The frame the display reads now (see Renderer3D::FrameRef): taken on the
   // emulation thread at the start of a display frame, used by whichever
   // thread composites its lines.
-  Renderer3D::FrameRef frame_ref() const { return renderer_.frame_ref(); }
+  Renderer3D::FrameRef frame_ref(bool allow_defer = false) const { return renderer_.frame_ref(allow_defer); }
   // Instrumentation: the worker's execution time (ns) accumulated since the
   // last take_worker_busy_ns, and the raster's serial cost of the last frame.
   u64 take_worker_busy_ns() { return worker_busy_ns_.exchange(0, std::memory_order_relaxed); }

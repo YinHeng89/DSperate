@@ -3,6 +3,10 @@
 #include "core/gpu/render3d.h"
 #include "core/div64.h"
 #include "core/state/state.h"
+#if DSPERATE_VULKAN
+#include "core/gpu/vk/vk_device.h"
+#include "core/gpu/vk/vk_raster.h"
+#endif
 
 #include <type_traits>
 #include <atomic>
@@ -371,7 +375,10 @@ public:
 };
 
 Renderer3D::Renderer3D(NDS& nds) : nds_(nds) { out_dst_ = out_[0].data(); reset(); }
-Renderer3D::~Renderer3D() = default;
+Renderer3D::~Renderer3D() {
+  if (ab_ref_) std::fclose(ab_ref_);
+  if (ab_cand_) std::fclose(ab_cand_);
+}
 
 void Renderer3D::reset() {
   color_.fill(0); depth_.fill(0); attr_.fill(0); out_[0].fill(0); out_[1].fill(0);
@@ -380,6 +387,7 @@ void Renderer3D::reset() {
   display_ = 0;
   out_dst_ = out_[0].data();
   pending_bands_ = 0; gen_ = 0;
+  gpu_frame_ = false; gpu_frame_prev_ = false; gpu_defer_ok_ = false;
   for (auto& b : bands_) b->reset();
 }
 
@@ -2049,6 +2057,77 @@ void Renderer3D::precompute_lines(Edge& e, s32 y0, s32 y1) {
 // the work the framebuffer reaches: the depth pre-pass against live depth_ and
 // attr_, the attribute staging into the span buffer, and the batch job. The
 // pixel stages and the resolve wait for flush_batch.
+namespace {
+Renderer3D::CoverageStats g_cov;
+std::mutex g_cov_mu;
+}
+const Renderer3D::CoverageStats& Renderer3D::coverage_stats() { return g_cov; }
+
+// Is pixel (x, y) inside the polygon, as a graphics pipeline would decide it?
+//
+// The comparison has to be set up carefully or it measures a half-pixel bias
+// instead of the thing it is for. A GPU generates a fragment when the pixel
+// CENTRE is inside the triangle. If the DS's integer vertex (sx, sy) names a
+// pixel, then drawing it means placing the vertex at that pixel's centre --
+// so the test is centre (x + 0.5, y + 0.5) against vertices (sx + 0.5,
+// sy + 0.5), and the two half-pixels cancel exactly. Hence integer point
+// against integer vertices.
+//
+// A clipped polygon is convex, so "inside" is: the point is on the same side
+// of every directed edge, with a point exactly on an edge accepted either way.
+static bool point_in_poly(const Gpu3D& gx, const Polygon& p, s32 x, s32 y) {
+  int sign = 0;
+  for (u32 i = 0; i < p.nverts; ++i) {
+    const Vertex& a = gx.vertex(p.vtx[i]);
+    const Vertex& b = gx.vertex(p.vtx[(i + 1) % p.nverts]);
+    const s64 cr = static_cast<s64>(b.sx - a.sx) * (y - a.sy) -
+                   static_cast<s64>(b.sy - a.sy) * (x - a.sx);
+    if (cr == 0) continue;                 // on the edge: either winding accepts it
+    const int sg = cr > 0 ? 1 : -1;
+    if (sign == 0) sign = sg;
+    else if (sign != sg) return false;
+  }
+  return true;
+}
+
+void Renderer3D::probe_coverage(const Polygon& p, const SpanJob& j) const {
+  if (!gx_) return;
+  // The pixels resolve_span actually draws: a running x through the three
+  // parts, each gated by its fill rule, exactly as that function walks them.
+  s32 iv[3][2];
+  u32 n = 0;
+  s32 x = j.xdraw;
+  auto part = [&](s32 limit, bool on) {
+    if (!on) { if (limit > x) x = limit; return; }
+    if (limit > x) { iv[n][0] = x; iv[n][1] = limit; ++n; x = limit; }
+  };
+  part(j.lim0, j.l_fill);
+  part(j.lim1, !j.wf_skip);
+  part(j.lim2, j.r_fill);
+
+  u64 drawn = 0, outside = 0;
+  u32 run = 0, worst = 0;
+  for (u32 k = 0; k < n; ++k)
+    for (s32 xx = iv[k][0]; xx < iv[k][1]; ++xx) {
+      ++drawn;
+      if (point_in_poly(*gx_, p, xx, j.y)) { run = 0; continue; }
+      ++outside;
+      if (++run > worst) worst = run;
+    }
+  if (!drawn) return;
+  std::lock_guard<std::mutex> lk(g_cov_mu);
+  g_cov.drawn += drawn;
+  g_cov.outside += outside;
+  ++g_cov.spans;
+  if (outside) {
+    ++g_cov.spans_bad;
+    const u32 b = outside == 1 ? 0 : outside == 2 ? 1 : outside <= 4 ? 2 : outside <= 8 ? 3 : outside <= 16 ? 4 : 5;
+    ++g_cov.bucket[b];
+    if (outside == drawn) ++g_cov.spans_all_out;
+  }
+  if (worst > g_cov.worst_run) g_cov.worst_run = worst;
+}
+
 void Renderer3D::stage_line(Edge& e, s32 y, const LineSpan& ls) {
   const Polygon& p = *e.poly;
   const Shade& sh = e.sh;
@@ -2115,6 +2194,7 @@ void Renderer3D::stage_line(Edge& e, s32 y, const LineSpan& ls) {
   j.lim1 = std::min({ls.xend - ls.r_len + 1, ls.xend + 1, 256});
   j.lim2 = std::min(ls.xend + 1, 256);
   j.l_fill = ls.l_fill; j.r_fill = ls.r_fill; j.wf_skip = ls.wf_skip;
+  if (coverage_probe_) probe_coverage(p, j);
 
   batch_px_ += static_cast<u32>(xb - xa);
 }
@@ -2761,14 +2841,21 @@ void Renderer3D::render(const Gpu3D& gx) {
   // Before anything: the previous frame's bands read the texture cache and
   // this object's state, and the identical-frame path below mutates the cache
   // even when it renders nothing.
+  gpu_sync_is_frame_ = true;
   sync_all();
-  // Everything from here to the band dispatch -- the identical-frame check,
-  // the texture cache validation and the resolve -- is R3D_PREP; the band
-  // workers account for themselves.
+  gpu_sync_is_frame_ = false;
+  // Everything from here to the raster seam -- the identical-frame check, the
+  // texture cache validation and the resolve -- is R3D_PREP; the GPU upload
+  // and the band dispatch account for themselves.
   const auto t_prep0 = prof::enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
   struct PrepEnd { std::chrono::steady_clock::time_point t0; bool* done; ~PrepEnd() { if (prof::enabled && !*done) { prof::add_ns(prof::R3D_PREP, static_cast<u64>((std::chrono::steady_clock::now() - t0).count())); *done = true; } } };
   bool prep_done = false;
   PrepEnd prep_end{t_prep0, &prep_done};
+  // Deferring shows the frame before the last one, so it is only right when
+  // the last two renders both went to the GPU and both actually drew. Every
+  // early return below -- an identical frame kept, ablation -- leaves this
+  // false, which costs one frame of waiting and never shows the wrong thing.
+  gpu_defer_ok_ = false;
   gx_ = &gx;
   // The slowest band of the frame just synced, kept for two frames (the
   // band-count choice below). The slots are read again by the profile after
@@ -2807,7 +2894,7 @@ void Renderer3D::render(const Gpu3D& gx) {
       texcache_.lookup(*vm_, fmt, (p.texparam & 0xFFFF) << 3, 8u << ((p.texparam >> 20) & 7), 8u << ((p.texparam >> 23) & 7),
                        p.texpal, (p.texparam & (1 << 29)) ? 0 : 31);
     }
-    if (texcache_.decodes_this_frame() == 0) { prof::add(prof::C_R3D_FRAMES_KEPT, 1); return; }
+    if (texcache_.decodes_this_frame() == 0) { prof::add(prof::C_R3D_FRAMES_KEPT, 1); ++gpu_stats_.kept; return; }
   }
   rendered_once_ = true;
   aa_rendered_ = aa_;
@@ -2818,19 +2905,109 @@ void Renderer3D::render(const Gpu3D& gx) {
   // it: job 0 now builds its own edges on its pool thread exactly as workers
   // 1..n always did, and the bins are cut from the polygon list directly.
   const u32 npoly = gx.render_polygon_count();
+  // Decided before the texture resolve, because the resolve depends on it.
+#if DSPERATE_VULKAN
+  gpu_live_ = vk_raster_ != nullptr && vk_raster_->ready();
+#endif
   poly_texels_.assign(npoly, nullptr);
+  if (gpu_live_) poly_texref_.assign(npoly, TextureCache::Ref{});
   u32 live = 0;
   for (u32 i = 0; i < npoly; ++i) {
     const Polygon& p = *polys[i];
     if (p.degenerate) continue;
     ++live;
     Shade sh;
-    if (texture_fields(sh, p))
-      poly_texels_[i] = texcache_.lookup(*vm_, sh.fmt, sh.base, static_cast<u32>(sh.width), static_cast<u32>(sh.height), sh.texpal, sh.alpha0);
+    // texture_fields answers "does the CPU need the decoded cache for this
+    // one" -- it says no whenever the direct VRAM pointers cover the texture,
+    // because a byte texel plus an L1 palette beats a word from a four-times
+    // larger array. The GPU has no such choice: the shader never learns the
+    // six texel formats, it reads the cache's one word per texel and nothing
+    // else. So with the GPU path live every textured polygon is resolved.
+    // The CPU's own sampling is untouched (setup_shade still takes the
+    // pointer only when texture_fields asked for it), which is what keeps the
+    // A/B comparison honest: the reference is the shipping code path.
+    if (texture_fields(sh, p) || (gpu_live_ && sh.textured)) {
+      const TextureCache::Ref r = texcache_.lookup_ref(*vm_, sh.fmt, sh.base, static_cast<u32>(sh.width), static_cast<u32>(sh.height), sh.texpal, sh.alpha0);
+      poly_texels_[i] = r.texels;
+      if (gpu_live_) poly_texref_[i] = r;
+    }
   }
   texels_in_ = &poly_texels_;
 
+  // ---- the GPU raster seam ------------------------------------------------
   if (prof::enabled && !prep_done) { prof::add_ns(prof::R3D_PREP, static_cast<u64>((std::chrono::steady_clock::now() - t_prep0).count())); prep_done = true; }
+  //
+  // Here and not earlier, because everything the GPU needs is now resolved:
+  // the polygon list, the render state, and the decoded textures as plain
+  // pointers. Here and not later, because everything below this point -- the
+  // band count, the pool, the bins, the workers -- IS the CPU raster, and
+  // none of it runs for a frame the GPU takes.
+  //
+  // The fall-through is the whole safety property. A frame the gate refuses,
+  // or one the backend will not dispatch, simply carries on into the band
+  // path below and is drawn exactly as it always was. There is no state to
+  // unwind, because nothing has been written yet.
+#if DSPERATE_VULKAN
+  if (gpu_live_ || gpu_gate_dryrun_) {
+    const u32 reject = gpu_supported(polys, npoly);
+    if (reject != GpuOk) {
+      ++gpu_stats_.rejected;
+      ++gpu_stats_.reject[reject];
+    } else {
+      ++gpu_stats_.eligible;
+    }
+    if (reject != GpuOk || !gpu_live_) {
+      // Nothing to do: the dry run only counts, and a refused frame falls
+      // through to the band path below exactly as it did before the seam.
+    } else if (const auto t0 = std::chrono::steady_clock::now(); !gpu_dispatch(polys, npoly)) {
+      if (prof::enabled) prof::add_ns(prof::GPU_UPLOAD, static_cast<u64>((std::chrono::steady_clock::now() - t0).count()));
+      ++gpu_stats_.failed;
+      gpu_stats_.last_fail = gpu_fail_;
+      for (auto& f : gpu_stats_.fails) {
+        if (!f.why) f.why = gpu_fail_;
+        if (f.why == gpu_fail_) { ++f.n; break; }
+      }
+    } else {
+      gpu_stats_.upload_ns += static_cast<u64>((std::chrono::steady_clock::now() - t0).count());
+      if (prof::enabled) prof::add_ns(prof::GPU_UPLOAD, static_cast<u64>((std::chrono::steady_clock::now() - t0).count()));
+      ++gpu_stats_.frames;
+      u32* const gdst = out_[display_ ^ 1].data();
+      pending_bands_ = 0;
+      wait_ns_.store(0, std::memory_order_relaxed);
+      if (!gpu_ab_) {
+        // The display reads the raster's own buffer; out_[] is not written.
+        gpu_defer_ok_ = gpu_frame_prev_;
+        gpu_frame_prev_ = true;
+        gpu_frame_ = true;
+        display_ ^= 1;
+        return;
+      }
+      // A/B: draw the same frame on the CPU as well, into out_[], and
+      // compare. Same list, same textures, same call -- so a difference is
+      // the GPU's. The CPU's picture is the one that reaches the display,
+      // which is why gpu_frame_ stays false.
+      gpu_frame_ = false;
+      build_edges();
+      render_band(0, 192, gdst);
+      vk_raster_->wait();
+      gpu_compare(gdst, vk_raster_->output());
+      display_ ^= 1;
+      return;
+    }
+  }
+#else
+  // Without Vulkan the gate still runs when asked for: --gpu-gate measures
+  // which frames a GPU raster could take, and that question is worth asking
+  // on a build (or a machine) that has no GPU.
+  if (gpu_gate_dryrun_) {
+    const u32 reject = gpu_supported(polys, npoly);
+    if (reject != GpuOk) { ++gpu_stats_.rejected; ++gpu_stats_.reject[reject]; }
+    else ++gpu_stats_.eligible;
+  }
+#endif
+  gpu_frame_ = false;
+  gpu_frame_prev_ = false;
+
   u32 maxb = band_count(live);
   // A hot compositor thread (Gpu lag mode) takes the fourth core of the
   // handhelds: three band workers beside it measured +9 % on Golden Sun's
@@ -2859,7 +3036,7 @@ void Renderer3D::render(const Gpu3D& gx) {
   if (bands_.size() < maxb - 1) {
     while (bands_.size() < maxb - 1) bands_.push_back(std::make_unique<Renderer3D>(nds_));
   }
-  for (auto& b : bands_) b->aa_ = aa_;   // the setting can change between frames
+  for (auto& b : bands_) { b->aa_ = aa_; b->coverage_probe_ = coverage_probe_; }   // the settings can change between frames
   // Never replaced once it is big enough: the compositor thread may be
   // waiting on it for the previous frame's bands (sync_line). So it is made
   // once, for the most workers any frame gets by default -- three, whatever
@@ -3080,12 +3257,37 @@ void Renderer3D::debug_dump(FILE* f) {
   if (pool_) pool_->debug_dump(f);
 }
 
-Renderer3D::FrameRef Renderer3D::frame_ref() const {
+Renderer3D::FrameRef Renderer3D::frame_ref(bool allow_defer) const {
   FrameRef f;
-  f.out = out_[display_].data();
   f.gen = gen_;
   f.nbins = pending_bands_;
   if (pending_bands_) f.bin_y = bin_y_;
+#if DSPERATE_VULKAN
+  if (gpu_frame_) {
+    // The pointer travels in the ref exactly as out_[display_] does, and for
+    // the same reason: render() of the next frame may already have moved on.
+    // The band cut travels with it too, so a GPU frame describes itself the
+    // way a CPU frame does and sync_line does not care which drew it.
+    if (allow_defer && gpu_defer_ok_) {
+      // The frame before the last one. Its fence was waited at the last
+      // render()'s sync_all and its memory invalidated there, so this ref
+      // carries no raster to wait for at all -- f.gpu stays null and
+      // sync_line returns immediately.
+      ++gpu_stats_.deferred;
+      f.out = vk_raster_->output_prev();
+      return f;
+    }
+    ++gpu_stats_.undeferred;
+    if (!allow_defer) ++gpu_stats_.defer_no_caller; else ++gpu_stats_.defer_no_prev;
+    f.out = vk_raster_->output();
+    f.gpu = vk_raster_.get();
+    f.nbins = vk_raster_->frame_bands();
+    if (f.nbins > MAX_BINS) f.nbins = MAX_BINS;
+    for (u32 i = 0; i <= f.nbins; ++i) f.bin_y[i] = vk_raster_->band_line(i);
+    return f;
+  }
+#endif
+  f.out = out_[display_].data();
   return f;
 }
 
@@ -3096,6 +3298,21 @@ Renderer3D::FrameRef Renderer3D::frame_ref() const {
 // frame's cut and generation travel in the ref -- so it can run on the
 // compositor thread while the emulation thread dispatches the next frame.
 void Renderer3D::sync_line(const FrameRef& f, s32 y) {
+#if DSPERATE_VULKAN
+  // A GPU frame is banded like a CPU one, so this is the same search: find
+  // the band that owns the line and wait only for that. With one band it
+  // degenerates to waiting for the whole picture, which is what it used to
+  // do unconditionally -- and what made the compositor pay the entire GPU
+  // time on line 0.
+  if (f.gpu) {
+    u32 b = 0;
+    while (b + 1 < f.nbins && y >= f.bin_y[b + 1]) ++b;
+    const auto t0 = std::chrono::steady_clock::now();
+    f.gpu->wait_band(b);
+    gpu_stats_.wait_line_ns += static_cast<u64>((std::chrono::steady_clock::now() - t0).count());
+    return;
+  }
+#endif
   if (!f.nbins || !pool_) return;
   u32 b = 0;
   while (b + 1 < f.nbins && y >= f.bin_y[b + 1]) ++b;
@@ -3116,6 +3333,23 @@ void Renderer3D::sync_line(const FrameRef& f, s32 y) {
 // is the only way texture VRAM or its banking can move -- the texture and
 // texture-palette views are never mapped into either CPU's address space).
 void Renderer3D::sync_all() {
+#if DSPERATE_VULKAN
+  // Same contract as the bands: after this returns, nothing is reading the
+  // polygon list, the texture cache or the render state. render() calls it
+  // first thing, which is what keeps frame N+1's dispatch behind frame N's
+  // fence without a second flight of buffers.
+  if (vk_raster_) {
+    const auto t0 = std::chrono::steady_clock::now();
+    vk_raster_->wait();
+    const u64 ns = static_cast<u64>((std::chrono::steady_clock::now() - t0).count());
+    if (gpu_sync_is_frame_) {
+      gpu_stats_.wait_frame_ns += ns;
+    } else if (ns > 1000) {   // a sync_all on an idle raster is not a wait
+      gpu_stats_.wait_forced_ns += ns;
+      ++gpu_stats_.wait_forced_n;
+    }
+  }
+#endif
   // Unconditionally, not just while bins are outstanding: sync_line clears
   // pending_bands_ once it has waited for every bin, and a worker can still
   // be inside the job at that point -- it marks its last bin done from in
@@ -3436,9 +3670,413 @@ void Renderer3D::render_band(s32 y0, s32 y1, u32* dst) {
 }
 
 
+// ---- the GPU raster -------------------------------------------------------
+
+bool Renderer3D::set_gpu_raster(bool on, std::string* why) {
+#if !DSPERATE_VULKAN
+  (void)on;
+  if (why) *why = "built without Vulkan (-DDSPERATE_VULKAN=OFF, or no vulkan/vulkan.h at configure time)";
+  return false;
+#else
+  // Whatever happens, no frame may be half-way through either raster.
+  sync_all();
+  if (!on) { vk_raster_.reset(); vk_dev_.reset(); gpu_frame_ = false; return false; }
+  if (vk_raster_ && vk_raster_->ready()) return true;
+
+  std::string reason;
+  if (!vk_dev_) {
+    vk_dev_ = vk::Device::create(&reason);
+    if (!vk_dev_) { if (why) *why = reason; return false; }
+  }
+  vk_raster_ = vk::Raster::create(*vk_dev_, &reason);
+  if (!vk_raster_) { if (why) *why = reason; vk_dev_.reset(); return false; }
+  if (!vk_raster_->ready()) {
+    // The backend built its buffers but cannot draw yet. Keep it -- it is
+    // still worth reporting what device it opened -- but say so, and leave
+    // render() on the band path, which is what ready() being false means.
+    if (why) *why = vk_dev_->name() + ": " + reason;
+    return false;
+  }
+  // Still to come with the upload path: binding the decoded texture cache
+  // for the GPU in place (VK_EXT_external_memory_host) rather than copying
+  // it. That needs the cache's texels in one arena -- today each entry owns
+  // its own vector (texcache.h) -- so it is part of that change, not this
+  // one. Raster::bind_texture_arena is waiting for it.
+  if (why) *why = vk_dev_->name();
+  return true;
+#endif
+}
+
+bool Renderer3D::gpu_pass_times(u64 ns[5], u64* frames) const {
+#if DSPERATE_VULKAN
+  if (!vk_raster_ || !vk_raster_->timing()) return false;
+  const auto& t = vk_raster_->pass_times();
+  for (u32 i = 0; i < 5; ++i) ns[i] = t.ns[i];
+  *frames = t.frames;
+  return true;
+#else
+  (void)ns; (void)frames;
+  return false;
+#endif
+}
+
+u32 Renderer3D::gpu_bands() const {
+#if DSPERATE_VULKAN
+  return vk_raster_ ? vk_raster_->bands() : 0;
+#else
+  return 0;
+#endif
+}
+
+bool Renderer3D::gpu_raster_active() const {
+  return vk_raster_ != nullptr && vk_raster_->ready();
+}
+
+// Which frames the GPU raster may take.
+//
+// The list is what the pixel pipeline does not implement yet, so it shrinks
+// as the shader grows; it is deliberately a whitelist of the simple case
+// rather than a blacklist of known-bad ones, because the failure mode of
+// guessing wrong here is a wrong picture rather than a slow one.
+//
+// Frame granularity is forced, not chosen: the two-deep pixel stack, the
+// edge-marking pass and the translucent polygon ids are all frame-global, so
+// a frame split between the two rasters would be wrong in a way neither of
+// them is alone.
+u32 Renderer3D::gpu_supported(const Polygon* const* polys, u32 npoly) const {
+  const u32 d = dispcnt_;
+  if (d & (1u << 4)) return GpuAA;           // anti-aliasing: the two-deep pixel stack
+  if (d & (1u << 14)) return GpuRearBitmap;  // rear plane from a bitmap rather than a clear colour
+  // Edge marking (bit 5) and fog (bit 7) are implemented: the raster writes
+  // its depth and attribute planes and post.comp applies them. They were the
+  // sole thing blocking Golden Sun and Spirit Tracks, on every frame.
+  for (u32 i = 0; i < npoly; ++i) {
+    const Polygon& p = *polys[i];
+    if (p.degenerate) continue;
+
+    if (p.attr & (1u << 14)) return GpuDepthEqual;           // depth-equal test and its tolerance
+    if (((p.attr >> 16) & 0x1F) == 0) return GpuWireframe;   // alpha 0 draws edges only
+  }
+  return GpuOk;
+}
+
+const char* Renderer3D::gpu_reject_name(u32 r) {
+  switch (r) {
+    case GpuAA: return "anti-aliasing";
+    case GpuEdgeMark: return "edge marking";
+    case GpuFog: return "fog";
+    case GpuRearBitmap: return "rear-plane bitmap";
+    case GpuShadow: return "shadow volumes";
+    case GpuToon: return "toon/highlight shading";
+    case GpuDepthEqual: return "depth-equal test";
+    case GpuWireframe: return "wireframe";
+    default: return "ok";
+  }
+}
+
+// Compare a GPU frame against the CPU frame drawn from the same list.
+//
+// Counted and summarised rather than printed per pixel: a broken shader
+// differs in tens of thousands of pixels and the interesting number is which
+// frame first went wrong and how badly, not the pixels themselves. The dump
+// that shows WHERE is the frontend's job (--gpu-ab-dump), so that this stays
+// cheap enough to leave running over a whole scene.
+// Convert the frame and submit it.
+//
+// The conversion writes into mapped GPU memory rather than into a staging
+// list that is then copied: this is the only pass over the data, and it lands
+// where the shader reads it. That is what keeps the CPU cost of driving the
+// GPU at the ~0.03 ms the probe measured rather than at the cost of a copy.
+//
+// Three things can make a frame undrawable here, and all three refuse it
+// rather than approximate it: a textured polygon whose texture the cache does
+// not hold (the shader has no other way to sample -- it never learns the six
+// texel formats, it reads the cache's one word per texel), a tile with more
+// polygons than its bin takes, and a list past the fixed buffer sizes. The
+// tile check is done here, on the host, rather than read back from the
+// binning pass: a readback would mean a second submit-and-wait to find out
+// whether the first one was valid.
+bool Renderer3D::gpu_dispatch(const Polygon* const* polys, u32 npoly) {
+#if !DSPERATE_VULKAN
+  (void)polys; (void)npoly;
+  return false;
+#else
+  using namespace ds::gpu::vk;
+  GpuPoly* const gp = vk_raster_->poly_buffer();
+  GpuVert* const gv = vk_raster_->vert_buffer();
+  u32 texcap = 0;
+  u32* const tex = vk_raster_->texel_buffer(&texcap);
+  if (!gp || !gv || !tex) { gpu_fail_ = "no mapped buffers"; return false; }
+
+  gpu_tile_use_.assign(DS_TILE_COUNT, 0);
+  if (gpu_arena_reset_) { gpu_resident_.clear(); gpu_arena_top_ = 0; gpu_arena_reset_ = false; }
+
+  // Shadow stencil clear bits. The hardware clears a whole SCANLINE of the
+  // stencil when a run of mask polygons begins -- when the previous polygon
+  // drawn on that line was not itself a mask. The shader cannot see that: the
+  // polygon that ended the run may cover the line in another tile entirely.
+  // So it is decided here, by the one pass that does see the whole list, in
+  // exactly the order the CPU raster processes it.
+  //
+  // Only for a frame that has masks at all, and the walk is over each
+  // polygon's own scanlines, so it costs about what the raster already pays
+  // per polygon rather than anything quadratic.
+  bool any_mask = false;
+  for (u32 i = 0; i < npoly && !any_mask; ++i) any_mask = polys[i]->shadow_mask && !polys[i]->degenerate;
+  u32* const shrun = vk_raster_->shadow_run_buffer();
+  u32* const rowpoly = vk_raster_->rowpoly_buffer();
+  if (any_mask) { gpu_line_mask_.assign(192, 0); gpu_line_run_.assign(192, 0); }
+
+  // The order-free prefix (vk_layout.h, GpuFrame::first_ordered). The
+  // hardware's own sort puts every opaque polygon before every translucent
+  // one, so the prefix is simply the list up to the first polygon whose
+  // result depends on what is already in the pixel: a translucent one, a
+  // shadow mask (its stencil reads the depth of the moment) or a shadow. An
+  // alpha test nothing passes (alpha_ref 31) empties it, since then an opaque
+  // polygon writes nothing and only the ordered loop knows that.
+  u32 first_ordered = ~0u, opaque_rows = 0;
+  bool prefix_cut_by_shadow = false;
+  const bool alpha_all_fail = rs_->alpha_ref >= 31;
+  // Without the visibility pass the whole list is the ordered tail, and so
+  // the whole list is binned. The census below still counts the prefix.
+  const bool use_vis = vk_raster_->visibility();
+
+  u32 np = 0, nv = 0, nt = 0, nrows = 0;
+  for (u32 i = 0; i < npoly; ++i) {
+    const Polygon& p = *polys[i];
+    if (p.degenerate) continue;
+    if (np >= DS_MAX_POLYS || nv + p.nverts > DS_MAX_VERTS) { gpu_fail_ = "polygon or vertex list past the buffer"; return false; }
+    if (first_ordered == ~0u && (alpha_all_fail || p.translucent || p.shadow_mask || p.shadow)) {
+      first_ordered = np;
+      opaque_rows = nrows;
+      prefix_cut_by_shadow = !alpha_all_fail && !p.translucent;
+    }
+
+    GpuPoly& o = gp[np];
+    o = GpuPoly{};
+    o.first_vert = nv;
+    o.nverts = p.nverts;
+    o.attr = p.attr;
+    o.texparam = p.texparam;
+    o.ytop = p.ytop;
+    o.ybot = p.ybot;
+    o.vtop = p.vtop;
+    o.vbot = p.vbot;
+    o.flags = (p.translucent ? DS_PF_TRANSLUCENT : 0u) |
+              (p.wbuffer ? DS_PF_WBUFFER : 0u) |
+              (p.facing ? DS_PF_FRONTFACING : 0u) |
+              (p.shadow_mask ? DS_PF_SHADOW_MASK : 0u) |
+              (p.shadow ? DS_PF_SHADOW : 0u);
+
+    if (any_mask) {
+      const s32 y0 = p.ytop < 0 ? 0 : p.ytop, y1 = p.ybot > 191 ? 191 : p.ybot;
+      if (p.shadow_mask) {
+        u32* const run = shrun + static_cast<size_t>(np) * DS_SHRUN_LINES;
+        for (s32 y = y0; y <= y1; ++y) {
+          const u32 u = static_cast<u32>(y);
+          if (!gpu_line_mask_[u]) { ++gpu_line_run_[u]; gpu_line_mask_[u] = 1; }
+          run[u] = gpu_line_run_[u];
+        }
+      } else {
+        // Any other polygon on the line ends the run, so the next mask on it
+        // begins a new one and the pixels of that line clear.
+        for (s32 y = y0; y <= y1; ++y) gpu_line_mask_[static_cast<u32>(y)] = 0;
+      }
+    }
+
+    s32 xmin = 0x7FFFFFFF, xmax = -0x7FFFFFFF;
+    for (u32 j = 0; j < p.nverts; ++j) {
+      const Vertex& v = gx_->vertex(p.vtx[j]);
+      GpuVert& d = gv[nv + j];
+      d.sx = v.sx; d.sy = v.sy;
+      d.z = p.z[j]; d.w = p.w[j];
+      d.r = v.fcol[0]; d.g = v.fcol[1]; d.b = v.fcol[2];
+      d.s = v.tex[0]; d.t = v.tex[1];
+      d.pad_[0] = d.pad_[1] = d.pad_[2] = 0;
+      if (v.sx < xmin) xmin = v.sx;
+      if (v.sx > xmax) xmax = v.sx;
+    }
+    o.xmin = xmin; o.xmax = xmax;
+    nv += p.nverts;
+
+    // This polygon's slice of the span table: one row per VISIBLE scanline it
+    // covers. ytop and ybot are not clamped to the screen -- the software
+    // raster clamps them where it loops -- so the rows are allocated for the
+    // clamped range and every consumer agrees to use that same clamp.
+    //
+    // The offsets are a running sum rather than polygon_index * 192, which
+    // would be 23 MB of mostly nothing; the cost of that is that the raster
+    // needs the base and the scanline range to find a row, so the binning
+    // pass carries both (bin.comp).
+    const s32 ry0 = p.ytop < 0 ? 0 : p.ytop, ry1 = p.ybot > 191 ? 191 : p.ybot;
+    const u32 rows = ry1 >= ry0 ? static_cast<u32>(ry1 - ry0) + 1 : 0;
+    if (nrows + rows > DS_MAX_SPAN_ROWS) { gpu_fail_ = "span table full"; return false; }
+    o.row_base = nrows;
+    for (u32 r = 0; r < rows; ++r) rowpoly[nrows + r] = np;   // the span pass is one lane per row: each row names its polygon
+    nrows += rows;
+
+    // The texture, as the cache already decoded it: one 32-bit word per texel,
+    // resident in the arena from the first frame that used it until the arena
+    // is next reset. A copy happens only for a texture the arena has never
+    // seen or that the cache re-decoded since (its version moved).
+    const u32 fmt = (p.texparam >> 26) & 7;
+    if ((dispcnt_ & 1) && fmt != 0) {
+      const TextureCache::Ref& r = poly_texref_[i];
+      if (!r.texels) { gpu_fail_ = "textured polygon with no cached texture"; return false; }
+      const u32 tw = 8u << ((p.texparam >> 20) & 7);
+      const u32 th = 8u << ((p.texparam >> 23) & 7);
+      GpuResident& res = gpu_resident_[r.id];
+      if (res.words != r.words || res.version != r.version) {
+        if (gpu_arena_top_ + r.words > texcap) {
+          // Full: this frame goes to the CPU and the next starts the arena
+          // over (everything is re-copied once). Rare, and the alternative
+          // -- compacting live entries mid-frame -- would move offsets already
+          // written into this frame's polygons.
+          gpu_arena_reset_ = true;
+          gpu_fail_ = "texture arena full";
+          return false;
+        }
+        std::memcpy(tex + gpu_arena_top_, r.texels, static_cast<size_t>(r.words) * sizeof(u32));
+        res.off = gpu_arena_top_; res.words = r.words; res.version = r.version;
+        gpu_arena_top_ += r.words;
+        nt += r.words;   // words copied this frame, for the statistics
+      }
+      const u32 off = res.off;
+      o.tex_offset = off;
+      o.tex_w = tw;
+      o.tex_h = th;
+      o.flags |= DS_PF_TEXTURED;
+      // Whether any texel can carry alpha 0 (see DS_PF_TEX_ALPHA). Formats 1
+      // and 6 carry graded alpha and make the polygon translucent anyway.
+      if ((p.texparam & (1u << 29)) || fmt == 5 || fmt == 7) o.flags |= DS_PF_TEX_ALPHA;
+    }
+
+    // The same bounding box the binning shader will use. Counting it here is
+    // what lets an overflowing frame be refused before anything is submitted.
+    // Only the polygons the binning pass will see: the ordered tail, or the
+    // whole list when the prefix is not going through the visibility pass.
+    if (use_vis && first_ordered == ~0u) { ++np; continue; }
+    const s32 tx0 = std::clamp(xmin / DS_TILE_W, 0, DS_TILES_X - 1);
+    const s32 tx1 = std::clamp(xmax / DS_TILE_W, 0, DS_TILES_X - 1);
+    const s32 ty0 = std::clamp(p.ytop / DS_TILE_H, 0, DS_TILES_Y - 1);
+    const s32 ty1 = std::clamp(p.ybot / DS_TILE_H, 0, DS_TILES_Y - 1);
+    for (s32 ty = ty0; ty <= ty1; ++ty)
+      for (s32 tx = tx0; tx <= tx1; ++tx)
+        if (++gpu_tile_use_[static_cast<u32>(ty * DS_TILES_X + tx)] > DS_TILE_POLYS) { gpu_fail_ = "tile bin overflow"; return false; }
+    if (use_vis) gpu_stats_.tail_area += static_cast<u64>(std::clamp(xmax, 0, 255) - std::clamp(xmin, 0, 255) + 1) * rows;
+
+    ++np;
+  }
+  // np == 0 is not a refusal: the raster clears the layer and that is the
+  // whole of such a frame. Sending it to the GPU keeps the two paths agreeing
+  // about which frames each drew.
+
+  // The state too large for the push constants. Written every frame rather
+  // than tracked for changes: it is 320 bytes, and the toon table is read by
+  // the raster itself rather than only by the final pass.
+  {
+    GpuPost* ps = vk_raster_->post_buffer();
+    ps->fog_color = rs_->fog_color;
+    ps->fog_offset = rs_->fog_offset;
+    ps->fog_shift = rs_->fog_shift;
+    ps->pad0_ = 0;
+    for (u32 i = 0; i < rs_->fog_density.size(); ++i) ps->density[i] = rs_->fog_density[i];
+    for (u32 i = 0; i < rs_->edge.size(); ++i) ps->edge[i] = rs_->edge[i];
+    for (u32 i = 0; i < rs_->toon.size(); ++i) ps->toon[i] = rs_->toon[i];
+  }
+
+  if (first_ordered == ~0u) { first_ordered = np; opaque_rows = nrows; }
+  gpu_stats_.opaque_polys += first_ordered;
+  gpu_stats_.tail_polys += np - first_ordered;
+  gpu_stats_.opaque_rows += opaque_rows;
+  if (prefix_cut_by_shadow) ++gpu_stats_.prefix_cut_by_shadow;
+
+  GpuFrame f{};
+  f.npoly = np;
+  f.first_ordered = use_vis ? first_ordered : 0;
+  f.opaque_rows = use_vis ? opaque_rows : 0;
+  f.nrows = nrows;
+  f.scale = vk_raster_->scale();
+  f.dispcnt = dispcnt_;
+  f.alpha_ref = rs_->alpha_ref;
+  // Exactly what clear_line() fills the ring with for a solid clear. The
+  // bitmap rear plane is gated off, so this is the only case that reaches here.
+  {
+    const u16 c = static_cast<u16>(rs_->clear_attr1);
+    auto ch = [](u16 v, u32 shift) { u32 x = (shift == 0 ? (v << 1) : (v >> shift)) & 0x3E; return x ? x + 1 : x; };
+    f.clear_color = ch(c, 0) | (ch(c, 4) << 8) | (ch(c, 9) << 16) | (((rs_->clear_attr1 >> 16) & 0x1F) << 24);
+    f.clear_depth = ((rs_->clear_attr2 & 0x7FFF) * 0x200) + 0x1FF;
+    f.clear_attr = (rs_->clear_attr1 & 0x3F000000) | (rs_->clear_attr1 & 0x8000);
+  }
+  gpu_stats_.texel_words += nt;
+  gpu_stats_.span_rows += nrows;
+  if (nrows > gpu_stats_.span_rows_max) gpu_stats_.span_rows_max = nrows;
+  // The arena's high-water mark, not this frame's copies: the shader reads
+  // whatever any polygon points into.
+  const auto t_submit = std::chrono::steady_clock::now();
+  const bool ok = vk_raster_->submit(np, nv, gpu_arena_top_, f);
+  gpu_stats_.submit_ns += static_cast<u64>((std::chrono::steady_clock::now() - t_submit).count());
+  if (!ok) { gpu_fail_ = "submit refused"; return false; }
+  return true;
+#endif
+}
+
+void Renderer3D::gpu_compare(const u32* cpu, const u32* gpu) {
+  ++gpu_stats_.ab_checked;
+  u32 bad = 0;
+  for (u32 i = 0; i < 256 * 192; ++i) bad += (cpu[i] != gpu[i]);
+  if (!bad) return;
+  ++gpu_stats_.ab_bad;
+  gpu_stats_.ab_pixels += bad;
+  if (bad > gpu_stats_.ab_worst) gpu_stats_.ab_worst = bad;
+  if (gpu_stats_.ab_first_frame < 0) gpu_stats_.ab_first_frame = static_cast<s32>(nds_.frame_count);
+  gpu_ab_write(ab_ref_, cpu);
+  gpu_ab_write(ab_cand_, gpu);
+}
+
+void Renderer3D::set_gpu_ab_dump(const char* ref_path, const char* cand_path) {
+  if (ab_ref_) std::fclose(ab_ref_);
+  if (ab_cand_) std::fclose(ab_cand_);
+  ab_ref_ = ref_path ? std::fopen(ref_path, "wb") : nullptr;
+  ab_cand_ = cand_path ? std::fopen(cand_path, "wb") : nullptr;
+}
+
+// One 3D layer as compare_frames.py wants a frame: the layer in the top
+// screen, a blank bottom screen after it. RGB666 + 5-bit alpha out of the
+// raster, 8 bits a channel in; the 6->8 expansion is (c * 255 + 31) / 63 so
+// that 63 lands on 255 rather than 252 and the images are the colours the
+// display would show.
+void Renderer3D::gpu_ab_write(FILE* f, const u32* layer) {
+  if (!f) return;
+  static thread_local std::array<u32, 256 * 192> px;
+  for (u32 i = 0; i < 256 * 192; ++i) {
+    const u32 v = layer[i];
+    const u32 r = ((v & 0x3F) * 255 + 31) / 63;
+    const u32 g = (((v >> 8) & 0x3F) * 255 + 31) / 63;
+    const u32 b = (((v >> 16) & 0x3F) * 255 + 31) / 63;
+    const u32 a = (((v >> 24) & 0x1F) * 255 + 15) / 31;
+    px[i] = (a << 24) | (r << 16) | (g << 8) | b;
+  }
+  std::fwrite(px.data(), sizeof(u32), px.size(), f);
+  static const std::array<u32, 256 * 192> blank{};   // the bottom screen the format expects
+  std::fwrite(blank.data(), sizeof(u32), blank.size(), f);
+}
+
+void Renderer3D::gpu_snapshot_output() {
+#if DSPERATE_VULKAN
+  if (!gpu_frame_ || !vk_raster_) return;
+  vk_raster_->wait();
+  std::memcpy(out_[display_].data(), vk_raster_->output(), 256 * 192 * sizeof(u32));
+#endif
+}
+
 template <class S> void Renderer3D::sync_output(S& s) {
   sync_all();
-  if constexpr (S::reading) { reset(); texcache_.clear(); }
+  // A GPU-drawn frame is in the raster's buffer, not out_[]. The state saves
+  // the picture the display is reading, so bring it across -- once, on a
+  // save, rather than every frame.
+  if constexpr (!S::reading) gpu_snapshot_output();
+  if constexpr (S::reading) { reset(); texcache_.clear(); gpu_arena_reset_ = true; }
   s.begin("R3DO");
   s.fields(rendered_once_, out_[display_]);   // reset() above leaves display_ at 0 on a load
   s.end();

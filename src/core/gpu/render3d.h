@@ -2,19 +2,25 @@
 // DSperate - Nintendo DS emulator. Copyright (C) 2026 DSperate contributors.
 #pragma once
 #include <functional>
+#include <cstdio>
 #include <cstdlib>
 #include "core/types.h"
 #include "core/gpu/texcache.h"
+
+#include <unordered_map>
 
 #include <array>
 #include <atomic>
 #include <thread>
 #include <memory>
+#include <string>
 #include <vector>
 
 namespace ds { struct NDS; }
 
 namespace ds::gpu {
+
+namespace vk { class Device; class Raster; }
 
 class Gpu3D;
 struct Polygon;
@@ -80,6 +86,131 @@ public:
   // makes it opt-in (video.aa), the headless frontend has --no-aa for measurement.
   void set_aa(bool on) { aa_ = on; }
   bool aa() const { return aa_; }
+
+  // The GPU 3D raster (docs/gpu-raster-scoping.md, P1). Off unless a frontend
+  // asks for it, and it may decline: no libvulkan, no device, no memory type
+  // with the cacheability the composite needs, or -- today -- a pixel
+  // pipeline that is not finished. Returns whether it is now on; `why` takes
+  // the reason when it is not.
+  //
+  // Only ever called on the coordinator. The band workers are Renderer3D
+  // instances too (bands_), and they must not each open a device.
+  bool set_gpu_raster(bool on, std::string* why = nullptr);
+  bool gpu_raster_active() const;
+
+  // A/B mode (--gpu-ab): draw every frame BOTH ways and compare, in the same
+  // call, from the same polygon list and the same resolved textures. That is
+  // the whole point of doing it in-process rather than diffing two runs --
+  // there is no timing divergence to rule out first, so a difference is the
+  // GPU's and nothing else's. The CPU's output is still what the display
+  // gets, so A/B is a measurement mode, not a render mode.
+  void set_gpu_ab(bool on) { gpu_ab_ = on; }
+  // Why a frame went to the CPU instead. Reported per reason rather than as a
+  // total, because the total only says the gate is narrow and the breakdown
+  // says which shader feature would widen it most.
+  enum GpuReject : u32 {
+    GpuOk = 0, GpuAA, GpuEdgeMark, GpuFog, GpuRearBitmap,
+    GpuShadow, GpuToon, GpuDepthEqual, GpuWireframe, GpuRejectCount
+  };
+  static const char* gpu_reject_name(u32 r);
+
+  struct GpuStats {
+    u64 frames = 0;       // frames the GPU drew (or, in A/B, drew alongside)
+    u64 eligible = 0;     // frames the gate would accept, whether or not one was drawn
+    u64 rejected = 0;     // frames the feature gate sent to the CPU
+    u64 failed = 0;       // frames the GPU accepted but could not dispatch
+    const char* last_fail = nullptr;   // and why the most recent one did not
+    // Refusals by reason: the gpu_fail_ strings are literals, so a pointer
+    // identifies one. Eight is more than there are reasons.
+    struct Fail { const char* why = nullptr; u64 n = 0; } fails[8];
+    u64 kept = 0;             // frames the identical-frame path kept, drawing nothing
+    // Where the frame's GPU time goes. `upload` is the CPU converting the
+    // polygon list into mapped memory and submitting; `wait` is whatever the
+    // emulation or compositing thread then blocks for on the fence. The two
+    // answer different questions -- whether driving the GPU is cheap (it
+    // should be ~0.03 ms) and whether the GPU is keeping up.
+    // Split by WHERE the wait is paid, because the three mean different
+    // things. `wait_line` is the compositor catching up to a frame the GPU is
+    // still drawing -- the expected, overlappable kind. `wait_frame` is the
+    // next frame's dispatch finding the previous one unfinished: the GPU did
+    // not keep up with a whole frame. `wait_forced` is everything else --
+    // chiefly a texture VRAM bank moving under the raster (Bus::update_vram
+    // calls sync_raster), which lands at an arbitrary point in the frame and
+    // so exposes the whole remaining latency with no slack to hide it in.
+    u64 upload_ns = 0, wait_line_ns = 0, wait_frame_ns = 0, wait_forced_ns = 0;
+    u64 submit_ns = 0;        // of upload_ns: Raster::submit itself (command recording and the queue submits)
+    u64 wait_forced_n = 0, texel_words = 0;
+    u64 span_rows = 0;        // rows the span table held, summed
+    // The order-free prefix (vk_layout.h GpuFrame::first_ordered): how much
+    // of the list it takes, and how often a shadow mask or shadow polygon
+    // inside the opaque group cut it short rather than the first translucent.
+    u64 opaque_polys = 0, tail_polys = 0, opaque_rows = 0, prefix_cut_by_shadow = 0;
+    u64 tail_area = 0;        // the tail's bounding-box area in pixels, summed: what the ordered loop walks at most
+    u32 span_rows_max = 0;    // and the most any one frame needed
+    u64 deferred = 0;         // display frames shown a frame late, and so never waited for
+    u64 undeferred = 0;       // and those that could not be, so paid the fence
+    u64 defer_no_caller = 0;  // ... because the caller refused (capture, or the knob is off)
+    u64 defer_no_prev = 0;    // ... because the frame before was not GPU-drawn
+    u64 reject[GpuRejectCount] = {};   // rejections by first reason found
+    u64 ab_checked = 0;   // frames compared
+    u64 ab_bad = 0;       // of those, frames with any differing pixel
+    u64 ab_pixels = 0;    // differing pixels, summed
+    u32 ab_worst = 0;     // most differing pixels in one frame
+    s32 ab_first_frame = -1;  // first frame that differed
+  };
+  const GpuStats& gpu_stats() const { return gpu_stats_; }
+  // GPU time per pass (DS_VK_TIMING=1): ns[] summed over `frames`; false
+  // when the backend is not timing.
+  bool gpu_pass_times(u64 ns[5], u64* frames) const;
+  u32 gpu_bands() const;   // completion checkpoints the GPU frame is cut into
+
+  // --gpu-coverage: does the DS's span ever fall OUTSIDE the polygon as a
+  // graphics pipeline would rasterise it?
+  //
+  // The question decides whether the raster could move to vertex/fragment
+  // shaders at all. A fragment shader only runs where the hardware generates
+  // a fragment, and the hardware generates one where a pixel CENTRE is inside
+  // the triangle. The DS's span is not that: it comes from 18-bit slope
+  // stepping with its own fill rules, X-major edge runs and an xmin/xmax
+  // clamp, and where those put a pixel the geometry does not cover, no
+  // fragment shader can recover it.
+  //
+  // So this counts, over real frames, every pixel the software raster draws
+  // and asks whether a pixel centre at that position lies inside the polygon.
+  // It needs no GPU and answers the question before any is written.
+  void set_coverage_probe(bool on) { coverage_probe_ = on; }
+  struct CoverageStats {
+    u64 drawn = 0;        // pixels the raster drew
+    u64 outside = 0;      // of those, pixels a pixel-centre test says are not in the polygon
+    u64 spans = 0;        // scanline spans examined
+    u64 spans_bad = 0;    // spans with at least one such pixel
+    u32 worst_run = 0;    // longest run of them in one span -- how far a primitive would need expanding
+    // Spans by how many of their pixels fell outside. The shape of this is
+    // the answer: a tail of ones and twos at span ends is a rounding effect a
+    // slightly expanded primitive would cover, and anything else is not.
+    u64 bucket[6] = {};   // 1, 2, 3-4, 5-8, 9-16, >16
+    u64 spans_all_out = 0;   // spans with NO pixel inside the polygon at all
+  };
+  static const CoverageStats& coverage_stats();
+
+  // Run the feature gate over every frame and count what it would take,
+  // without a GPU and without drawing anything differently. Worth having
+  // separately from the raster: it answers "is this whitelist wide enough to
+  // be worth finishing the shader for, and on which games" on any machine,
+  // now, rather than after the pixel pipeline exists. The gate is pure -- it
+  // reads the polygon list and the render state and writes nothing -- so a
+  // dry run cannot change a frame.
+  void set_gpu_gate_dryrun(bool on) { gpu_gate_dryrun_ = on; }
+
+  // Where a DIFFERING A/B frame goes, so that the difference can be looked
+  // at rather than only counted. Two streams in exactly the format
+  // tools/compare_frames.py already reads -- 0xAARRGGBB, top screen then
+  // bottom -- with the 3D layer expanded into the top screen and the bottom
+  // left blank. That is a deliberate choice of format over convenience: the
+  // diff images, the bounding box and the PNG dump all come for free, and
+  // frame N of one file is frame N of the other because only differing
+  // frames are written and both are written together.
+  void set_gpu_ab_dump(const char* ref_path, const char* cand_path);
 
 private:
   NDS& nds_;
@@ -513,14 +644,31 @@ public:
   // reading frame N's buffer and waiting on frame N's bands after render()
   // has dispatched frame N+1 into the other buffer at line 215. A frame with
   // nothing outstanding (rendered inline, kept, or ablated) has nbins 0.
+  //
+  // A GPU-drawn frame carries `gpu` instead of a band cut: `out` names the
+  // raster's own buffer (the composite reads Vulkan memory directly -- see
+  // vk_raster.h) and what sync_line waits for is one fence, not a band. The
+  // granularity is the whole frame either way, because a tile raster has no
+  // per-scanline completion to report.
   struct FrameRef {
     const u32* out = nullptr;
     u64 gen = 0;
     u32 nbins = 0;
+    vk::Raster* gpu = nullptr;
     std::array<s32, MAX_BINS + 1> bin_y{};
     const u32* line(u32 y) const { return out + y * 256; }
   };
-  FrameRef frame_ref() const;
+  // `allow_defer`: the caller is willing to show the frame BEFORE the one
+  // just drawn. That hands the GPU a whole extra frame to finish in, which
+  // removes the compositor's wait entirely -- it is by far the largest term
+  // left. The cost is a frame of visual latency, and it is unsafe for a frame
+  // that display-captures, because capture writes the composited result into
+  // VRAM the guest reads back: stale there is wrong emulation, not lag. The
+  // caller owns that decision (Gpu::begin_frame).
+  //
+  // Only a GPU frame defers, and only when the frame before it was also
+  // GPU-drawn; anything else returns the ordinary ref and waits as before.
+  FrameRef frame_ref(bool allow_defer = false) const;
   void sync_line(const FrameRef& f, s32 y);   // any thread; each call waits for one band at most
   void sync_all();
   bool raster_pending() const { return pending_bands_ != 0; }
@@ -537,6 +685,54 @@ private:
   u32 pending_bands_ = 0;             // bins in flight (0 = nothing running)
   u64 gen_ = 0;                       // pool generation of the bands in flight
   bool async_ = std::getenv("DS_R3D_SYNC") == nullptr;
+
+  // The GPU raster and the device it runs on, owned by the coordinator only.
+  // Held as unique_ptrs to incomplete types: the destructor is out of line,
+  // so render3d.h stays free of the Vulkan headers and of DSPERATE_VULKAN.
+  std::unique_ptr<vk::Device>  vk_dev_;
+  std::unique_ptr<vk::Raster>  vk_raster_;
+  bool gpu_frame_ = false;    // the last render() went to the GPU: out_[] is not where the picture is
+  bool gpu_live_ = false;     // the backend can draw: latched once per frame, before the texture resolve reads it
+  bool gpu_frame_prev_ = false;   // the render before the last one also went to the GPU
+  bool gpu_defer_ok_ = false;     // ... and so the previous GPU buffer is the frame before this one
+  bool gpu_sync_is_frame_ = false;   // the sync_all at the top of render(), as against a forced one
+  bool gpu_ab_ = false;
+  mutable GpuStats gpu_stats_{};   // mutable: frame_ref is const and counts deferrals
+  // Whether the GPU raster implements everything this frame needs. Whole
+  // frames, never part of one: the pixel stack, the edge-marking pass and
+  // the translucent polygon ids are frame-global, so a frame split across
+  // the two rasters would be wrong in ways neither of them is alone.
+  u32 gpu_supported(const Polygon* const* polys, u32 npoly) const;
+  bool gpu_gate_dryrun_ = false;
+  bool coverage_probe_ = false;
+  void probe_coverage(const Polygon& p, const SpanJob& j) const;
+  // Convert this frame's polygon list into the shader's layout, straight into
+  // mapped GPU memory, and submit it. False if it could not be -- a texture
+  // the cache does not hold, a tile with more polygons than the bins take, a
+  // list past the buffer sizes -- and then the CPU draws the frame.
+  bool gpu_dispatch(const Polygon* const* polys, u32 npoly);
+  // Why the last refusal, for the report. A string rather than an enum
+  // because every one of them is a distinct one-off condition and the only
+  // consumer is a human reading a line of output.
+  const char* gpu_fail_ = nullptr;
+  std::vector<u32> gpu_tile_use_;         // per-tile polygon count, for the overflow check
+  std::vector<u8>  gpu_line_mask_;        // "the last polygon on this line was a shadow mask", while uploading
+  std::vector<u32> gpu_line_run_;         // and which mask run that line is up to
+  // The GPU's texel arena is PERSISTENT across frames: a decoded texture is
+  // copied in once and stays, keyed by the cache entry's id and decode
+  // version, so a frame copies only what the cache re-decoded. The arena is
+  // bump-allocated; when it fills, the frame is refused (CPU raster) and the
+  // arena starts over at the next one.
+  struct GpuResident { u32 off = 0, words = 0, version = 0; };
+  std::unordered_map<u32, GpuResident> gpu_resident_;
+  u32 gpu_arena_top_ = 0;
+  bool gpu_arena_reset_ = false;          // start over at the next frame (the arena filled)
+  std::vector<TextureCache::Ref> poly_texref_;   // per polygon, the GPU path's view of its texture
+  void gpu_compare(const u32* cpu, const u32* gpu);
+  void gpu_ab_write(FILE* f, const u32* layer);
+  FILE* ab_ref_ = nullptr;
+  FILE* ab_cand_ = nullptr;
+  void gpu_snapshot_output();   // bring a GPU frame into out_[] for a save state
 
   u32  edge_count_ = 0;
   u32* out_dst_ = nullptr;                              // where final_pass writes

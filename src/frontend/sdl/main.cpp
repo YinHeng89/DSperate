@@ -173,6 +173,7 @@ const char* kUsage =
     "  --cpu-uc        CPU tuning, underclock: for the harder to run games and/or the lowest end devices.\n                  The game's CPUs run slower than a console's, so there is less to emulate a frame\n                  (less accurate; a game can miss VBlanks); emu.cpu_tuning = underclock\n"
     "  --fast-load     cart DMA reads the card without its clock (may affect accuracy); emu.fast_load\n"
     "  --aa / --no-aa  3D anti-aliasing on (hardware behaviour) or off; video.aa, off by default\n"
+    "  --gpu-raster    rasterise 3D on the GPU (Vulkan compute) where the frame allows it; video.gpu_raster, off by default\n"
     "  --lockstep      128-cycle CPU interleave (melonDS lockstep) instead of event-bound; --quantum N for any value\n"
     "  --frameskip N   skip drawing up to N frames in N+1 (0 = off); emu.frameskip. Skipping runs\n"
     "                  in whole display periods, so on a game that drives its screens on\n"
@@ -1238,6 +1239,8 @@ int main(int argc, char** argv) {
     else if (flag("--no-frameskip-capture")) cli.set("emu.frameskip_capture", "false");
     else if (flag("--aa")) cli.set("video.aa", "true");
     else if (flag("--no-aa")) cli.set("video.aa", "false");
+    else if (flag("--gpu-raster")) cli.set("video.gpu_raster", "true");
+    else if (flag("--no-gpu-raster")) cli.set("video.gpu_raster", "false");
     // The two halves of Timing OC separately: they pull in opposite directions
     // on Golden Sun, so the bundled flag reads flat while neither half is.
     else if (flag("--help")) { std::fputs(kUsage, stderr); return 0; }
@@ -1293,7 +1296,7 @@ int main(int argc, char** argv) {
   }
   auto apply_cli = [&] { for (const char* k : {"paths.bios9", "paths.bios7", "paths.firmware", "video.scale", "video.dual_window", "video.layout", "video.screen", "video.pip_alpha", "video.dominant_ratio", "video.dominant_threshold", "video.integer_scale",
                                               "video.fullscreen", "video.linear", "video.lcd_grid", "video.chunky", "video.chunky_threshold", "video.chunky_cell", "video.seam", "video.disp", "video.fbdev", "video.gpu_present", "video.vsync", "audio.enabled", "audio.volume",
-                                              "audio.mic", "emu.jit", "emu.quantum", "emu.speed", "emu.limiter", "emu.pacing", "audio.buffer_size", "audio.latency_frames", "emu.timing_oc", "emu.gx_worker", "emu.cpu_tuning", "emu.fast_load", "emu.frameskip", "emu.frameskip_mode", "emu.frameskip_capture", "video.aa", "emu.autosave_png", "emu.autoload", "cheevos.enabled", "cheevos.token_file", "cheevos.username"}) if (cli.has(k)) cfg.set(k, cli.str(k)); };
+                                              "audio.mic", "emu.jit", "emu.quantum", "emu.speed", "emu.limiter", "emu.pacing", "audio.buffer_size", "audio.latency_frames", "emu.timing_oc", "emu.gx_worker", "emu.cpu_tuning", "emu.fast_load", "emu.frameskip", "emu.frameskip_mode", "emu.frameskip_capture", "video.aa", "video.gpu_raster", "video.gpu_defer", "emu.autosave_png", "emu.autoload", "cheevos.enabled", "cheevos.token_file", "cheevos.username"}) if (cli.has(k)) cfg.set(k, cli.str(k)); };
   apply_cli();
   const std::string bios9 = cfg.str("paths.bios9"), bios7 = cfg.str("paths.bios7");
   // The DSi's own firmware, for a session that is a DSi from the start, unless
@@ -1972,12 +1975,34 @@ sdl_ready:
   session.open(nds, cfg, rom_path, save_arg);
 
   nds.sched.set_quantum(quantum);
-  nds.gpu3d.set_timing_oc(cfg.flag("emu.timing_oc", false));
+  // The GPU raster is an inexact tier already, and the frame it is meant to
+  // shorten is set by the emulation thread -- where the geometry engine runs
+  // inline in the exact model (2.8-3.4 ms on NSMB and Spirit Tracks). So the
+  // GPU raster brings the untimed geometry model with it unless the config
+  // says otherwise: measured on the RG DS Plus, NSMB 18.9 -> 15.9 ms median
+  // and Spirit Tracks 19.9 -> 16.3, against 19.9 / 20.3 for the GPU raster
+  // alone (docs/gpu-raster-workload-scoping.md §9). (User decision, 2026-09-16.)
+  const bool timing_oc = cfg.has("emu.timing_oc") ? cfg.flag("emu.timing_oc", false) : cfg.flag("video.gpu_raster", false);
+  nds.gpu3d.set_timing_oc(timing_oc);
   // Geometry worker + per-frame shape controller, with either inexact tier
   // (no-FIFO, or the FIFO kept with the cull priced by ratio under --cpu-oc).
-  nds.gpu3d.set_geometry_worker(cfg.flag("emu.timing_oc", false) || cfg.flag("emu.gx_worker", false) || cpu_oc_mode(cfg.str("emu.cpu_tuning")) != 0);   // DS_GX_THREAD: 0 never, 1 per-frame shape controller, 2 always
+  nds.gpu3d.set_geometry_worker(timing_oc || cfg.flag("emu.gx_worker", false) || cpu_oc_mode(cfg.str("emu.cpu_tuning")) != 0);   // DS_GX_THREAD: 0 never, 1 per-frame shape controller, 2 always
   nds.io.set_cart_bulk(cfg.flag("emu.fast_load", false));   // may introduce accuracy issues, see config.cpp
   nds.gpu3d.renderer().set_aa(cfg.flag("video.aa", false));   // opt-in: see config.cpp
+  // The GPU 3D raster, opt-in and allowed to decline. Deferred rather than
+  // live because it opens a Vulkan device, and the reason it could not is
+  // worth printing once at startup rather than swallowing: on a device with
+  // no driver the emulator runs exactly as before.
+  if (cfg.flag("video.gpu_raster", false)) {
+    std::string why;
+    const bool on = nds.gpu3d.renderer().set_gpu_raster(true, &why);
+    std::fprintf(stderr, "gpu raster: %s%s%s\n", on ? "on" : "OFF -- software raster",
+                 why.empty() ? "" : " -- ", why.c_str());
+    if (on && cfg.flag("video.gpu_defer", false)) {
+      nds.gpu.set_defer_3d(true);
+      std::fprintf(stderr, "gpu raster: deferred composite -- the 3D layer is shown one frame late\n");
+    }
+  }
   if (!boot_firmware || nds.dsi) nds.setup_direct_boot();   // on a DSi this is the NAND boot (NDS::boot_dsi_nand)
   // A DSiWare title given with --dsi-mode starts straight away (the TLNC
   // autoload the launcher reads), unless --dsi-menu asks for the menu with it.
@@ -2960,7 +2985,7 @@ sdl_ready:
       ::ds::jit::set_cpu_oc(static_cast<::ds::jit::CpuOc>(cpu_oc_applied));
       ::ds::jit::flush_all();
 #endif
-      nds.gpu3d.set_geometry_worker(mode != 0 || cfg.flag("emu.timing_oc", false) || cfg.flag("emu.gx_worker", false));
+      nds.gpu3d.set_geometry_worker(mode != 0 || timing_oc || cfg.flag("emu.gx_worker", false));
       return;
     }
     if (is("emu.timing_oc")) { nds.gpu3d.set_timing_oc(on); nds.gpu3d.set_geometry_worker(on || cfg.flag("emu.gx_worker", false) || cpu_oc_mode(cfg.str("emu.cpu_tuning")) != 0); return; }
@@ -4663,6 +4688,36 @@ sdl_ready:
     // vsync on the present blocks and the tail pins to the refresh.
     ds::frame_report(work_ms, "work");
     ds::prof::frame_breakdown(frame_ms);
+    // The GPU raster's own row: its wait is paid inside whichever stage asked
+    // for the 3D layer (the compositor's, mostly), so the stage table cannot
+    // show it on its own. Same figures the headless frontend prints.
+    if (nds.gpu3d.renderer().gpu_raster_active()) {
+      const auto& g = nds.gpu3d.renderer().gpu_stats();
+      if (g.frames) {
+        const double n = static_cast<double>(g.frames);
+        std::fprintf(stderr, "gpu raster: %llu frames drawn; per frame upload %.3f ms (CPU, of which submit %.3f), fence wait %.3f ms -- composite %.3f, next dispatch %.3f, forced %.3f\n",
+                     static_cast<unsigned long long>(g.frames), double(g.upload_ns) / n / 1e6, double(g.submit_ns) / n / 1e6,
+                     double(g.wait_line_ns + g.wait_frame_ns + g.wait_forced_ns) / n / 1e6,
+                     double(g.wait_line_ns) / n / 1e6, double(g.wait_frame_ns) / n / 1e6, double(g.wait_forced_ns) / n / 1e6);
+        std::fprintf(stderr, "gpu raster: per frame -- order-free prefix %.0f polygons (%.0f K span rows), ordered tail %.0f covering %.0f K px\n",
+                     double(g.opaque_polys) / n, double(g.opaque_rows) / n / 1024.0, double(g.tail_polys) / n, double(g.tail_area) / n / 1024.0);
+
+      // Why frames did not go to the GPU: the gate (per reason, above), the
+      // identical-frame path (nothing drawn at all), and the upload's own
+      // refusals, per reason.
+      std::fprintf(stderr, "gpu raster: %llu frames kept by the identical-frame path; %llu refused at upload%s\n",
+                   (unsigned long long)g.kept, (unsigned long long)g.failed, g.failed ? ":" : "");
+      for (const auto& f : g.fails) if (f.why) std::fprintf(stderr, "gpu raster:   %-40s %llu frames\n", f.why, (unsigned long long)f.n);
+      // GPU time per pass (DS_VK_TIMING=1), per frame.
+      { ds::u64 pns[5], pf = 0;
+        if (nds.gpu3d.renderer().gpu_pass_times(pns, &pf) && pf) {
+          const double k = 1.0 / (double(pf) * 1e6);
+          std::fprintf(stderr, "gpu raster: GPU time per frame -- span %.3f ms, bin %.3f, visibility %.3f, raster %.3f, final pass %.3f (total %.3f, %llu frames stamped)\n",
+                       double(pns[0]) * k, double(pns[1]) * k, double(pns[2]) * k, double(pns[3]) * k, double(pns[4]) * k,
+                       double(pns[0] + pns[1] + pns[2] + pns[3] + pns[4]) * k, (unsigned long long)pf);
+        } }
+      }
+    }
     if (!frame_ms.empty())
       std::fprintf(stderr, "  (emulation only; excluded: present %.1f ms, pacing %.1f ms total over %zu frames)\n",
                    static_cast<double>(draw_ticks_total) * ticks_to_ms,
