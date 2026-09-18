@@ -242,3 +242,44 @@ GPU times on the device in A/B mode (CPU drawing beside it): etody 4.4 ms,
 gsdd 10.5. Not yet changed: the upload still runs on the emulation thread
 (P2b moves it), and the branch's deferred-composite knob came along
 (`video.gpu_defer`, measured worthless there; left off).
+
+## P2b — the GPU job thread: LANDED, and the compute raster's verdict at 1x
+
+`Renderer3D` now hands a GPU frame to its own thread (`gpu_thread_main`):
+the polygon conversion, the upload and the submit run there, and a frame
+the upload refuses is drawn by the CPU raster on that thread into `out_[]`
+(`FrameRef::job`; `frame_ref()` waits for the decision, `sync_all()` joins
+the job). `DS_GPU_THREAD=0` keeps the old inline path. Frame hashes of the
+threaded and inline paths are identical (etody, mlbis, 600 frames, host).
+The core and the frontend now share one Vulkan context
+(`vk::Device::shared`), which P2c/P3 need to bind the raster's layer from
+the present stage.
+
+**The gate the plan set for P2 -- "emulation median not worse than software
++ untimed geometry" -- FAILS, and not because of the upload.** Device, SDL
+dual window, GPU present on in every arm, work median (emulation + present):
+
+| scene | software + timing_oc | compute raster, job thread | inline | compositor's fence wait |
+| --- | --- | --- | --- | --- |
+| NSMB | 11.0 | 11.1-11.2 | 11.6 | 0.11 ms |
+| Spirit Tracks | 15.8-16.0 | 16.6-17.2 | 17.1 | 1.2-2.3 ms |
+| Golden Sun | 16.8 | 22.7-23.4 | 23.0-23.7 | 6.5-8.0 ms |
+| Etrian Odyssey | 6.8-6.9 | 14.7-14.9 | 14.7-14.8 | 5.3-6.0 ms |
+
+The thread saves its 0.5 ms on NSMB and nothing elsewhere: the term is the
+compositor waiting for the GPU at line 0. The raster dispatches at line 215
+and the display asks for line 0 about 3 ms later; a compute frame of 3-7 ms
+cannot be there, and on Golden Sun (engine A per line, capture every frame)
+the wait lands squarely on the emulation thread. The deferred composite
+would hide it but is refused exactly where it is needed (capture). So on
+this device the compute raster is not a frame-time path at 1x either; it
+stays as the **exact GPU reference, opt-in** (`--gpu-raster`), and the
+freed cores do not pay for its latency.
+
+**Consequence for the plan.** The graphics-pipeline renderer of P0.3 draws
+these scenes in 0.5-2 ms at 1x (fans + texel), which fits the window with
+room for its real shading. It therefore becomes the GPU 3D path at 1x as
+well as at hi-res (inexact coverage, allowed by the user's decision), fed
+through the same seam and `FrameRef` the compute raster uses, so P3 lands
+first at S=1 against the same A/B and frame-time gates, and the composite
+work (P2c) follows for S>=2.

@@ -28,17 +28,9 @@ __asm__(".section .rodata\n.balign 4\n.globl ds_present_spv_data\nds_present_spv
         ".globl ds_present_spv_end\nds_present_spv_end:\n.previous\n");
 extern "C" const unsigned char ds_present_spv_data[], ds_present_spv_end[];
 
-// One Vulkan context for the process: a dual-window layout has two Displays
-// and there is no reason for two devices (instance creation is ~18 ms).
-std::shared_ptr<Device> shared_device(std::string* why) {
-  static std::weak_ptr<Device> weak;
-  if (auto d = weak.lock()) return d;
-  std::unique_ptr<Device> u = Device::create(why);
-  if (!u) return nullptr;
-  std::shared_ptr<Device> d(std::move(u));
-  weak = d;
-  return d;
-}
+// One Vulkan context for the process (vk::Device::shared): the 3D raster in
+// the core and this stage share it, so the raster's layer can be bound here.
+std::shared_ptr<Device> shared_device(std::string* why) { return Device::shared(why); }
 
 constexpr u32 kFrameWords = 256 * 192;     // one screen
 constexpr u32 kSlotWords = 2 * kFrameWords;  // both screens

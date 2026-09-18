@@ -17,6 +17,17 @@
 
 namespace ds::gpu::vk {
 
+std::shared_ptr<Device> Device::shared(std::string* why) {
+  static std::weak_ptr<Device> weak;
+  if (auto d = weak.lock()) return d;
+  std::unique_ptr<Device> u = create(why);
+  if (!u) return nullptr;
+  std::shared_ptr<Device> d(std::move(u));
+  weak = d;
+  return d;
+}
+
+
 #if !DS_VK_AVAILABLE
 
 struct Device::Impl {};

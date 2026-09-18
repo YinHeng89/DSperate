@@ -376,11 +376,13 @@ public:
 
 Renderer3D::Renderer3D(NDS& nds) : nds_(nds) { out_dst_ = out_[0].data(); reset(); }
 Renderer3D::~Renderer3D() {
+  gpu_thread_stop();
   if (ab_ref_) std::fclose(ab_ref_);
   if (ab_cand_) std::fclose(ab_cand_);
 }
 
 void Renderer3D::reset() {
+  gpu_job_wait_done();
   color_.fill(0); depth_.fill(0); attr_.fill(0); out_[0].fill(0); out_[1].fill(0);
   stencil_.fill(0);
   prev_shadow_mask_.fill(false);
@@ -2959,6 +2961,23 @@ void Renderer3D::render(const Gpu3D& gx) {
     if (reject != GpuOk || !gpu_live_) {
       // Nothing to do: the dry run only counts, and a refused frame falls
       // through to the band path below exactly as it did before the seam.
+    } else if (!gpu_ab_ && gpu_thread_.joinable()) {
+      // The GPU job thread takes it from here: conversion, upload, submit,
+      // and the CPU fallback if the upload refuses. Everything it reads --
+      // the polygon list, rs_frame_, the texture refs -- stays put until the
+      // next render(), whose sync_all() joins the job first.
+      gpu_job_polys_.assign(polys, polys + npoly);
+      gpu_job_n_ = npoly;
+      gpu_job_dst_ = out_[display_ ^ 1].data();
+      gpu_job_fallback_ = false;
+      pending_bands_ = 0;
+      wait_ns_.store(0, std::memory_order_relaxed);
+      gpu_defer_ok_ = gpu_frame_prev_;
+      gpu_frame_prev_ = true;
+      gpu_frame_ = true;
+      display_ ^= 1;
+      gpu_job_set(GpuJobSync::Pending);
+      return;
     } else if (const auto t0 = std::chrono::steady_clock::now(); !gpu_dispatch(polys, npoly)) {
       if (prof::enabled) prof::add_ns(prof::GPU_UPLOAD, static_cast<u64>((std::chrono::steady_clock::now() - t0).count()));
       ++gpu_stats_.failed;
@@ -3264,6 +3283,15 @@ Renderer3D::FrameRef Renderer3D::frame_ref(bool allow_defer) const {
   if (pending_bands_) f.bin_y = bin_y_;
 #if DSPERATE_VULKAN
   if (gpu_frame_) {
+    // A frame on the job thread: wait until it has decided between the GPU
+    // and the CPU fallback (the conversion, well under a millisecond, and
+    // normally long done by the time the display asks).
+    gpu_job_wait(GpuJobSync::Submitted);
+    if (gpu_job_fallback_) {
+      f.out = gpu_job_dst_;
+      f.job = &gpu_job_;
+      return f;
+    }
     // The pointer travels in the ref exactly as out_[display_] does, and for
     // the same reason: render() of the next frame may already have moved on.
     // The band cut travels with it too, so a GPU frame describes itself the
@@ -3299,6 +3327,7 @@ Renderer3D::FrameRef Renderer3D::frame_ref(bool allow_defer) const {
 // compositor thread while the emulation thread dispatches the next frame.
 void Renderer3D::sync_line(const FrameRef& f, s32 y) {
 #if DSPERATE_VULKAN
+  if (f.job) { gpu_job_wait(GpuJobSync::FallbackDone); return; }
   // A GPU frame is banded like a CPU one, so this is the same search: find
   // the band that owns the line and wait only for that. With one band it
   // degenerates to waiting for the whole picture, which is what it used to
@@ -3338,6 +3367,7 @@ void Renderer3D::sync_all() {
   // polygon list, the texture cache or the render state. render() calls it
   // first thing, which is what keeps frame N+1's dispatch behind frame N's
   // fence without a second flight of buffers.
+  gpu_job_wait_done();
   if (vk_raster_) {
     const auto t0 = std::chrono::steady_clock::now();
     vk_raster_->wait();
@@ -3680,12 +3710,12 @@ bool Renderer3D::set_gpu_raster(bool on, std::string* why) {
 #else
   // Whatever happens, no frame may be half-way through either raster.
   sync_all();
-  if (!on) { vk_raster_.reset(); vk_dev_.reset(); gpu_frame_ = false; return false; }
+  if (!on) { gpu_thread_stop(); vk_raster_.reset(); vk_dev_.reset(); gpu_frame_ = false; return false; }
   if (vk_raster_ && vk_raster_->ready()) return true;
 
   std::string reason;
   if (!vk_dev_) {
-    vk_dev_ = vk::Device::create(&reason);
+    vk_dev_ = vk::Device::shared(&reason);
     if (!vk_dev_) { if (why) *why = reason; return false; }
   }
   vk_raster_ = vk::Raster::create(*vk_dev_, &reason);
@@ -3703,7 +3733,78 @@ bool Renderer3D::set_gpu_raster(bool on, std::string* why) {
   // its own vector (texcache.h) -- so it is part of that change, not this
   // one. Raster::bind_texture_arena is waiting for it.
   if (why) *why = vk_dev_->name();
+  static const bool threaded = [] { const char* e = std::getenv("DS_GPU_THREAD"); return !e || std::atoi(e) != 0; }();
+  if (threaded && !gpu_thread_.joinable()) {
+    gpu_job_.quit = false;
+    gpu_job_.state.store(GpuJobSync::Idle);
+    gpu_thread_ = std::thread([this] { gpu_thread_main(); });
+  }
   return true;
+#endif
+}
+
+void Renderer3D::gpu_job_set(u32 state) {
+  { std::lock_guard<std::mutex> lk(gpu_job_.m); gpu_job_.state.store(state, std::memory_order_release); }
+  gpu_job_.cv.notify_all();
+}
+
+void Renderer3D::gpu_job_wait(u32 min_state) const {
+  if (!gpu_thread_.joinable()) return;   // inline upload (DS_GPU_THREAD=0): nothing to wait for
+  if (gpu_job_.state.load(std::memory_order_acquire) >= min_state) return;
+  std::unique_lock<std::mutex> lk(gpu_job_.m);
+  gpu_job_.cv.wait(lk, [&] { return gpu_job_.state.load(std::memory_order_acquire) >= min_state; });
+}
+
+// Idle, Submitted and FallbackDone are the states in which the thread reads
+// nothing of this object; Pending, Running and Fallback are not.
+void Renderer3D::gpu_job_wait_done() const {
+  if (!gpu_thread_.joinable()) return;
+  auto quiet = [&] { const u32 s = gpu_job_.state.load(std::memory_order_acquire); return s == GpuJobSync::Idle || s == GpuJobSync::Submitted || s == GpuJobSync::FallbackDone; };
+  if (quiet()) return;
+  std::unique_lock<std::mutex> lk(gpu_job_.m);
+  gpu_job_.cv.wait(lk, quiet);
+}
+
+void Renderer3D::gpu_thread_stop() {
+  if (!gpu_thread_.joinable()) return;
+  { std::lock_guard<std::mutex> lk(gpu_job_.m); gpu_job_.quit = true; }
+  gpu_job_.cv.notify_all();
+  gpu_thread_.join();
+}
+
+void Renderer3D::gpu_thread_main() {
+#if DSPERATE_VULKAN
+  for (;;) {
+    {
+      std::unique_lock<std::mutex> lk(gpu_job_.m);
+      gpu_job_.cv.wait(lk, [&] { return gpu_job_.quit || gpu_job_.state.load(std::memory_order_acquire) == GpuJobSync::Pending; });
+      if (gpu_job_.quit) return;
+      gpu_job_.state.store(GpuJobSync::Running, std::memory_order_release);
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    const bool ok = gpu_dispatch(gpu_job_polys_.data(), gpu_job_n_);
+    const u64 ns = static_cast<u64>((std::chrono::steady_clock::now() - t0).count());
+    gpu_stats_.upload_ns += ns;
+    if (prof::enabled) prof::add_ns(prof::GPU_UPLOAD, ns);
+    if (ok) {
+      ++gpu_stats_.frames;
+      gpu_job_set(GpuJobSync::Submitted);
+      continue;
+    }
+    ++gpu_stats_.failed;
+    gpu_stats_.last_fail = gpu_fail_;
+    for (auto& f : gpu_stats_.fails) {
+      if (!f.why) f.why = gpu_fail_;
+      if (f.why == gpu_fail_) { ++f.n; break; }
+    }
+    // The CPU raster, here: the emulation thread has moved on and this
+    // thread is the one with the frame in hand. Same call the A/B path makes.
+    gpu_job_fallback_ = true;
+    gpu_job_set(GpuJobSync::Fallback);
+    build_edges();
+    render_band(0, 192, gpu_job_dst_);
+    gpu_job_set(GpuJobSync::FallbackDone);
+  }
 #endif
 }
 
@@ -4065,6 +4166,8 @@ void Renderer3D::gpu_ab_write(FILE* f, const u32* layer) {
 void Renderer3D::gpu_snapshot_output() {
 #if DSPERATE_VULKAN
   if (!gpu_frame_ || !vk_raster_) return;
+  gpu_job_wait_done();
+  if (gpu_job_fallback_) return;   // already in out_[display_]
   vk_raster_->wait();
   std::memcpy(out_[display_].data(), vk_raster_->output(), 256 * 192 * sizeof(u32));
 #endif

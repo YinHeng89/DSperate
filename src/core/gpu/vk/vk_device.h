@@ -61,6 +61,11 @@ public:
   // queue, or no memory type with the cacheability CpuRead needs. Never
   // throws and never aborts -- a missing GPU is an ordinary outcome.
   static std::unique_ptr<Device> create(std::string* why = nullptr);
+  // The process's one context, shared by the 3D raster (core) and the
+  // present stage (frontend) so the raster's output can be bound by the
+  // present without leaving the device. Created on first use, released when
+  // the last holder lets go; a failed creation is not cached.
+  static std::shared_ptr<Device> shared(std::string* why = nullptr);
   ~Device();
 
   Device(const Device&) = delete;

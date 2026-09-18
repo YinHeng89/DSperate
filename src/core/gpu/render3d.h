@@ -11,6 +11,8 @@
 
 #include <array>
 #include <atomic>
+#include <condition_variable>
+#include <mutex>
 #include <thread>
 #include <memory>
 #include <string>
@@ -650,11 +652,25 @@ public:
   // vk_raster.h) and what sync_line waits for is one fence, not a band. The
   // granularity is the whole frame either way, because a tile raster has no
   // per-scanline completion to report.
+  // The GPU job thread's hand-off (P2b, docs/gpu-path-scoping.md). render()
+  // hands a GPU frame over -- the polygon list and the render state are
+  // stable until the next render() -- and the thread converts, uploads and
+  // submits it, so the emulation thread pays none of that. A frame the
+  // upload refuses (a full bin, a full arena) is drawn on the same thread by
+  // the CPU raster into out_[], and frame_ref() learns which happened.
+  struct GpuJobSync {
+    enum : u32 { Idle = 0, Pending, Running, Submitted, Fallback, FallbackDone };
+    std::mutex m;
+    std::condition_variable cv;
+    std::atomic<u32> state{Idle};
+    bool quit = false;
+  };
   struct FrameRef {
     const u32* out = nullptr;
     u64 gen = 0;
     u32 nbins = 0;
     vk::Raster* gpu = nullptr;
+    GpuJobSync* job = nullptr;   // a fallback frame still being drawn on the GPU job thread
     std::array<s32, MAX_BINS + 1> bin_y{};
     const u32* line(u32 y) const { return out + y * 256; }
   };
@@ -689,7 +705,7 @@ private:
   // The GPU raster and the device it runs on, owned by the coordinator only.
   // Held as unique_ptrs to incomplete types: the destructor is out of line,
   // so render3d.h stays free of the Vulkan headers and of DSPERATE_VULKAN.
-  std::unique_ptr<vk::Device>  vk_dev_;
+  std::shared_ptr<vk::Device>  vk_dev_;   // the process-wide context (vk::Device::shared)
   std::unique_ptr<vk::Raster>  vk_raster_;
   bool gpu_frame_ = false;    // the last render() went to the GPU: out_[] is not where the picture is
   bool gpu_live_ = false;     // the backend can draw: latched once per frame, before the texture resolve reads it
@@ -698,6 +714,18 @@ private:
   bool gpu_sync_is_frame_ = false;   // the sync_all at the top of render(), as against a forced one
   bool gpu_ab_ = false;
   mutable GpuStats gpu_stats_{};   // mutable: frame_ref is const and counts deferrals
+  // The GPU job thread (DS_GPU_THREAD=0 keeps the upload on the emulation thread).
+  std::thread gpu_thread_;
+  mutable GpuJobSync gpu_job_;
+  std::vector<const Polygon*> gpu_job_polys_;
+  u32  gpu_job_n_ = 0;
+  u32* gpu_job_dst_ = nullptr;         // out_[] slot a fallback frame is drawn into
+  bool gpu_job_fallback_ = false;      // the last job fell back to the CPU raster
+  void gpu_thread_main();
+  void gpu_job_set(u32 state);
+  void gpu_job_wait(u32 min_state) const;   // block until state >= min_state (Submitted/Fallback = decided)
+  void gpu_job_wait_done() const;           // until nothing is running on the thread
+  void gpu_thread_stop();
   // Whether the GPU raster implements everything this frame needs. Whole
   // frames, never part of one: the pixel stack, the edge-marking pass and
   // the translucent polygon ids are frame-global, so a frame split across
