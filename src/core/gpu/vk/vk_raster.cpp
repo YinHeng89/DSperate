@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // DSperate - Nintendo DS emulator. Copyright (C) 2026 DSperate contributors.
+#include <dirent.h>
+#include <unistd.h>
+#include <string>
+#include <chrono>
 #include "core/gpu/vk/vk_raster.h"
 
 #include "core/gpu/vk/vk_internal.h"
@@ -1020,6 +1024,38 @@ bool Raster::tri_ordered() const { return d_ && d_->tri && d_->roaa; }
 const Raster::PassTimes& Raster::pass_times() const { return d_->times; }
 bool Raster::timing() const { return d_ && d_->timing; }
 
+// The stall probe's reader: this process's context under
+// /sys/kernel/debug/mali0/ctx/<pid>_<n>/ (atoms in flight, memory pools) and
+// the device-wide utilisation and power state.
+static void stall_probe_dump(const char* when) {
+#if defined(__linux__)
+  auto cat = [&](const std::string& path, int max_lines) {
+    FILE* f = std::fopen(path.c_str(), "r");
+    if (!f) { std::fprintf(stderr, "  %s: (unreadable)\n", path.c_str()); return; }
+    char line[512]; int n = 0;
+    while (n < max_lines && std::fgets(line, sizeof line, f)) { std::fprintf(stderr, "  %s", line); ++n; }
+    std::fclose(f);
+  };
+  std::fprintf(stderr, "gpu raster: STALL PROBE %s (pid %d)\n", when, static_cast<int>(getpid()));
+  const std::string base = "/sys/kernel/debug/mali0/";
+  char pfx[32]; std::snprintf(pfx, sizeof pfx, "%d_", static_cast<int>(getpid()));
+  if (DIR* dir = opendir((base + "ctx").c_str())) {
+    while (dirent* e = readdir(dir)) {
+      if (std::strncmp(e->d_name, pfx, std::strlen(pfx)) != 0) continue;
+      const std::string c = base + "ctx/" + e->d_name + "/";
+      std::fprintf(stderr, " ctx %s atoms:\n", e->d_name); cat(c + "atoms", 40);
+      std::fprintf(stderr, " mem_pool_size / lp / jit_used / jit_phys:\n"); cat(c + "mem_pool_size", 2); cat(c + "lp_mem_pool_size", 2); cat(c + "mem_jit_used", 2); cat(c + "mem_jit_phys", 2);
+    }
+    closedir(dir);
+  }
+  std::fprintf(stderr, " dvfs_utilization:\n"); cat(base + "dvfs_utilization", 2);
+  std::fprintf(stderr, " gpu_memory:\n"); cat(base + "gpu_memory", 12);
+  std::fprintf(stderr, " power_policy / cur_freq:\n"); cat("/sys/devices/platform/fde60000.gpu/power_policy", 1); cat("/sys/class/devfreq/fde60000.gpu/cur_freq", 1);
+#else
+  (void)when;
+#endif
+}
+
 void Raster::wait_band(u32 b) {
   if (!d_) return;
   Impl& d = *d_;
@@ -1037,6 +1073,21 @@ void Raster::wait_band(u32 b) {
     if (d.in_flight & (1u << i)) pending[n++] = d.fence[i];
   if (!n) return;
   const Api& a = *d.api;
+  // DS_GPU_STALL_PROBE=1: a fence that is not signalled within 100 ms is a
+  // stall (docs/gpu-path-scoping.md); read the Mali driver's view of this
+  // process's atoms and the GPU's utilisation WHILE it is happening, then
+  // keep waiting. Linux debugfs, root -- the RG DS Plus rig.
+  static const bool probe = std::getenv("DS_GPU_STALL_PROBE") != nullptr;
+  if (probe) {
+    VkResult r = a.vkWaitForFences(d.vk->dev, n, pending, VK_TRUE, 100'000'000ull);
+    if (r == VK_TIMEOUT) {
+      const auto t0 = std::chrono::steady_clock::now();
+      stall_probe_dump("at +100 ms");
+      a.vkWaitForFences(d.vk->dev, n, pending, VK_TRUE, UINT64_MAX);
+      std::fprintf(stderr, "gpu raster: probe -- fence signalled %.1f ms after the probe\n", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+      stall_probe_dump("after");
+    }
+  } else
   a.vkWaitForFences(d.vk->dev, n, pending, VK_TRUE, UINT64_MAX);
 
   // Invalidate only the scanlines these bands wrote -- the composite reads

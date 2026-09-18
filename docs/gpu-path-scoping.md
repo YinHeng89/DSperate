@@ -566,3 +566,41 @@ land on the same frames. Not the dual-window sync. Next step is a Mali
 kernel trace (kbase ftrace events / debugfs instrumentation) around a
 stall to see whether the job is queued, soft-stopped or replayed, and a
 look at what differs per process start (GPU context, memory placement).
+
+### RESOLVED: the stall is the Mali fault worker starved on CPU0 (2026-09-18)
+
+The stall probe (`DS_GPU_STALL_PROBE=1`: a fence not signalled in 100 ms
+dumps this process's kbase context from debugfs, then keeps waiting) caught
+three stalls in one run. Mid-stall: a tiler/compute atom (core req 0x4e)
+running for hundreds of milliseconds, the frame's fragment atom queued
+behind it with no start time, a JIT_FREE soft job queued, JIT memory in use
+(the tiler heap, ~112 KB, `mem_jit_used`). The Mali JM driver grows the
+tiler heap on demand through GPU page faults; the MMU interrupt (irq 82,
+`/proc/interrupts`) and the two other GPU interrupts are serviced on CPU0
+only, and the fault is completed by a kernel worker on that CPU. Our
+SCHED_RR threads (the whole process is RR 5) saturate whichever core they
+land on; when that is CPU0 the worker runs only when the RT bandwidth cap
+opens (950 ms of every second to RT) -- the 0.2-0.95 s hold, the per-run
+bimodality (where the RT threads landed at start), and the same frames
+within a stalling run (where the heap grows). Content only sets the fault
+points; the sky frame stalled because its heap was regrown after a trim.
+
+| configuration | runs | stalls |
+| --- | --- | --- |
+| baseline, RR 5, all CPUs | ~20 | ~12 runs, 0.2-0.95 s |
+| serialize_jobs=full (kbase) | 4 | 2 runs |
+| emu.realtime=off | 6 | 0 (max frame 51 ms; costs 1.5-2 ms median) |
+| RR 5, `taskset -c 1-3` | 4 | 0 (max 56 ms; median unchanged, 15.1 vs 15.2) |
+| RR 5, automatic avoidance (below), dual window | 4 | 0, 0, 0, one 85 ms |
+
+Landed: `ds::gpu_irq_cpus()` reads the CPUs that service any gpu/mali
+interrupt from /proc/interrupts (effective affinity), `ds::avoid_cpus()`
+drops them from the process affinity when at least two CPUs remain and
+every dropped CPU has an equal-or-greater `cpu_capacity` (else max
+frequency) among the rest -- a big.LITTLE device keeps its big cores.
+`emu.gpu_irq_avoid` (default on) applies it at start-up when real-time
+scheduling took and `video.gpu_raster` is on; the present stage alone is a
+compute dispatch with no tiler, and its software raster wants every core.
+`fully_backed_gpf_memory` (the kbase module parameter that would remove the
+faults) is read-only on ROCKNIX. The stencil-vs-shadow-plane bisect above
+was chasing noise; the shadow plane stays because it is simpler.

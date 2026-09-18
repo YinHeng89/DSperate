@@ -1366,11 +1366,28 @@ int main(int argc, char** argv) {
   {
     const std::string rt = cfg.str("emu.realtime", "rr");
     const int prio = cfg.num("emu.rt_priority", 5);
+    bool rt_on = false;
     if (rt == "rr" || rt == "fifo") {
       sched_param sp{}; sp.sched_priority = prio;
       if (sched_setscheduler(0, rt == "rr" ? SCHED_RR : SCHED_FIFO, &sp) != 0)
         VLOG("realtime scheduling (%s %d) not permitted: %s\n", rt.c_str(), prio, std::strerror(errno));
-      else VLOG("realtime scheduling: %s %d\n", rt.c_str(), prio);
+      else { VLOG("realtime scheduling: %s %d\n", rt.c_str(), prio); rt_on = true; }
+    }
+    // emu.gpu_irq_avoid (default on): with the GPU raster on under real-time
+    // scheduling, keep the process off the CPU that services the GPU's
+    // interrupts. (The present stage alone is a compute dispatch with no
+    // tiler and no page faults, and its software raster wants every core.) The Mali driver grows the tiler heap through page faults
+    // handled by a worker on that CPU; a SCHED_RR thread there starves it
+    // until the RT bandwidth cap opens, and a GPU frame completes up to a
+    // second late (docs/gpu-path-scoping.md, "GPU-side stalls": 12 of 20
+    // runs stalled; 0 of 4 pinned off cpu 0, at the same median). Only when
+    // a core of equal capacity remains, so a big.LITTLE device keeps its big
+    // cores; DS_HOST_CORES / taskset restrictions are respected.
+    if (rt_on && cfg.flag("video.gpu_raster", false) && cfg.flag("emu.gpu_irq_avoid", true)) {
+      std::string note;
+      const ds::u64 irq_cpus = ds::gpu_irq_cpus();
+      if (!irq_cpus) VLOG("gpu irq avoid: no GPU interrupt found in /proc/interrupts\n");
+      else { ds::avoid_cpus(irq_cpus, &note); VLOG("gpu irq avoid: %s\n", note.c_str()); }
     }
   }
   // Core knobs the core reads from the environment. These must be set before
