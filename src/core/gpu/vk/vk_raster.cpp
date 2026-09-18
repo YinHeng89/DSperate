@@ -154,12 +154,12 @@ struct Raster::Impl {
   VkPipeline            pipe_tail[2][2] = {{VK_NULL_HANDLE, VK_NULL_HANDLE}, {VK_NULL_HANDLE, VK_NULL_HANDLE}};   // [wbuffer][depth write]
   // Shadow volumes: a mask polygon marks the stencil where its depth test
   // FAILS (the volume's interior), a shadow polygon draws only there.
-  VkPipeline            pipe_mask[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};                                              // [wbuffer]
-  VkPipeline            pipe_shadow[2][2] = {{VK_NULL_HANDLE, VK_NULL_HANDLE}, {VK_NULL_HANDLE, VK_NULL_HANDLE}};   // [wbuffer][depth write]
+  VkPipeline            pipe_mask = VK_NULL_HANDLE;   // shadow masks: no depth test, writes the shadow plane only (tri_mask.frag)
+  VkShaderModule        mod_tmf = VK_NULL_HANDLE;
   VkFormat              ds_format = VK_FORMAT_D32_SFLOAT;
-  bool                  stencil = false;
+  bool                  stencil = false;   // shadows drawn (the name is historical: the stencil attachment is gone, see tri_mask.frag)
   struct Img { VkImage img = VK_NULL_HANDLE; VkDeviceMemory mem = VK_NULL_HANDLE; VkImageView view = VK_NULL_HANDLE; };
-  Img img_col, img_attr, img_z, img_d;
+  Img img_col, img_attr, img_z, img_d, img_sh;   // img_sh: the shadow plane (R32_UINT run ids), colour attachment 3
   Img img_col3[3];
 
   u64  gen = 0;              // frames submitted; the buffer is gen % 3
@@ -182,13 +182,13 @@ bool Raster::tri_setup(Impl& d, Device& dev, std::string* why) {
   const DeviceInternal* vk = d.vk;
   auto fail = [&](const char* m) { if (why) *why = m; return false; };
   const u32 W = 256 * scale_, H = 192 * scale_;
-  d.roaa = dev.limits().ordered_attachments;
+  d.roaa = dev.limits().ordered_attachments && !std::getenv("DS_VK_TRI_NOROAA");   // DS_VK_TRI_NOROAA=1: the per-polygon barrier fallback, for bisecting
 
   auto shader = [&](Spirv s, VkShaderModule* out) {
     VkShaderModuleCreateInfo ci{}; ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO; ci.codeSize = s.bytes; ci.pCode = s.code;
     return a.vkCreateShaderModule(vk->dev, &ci, nullptr, out) == VK_SUCCESS;
   };
-  if (!shader(shader_tri_vert(), &d.mod_tv) || !shader(shader_tri_opaque(), &d.mod_tof) || !shader(shader_tri_tail(), &d.mod_ttf)) return fail("triangle shaders rejected by the driver");
+  if (!shader(shader_tri_vert(), &d.mod_tv) || !shader(shader_tri_opaque(), &d.mod_tof) || !shader(shader_tri_tail(), &d.mod_ttf) || !shader(shader_tri_mask(), &d.mod_tmf)) return fail("triangle shaders rejected by the driver");
   if (std::getenv("DS_VK_TRI_FLAT")) { if (!shader(shader_tri_flat(), &d.mod_tof)) return fail("flat shader rejected"); std::fprintf(stderr, "gpu raster: ATTRIBUTION -- flat fragment stage\n"); }
 
   // Set 0: the same buffers as the compute passes, for the vertex and fragment stages.
@@ -196,10 +196,10 @@ bool Raster::tri_setup(Impl& d, Device& dev, std::string* why) {
   for (u32 i = 0; i < B_COUNT; ++i) { binds[i].binding = i; binds[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; binds[i].descriptorCount = 1; binds[i].stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT; }
   VkDescriptorSetLayoutCreateInfo dsli{}; dsli.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO; dsli.bindingCount = B_COUNT; dsli.pBindings = binds;
   if (a.vkCreateDescriptorSetLayout(vk->dev, &dsli, nullptr, &d.dsl_g) != VK_SUCCESS) return fail("graphics descriptor layout");
-  // Set 1: the colour and attribute attachments, read back in the tail.
-  VkDescriptorSetLayoutBinding inb[2]{};
-  for (u32 i = 0; i < 2; ++i) { inb[i].binding = i; inb[i].descriptorType = VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT; inb[i].descriptorCount = 1; inb[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT; }
-  VkDescriptorSetLayoutCreateInfo dsli2{}; dsli2.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO; dsli2.bindingCount = 2; dsli2.pBindings = inb;
+  // Set 1: the colour, attribute, depth and shadow attachments, read back in the tail.
+  VkDescriptorSetLayoutBinding inb[4]{};
+  for (u32 i = 0; i < 4; ++i) { inb[i].binding = i; inb[i].descriptorType = VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT; inb[i].descriptorCount = 1; inb[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT; }
+  VkDescriptorSetLayoutCreateInfo dsli2{}; dsli2.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO; dsli2.bindingCount = 4; dsli2.pBindings = inb;
   if (a.vkCreateDescriptorSetLayout(vk->dev, &dsli2, nullptr, &d.dsl_in) != VK_SUCCESS) return fail("input attachment layout");
   VkDescriptorSetLayout sets2[2] = {d.dsl_g, d.dsl_in};
   VkPushConstantRange pcr{}; pcr.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT; pcr.size = sizeof(GpuFrame);
@@ -283,50 +283,47 @@ bool Raster::tri_setup(Impl& d, Device& dev, std::string* why) {
     if (!make_image(VK_FORMAT_R32_UINT, cu, VK_IMAGE_ASPECT_COLOR_BIT, d.img_attr)) return fail("attribute attachment");
     if (!make_image(VK_FORMAT_R32_UINT, cu, VK_IMAGE_ASPECT_COLOR_BIT, d.img_z)) return fail("depth plane attachment");
   }
-  {
-    // A stencil for the shadow volumes where the driver has one with the depth.
-    // Float depth first: the W-buffer test runs on 1 / depth (tri.vert), and
-    // 24 fixed bits of 1 / 40000 resolve only ~100 DS depth units there.
-    const VkFormat cands[] = {VK_FORMAT_D32_SFLOAT_S8_UINT, VK_FORMAT_D24_UNORM_S8_UINT};
-    for (VkFormat f : cands) {
-      VkFormatProperties fp{}; if (a.vkGetPhysicalDeviceFormatProperties) a.vkGetPhysicalDeviceFormatProperties(vk->phys, f, &fp);
-      if (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) { d.ds_format = f; d.stencil = true; break; }
-    }
-    if (std::getenv("DS_VK_TRI_NOSTENCIL")) { d.ds_format = VK_FORMAT_D32_SFLOAT; d.stencil = false; }
-  }
-  if (!make_image(d.ds_format, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, d.stencil ? (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT) : VK_IMAGE_ASPECT_DEPTH_BIT, d.img_d)) return fail("depth buffer");
+  // No stencil attachment: shadow volumes go through the shadow plane
+  // (tri_mask.frag) after libmali held job completion for up to a second on
+  // frames with stencil masks. DS_VK_TRI_NOSTENCIL=1 still means "no shadows".
+  d.ds_format = VK_FORMAT_D32_SFLOAT;
+  d.stencil = !std::getenv("DS_VK_TRI_NOSTENCIL");
+  if (!make_image(VK_FORMAT_R32_UINT, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT, VK_IMAGE_ASPECT_COLOR_BIT, d.img_sh)) return fail("shadow plane attachment");
+  if (!make_image(d.ds_format, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, VK_IMAGE_ASPECT_DEPTH_BIT, d.img_d)) return fail("depth buffer");
   {
     VkDescriptorSetLayout l3[3] = {d.dsl_in, d.dsl_in, d.dsl_in};
     VkDescriptorSetAllocateInfo dsa3{}; dsa3.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO; dsa3.descriptorPool = d.pool; dsa3.descriptorSetCount = 3; dsa3.pSetLayouts = l3;
     if (a.vkAllocateDescriptorSets(vk->dev, &dsa3, d.set_in3) != VK_SUCCESS) return fail("input attachment sets");
     for (int k = 0; k < 3; ++k) {
-      VkDescriptorImageInfo di[2]{};
+      VkDescriptorImageInfo di[4]{};
       di[0].imageView = d.alias ? d.img_col3[k].view : d.img_col.view; di[0].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
       di[1].imageView = d.img_attr.view; di[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-      VkWriteDescriptorSet w[2]{};
-      for (u32 i = 0; i < 2; ++i) { w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[i].dstSet = d.set_in3[k]; w[i].dstBinding = i; w[i].descriptorCount = 1; w[i].descriptorType = VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT; w[i].pImageInfo = &di[i]; }
-      a.vkUpdateDescriptorSets(vk->dev, 2, w, 0, nullptr);
+      di[2].imageView = d.img_z.view; di[2].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+      di[3].imageView = d.img_sh.view; di[3].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+      VkWriteDescriptorSet w[4]{};
+      for (u32 i = 0; i < 4; ++i) { w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[i].dstSet = d.set_in3[k]; w[i].dstBinding = i; w[i].descriptorCount = 1; w[i].descriptorType = VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT; w[i].pImageInfo = &di[i]; }
+      a.vkUpdateDescriptorSets(vk->dev, 4, w, 0, nullptr);
     }
     d.set_in = d.set_in3[0];
   }
 
-  VkAttachmentDescription at[4]{};
-  for (u32 i = 0; i < 3; ++i) {
+  VkAttachmentDescription at[5]{};   // colour, attribute, depth record, shadow plane; the depth buffer
+  for (u32 i = 0; i < 4; ++i) {
     at[i].format = VK_FORMAT_R32_UINT; at[i].samples = VK_SAMPLE_COUNT_1_BIT;
     at[i].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; at[i].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
     at[i].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE; at[i].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
     at[i].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED; at[i].finalLayout = VK_IMAGE_LAYOUT_GENERAL;
   }
-  at[3] = at[0]; at[3].format = d.ds_format; at[3].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE; at[3].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-  at[3].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; at[3].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-  VkAttachmentReference cr[3] = {{0, VK_IMAGE_LAYOUT_GENERAL}, {1, VK_IMAGE_LAYOUT_GENERAL}, {2, VK_IMAGE_LAYOUT_GENERAL}};
-  VkAttachmentReference ir[2] = {{0, VK_IMAGE_LAYOUT_GENERAL}, {1, VK_IMAGE_LAYOUT_GENERAL}};
-  VkAttachmentReference dr{3, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
+  at[3].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;   // the shadow plane lives inside the pass
+  at[4] = at[0]; at[4].format = d.ds_format; at[4].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE; at[4].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+  VkAttachmentReference cr[4] = {{0, VK_IMAGE_LAYOUT_GENERAL}, {1, VK_IMAGE_LAYOUT_GENERAL}, {2, VK_IMAGE_LAYOUT_GENERAL}, {3, VK_IMAGE_LAYOUT_GENERAL}};
+  VkAttachmentReference ir[4] = {{0, VK_IMAGE_LAYOUT_GENERAL}, {1, VK_IMAGE_LAYOUT_GENERAL}, {2, VK_IMAGE_LAYOUT_GENERAL}, {3, VK_IMAGE_LAYOUT_GENERAL}};
+  VkAttachmentReference dr{4, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
   VkSubpassDescription sp{};
   sp.flags = d.roaa ? VK_SUBPASS_DESCRIPTION_RASTERIZATION_ORDER_ATTACHMENT_COLOR_ACCESS_BIT_EXT : 0u;
   sp.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
-  sp.inputAttachmentCount = 2; sp.pInputAttachments = ir;
-  sp.colorAttachmentCount = 3; sp.pColorAttachments = cr;
+  sp.inputAttachmentCount = 4; sp.pInputAttachments = ir;
+  sp.colorAttachmentCount = 4; sp.pColorAttachments = cr;
   sp.pDepthStencilAttachment = &dr;
   // The self-dependency that makes reading the attachment just written legal
   // (and, without ordered access, the barrier the host puts between tail polygons).
@@ -335,11 +332,11 @@ bool Raster::tri_setup(Impl& d, Device& dev, std::string* why) {
   dep.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT; dep.dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
   dep.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT; dep.dstAccessMask = VK_ACCESS_INPUT_ATTACHMENT_READ_BIT;
   dep.dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT;
-  VkRenderPassCreateInfo rpi{}; rpi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO; rpi.attachmentCount = 4; rpi.pAttachments = at; rpi.subpassCount = 1; rpi.pSubpasses = &sp; rpi.dependencyCount = 1; rpi.pDependencies = &dep;
+  VkRenderPassCreateInfo rpi{}; rpi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO; rpi.attachmentCount = 5; rpi.pAttachments = at; rpi.subpassCount = 1; rpi.pSubpasses = &sp; rpi.dependencyCount = 1; rpi.pDependencies = &dep;
   if (a.vkCreateRenderPass(vk->dev, &rpi, nullptr, &d.rp) != VK_SUCCESS) return fail("render pass");
   for (int k = 0; k < 3; ++k) {
-    VkImageView views[4] = {d.alias ? d.img_col3[k].view : d.img_col.view, d.img_attr.view, d.img_z.view, d.img_d.view};
-    VkFramebufferCreateInfo fbi{}; fbi.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO; fbi.renderPass = d.rp; fbi.attachmentCount = 4; fbi.pAttachments = views; fbi.width = W; fbi.height = H; fbi.layers = 1;
+    VkImageView views[5] = {d.alias ? d.img_col3[k].view : d.img_col.view, d.img_attr.view, d.img_z.view, d.img_sh.view, d.img_d.view};
+    VkFramebufferCreateInfo fbi{}; fbi.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO; fbi.renderPass = d.rp; fbi.attachmentCount = 5; fbi.pAttachments = views; fbi.width = W; fbi.height = H; fbi.layers = 1;
     if (a.vkCreateFramebuffer(vk->dev, &fbi, nullptr, &d.fb3[k]) != VK_SUCCESS) return fail("framebuffer");
   }
   d.fb = d.fb3[0];
@@ -359,18 +356,13 @@ bool Raster::tri_setup(Impl& d, Device& dev, std::string* why) {
     VkPipelineDepthStencilStateCreateInfo dss{}; dss.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
     dss.depthTestEnable = VK_TRUE; dss.depthWriteEnable = depth_write ? VK_TRUE : VK_FALSE; dss.depthCompareOp = wbuf ? (equal_passes ? VK_COMPARE_OP_GREATER_OR_EQUAL : VK_COMPARE_OP_GREATER) : (equal_passes ? VK_COMPARE_OP_LESS_OR_EQUAL : VK_COMPARE_OP_LESS);   // W-buffer: GREATER on 1 / depth (tri.vert)
     if (kind == 1) {
-      // The mask: no colour, no depth, the stencil set where the depth test fails.
-      dss.depthWriteEnable = VK_FALSE; dss.stencilTestEnable = VK_TRUE;
-      dss.front.compareOp = VK_COMPARE_OP_ALWAYS; dss.front.failOp = VK_STENCIL_OP_KEEP; dss.front.passOp = VK_STENCIL_OP_KEEP; dss.front.depthFailOp = VK_STENCIL_OP_REPLACE;
-      dss.front.compareMask = 0xFF; dss.front.writeMask = 0xFF; dss.front.reference = 1; dss.back = dss.front;
-    } else if (kind == 2) {
-      // The shadow: only where the stencil is set.
-      dss.stencilTestEnable = VK_TRUE;
-      dss.front.compareOp = VK_COMPARE_OP_EQUAL; dss.front.failOp = VK_STENCIL_OP_KEEP; dss.front.passOp = VK_STENCIL_OP_KEEP; dss.front.depthFailOp = VK_STENCIL_OP_KEEP;
-      dss.front.compareMask = 0xFF; dss.front.writeMask = 0; dss.front.reference = 1; dss.back = dss.front;
+      // The mask: no depth test (the shader does the DS's, against the depth
+      // record), no depth write, the shadow plane its only output.
+      dss.depthTestEnable = VK_FALSE; dss.depthWriteEnable = VK_FALSE;
     }
-    VkPipelineColorBlendAttachmentState cba[3]{}; for (auto& c : cba) c.colorWriteMask = kind == 1 ? 0u : 0xFu;
-    VkPipelineColorBlendStateCreateInfo cbs{}; cbs.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO; cbs.attachmentCount = 3; cbs.pAttachments = cba;
+    VkPipelineColorBlendAttachmentState cba[4]{};
+    for (u32 i = 0; i < 4; ++i) cba[i].colorWriteMask = (i == 3) == (kind == 1) ? 0xFu : 0u;   // the mask writes the shadow plane alone; everything else never touches it
+    VkPipelineColorBlendStateCreateInfo cbs{}; cbs.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO; cbs.attachmentCount = 4; cbs.pAttachments = cba;
     if (d.roaa) cbs.flags = VK_PIPELINE_COLOR_BLEND_STATE_CREATE_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_BIT_EXT;
     VkGraphicsPipelineCreateInfo gpi{}; gpi.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO; gpi.stageCount = 2; gpi.pStages = st;
     gpi.pVertexInputState = &vin; gpi.pInputAssemblyState = &ia; gpi.pViewportState = &vps; gpi.pRasterizationState = &rs; gpi.pMultisampleState = &ms;
@@ -381,11 +373,8 @@ bool Raster::tri_setup(Impl& d, Device& dev, std::string* why) {
     if (!pipeline(d.mod_tof, wb != 0, true, &d.pipe_op[wb][0])) return fail("opaque pipeline");
     if (!pipeline(d.mod_tof, wb != 0, true, &d.pipe_op[wb][1], 0, true)) return fail("opaque front-facing pipeline");
     for (int wr = 0; wr < 2; ++wr) if (!pipeline(d.mod_ttf, wb != 0, wr != 0, &d.pipe_tail[wb][wr])) return fail("tail pipeline");
-    if (d.stencil) {
-      if (!pipeline(d.mod_tof, wb != 0, false, &d.pipe_mask[wb], 1)) return fail("mask pipeline");
-      for (int wr = 0; wr < 2; ++wr) if (!pipeline(d.mod_ttf, wb != 0, wr != 0, &d.pipe_shadow[wb][wr], 2)) return fail("shadow pipeline");
-    }
   }
+  if (!pipeline(d.mod_tmf, false, false, &d.pipe_mask, 1)) return fail("mask pipeline");
   return true;
 }
 
@@ -529,7 +518,7 @@ std::unique_ptr<Raster> Raster::create(Device& dev, std::string* why) {
   psz[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
   psz[0].descriptorCount = B_COUNT * 6;
   psz[1].type = VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT;
-  psz[1].descriptorCount = 8;
+  psz[1].descriptorCount = 16;   // four input attachments per set, three sets (set_in3)
   VkDescriptorPoolCreateInfo dpi{};
   dpi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
   dpi.maxSets = 10;
@@ -581,7 +570,7 @@ std::unique_ptr<Raster> Raster::create(Device& dev, std::string* why) {
       // The host lays out the list as it does for the visibility pass: the
       // real order-free prefix, and only the tail binned.
       self->vis_ = true;
-      std::fprintf(stderr, "gpu raster: triangle path at %ux, ordered attachment access %s, %s, %s\n", self->scale_, d.roaa ? "on" : "OFF (a barrier per tail polygon)", d.alias ? "attachments aliased on the buffers" : "attachments copied into the buffers", d.stencil ? "stencil shadows" : "NO stencil (shadows not drawn)");
+      std::fprintf(stderr, "gpu raster: triangle path at %ux, ordered attachment access %s, %s, %s\n", self->scale_, d.roaa ? "on" : "OFF (a barrier per tail polygon)", d.alias ? "attachments aliased on the buffers" : "attachments copied into the buffers", d.stencil ? "shadows through the shadow plane" : "shadows OFF");
     }
   }
 
@@ -778,15 +767,15 @@ bool Raster::submit(u32 npoly, u32 nvert, u32 ntexels, const GpuFrame& frame) {
     stamp(cb, 8);
     const u32 W = 256 * scale_, H = 192 * scale_;
     const bool wbuf = (frame.flags & DS_FF_WBUFFER) != 0u;
-    VkClearValue cv[4]{};
+    VkClearValue cv[5]{};
     cv[0].color.uint32[0] = frame.clear_color;
     cv[1].color.uint32[0] = frame.clear_attr;
     cv[2].color.uint32[0] = frame.clear_depth;
-    cv[3].depthStencil.depth = wbuf ? 1.f / static_cast<float>(std::max<u32>(frame.clear_depth, 1)) : static_cast<float>(frame.clear_depth) / 16777215.f;
-    cv[3].depthStencil.stencil = 0;
+    cv[3].color.uint32[0] = 0xFFFFFFFFu;   // the shadow plane: no run yet -- a shadow polygon before any mask (run 0 in its flags) must match nothing
+    cv[4].depthStencil.depth = wbuf ? 1.f / static_cast<float>(std::max<u32>(frame.clear_depth, 1)) : static_cast<float>(frame.clear_depth) / 16777215.f;
     VkRenderPassBeginInfo rb{};
     rb.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-    rb.renderPass = d.rp; rb.framebuffer = d.fb3[back]; rb.renderArea = {{0, 0}, {W, H}}; rb.clearValueCount = 4; rb.pClearValues = cv;
+    rb.renderPass = d.rp; rb.framebuffer = d.fb3[back]; rb.renderArea = {{0, 0}, {W, H}}; rb.clearValueCount = 5; rb.pClearValues = cv;
     a.vkCmdBeginRenderPass(cb, &rb, VK_SUBPASS_CONTENTS_INLINE);
     VkDescriptorSet gs[2] = {d.set_g[back], d.set_in3[back]};
     a.vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, d.layout_g, 0, 2, gs, 0, nullptr);
@@ -808,36 +797,45 @@ bool Raster::submit(u32 npoly, u32 nvert, u32 ntexels, const GpuFrame& frame) {
       a.vkCmdPushConstants(cb, d.layout_g, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(GpuFrame), &frame);
     }
     stamp(cb, 5);
-    // The tail in runs of one depth-write setting; shadow masks and shadow
-    // polygons are not drawn (no stencil on this path yet).
+    // The tail in runs of one kind (translucent, shadow mask, shadow) and one
+    // depth-write setting. A run of masks gets a fresh run id, which the
+    // masks write into the shadow plane where their depth test fails
+    // (tri_mask.frag) and the shadow polygons after them test for
+    // (tri_tail.frag); the id travels in the push constant's flags. The DS
+    // clears its stencil per scanline when a run begins; a new id per run is
+    // that, frame-wide.
     const GpuPoly* gp = static_cast<const GpuPoly*>(d.polys.ptr);
     static const bool no_tail = std::getenv("DS_VK_TRI_NOTAIL") != nullptr;   // attribution: leave the translucent tail out
-    // Runs of one kind (translucent, shadow mask, shadow) and one depth-write
-    // setting. A run of masks starts by clearing the stencil -- the DS clears
-    // it per scanline when a run begins; whole-frame is the approximation.
+    static const bool no_shadow_draw = std::getenv("DS_VK_TRI_NOSHADOWDRAW") != nullptr;   // bisecting: masks and shadows are not drawn
+    static const bool no_mask = std::getenv("DS_VK_TRI_NOMASK") != nullptr;                // bisecting: masks not drawn (shadows then match nothing)
+    static const bool no_shadow = std::getenv("DS_VK_TRI_NOSHADOW") != nullptr;            // bisecting: shadow polygons not drawn
+    static const bool mask_as_tail = std::getenv("DS_VK_TRI_MASKASTAIL") != nullptr;       // bisecting: masks drawn with the tail pipeline (their geometry, not their pipeline)
     auto kind_of = [&](const GpuPoly& p) { return (p.flags & DS_PF_SHADOW_MASK) ? 1 : (p.flags & DS_PF_SHADOW) ? 2 : 0; };
+    auto barrier = [&] {
+      VkMemoryBarrier mb{}; mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER; mb.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT; mb.dstAccessMask = VK_ACCESS_INPUT_ATTACHMENT_READ_BIT;
+      a.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_DEPENDENCY_BY_REGION_BIT, 1, &mb, 0, nullptr, 0, nullptr);
+    };
+    u32 run = 0;
+    GpuFrame ftail = frame;
     for (u32 i = frame.first_ordered; (st & 2) && !no_tail && i < npoly;) {
       const int kind = kind_of(gp[i]);
       const bool wr = (gp[i].attr & 0x800u) != 0u;
       u32 j = i + 1;
       while (j < npoly && kind_of(gp[j]) == kind && ((gp[j].attr & 0x800u) != 0u) == wr) ++j;
-      if (kind != 0 && !d.stencil) { i = j; continue; }   // no stencil on this driver: shadows are not drawn
-      if (kind == 1) {
-        VkClearAttachment ca{}; ca.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT; ca.clearValue.depthStencil.stencil = 0;
-        VkClearRect cr{}; cr.rect = {{0, 0}, {W, H}}; cr.layerCount = 1;
-        a.vkCmdClearAttachments(cb, 1, &ca, 1, &cr);
-        a.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, d.pipe_mask[wbuf ? 1 : 0]);
+      if (kind != 0 && (!d.stencil || no_shadow_draw)) { i = j; continue; }   // shadows off
+      if ((kind == 1 && no_mask) || (kind == 2 && no_shadow)) { i = j; continue; }
+      if (kind == 1 && !mask_as_tail) {
+        ftail.flags = frame.flags | (++run << DS_FF_RUN_SHIFT);
+        a.vkCmdPushConstants(cb, d.layout_g, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(GpuFrame), &ftail);
+        a.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, d.pipe_mask);
         a.vkCmdDraw(cb, 24, j - i, 0, i);
+        if (!d.roaa) barrier();   // the shadows read what the masks wrote
         i = j;
         continue;
       }
-      a.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, kind == 2 ? d.pipe_shadow[wbuf ? 1 : 0][wr ? 1 : 0] : d.pipe_tail[wbuf ? 1 : 0][wr ? 1 : 0]);
+      a.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, d.pipe_tail[wbuf ? 1 : 0][wr ? 1 : 0]);
       if (d.roaa) a.vkCmdDraw(cb, 24, j - i, 0, i);
-      else for (u32 k = i; k < j; ++k) {
-        a.vkCmdDraw(cb, 24, 1, 0, k);
-        VkMemoryBarrier mb{}; mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER; mb.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT; mb.dstAccessMask = VK_ACCESS_INPUT_ATTACHMENT_READ_BIT;
-        a.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_DEPENDENCY_BY_REGION_BIT, 1, &mb, 0, nullptr, 0, nullptr);
-      }
+      else for (u32 k = i; k < j; ++k) { a.vkCmdDraw(cb, 24, 1, 0, k); barrier(); }
       i = j;
     }
     a.vkCmdEndRenderPass(cb);

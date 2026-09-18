@@ -4016,6 +4016,13 @@ bool Renderer3D::gpu_dispatch(const Polygon* const* polys, u32 npoly) {
     static const bool dump_on = std::getenv("DS_GPU_DUMP_AT") != nullptr;
     static int dump_x = -1, dump_y = -1;
     if (dump_on && dump_x < 0) std::sscanf(std::getenv("DS_GPU_DUMP_AT"), "%d,%d", &dump_x, &dump_y);
+    // DS_GPU_DUMP_SHADOWS=1: every shadow-mode polygon of every frame, one line each.
+    static const bool dump_shadows = std::getenv("DS_GPU_DUMP_SHADOWS") != nullptr;
+    if (dump_shadows && ((p.attr >> 4) & 3) == 3) {
+      std::fprintf(stderr, "[shadow] frame %llu poly %u attr %08x texparam %08x n%u ytop %d ybot %d:", static_cast<unsigned long long>(nds_.frame_count), i, p.attr, p.texparam, p.nverts, p.ytop, p.ybot);
+      for (u32 j = 0; j < p.nverts; ++j) { const Vertex& v = gx_->vertex(p.vtx[j]); std::fprintf(stderr, " (%d,%d s%d t%d w%d z%d)", v.sx, v.sy, v.tex[0], v.tex[1], p.w[j], p.z[j]); }
+      std::fprintf(stderr, "\n");
+    }
     // DS_GPU_DUMP_FRAME=N: every polygon of NDS frame N (a GPU stall on one frame).
     static const long dump_frame = std::getenv("DS_GPU_DUMP_FRAME") ? std::atol(std::getenv("DS_GPU_DUMP_FRAME")) : -1;
     if (dump_frame >= 0 && static_cast<long>(nds_.frame_count) == dump_frame) {

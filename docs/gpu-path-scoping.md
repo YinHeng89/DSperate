@@ -527,3 +527,37 @@ prints every polygon of NDS frame N; `DS_GPU_COMP_DUMP_FROM/COUNT` set a
 fixed window. Verdict so far: a driver-side hold of GPU job completion,
 timing-dependent, not content-dependent and not the frame limiter (the
 wait is inside the raster's fence at line 0).
+
+### Stall bisect from power-on (2026-09-18, later)
+
+The intro from power-on (`--dual-window --gpu-present --gpu-raster
+--internal-res 2 --frames 1800`, no load-state) reproduces the stall in
+most runs, 1-4 per run, at 1x as well as 2x. Bisect by environment switch,
+one or two 1800-frame runs each (a probabilistic stall, so single clean
+runs prove little):
+
+| configuration | runs | stalls |
+| --- | --- | --- |
+| baseline (stencil shadows) | 6 | 1, 4, 0, 2, 1, 1 |
+| DS_VK_TRI_NOTAIL (no translucent tail) | 1 | 0 |
+| DS_VK_TRI_NOSTENCIL / NOSHADOWDRAW (no masks, no shadows) | 3 | 0 |
+| DS_VK_MODE=compute | 1 | 0 |
+| D24_S8 instead of D32_S8 | 4 | 0, 1, 0, 0 |
+| DS_VK_TRI_NOROAA (per-polygon barriers) | 1 | 3 |
+| shadow PLANE instead of stencil (below) | 4 | 3, 1, 0, 0 |
+| masks only / shadows only / masks through the tail pipeline | 2 each | 0+0 / 2+1 / 0+3 |
+
+The stencil was rebuilt as a colour plane of run ids (tri_mask.frag writes
+the run id where the DS depth test fails, reading the depth and attribute
+records as input attachments; tri_tail.frag discards a shadow fragment
+whose plane id differs; no stencil attachment, no in-pass clears; host A/B
+identical to the stencil version). The stall survived it. And a per-frame
+census of shadow-mode polygons (`DS_GPU_DUMP_SHADOWS=1`) shows the first
+shadow polygon of the intro at frame 339, while stalls were reported at
+frames 240 and 246 -- so the shadows are not the trigger either; the clean
+runs above were luck or a time-varying condition. What is established: the
+job thread submits within 1 ms, the fence completes 0.2-0.95 s late, no
+kernel message, no memory-reclaim activity, both governors, any depth
+format, with and without ordered attachment access. Next step is a Mali
+kernel trace (kbase ftrace events / debugfs instrumentation) around a
+stall to see whether the job is queued, soft-stopped or replayed.

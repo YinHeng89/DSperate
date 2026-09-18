@@ -11,8 +11,12 @@
 #include "tri_frag_common.glsl"
 layout(input_attachment_index = 0, set = 1, binding = 0) uniform usubpassInput in_col;
 layout(input_attachment_index = 1, set = 1, binding = 1) uniform usubpassInput in_attr;
+layout(input_attachment_index = 3, set = 1, binding = 3) uniform usubpassInput in_sh;
 void main() {
   GpuPoly p = polys[v_poly];
+  // A shadow polygon draws only inside the volume its run's masks marked
+  // (tri_mask.frag): the plane holds that run's id there.
+  if ((p.flags & DS_PF_SHADOW) != 0u && subpassLoad(in_sh).r != (pc.f.flags >> DS_FF_RUN_SHIFT)) discard;
   Frag f = shade_fragment(p);
   if (f.alpha <= pc.f.alpha_ref) discard;
   if (f.alpha == 31u) { o_col = f.src; o_attr = f.polyattr; o_z = f.depth; return; }

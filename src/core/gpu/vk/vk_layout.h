@@ -187,6 +187,7 @@ struct GpuFrame {
 #define DS_FF_WBUFFER 0x1u   // the frame depth-tests on W (SWAP_BUFFERS bit 1); the triangle path picks its pipelines by it
 #define DS_FF_FACE_BACK  0x4u  // the triangle path's opaque draw, back-facing polygons only (tri.vert collapses the rest)
 #define DS_FF_FACE_FRONT 0x8u  // ... front-facing only: drawn second, LESS_OR_EQUAL, so a front face at the depth of an opaque back-facing pixel wins (Renderer3D::depth_pass mode 1)
+#define DS_FF_RUN_SHIFT 16u  // bits 16-31: the shadow-mask run this draw belongs to (the shadow plane holds run ids; see vk_raster.cpp)
 #define DS_FF_IDCOLOUR 0x2u  // debugging (DS_VK_TRI_IDCOL=1): the opaque draw writes the polygon INDEX as its colour (r = i & 63, g = i >> 6 & 63, b = i >> 12 & 63)
 
 // Render state too large for the push constants: the fog table, the edge
