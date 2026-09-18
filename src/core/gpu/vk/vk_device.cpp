@@ -142,7 +142,21 @@ std::unique_ptr<Device> Device::create(std::string* why) {
   if (!n) return set("no Vulkan device");
   std::vector<VkPhysicalDevice> devs(n);
   d.api.vkEnumeratePhysicalDevices(d.inst, &n, devs.data());
+  // DS_VK_DEVICE picks the physical device by index or by a substring of its
+  // name (a development box may have an integrated and a discrete GPU, and
+  // each is a different driver to test against); DS_VK_LIST_EXT lists them.
   d.phys = devs[0];
+  if (const char* pick = std::getenv("DS_VK_DEVICE")) {
+    char* end = nullptr;
+    const long idx = std::strtol(pick, &end, 10);
+    for (u32 i = 0; i < n; ++i) {
+      VkPhysicalDeviceProperties pp{}; d.api.vkGetPhysicalDeviceProperties(devs[i], &pp);
+      const bool by_index = end && *end == '\0' && idx == static_cast<long>(i);
+      if (by_index || (!(end && *end == '\0') && std::strstr(pp.deviceName, pick))) { d.phys = devs[i]; break; }
+    }
+  }
+  if (std::getenv("DS_VK_LIST_EXT"))
+    for (u32 i = 0; i < n; ++i) { VkPhysicalDeviceProperties pp{}; d.api.vkGetPhysicalDeviceProperties(devs[i], &pp); std::fprintf(stderr, "vk: device %u: %s%s\n", i, pp.deviceName, devs[i] == d.phys ? " (selected)" : ""); }
 
   VkPhysicalDeviceProperties props{};
   d.api.vkGetPhysicalDeviceProperties(d.phys, &props);
@@ -171,7 +185,7 @@ std::unique_ptr<Device> Device::create(std::string* why) {
   d.api.vkEnumerateDeviceExtensionProperties(d.phys, nullptr, &ne, nullptr);
   std::vector<VkExtensionProperties> exts(ne);
   d.api.vkEnumerateDeviceExtensionProperties(d.phys, nullptr, &ne, exts.data());
-  bool has_atomic64_ext = false, has_fd = false, has_dmabuf = false, has_modifier = false, has_fmtlist = false, has_foreign = false;
+  bool has_atomic64_ext = false, has_fd = false, has_dmabuf = false, has_modifier = false, has_fmtlist = false, has_foreign = false, has_roaa = false;
   for (const auto& e : exts) {
     if (!std::strcmp(e.extensionName, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME)) d.has_host_import = true;
     if (!std::strcmp(e.extensionName, VK_KHR_SHADER_ATOMIC_INT64_EXTENSION_NAME)) has_atomic64_ext = true;
@@ -180,6 +194,7 @@ std::unique_ptr<Device> Device::create(std::string* why) {
     if (!std::strcmp(e.extensionName, VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME)) has_modifier = true;
     if (!std::strcmp(e.extensionName, VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME)) has_fmtlist = true;
     if (!std::strcmp(e.extensionName, VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME)) has_foreign = true;
+    if (!std::strcmp(e.extensionName, VK_EXT_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_EXTENSION_NAME)) has_roaa = true;
   }
   self->limits_.dmabuf_import = has_fd && has_dmabuf;
   self->limits_.drm_modifier = self->limits_.dmabuf_import && has_modifier && has_fmtlist;
@@ -188,12 +203,16 @@ std::unique_ptr<Device> Device::create(std::string* why) {
   // key the shader builds is a 64-bit integer before it is an atomic.
   VkPhysicalDeviceShaderAtomicInt64Features at64{};
   at64.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_INT64_FEATURES;
+  VkPhysicalDeviceRasterizationOrderAttachmentAccessFeaturesEXT roaa{};
+  roaa.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_FEATURES_EXT;
   VkPhysicalDeviceFeatures2 f2{};
   f2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
   f2.pNext = &at64;
-  if (d.api.vkGetPhysicalDeviceFeatures2 && (has_atomic64_ext || props.apiVersion >= VK_API_VERSION_1_2)) {
+  if (has_roaa) at64.pNext = &roaa;
+  if (d.api.vkGetPhysicalDeviceFeatures2 && (has_atomic64_ext || has_roaa || props.apiVersion >= VK_API_VERSION_1_2)) {
     d.api.vkGetPhysicalDeviceFeatures2(d.phys, &f2);
-    self->limits_.int64_atomics = f2.features.shaderInt64 && at64.shaderBufferInt64Atomics;
+    self->limits_.int64_atomics = (has_atomic64_ext || props.apiVersion >= VK_API_VERSION_1_2) && f2.features.shaderInt64 && at64.shaderBufferInt64Atomics;
+    self->limits_.ordered_attachments = has_roaa && roaa.rasterizationOrderColorAttachmentAccess;
   }
   // DS_VK_LIST_EXT=1: what this driver actually offers. Worth having as a
   // knob rather than a one-off program -- the handhelds have no compiler, so
@@ -212,6 +231,7 @@ std::unique_ptr<Device> Device::create(std::string* why) {
   for (u32 i = 0; i < nq; ++i)
     if (qf[i].queueFlags & VK_QUEUE_COMPUTE_BIT) {
       d.qfam = i; found = true;
+      self->limits_.graphics = (qf[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) != 0;
       if (qf[i].timestampValidBits) self->limits_.timestamp_period_ns = props.limits.timestampPeriod;
       break;
     }
@@ -224,15 +244,20 @@ std::unique_ptr<Device> Device::create(std::string* why) {
   if (self->limits_.dmabuf_import) { want.push_back(VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME); want.push_back(VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME); }
   if (self->limits_.drm_modifier) { want.push_back(VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME); want.push_back(VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME); }
   if (self->limits_.dmabuf_import && has_foreign) want.push_back(VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME);
+  if (self->limits_.ordered_attachments) want.push_back(VK_EXT_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_EXTENSION_NAME);
   // Enable exactly the two features the raster uses and nothing else the
   // query happened to return.
   VkPhysicalDeviceShaderAtomicInt64Features en64{};
   en64.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_INT64_FEATURES;
   en64.shaderBufferInt64Atomics = VK_TRUE;
+  VkPhysicalDeviceRasterizationOrderAttachmentAccessFeaturesEXT enroaa{};
+  enroaa.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_FEATURES_EXT;
+  enroaa.rasterizationOrderColorAttachmentAccess = VK_TRUE;
   VkPhysicalDeviceFeatures2 enf{};
   enf.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
-  enf.pNext = &en64;
-  enf.features.shaderInt64 = VK_TRUE;
+  // Chain only what is on: shaderInt64 + the 64-bit atomics, and/or ordered attachments.
+  if (self->limits_.int64_atomics) { enf.pNext = &en64; enf.features.shaderInt64 = VK_TRUE; }
+  if (self->limits_.ordered_attachments) { enroaa.pNext = enf.pNext; enf.pNext = &enroaa; }
 
   const float prio = 1.0f;
   VkDeviceQueueCreateInfo qi{};
@@ -246,7 +271,7 @@ std::unique_ptr<Device> Device::create(std::string* why) {
   di.pQueueCreateInfos = &qi;
   di.enabledExtensionCount = static_cast<u32>(want.size());
   di.ppEnabledExtensionNames = want.empty() ? nullptr : want.data();
-  if (self->limits_.int64_atomics) di.pNext = &enf;
+  if (self->limits_.int64_atomics || self->limits_.ordered_attachments) di.pNext = &enf;
   if (d.api.vkCreateDevice(d.phys, &di, nullptr, &d.dev) != VK_SUCCESS) return set("vkCreateDevice failed");
   d.api.vkGetDeviceQueue(d.dev, d.qfam, 0, &d.queue);
 

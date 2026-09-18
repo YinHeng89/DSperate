@@ -21,6 +21,9 @@ Spirv shader_raster();   // raster pass: one workgroup per tile
 Spirv shader_post();     // final pass: edge marking then fog
 Spirv shader_vis();      // visibility pass: the order-free prefix, one fragment at a time
 Spirv shader_raster_vis();   // raster pass seeded from the visibility pass (needs shaderInt64)
+Spirv shader_tri_vert();     // the triangle path: polygons as fans through the hardware rasteriser
+Spirv shader_tri_opaque();   // ... its opaque-prefix fragment stage
+Spirv shader_tri_tail();     // ... and the ordered translucent tail
 
 } // namespace ds::gpu::vk
 

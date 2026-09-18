@@ -181,8 +181,10 @@ struct GpuFrame {
   uint   first_ordered;
   uint   opaque_rows;
   uint   nrows;         // span rows this frame, all polygons: the span pass is one lane per row
-  uint   pad_;
+  uint   flags;         // DS_FF_*
 };
+
+#define DS_FF_WBUFFER 0x1u   // the frame depth-tests on W (SWAP_BUFFERS bit 1); the triangle path picks its pipelines by it
 
 // Render state too large for the push constants: the fog table, the edge
 // colours and the toon table. Uploaded every frame -- it is 320 bytes, which

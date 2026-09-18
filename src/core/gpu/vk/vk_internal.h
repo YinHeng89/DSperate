@@ -43,7 +43,9 @@ namespace ds::gpu::vk {
   F(vkQueueSubmit) \
   F(vkCreateImage) F(vkDestroyImage) F(vkGetImageMemoryRequirements) F(vkBindImageMemory) \
   F(vkCreateImageView) F(vkDestroyImageView) F(vkGetImageSubresourceLayout) \
-  F(vkGetMemoryFdPropertiesKHR) F(vkGetPhysicalDeviceImageFormatProperties2)
+  F(vkGetMemoryFdPropertiesKHR) F(vkGetPhysicalDeviceImageFormatProperties2) \
+  F(vkCreateGraphicsPipelines) F(vkCreateRenderPass) F(vkDestroyRenderPass) F(vkCreateFramebuffer) F(vkDestroyFramebuffer) \
+  F(vkCmdBeginRenderPass) F(vkCmdEndRenderPass) F(vkCmdDraw) F(vkCmdCopyImageToBuffer)
 
 #define DS_VK_FNS DS_VK_FNS_CORE DS_VK_FNS_PIPE
 

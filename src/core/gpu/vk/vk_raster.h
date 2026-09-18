@@ -113,6 +113,11 @@ public:
   // one: edge marking reads across band boundaries, so no part of the picture
   // is final until the whole of it is.
   u32 frame_bands() const;
+  // The triangle path is drawing (DS_VK_MODE=tri, or the default where the
+  // device can): polygons through the hardware rasteriser rather than the
+  // compute passes. Same output contract, one band.
+  bool tri() const;
+  bool tri_ordered() const;   // ... with ordered attachment access (one draw per tail run)
   s32 band_line(u32 b) const;
 
   // Wait for bands 0..b and make their output readable by the CPU. Idempotent
@@ -149,6 +154,7 @@ public:
 private:
   Raster() = default;
   struct Impl;
+  bool tri_setup(Impl& d, Device& dev, std::string* why);   // the triangle path's resources (vk_raster.cpp)
   std::unique_ptr<Impl> d_;
   bool ready_ = false;
   bool vis_ = false;

@@ -283,3 +283,55 @@ well as at hi-res (inexact coverage, allowed by the user's decision), fed
 through the same seam and `FrameRef` the compute raster uses, so P3 lands
 first at S=1 against the same A/B and frame-time gates, and the composite
 work (P2c) follows for S>=2.
+
+## P3 at 1x — the triangle path: LANDED (default GPU raster; `DS_VK_MODE=compute` for the old one)
+
+`vk_raster.cpp` grew a second mode: polygons drawn as fans through the
+hardware rasteriser (`shaders/tri.vert`, `tri_opaque.frag`, `tri_tail.frag`,
+`tri_frag_common.glsl` over `ds_shade.glsl`), one render pass with three
+R32_UINT colour attachments (the layer record, the attribute plane, the DS
+depth plane) and a D32 depth buffer, then copies into the compute path's
+`out[]`/`depth`/`attr` buffers -- so the final pass (fog, edge marking), the
+output contract, `FrameRef`, the A/B harness and the host see exactly what
+the compute passes gave them. The opaque prefix is one draw with the
+hardware depth test in submission order (LESS on z, or GREATER on 1/w for
+W-buffer frames, chosen by `GpuFrame::flags`); the translucent tail is drawn
+in runs by depth-write bit with the DS blend and the equal-id rule in the
+fragment stage, reading the attachments it writes -- ordered per pixel by
+`VK_EXT_rasterization_order_attachment_access` on libmali, or behind a
+per-polygon barrier on drivers without it (RADV). Not yet: shadow masks and
+shadow polygons (skipped), edge flags (edge marking marks nothing), the
+mode-1 back-facing depth rule, anti-aliasing (gated as before).
+
+Fill rules that had to be learnt from the picture, with the numbers on
+Etrian's replay (700 frames, 488 rasterised; the count is pixels that differ
+from the software raster, mostly one 6-bit step in textured areas):
+- vertices at (sx, sy + 0.5), the polygon's right-side vertices pushed one
+  pixel out: the DS span is inclusive of xend, a triangle excludes the
+  centre on its right edge; without the push the last column of every
+  polygon was missing (5.0 M -> 6.1 M pixels but the right picture; pushing
+  0.5 leaves the column empty, 1.5 over-covers, extrapolating the attributes
+  along with the push shifts texels: 6.8 M and wrong corners);
+- texture coordinates TRUNCATE (12.4 >> 4, as the DS), colours ROUND: a
+  102-pixel quad stretched across ONE texel column (the menu panels, s 22.0
+  -> 23.0) flips onto the edge texel columns early under rounding -- the
+  "vertical cut" -- and truncating colours too measured worse (7.0 M);
+- zero-width / zero-height polygons get a pixel of extent (a line to the DS).
+`DS_GPU_DUMP_AT=x,y` prints the polygons over a pixel, which is how the
+stretched quad was found.
+
+Device (SDL, dual window, GPU present on, work median, both orders):
+
+| scene | software + timing_oc | triangle path | over budget |
+| --- | --- | --- | --- |
+| Golden Sun | 16.8 | **15.5-15.6** | 52 % -> 28 % |
+| Spirit Tracks | 15.9 | **15.7** | 17-23 % -> 10-12 % |
+| NSMB | 10.9-11.0 | 11.0-11.2 | 0.2 % -> 0.1 % |
+| Etrian Odyssey | 6.7 | 6.6-6.7 | 2.3 % -> 2.1 % |
+
+GPU time per frame (device, A/B mode): Golden Sun 9.7 ms raster + 0.9 final
+pass -- higher than the P0.3 probe's 2 ms because this is the full shading
+with the real tail, the three attachments and the copies, and the A/B run
+draws on the CPU beside it; the compositor's fence wait is 0.1-0.6 ms
+against the compute raster's 6.5-8. The first GPU 3D path that is never
+slower than the software one here, and it idles the three band workers.

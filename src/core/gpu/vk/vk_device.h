@@ -124,6 +124,12 @@ public:
     // importer falls back to VK_IMAGE_TILING_LINEAR.
     bool dmabuf_import = false;
     bool drm_modifier = false;
+    // The queue also does graphics, and VK_EXT_rasterization_order_attachment_access
+    // is on: the triangle path's translucent tail reads the colour attachment
+    // it writes, in primitive order, in one draw. Without it the tail is
+    // drawn with a barrier per polygon (correct, slower).
+    bool graphics = false;
+    bool ordered_attachments = false;
   };
   const Limits& limits() const { return limits_; }
 

@@ -127,12 +127,172 @@ struct Raster::Impl {
   double               tick_ns = 0;
   Raster::PassTimes    times;
 
+  // The triangle path (P3). Images the render pass draws into and the copies
+  // back into the compute path's buffers, so out[], depth and attr -- and the
+  // final pass, and the host -- see exactly what they see from the compute
+  // raster.
+  bool tri = false, roaa = false;
+  VkShaderModule        mod_tv = VK_NULL_HANDLE, mod_tof = VK_NULL_HANDLE, mod_ttf = VK_NULL_HANDLE;
+  VkDescriptorSetLayout dsl_g = VK_NULL_HANDLE, dsl_in = VK_NULL_HANDLE;
+  VkPipelineLayout      layout_g = VK_NULL_HANDLE;
+  VkDescriptorSet       set_g[3] = {VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE}, set_in = VK_NULL_HANDLE;
+  VkRenderPass          rp = VK_NULL_HANDLE;
+  VkFramebuffer         fb = VK_NULL_HANDLE;
+  VkPipeline            pipe_op[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};            // [wbuffer]
+  VkPipeline            pipe_tail[2][2] = {{VK_NULL_HANDLE, VK_NULL_HANDLE}, {VK_NULL_HANDLE, VK_NULL_HANDLE}};   // [wbuffer][depth write]
+  struct Img { VkImage img = VK_NULL_HANDLE; VkDeviceMemory mem = VK_NULL_HANDLE; VkImageView view = VK_NULL_HANDLE; };
+  Img img_col, img_attr, img_z, img_d;
+
   u64  gen = 0;              // frames submitted; the buffer is gen % 3
   u32  bands = 1;
   bool post_frame = false;   // the frame in flight ends with the final pass
   u32  in_flight = 0;        // bitmask of bands submitted and not yet waited for (bit `bands` is the final pass)
   std::mutex wait_mutex;     // waited from the compositor and the emulation thread
 };
+
+// The triangle path's resources: three R32_UINT colour attachments (the 3D
+// layer record, the attribute plane, the depth plane) and a D32 depth buffer,
+// one render pass whose single subpass also reads the colour and attribute
+// attachments as input attachments (ordered per pixel with
+// VK_EXT_rasterization_order_attachment_access, else behind a per-polygon
+// barrier), and six pipelines: the opaque prefix and the translucent tail,
+// each for the Z-buffer (LESS on z) and W-buffer (GREATER on 1/w) modes, the
+// tail with and without the depth write.
+bool Raster::tri_setup(Impl& d, Device& dev, std::string* why) {
+  const Api& a = *d.api;
+  const DeviceInternal* vk = d.vk;
+  auto fail = [&](const char* m) { if (why) *why = m; return false; };
+  const u32 W = 256 * scale_, H = 192 * scale_;
+  d.roaa = dev.limits().ordered_attachments;
+
+  auto shader = [&](Spirv s, VkShaderModule* out) {
+    VkShaderModuleCreateInfo ci{}; ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO; ci.codeSize = s.bytes; ci.pCode = s.code;
+    return a.vkCreateShaderModule(vk->dev, &ci, nullptr, out) == VK_SUCCESS;
+  };
+  if (!shader(shader_tri_vert(), &d.mod_tv) || !shader(shader_tri_opaque(), &d.mod_tof) || !shader(shader_tri_tail(), &d.mod_ttf)) return fail("triangle shaders rejected by the driver");
+
+  // Set 0: the same buffers as the compute passes, for the vertex and fragment stages.
+  VkDescriptorSetLayoutBinding binds[B_COUNT]{};
+  for (u32 i = 0; i < B_COUNT; ++i) { binds[i].binding = i; binds[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; binds[i].descriptorCount = 1; binds[i].stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT; }
+  VkDescriptorSetLayoutCreateInfo dsli{}; dsli.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO; dsli.bindingCount = B_COUNT; dsli.pBindings = binds;
+  if (a.vkCreateDescriptorSetLayout(vk->dev, &dsli, nullptr, &d.dsl_g) != VK_SUCCESS) return fail("graphics descriptor layout");
+  // Set 1: the colour and attribute attachments, read back in the tail.
+  VkDescriptorSetLayoutBinding inb[2]{};
+  for (u32 i = 0; i < 2; ++i) { inb[i].binding = i; inb[i].descriptorType = VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT; inb[i].descriptorCount = 1; inb[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT; }
+  VkDescriptorSetLayoutCreateInfo dsli2{}; dsli2.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO; dsli2.bindingCount = 2; dsli2.pBindings = inb;
+  if (a.vkCreateDescriptorSetLayout(vk->dev, &dsli2, nullptr, &d.dsl_in) != VK_SUCCESS) return fail("input attachment layout");
+  VkDescriptorSetLayout sets2[2] = {d.dsl_g, d.dsl_in};
+  VkPushConstantRange pcr{}; pcr.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT; pcr.size = sizeof(GpuFrame);
+  VkPipelineLayoutCreateInfo pli{}; pli.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO; pli.setLayoutCount = 2; pli.pSetLayouts = sets2; pli.pushConstantRangeCount = 1; pli.pPushConstantRanges = &pcr;
+  if (a.vkCreatePipelineLayout(vk->dev, &pli, nullptr, &d.layout_g) != VK_SUCCESS) return fail("graphics pipeline layout");
+
+  VkDescriptorSetLayout lg[4] = {d.dsl_g, d.dsl_g, d.dsl_g, d.dsl_in};
+  VkDescriptorSet got[4];
+  VkDescriptorSetAllocateInfo dsa{}; dsa.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO; dsa.descriptorPool = d.pool; dsa.descriptorSetCount = 4; dsa.pSetLayouts = lg;
+  if (a.vkAllocateDescriptorSets(vk->dev, &dsa, got) != VK_SUCCESS) return fail("graphics descriptor sets");
+  for (int i = 0; i < 3; ++i) d.set_g[i] = got[i];
+  d.set_in = got[3];
+  for (int i = 0; i < 3; ++i) {
+    VkDescriptorBufferInfo bi[B_COUNT]{};
+    const Buffer* src[B_COUNT] = {&d.polys, &d.verts, &d.tiles, &d.texels, &d.out[i], &d.post, &d.depth, &d.attr, &d.shclear, &d.rows, &d.keys, &d.rowpoly};
+    VkWriteDescriptorSet w[B_COUNT]{};
+    for (u32 b = 0; b < B_COUNT; ++b) {
+      bi[b].buffer = vk_buf(*src[b]); bi[b].range = VK_WHOLE_SIZE;
+      w[b].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[b].dstSet = d.set_g[i]; w[b].dstBinding = b; w[b].descriptorCount = 1;
+      w[b].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[b].pBufferInfo = &bi[b];
+    }
+    a.vkUpdateDescriptorSets(vk->dev, B_COUNT, w, 0, nullptr);
+  }
+
+  VkPhysicalDeviceMemoryProperties mp{}; a.vkGetPhysicalDeviceMemoryProperties(vk->phys, &mp);
+  auto make_image = [&](VkFormat fmt, VkImageUsageFlags usage, VkImageAspectFlags aspect, Impl::Img& o) {
+    VkImageCreateInfo ii{}; ii.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO; ii.imageType = VK_IMAGE_TYPE_2D; ii.format = fmt; ii.extent = {W, H, 1};
+    ii.mipLevels = 1; ii.arrayLayers = 1; ii.samples = VK_SAMPLE_COUNT_1_BIT; ii.tiling = VK_IMAGE_TILING_OPTIMAL; ii.usage = usage;
+    ii.sharingMode = VK_SHARING_MODE_EXCLUSIVE; ii.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (a.vkCreateImage(vk->dev, &ii, nullptr, &o.img) != VK_SUCCESS) return false;
+    VkMemoryRequirements mr{}; a.vkGetImageMemoryRequirements(vk->dev, o.img, &mr);
+    u32 type = ~0u;
+    for (u32 t = 0; t < mp.memoryTypeCount && type == ~0u; ++t) if ((mr.memoryTypeBits & (1u << t)) && (mp.memoryTypes[t].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) type = t;
+    for (u32 t = 0; t < mp.memoryTypeCount && type == ~0u; ++t) if (mr.memoryTypeBits & (1u << t)) type = t;
+    if (type == ~0u) return false;
+    VkMemoryAllocateInfo ai{}; ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO; ai.allocationSize = mr.size; ai.memoryTypeIndex = type;
+    if (a.vkAllocateMemory(vk->dev, &ai, nullptr, &o.mem) != VK_SUCCESS) return false;
+    if (a.vkBindImageMemory(vk->dev, o.img, o.mem, 0) != VK_SUCCESS) return false;
+    VkImageViewCreateInfo vi{}; vi.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO; vi.image = o.img; vi.viewType = VK_IMAGE_VIEW_TYPE_2D; vi.format = fmt; vi.subresourceRange = {aspect, 0, 1, 0, 1};
+    return a.vkCreateImageView(vk->dev, &vi, nullptr, &o.view) == VK_SUCCESS;
+  };
+  const VkImageUsageFlags cu = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+  if (!make_image(VK_FORMAT_R32_UINT, cu, VK_IMAGE_ASPECT_COLOR_BIT, d.img_col)) return fail("colour attachment");
+  if (!make_image(VK_FORMAT_R32_UINT, cu, VK_IMAGE_ASPECT_COLOR_BIT, d.img_attr)) return fail("attribute attachment");
+  if (!make_image(VK_FORMAT_R32_UINT, cu, VK_IMAGE_ASPECT_COLOR_BIT, d.img_z)) return fail("depth plane attachment");
+  if (!make_image(VK_FORMAT_D32_SFLOAT, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, VK_IMAGE_ASPECT_DEPTH_BIT, d.img_d)) return fail("depth buffer");
+  {
+    VkDescriptorImageInfo di[2]{};
+    di[0].imageView = d.img_col.view; di[0].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    di[1].imageView = d.img_attr.view; di[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    VkWriteDescriptorSet w[2]{};
+    for (u32 i = 0; i < 2; ++i) { w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[i].dstSet = d.set_in; w[i].dstBinding = i; w[i].descriptorCount = 1; w[i].descriptorType = VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT; w[i].pImageInfo = &di[i]; }
+    a.vkUpdateDescriptorSets(vk->dev, 2, w, 0, nullptr);
+  }
+
+  VkAttachmentDescription at[4]{};
+  for (u32 i = 0; i < 3; ++i) {
+    at[i].format = VK_FORMAT_R32_UINT; at[i].samples = VK_SAMPLE_COUNT_1_BIT;
+    at[i].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; at[i].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    at[i].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE; at[i].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    at[i].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED; at[i].finalLayout = VK_IMAGE_LAYOUT_GENERAL;
+  }
+  at[3] = at[0]; at[3].format = VK_FORMAT_D32_SFLOAT; at[3].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE; at[3].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+  VkAttachmentReference cr[3] = {{0, VK_IMAGE_LAYOUT_GENERAL}, {1, VK_IMAGE_LAYOUT_GENERAL}, {2, VK_IMAGE_LAYOUT_GENERAL}};
+  VkAttachmentReference ir[2] = {{0, VK_IMAGE_LAYOUT_GENERAL}, {1, VK_IMAGE_LAYOUT_GENERAL}};
+  VkAttachmentReference dr{3, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
+  VkSubpassDescription sp{};
+  sp.flags = d.roaa ? VK_SUBPASS_DESCRIPTION_RASTERIZATION_ORDER_ATTACHMENT_COLOR_ACCESS_BIT_EXT : 0u;
+  sp.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+  sp.inputAttachmentCount = 2; sp.pInputAttachments = ir;
+  sp.colorAttachmentCount = 3; sp.pColorAttachments = cr;
+  sp.pDepthStencilAttachment = &dr;
+  // The self-dependency that makes reading the attachment just written legal
+  // (and, without ordered access, the barrier the host puts between tail polygons).
+  VkSubpassDependency dep{};
+  dep.srcSubpass = 0; dep.dstSubpass = 0;
+  dep.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT; dep.dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+  dep.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT; dep.dstAccessMask = VK_ACCESS_INPUT_ATTACHMENT_READ_BIT;
+  dep.dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT;
+  VkRenderPassCreateInfo rpi{}; rpi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO; rpi.attachmentCount = 4; rpi.pAttachments = at; rpi.subpassCount = 1; rpi.pSubpasses = &sp; rpi.dependencyCount = 1; rpi.pDependencies = &dep;
+  if (a.vkCreateRenderPass(vk->dev, &rpi, nullptr, &d.rp) != VK_SUCCESS) return fail("render pass");
+  VkImageView views[4] = {d.img_col.view, d.img_attr.view, d.img_z.view, d.img_d.view};
+  VkFramebufferCreateInfo fbi{}; fbi.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO; fbi.renderPass = d.rp; fbi.attachmentCount = 4; fbi.pAttachments = views; fbi.width = W; fbi.height = H; fbi.layers = 1;
+  if (a.vkCreateFramebuffer(vk->dev, &fbi, nullptr, &d.fb) != VK_SUCCESS) return fail("framebuffer");
+
+  // Pipelines. Compile time is 13-45 ms each on the G52; six of them, at startup.
+  auto pipeline = [&](VkShaderModule fs, bool wbuf, bool depth_write, VkPipeline* out) {
+    VkPipelineShaderStageCreateInfo st[2]{};
+    st[0].sType = st[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    st[0].stage = VK_SHADER_STAGE_VERTEX_BIT; st[0].module = d.mod_tv; st[0].pName = "main";
+    st[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; st[1].module = fs; st[1].pName = "main";
+    VkPipelineVertexInputStateCreateInfo vin{}; vin.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+    VkPipelineInputAssemblyStateCreateInfo ia{}; ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO; ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    VkViewport vp{0.f, 0.f, static_cast<float>(W), static_cast<float>(H), 0.f, 1.f}; VkRect2D sc{{0, 0}, {W, H}};
+    VkPipelineViewportStateCreateInfo vps{}; vps.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO; vps.viewportCount = 1; vps.pViewports = &vp; vps.scissorCount = 1; vps.pScissors = &sc;
+    VkPipelineRasterizationStateCreateInfo rs{}; rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO; rs.polygonMode = VK_POLYGON_MODE_FILL; rs.cullMode = VK_CULL_MODE_NONE; rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE; rs.lineWidth = 1.f;
+    VkPipelineMultisampleStateCreateInfo ms{}; ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO; ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    VkPipelineDepthStencilStateCreateInfo dss{}; dss.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+    dss.depthTestEnable = VK_TRUE; dss.depthWriteEnable = depth_write ? VK_TRUE : VK_FALSE; dss.depthCompareOp = wbuf ? VK_COMPARE_OP_GREATER : VK_COMPARE_OP_LESS;
+    VkPipelineColorBlendAttachmentState cba[3]{}; for (auto& c : cba) c.colorWriteMask = 0xF;
+    VkPipelineColorBlendStateCreateInfo cbs{}; cbs.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO; cbs.attachmentCount = 3; cbs.pAttachments = cba;
+    if (d.roaa) cbs.flags = VK_PIPELINE_COLOR_BLEND_STATE_CREATE_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_BIT_EXT;
+    VkGraphicsPipelineCreateInfo gpi{}; gpi.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO; gpi.stageCount = 2; gpi.pStages = st;
+    gpi.pVertexInputState = &vin; gpi.pInputAssemblyState = &ia; gpi.pViewportState = &vps; gpi.pRasterizationState = &rs; gpi.pMultisampleState = &ms;
+    gpi.pDepthStencilState = &dss; gpi.pColorBlendState = &cbs; gpi.layout = d.layout_g; gpi.renderPass = d.rp;
+    return a.vkCreateGraphicsPipelines(vk->dev, VK_NULL_HANDLE, 1, &gpi, nullptr, out) == VK_SUCCESS;
+  };
+  for (int wb = 0; wb < 2; ++wb) {
+    if (!pipeline(d.mod_tof, wb != 0, true, &d.pipe_op[wb])) return fail("opaque pipeline");
+    for (int wr = 0; wr < 2; ++wr) if (!pipeline(d.mod_ttf, wb != 0, wr != 0, &d.pipe_tail[wb][wr])) return fail("tail pipeline");
+  }
+  return true;
+}
 
 std::unique_ptr<Raster> Raster::create(Device& dev, std::string* why) {
   auto set_why = [&](const char* m) { if (why) *why = m; return nullptr; };
@@ -147,6 +307,13 @@ std::unique_ptr<Raster> Raster::create(Device& dev, std::string* why) {
   d.vk = vk;
   d.api = vk->api;
   self->scale_ = 1;
+  // DS_VK_MODE: "tri" for the triangle path, "compute" for the compute
+  // passes. The triangle path is the default where the device can run it.
+  {
+    const Api& a0 = *d.api;
+    const bool tri_wanted = [] { const char* e = std::getenv("DS_VK_MODE"); return !e || std::strcmp(e, "compute") != 0; }();
+    d.tri = tri_wanted && dev.limits().graphics && a0.vkCreateGraphicsPipelines && a0.vkCreateRenderPass && a0.vkCmdCopyImageToBuffer;
+  }
 
   // The tile shape the pixel pipeline uses has to fit the device; check it
   // here so a part with a smaller limit fails at startup rather than in the
@@ -251,14 +418,16 @@ std::unique_ptr<Raster> Raster::create(Device& dev, std::string* why) {
     if (!pipeline(d.mod_raster_vis, &d.pipe_raster_vis)) return set_why("seeded raster pipeline failed to compile");
   }
 
-  VkDescriptorPoolSize psz{};
-  psz.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-  psz.descriptorCount = B_COUNT * 3;
+  VkDescriptorPoolSize psz[2]{};
+  psz[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  psz[0].descriptorCount = B_COUNT * 6;
+  psz[1].type = VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT;
+  psz[1].descriptorCount = 2;
   VkDescriptorPoolCreateInfo dpi{};
   dpi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-  dpi.maxSets = 3;
-  dpi.poolSizeCount = 1;
-  dpi.pPoolSizes = &psz;
+  dpi.maxSets = 7;
+  dpi.poolSizeCount = 2;
+  dpi.pPoolSizes = psz;
   if (a.vkCreateDescriptorPool(vk->dev, &dpi, nullptr, &d.pool) != VK_SUCCESS)
     return set_why("descriptor pool failed");
 
@@ -292,13 +461,29 @@ std::unique_ptr<Raster> Raster::create(Device& dev, std::string* why) {
     a.vkUpdateDescriptorSets(vk->dev, B_COUNT, w, 0, nullptr);
   }
 
+  if (d.tri) {
+    std::string treason;
+    if (!self->tri_setup(d, dev, &treason)) {
+      std::fprintf(stderr, "gpu raster: triangle path unavailable (%s); compute passes instead\n", treason.c_str());
+      d.tri = false;
+      // The compute path wants its bands back; the command buffers and
+      // fences below are sized from d.bands.
+      d.bands = band_count();
+      self->bands_ = d.bands;
+    } else {
+      // The host lays out the list as it does for the visibility pass: the
+      // real order-free prefix, and only the tail binned.
+      self->vis_ = true;
+    }
+  }
+
   VkCommandPoolCreateInfo cpi{};
   cpi.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
   cpi.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
   cpi.queueFamilyIndex = vk->qfam;
   if (a.vkCreateCommandPool(vk->dev, &cpi, nullptr, &d.cmdpool) != VK_SUCCESS)
     return set_why("command pool failed");
-  d.bands = band_count();
+  d.bands = d.tri ? 1 : band_count();
   self->bands_ = d.bands;
   for (int i = 0; i < 3; ++i) {
     VkCommandBufferAllocateInfo cbi{};
@@ -468,6 +653,86 @@ bool Raster::submit(u32 npoly, u32 nvert, u32 ntexels, const GpuFrame& frame) {
     if (d.timing) a.vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, d.qpool[back], q);
   };
 
+  if (d.tri) {
+    // One command buffer, one band: the render pass, then the three
+    // attachments copied into the compute path's buffers so out[], the
+    // depth and attribute planes, the final pass and the host all read what
+    // they always read.
+    VkCommandBuffer cb = d.cmd[back][0];
+    a.vkResetCommandBuffer(cb, 0);
+    VkCommandBufferBeginInfo bi{};
+    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    if (a.vkBeginCommandBuffer(cb, &bi) != VK_SUCCESS) return false;
+    if (d.timing) a.vkCmdResetQueryPool(cb, d.qpool[back], 0, d.qcount);
+    for (u32 q = 0; q < 6; ++q) stamp(cb, q);   // the compute passes' slots: empty intervals
+    if (!(d.post_frame && (st & 10) == 10)) { stamp(cb, 6); stamp(cb, 7); }
+    stamp(cb, 8);
+    const u32 W = 256 * scale_, H = 192 * scale_;
+    const bool wbuf = (frame.flags & DS_FF_WBUFFER) != 0u;
+    VkClearValue cv[4]{};
+    cv[0].color.uint32[0] = frame.clear_color;
+    cv[1].color.uint32[0] = frame.clear_attr;
+    cv[2].color.uint32[0] = frame.clear_depth;
+    cv[3].depthStencil.depth = wbuf ? 0.f : static_cast<float>(frame.clear_depth) / 16777215.f;
+    VkRenderPassBeginInfo rb{};
+    rb.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+    rb.renderPass = d.rp; rb.framebuffer = d.fb; rb.renderArea = {{0, 0}, {W, H}}; rb.clearValueCount = 4; rb.pClearValues = cv;
+    a.vkCmdBeginRenderPass(cb, &rb, VK_SUBPASS_CONTENTS_INLINE);
+    VkDescriptorSet gs[2] = {d.set_g[back], d.set_in};
+    a.vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, d.layout_g, 0, 2, gs, 0, nullptr);
+    a.vkCmdPushConstants(cb, d.layout_g, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(GpuFrame), &frame);
+    if ((st & 2) && frame.first_ordered) {
+      a.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, d.pipe_op[wbuf ? 1 : 0]);
+      a.vkCmdDraw(cb, 24, frame.first_ordered, 0, 0);
+    }
+    // The tail in runs of one depth-write setting; shadow masks and shadow
+    // polygons are not drawn (no stencil on this path yet).
+    const GpuPoly* gp = static_cast<const GpuPoly*>(d.polys.ptr);
+    const u32 skip = DS_PF_SHADOW_MASK | DS_PF_SHADOW;
+    for (u32 i = frame.first_ordered; (st & 2) && i < npoly;) {
+      if (gp[i].flags & skip) { ++i; continue; }
+      const bool wr = (gp[i].attr & 0x800u) != 0u;
+      u32 j = i + 1;
+      while (j < npoly && !(gp[j].flags & skip) && ((gp[j].attr & 0x800u) != 0u) == wr) ++j;
+      a.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, d.pipe_tail[wbuf ? 1 : 0][wr ? 1 : 0]);
+      if (d.roaa) a.vkCmdDraw(cb, 24, j - i, 0, i);
+      else for (u32 k = i; k < j; ++k) {
+        a.vkCmdDraw(cb, 24, 1, 0, k);
+        VkMemoryBarrier mb{}; mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER; mb.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT; mb.dstAccessMask = VK_ACCESS_INPUT_ATTACHMENT_READ_BIT;
+        a.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_DEPENDENCY_BY_REGION_BIT, 1, &mb, 0, nullptr, 0, nullptr);
+      }
+      i = j;
+    }
+    a.vkCmdEndRenderPass(cb);
+    // The attachments into the buffers: colour -> out[back], depth plane -> depth, attributes -> attr.
+    {
+      VkImageMemoryBarrier ib[3]{};
+      VkImage imgs[3] = {d.img_col.img, d.img_z.img, d.img_attr.img};
+      for (u32 i = 0; i < 3; ++i) {
+        ib[i].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER; ib[i].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT; ib[i].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        ib[i].oldLayout = VK_IMAGE_LAYOUT_GENERAL; ib[i].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        ib[i].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED; ib[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        ib[i].image = imgs[i]; ib[i].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+      }
+      a.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 3, ib);
+      VkBufferImageCopy rg{}; rg.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}; rg.imageExtent = {W, H, 1};
+      a.vkCmdCopyImageToBuffer(cb, d.img_col.img, VK_IMAGE_LAYOUT_GENERAL, vk_buf(d.out[back]), 1, &rg);
+      a.vkCmdCopyImageToBuffer(cb, d.img_z.img, VK_IMAGE_LAYOUT_GENERAL, vk_buf(d.depth), 1, &rg);
+      a.vkCmdCopyImageToBuffer(cb, d.img_attr.img, VK_IMAGE_LAYOUT_GENERAL, vk_buf(d.attr), 1, &rg);
+      VkMemoryBarrier mb{}; mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER; mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+      a.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    }
+    stamp(cb, 9);
+    if (a.vkEndCommandBuffer(cb) != VK_SUCCESS) return false;
+    a.vkResetFences(d.vk->dev, 1, &d.fence[0]);
+    VkSubmitInfo si{};
+    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &cb;
+    if (a.vkQueueSubmit(d.vk->queue, 1, &si, d.fence[0]) != VK_SUCCESS) return false;
+    d.in_flight |= 1u;
+  } else
   for (u32 b = 0; b < d.bands; ++b) {
     VkCommandBuffer cb = d.cmd[back][b];
     a.vkResetCommandBuffer(cb, 0);
@@ -585,6 +850,9 @@ bool Raster::submit(u32 npoly, u32 nvert, u32 ntexels, const GpuFrame& frame) {
   ++d.gen;                      // output() and the next frame name different buffers
   return true;
 }
+
+bool Raster::tri() const { return d_ && d_->tri; }
+bool Raster::tri_ordered() const { return d_ && d_->tri && d_->roaa; }
 
 const Raster::PassTimes& Raster::pass_times() const { return d_->times; }
 bool Raster::timing() const { return d_ && d_->timing; }
