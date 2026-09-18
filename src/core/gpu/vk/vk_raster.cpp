@@ -144,10 +144,17 @@ struct Raster::Impl {
   VkDescriptorSet       set_g[3] = {VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE}, set_in = VK_NULL_HANDLE;
   VkRenderPass          rp = VK_NULL_HANDLE;
   VkFramebuffer         fb = VK_NULL_HANDLE;
+  // No-copy form: LINEAR images aliased on out[i], depth and attr, so the
+  // render pass writes the buffers the host, the final pass and the
+  // downsample read. One colour image and framebuffer per out[] slot.
+  bool alias = false;
+  VkFramebuffer fb3[3] = {VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE};
+  VkDescriptorSet set_in3[3] = {VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE};
   VkPipeline            pipe_op[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};            // [wbuffer]
   VkPipeline            pipe_tail[2][2] = {{VK_NULL_HANDLE, VK_NULL_HANDLE}, {VK_NULL_HANDLE, VK_NULL_HANDLE}};   // [wbuffer][depth write]
   struct Img { VkImage img = VK_NULL_HANDLE; VkDeviceMemory mem = VK_NULL_HANDLE; VkImageView view = VK_NULL_HANDLE; };
   Img img_col, img_attr, img_z, img_d;
+  Img img_col3[3];
 
   u64  gen = 0;              // frames submitted; the buffer is gen % 3
   u32  bands = 1;
@@ -229,17 +236,61 @@ bool Raster::tri_setup(Impl& d, Device& dev, std::string* why) {
     return a.vkCreateImageView(vk->dev, &vi, nullptr, &o.view) == VK_SUCCESS;
   };
   const VkImageUsageFlags cu = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
-  if (!make_image(VK_FORMAT_R32_UINT, cu, VK_IMAGE_ASPECT_COLOR_BIT, d.img_col)) return fail("colour attachment");
-  if (!make_image(VK_FORMAT_R32_UINT, cu, VK_IMAGE_ASPECT_COLOR_BIT, d.img_attr)) return fail("attribute attachment");
-  if (!make_image(VK_FORMAT_R32_UINT, cu, VK_IMAGE_ASPECT_COLOR_BIT, d.img_z)) return fail("depth plane attachment");
+  // A LINEAR image bound to a buffer's memory: the render pass then writes
+  // the buffer itself and the three copies (1.9 ms a frame on the G52, a
+  // tiled-to-linear conversion) go away. Needs the format to render linear,
+  // the driver's row pitch to be ours, and a memory type both can share.
+  auto alias_image = [&](const Buffer& buf, Impl::Img& o) {
+    VkImageCreateInfo ii{}; ii.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO; ii.imageType = VK_IMAGE_TYPE_2D; ii.format = VK_FORMAT_R32_UINT;
+    ii.extent = {W, H, 1}; ii.mipLevels = 1; ii.arrayLayers = 1; ii.samples = VK_SAMPLE_COUNT_1_BIT; ii.tiling = VK_IMAGE_TILING_LINEAR;
+    ii.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT; ii.sharingMode = VK_SHARING_MODE_EXCLUSIVE; ii.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (a.vkCreateImage(vk->dev, &ii, nullptr, &o.img) != VK_SUCCESS) return false;
+    VkMemoryRequirements mr{}; a.vkGetImageMemoryRequirements(vk->dev, o.img, &mr);
+    VkImageSubresource sr{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0}; VkSubresourceLayout lay{}; a.vkGetImageSubresourceLayout(vk->dev, o.img, &sr, &lay);
+    if (lay.offset != 0 || lay.rowPitch != static_cast<VkDeviceSize>(W) * 4 || mr.size > buf.size) {
+      std::fprintf(stderr, "gpu raster: linear alias refused -- offset %llu pitch %llu (ours %u) size %llu (buffer %zu) typebits %x\n", (unsigned long long)lay.offset, (unsigned long long)lay.rowPitch, W * 4, (unsigned long long)mr.size, buf.size, mr.memoryTypeBits);
+      a.vkDestroyImage(vk->dev, o.img, nullptr); o.img = VK_NULL_HANDLE; return false;
+    }
+    if (a.vkBindImageMemory(vk->dev, o.img, reinterpret_cast<VkDeviceMemory>(buf.memory), 0) != VK_SUCCESS) { std::fprintf(stderr, "gpu raster: linear alias refused -- bind failed\n"); a.vkDestroyImage(vk->dev, o.img, nullptr); o.img = VK_NULL_HANDLE; return false; }
+    VkImageViewCreateInfo vi{}; vi.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO; vi.image = o.img; vi.viewType = VK_IMAGE_VIEW_TYPE_2D; vi.format = VK_FORMAT_R32_UINT; vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    return a.vkCreateImageView(vk->dev, &vi, nullptr, &o.view) == VK_SUCCESS;
+  };
+  {
+    VkFormatProperties fp{}; if (a.vkGetPhysicalDeviceFormatProperties) a.vkGetPhysicalDeviceFormatProperties(vk->phys, VK_FORMAT_R32_UINT, &fp);
+    const bool linear_ok = (fp.linearTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) != 0 && std::getenv("DS_VK_TRI_COPY") == nullptr;
+    if (std::getenv("DS_VK_LIST_EXT") && a.vkGetPhysicalDeviceFormatProperties) {
+      const VkFormat fmts[] = {VK_FORMAT_R32_UINT, VK_FORMAT_R8G8B8A8_UINT, VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_R32_SFLOAT, VK_FORMAT_R16G16_UINT};
+      const char* names[] = {"R32_UINT", "R8G8B8A8_UINT", "R8G8B8A8_UNORM", "B8G8R8A8_UNORM", "R32_SFLOAT", "R16G16_UINT"};
+      for (int i = 0; i < 6; ++i) { VkFormatProperties f2{}; a.vkGetPhysicalDeviceFormatProperties(vk->phys, fmts[i], &f2);
+        std::fprintf(stderr, "vk: %-15s linear features %08x (colour attachment %s, input %s)  optimal %08x\n", names[i], f2.linearTilingFeatures, (f2.linearTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) ? "yes" : "no", (f2.linearTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) ? "yes" : "no", f2.optimalTilingFeatures); }
+    }
+    d.alias = linear_ok;
+    if (d.alias) for (int i = 0; i < 3 && d.alias; ++i) d.alias = alias_image(d.out[i], d.img_col3[i]);
+    if (d.alias) d.alias = alias_image(d.attr, d.img_attr) && alias_image(d.depth, d.img_z);
+    if (!d.alias) {
+      for (auto& im : d.img_col3) { if (im.view) a.vkDestroyImageView(vk->dev, im.view, nullptr); if (im.img) a.vkDestroyImage(vk->dev, im.img, nullptr); im = Impl::Img{}; }
+      for (Impl::Img* im : {&d.img_attr, &d.img_z}) { if (im->view) a.vkDestroyImageView(vk->dev, im->view, nullptr); if (im->img) a.vkDestroyImage(vk->dev, im->img, nullptr); *im = Impl::Img{}; }
+    }
+  }
+  if (!d.alias) {
+    if (!make_image(VK_FORMAT_R32_UINT, cu, VK_IMAGE_ASPECT_COLOR_BIT, d.img_col)) return fail("colour attachment");
+    if (!make_image(VK_FORMAT_R32_UINT, cu, VK_IMAGE_ASPECT_COLOR_BIT, d.img_attr)) return fail("attribute attachment");
+    if (!make_image(VK_FORMAT_R32_UINT, cu, VK_IMAGE_ASPECT_COLOR_BIT, d.img_z)) return fail("depth plane attachment");
+  }
   if (!make_image(VK_FORMAT_D32_SFLOAT, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, VK_IMAGE_ASPECT_DEPTH_BIT, d.img_d)) return fail("depth buffer");
   {
-    VkDescriptorImageInfo di[2]{};
-    di[0].imageView = d.img_col.view; di[0].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-    di[1].imageView = d.img_attr.view; di[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-    VkWriteDescriptorSet w[2]{};
-    for (u32 i = 0; i < 2; ++i) { w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[i].dstSet = d.set_in; w[i].dstBinding = i; w[i].descriptorCount = 1; w[i].descriptorType = VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT; w[i].pImageInfo = &di[i]; }
-    a.vkUpdateDescriptorSets(vk->dev, 2, w, 0, nullptr);
+    VkDescriptorSetLayout l3[3] = {d.dsl_in, d.dsl_in, d.dsl_in};
+    VkDescriptorSetAllocateInfo dsa3{}; dsa3.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO; dsa3.descriptorPool = d.pool; dsa3.descriptorSetCount = 3; dsa3.pSetLayouts = l3;
+    if (a.vkAllocateDescriptorSets(vk->dev, &dsa3, d.set_in3) != VK_SUCCESS) return fail("input attachment sets");
+    for (int k = 0; k < 3; ++k) {
+      VkDescriptorImageInfo di[2]{};
+      di[0].imageView = d.alias ? d.img_col3[k].view : d.img_col.view; di[0].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+      di[1].imageView = d.img_attr.view; di[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+      VkWriteDescriptorSet w[2]{};
+      for (u32 i = 0; i < 2; ++i) { w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[i].dstSet = d.set_in3[k]; w[i].dstBinding = i; w[i].descriptorCount = 1; w[i].descriptorType = VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT; w[i].pImageInfo = &di[i]; }
+      a.vkUpdateDescriptorSets(vk->dev, 2, w, 0, nullptr);
+    }
+    d.set_in = d.set_in3[0];
   }
 
   VkAttachmentDescription at[4]{};
@@ -268,9 +319,12 @@ bool Raster::tri_setup(Impl& d, Device& dev, std::string* why) {
   dep.dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT;
   VkRenderPassCreateInfo rpi{}; rpi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO; rpi.attachmentCount = 4; rpi.pAttachments = at; rpi.subpassCount = 1; rpi.pSubpasses = &sp; rpi.dependencyCount = 1; rpi.pDependencies = &dep;
   if (a.vkCreateRenderPass(vk->dev, &rpi, nullptr, &d.rp) != VK_SUCCESS) return fail("render pass");
-  VkImageView views[4] = {d.img_col.view, d.img_attr.view, d.img_z.view, d.img_d.view};
-  VkFramebufferCreateInfo fbi{}; fbi.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO; fbi.renderPass = d.rp; fbi.attachmentCount = 4; fbi.pAttachments = views; fbi.width = W; fbi.height = H; fbi.layers = 1;
-  if (a.vkCreateFramebuffer(vk->dev, &fbi, nullptr, &d.fb) != VK_SUCCESS) return fail("framebuffer");
+  for (int k = 0; k < 3; ++k) {
+    VkImageView views[4] = {d.alias ? d.img_col3[k].view : d.img_col.view, d.img_attr.view, d.img_z.view, d.img_d.view};
+    VkFramebufferCreateInfo fbi{}; fbi.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO; fbi.renderPass = d.rp; fbi.attachmentCount = 4; fbi.pAttachments = views; fbi.width = W; fbi.height = H; fbi.layers = 1;
+    if (a.vkCreateFramebuffer(vk->dev, &fbi, nullptr, &d.fb3[k]) != VK_SUCCESS) return fail("framebuffer");
+  }
+  d.fb = d.fb3[0];
 
   // Pipelines. Compile time is 13-45 ms each on the G52; six of them, at startup.
   auto pipeline = [&](VkShaderModule fs, bool wbuf, bool depth_write, VkPipeline* out) {
@@ -331,8 +385,11 @@ std::unique_ptr<Raster> Raster::create(Device& dev, std::string* why) {
   // DS_VK_SCALE: the internal resolution of the triangle path (1..4). The
   // compute passes stay at 1.
   if (d.tri) if (const char* e = std::getenv("DS_VK_SCALE")) { const int s = std::atoi(e); if (s >= 1 && s <= 4) self->scale_ = static_cast<u32>(s); }
+  // A little past the plane: a LINEAR image aliased on the buffer (the
+  // triangle path's no-copy form) asks for slightly more than W*H*4 on
+  // libmali (198208 for 196608), and the aliasing is refused without it.
   const size_t out_bytes = static_cast<size_t>(256 * self->scale_) *
-                           static_cast<size_t>(192 * self->scale_) * sizeof(u32);
+                           static_cast<size_t>(192 * self->scale_) * sizeof(u32) + 16384;
 
   // The 3D layer, one per frame in flight. Access::CpuRead is not a
   // preference: the NEON composite reads this buffer directly.
@@ -438,10 +495,10 @@ std::unique_ptr<Raster> Raster::create(Device& dev, std::string* why) {
   psz[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
   psz[0].descriptorCount = B_COUNT * 6;
   psz[1].type = VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT;
-  psz[1].descriptorCount = 2;
+  psz[1].descriptorCount = 8;
   VkDescriptorPoolCreateInfo dpi{};
   dpi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-  dpi.maxSets = 7;
+  dpi.maxSets = 10;
   dpi.poolSizeCount = 2;
   dpi.pPoolSizes = psz;
   if (a.vkCreateDescriptorPool(vk->dev, &dpi, nullptr, &d.pool) != VK_SUCCESS)
@@ -490,7 +547,7 @@ std::unique_ptr<Raster> Raster::create(Device& dev, std::string* why) {
       // The host lays out the list as it does for the visibility pass: the
       // real order-free prefix, and only the tail binned.
       self->vis_ = true;
-      std::fprintf(stderr, "gpu raster: triangle path at %ux, ordered attachment access %s\n", self->scale_, d.roaa ? "on" : "OFF (a barrier per tail polygon)");
+      std::fprintf(stderr, "gpu raster: triangle path at %ux, ordered attachment access %s, %s\n", self->scale_, d.roaa ? "on" : "OFF (a barrier per tail polygon)", d.alias ? "attachments aliased on the buffers" : "attachments copied into the buffers");
     }
   }
 
@@ -694,9 +751,9 @@ bool Raster::submit(u32 npoly, u32 nvert, u32 ntexels, const GpuFrame& frame) {
     cv[3].depthStencil.depth = wbuf ? 0.f : static_cast<float>(frame.clear_depth) / 16777215.f;
     VkRenderPassBeginInfo rb{};
     rb.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-    rb.renderPass = d.rp; rb.framebuffer = d.fb; rb.renderArea = {{0, 0}, {W, H}}; rb.clearValueCount = 4; rb.pClearValues = cv;
+    rb.renderPass = d.rp; rb.framebuffer = d.fb3[back]; rb.renderArea = {{0, 0}, {W, H}}; rb.clearValueCount = 4; rb.pClearValues = cv;
     a.vkCmdBeginRenderPass(cb, &rb, VK_SUBPASS_CONTENTS_INLINE);
-    VkDescriptorSet gs[2] = {d.set_g[back], d.set_in};
+    VkDescriptorSet gs[2] = {d.set_g[back], d.set_in3[back]};
     a.vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, d.layout_g, 0, 2, gs, 0, nullptr);
     a.vkCmdPushConstants(cb, d.layout_g, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(GpuFrame), &frame);
     stamp(cb, 4);
@@ -726,6 +783,12 @@ bool Raster::submit(u32 npoly, u32 nvert, u32 ntexels, const GpuFrame& frame) {
       i = j;
     }
     a.vkCmdEndRenderPass(cb);
+    if (d.alias) {
+      // The attachments ARE the buffers: hand the writes to the host, the
+      // final pass and the downsample.
+      VkMemoryBarrier mb{}; mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER; mb.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT; mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+      a.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    } else {
     // The attachments into the buffers: colour -> out[back], depth plane -> depth, attributes -> attr.
     {
       VkImageMemoryBarrier ib[3]{};
@@ -741,11 +804,15 @@ bool Raster::submit(u32 npoly, u32 nvert, u32 ntexels, const GpuFrame& frame) {
       static const bool no_copy = std::getenv("DS_VK_TRI_NOCOPY") != nullptr;   // attribution: the pass without its copies (the output is stale)
       if (!no_copy) {
         a.vkCmdCopyImageToBuffer(cb, d.img_col.img, VK_IMAGE_LAYOUT_GENERAL, vk_buf(d.out[back]), 1, &rg);
-        a.vkCmdCopyImageToBuffer(cb, d.img_z.img, VK_IMAGE_LAYOUT_GENERAL, vk_buf(d.depth), 1, &rg);
-        a.vkCmdCopyImageToBuffer(cb, d.img_attr.img, VK_IMAGE_LAYOUT_GENERAL, vk_buf(d.attr), 1, &rg);
+        // The depth and attribute planes are read by the final pass alone.
+        if (d.post_frame) {
+          a.vkCmdCopyImageToBuffer(cb, d.img_z.img, VK_IMAGE_LAYOUT_GENERAL, vk_buf(d.depth), 1, &rg);
+          a.vkCmdCopyImageToBuffer(cb, d.img_attr.img, VK_IMAGE_LAYOUT_GENERAL, vk_buf(d.attr), 1, &rg);
+        }
       }
       VkMemoryBarrier mb{}; mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER; mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
       a.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    }
     }
     if (scale_ > 1 && !(d.post_frame && (st & 10) == 10)) {
       a.vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, d.layout, 0, 1, &d.set[back], 0, nullptr);

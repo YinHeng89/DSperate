@@ -386,3 +386,46 @@ into LINEAR images aliased on the buffers' memory (no copies), then the
 fragment stage. Timestamps inside the render pass read zero on this tiler,
 so attribution is by leaving parts out (`DS_VK_TRI_NOTAIL`, `_NOOPAQUE`,
 `_NOCOPY`, `DS_VK_TRI_FLAT`).
+
+## Aliased attachments, the overlay plane, and the 2x gate (2026-09-18)
+
+**No more copies.** The triangle path's colour, attribute and depth-plane
+attachments are LINEAR images bound to the memory of `out[i]`, `attr` and
+`depth` (`alias_image` in `tri_setup`; libmali renders R32_UINT linear, and
+asks 198208 bytes for a 196608-byte plane, so the buffers carry 16 KB of
+slack). Where the driver refuses, the copies remain (`DS_VK_TRI_COPY=1`
+forces them). Headless GPU ms per frame: Etrian 2.2 -> 1.9 at 1x, 4.2 at 2x;
+Golden Sun 6.6 -> 7.7 (noise across runs; its pass is fragment work). Same
+A/B residuals to the pixel.
+
+**The overlay plane.** `GpuPresent::overlay()` is the GPU tier's canvas
+(`Display::canvas`/`canvas_capable`): a host-cached plane per slot in the
+logical frame, cleared where the frame before last drew, blended last by
+`present.comp`. The OSD, toasts, the pause menu and the loader notice come
+out at panel resolution again on this tier, over the composited 3D screen.
+Two traps that cost a session: the overlays were sized at open, when the
+window is still 512x384, and `reimport()` after the fullscreen resize kept
+them -- a GPU read fault (dmesg `JOB_READ_FAULT`, `vkWaitForFences`
+returning DEVICE_LOST after 25 frames) that showed as a black picture with
+a flickering label; and `note_canvas_draw_all()` measured the canvas by the
+scanline path's frame size, zero here, so nothing was blended at all. The
+unscaled canvas path now notes only the label rectangles.
+
+**The gate at 1x and 2x** (device, dual window, GPU present, work median,
+both orders; `sw-oc` = software raster + untimed geometry):
+
+| scene | sw-oc | triangle 1x | triangle 2x |
+| --- | --- | --- | --- |
+| Golden Sun | 16.9 | **15.1-15.6** | 20.8 |
+| Spirit Tracks | 16.3-16.5 | 16.5-16.7 | 16.8 |
+| NSMB | 11.3-11.4 | 11.2-11.7 | 11.5 |
+| Etrian Odyssey | 7.6-7.7 | 7.6 | 14.1 |
+
+At 1x: never worse, Golden Sun 1.5 ms better, the three band-worker cores
+idle. At 2x NSMB is free and Etrian and Golden Sun pay 4-6.5 ms, all of it
+the compositor's fence wait at line 0: a 2x pass of 4-10 ms plus the 2x
+composite and present on the shared GPU cannot land in the ~3 ms between the
+dispatch at line 215 and the first display line. So `video.internal_res`
+stays a per-game choice for now; the plan's auto cap (drop to 1x after N
+over-budget fence waits) is the follow-up, and the fragment stage is the
+remaining GPU lever (flat shading measured 2.2 ms cheaper on Golden Sun).

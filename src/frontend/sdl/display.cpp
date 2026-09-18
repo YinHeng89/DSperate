@@ -523,7 +523,8 @@ void Display::draw_gpu(const u32* const fb[SCREENS]) {
   out_size(lw, lh);
   GpuPresent::View v[SCREENS];
   for (int i = 0; i < nviews_; ++i) v[i] = GpuPresent::View{views_[i].screen, views_[i].rect, views_[i].shown, !views_[i].direct};
-  gpu_->present(*out_, fb, v, nviews_, rot_, lw, lh, inset_alpha_, gpu_layer_, gpu_layer_bytes_, gpu_layer_scale_);
+  gpu_->present(*out_, fb, v, nviews_, rot_, lw, lh, inset_alpha_, gpu_layer_, gpu_layer_bytes_, gpu_layer_scale_, canvas_drawn_);
+  canvas_drawn_ = SDL_Rect{0, 0, 0, 0};
 }
 
 void Display::draw(const u32* const fb[SCREENS]) {
@@ -1099,12 +1100,25 @@ bool Display::canvas_capable() const {
   // false) and still has its overlay, and the frontend's unscaled path draws
   // on it just the same.
   if (disp_) return disp_->overlay_available();
+  if (gpu_) return true;   // the GPU present stage blends its own overlay plane
   // Everywhere else the canvas is the frame itself, so it needs one: the
   // SDL_Renderer path has no buffer of its own and keeps the DS-space path.
   return scaled_;
 }
 
 bool Display::canvas(CanvasView& out) const {
+  if (gpu_) {
+    int lw = 0, lh = 0;
+    if (!out_size(lw, lh)) return false;
+    u32* px = gpu_->overlay(lw, lh);
+    if (!px) return false;
+    // note_canvas_draw_all() measures the canvas by these, which the scanline
+    // path sets in take_frame(); here the canvas is the overlay plane.
+    const_cast<Display*>(this)->frame_w_ = lw;
+    const_cast<Display*>(this)->frame_h_ = lh;
+    out = CanvasView{px, static_cast<u32>(lw), lw, lh};
+    return true;
+  }
   if (disp_) {
     u32* px = nullptr; int pitch = 0, w = 0, h = 0;
     if (!disp_->overlay(px, pitch, w, h)) return false;

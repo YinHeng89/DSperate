@@ -51,8 +51,15 @@ public:
   // the planes are registered, screen 0 is composited here at S x from the
   // exported planes and that layer (shaders/composite.comp) instead of
   // taken from fb[0].
+  // `drawn`: the rectangle of the overlay the frontend drew this frame (see overlay()).
   bool present(ScanoutOut& out, const u32* const fb[2], const View* views, int nviews, int rot, int lw, int lh, u8 inset_alpha,
-               u64 hires = 0, size_t hires_bytes = 0, u32 scale = 1);
+               u64 hires = 0, size_t hires_bytes = 0, u32 scale = 1, SDL_Rect drawn = SDL_Rect{0, 0, 0, 0});
+  // The canvas the frontend draws its overlays on (the OSD, the pause menu,
+  // notices) for the coming frame, in the logical frame at `lw` x `lh`
+  // pixels, pitch `lw`, 0xAARRGGBB with the alpha honoured. Host-cached
+  // memory (the drawing reads it back). Cleared where the frame before last
+  // drew, so the caller only paints; present() takes the rectangle drawn.
+  u32* overlay(int lw, int lh);
   // The planes the core's 2D engine writes for the composite (Gpu::LayerExport
   // takes exactly these); one set for the process, allocated by the first
   // stage opened. Null pointers when there is no stage.

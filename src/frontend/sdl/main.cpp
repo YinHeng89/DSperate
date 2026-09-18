@@ -4421,11 +4421,14 @@ sdl_ready:
         const bool osd_on_canvas = display.canvas_capable() && want_osd && display.canvas(ocv);
         if (osd_on_canvas) {
           const ds::sdl::Canvas c{ocv.px, ocv.pitch, ocv.w, ocv.h};
-          if (slot_osd) draw_label(c, slot_text.c_str(), false);
-          if (fps_field) draw_label(c, fps_text.c_str(), true);
-          if (toast_on()) draw_toast_on(c);
-          if (menu_over_live) menu.draw(c);
-          display.note_canvas_draw_all();
+          // Only what was drawn: on the GPU tier the noted area is cleared
+          // and flushed again next time round, and a whole 1024x768 plane
+          // a frame is a millisecond the labels do not need.
+          const auto note = [&](const ds::sdl::Rect& r) { display.note_canvas_draw(r.x, r.y, r.w, r.h); };
+          if (slot_osd) note(draw_label(c, slot_text.c_str(), false));
+          if (fps_field) note(draw_label(c, fps_text.c_str(), true));
+          if (toast_on()) { draw_toast_on(c); display.note_canvas_draw_all(); }
+          if (menu_over_live) { menu.draw(c); display.note_canvas_draw_all(); }
         }
         // After the cursor: when the overlays are on the bottom screen this
         // copies the frame that already has the crosshair in it, so both show.
