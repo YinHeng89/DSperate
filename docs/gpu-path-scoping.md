@@ -558,6 +558,11 @@ frames 240 and 246 -- so the shadows are not the trigger either; the clean
 runs above were luck or a time-varying condition. What is established: the
 job thread submits within 1 ms, the fence completes 0.2-0.95 s late, no
 kernel message, no memory-reclaim activity, both governors, any depth
-format, with and without ordered attachment access. Next step is a Mali
+format, with and without ordered attachment access. Single window (no
+`--dual-window`) at 2x: 4 runs, stalls 0, 0, 2, 2 -- and the two stalling
+runs stalled at the SAME frames (308, then ~1120): a run is either in a
+stalling state from the start or it is not, and in that state the stalls
+land on the same frames. Not the dual-window sync. Next step is a Mali
 kernel trace (kbase ftrace events / debugfs instrumentation) around a
-stall to see whether the job is queued, soft-stopped or replayed.
+stall to see whether the job is queued, soft-stopped or replayed, and a
+look at what differs per process start (GPU context, memory placement).
