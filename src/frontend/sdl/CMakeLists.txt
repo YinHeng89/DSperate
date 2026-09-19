@@ -2,6 +2,14 @@
 add_executable(dsperate main.cpp config.cpp display.cpp audio.cpp input.cpp menu.cpp settings.cpp lid.cpp mic_alsa.cpp loader_cart.cpp dmaheap.cpp
   display_drm.cpp display_disp.cpp display_fbdev.cpp)
 target_link_libraries(dsperate PRIVATE dsperate_core ${SDL2_LIBRARIES} ${CMAKE_DL_LIBS})
+# --version: the tag and commit, restamped on every build (cmake/version.cmake).
+# Its own translation unit, so a new commit recompiles nothing else.
+set(_ds_version_cpp ${CMAKE_CURRENT_BINARY_DIR}/version.cpp)
+add_custom_target(dsperate_version
+  COMMAND ${CMAKE_COMMAND} -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${_ds_version_cpp} -DDSPERATE_VERSION=${DSPERATE_VERSION} -P ${CMAKE_SOURCE_DIR}/cmake/version.cmake
+  BYPRODUCTS ${_ds_version_cpp} VERBATIM)
+target_sources(dsperate PRIVATE ${_ds_version_cpp})
+add_dependencies(dsperate dsperate_version)
 # RetroAchievements, when it is built at all. The frontend is the only consumer;
 # with DSPERATE_CHEEVOS off the macro is undefined and main.cpp compiles as it
 # did before any of this existed.

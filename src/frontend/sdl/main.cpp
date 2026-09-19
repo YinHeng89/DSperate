@@ -70,6 +70,10 @@
 #include <random>
 #include <vector>
 
+// cmake/version.cmake: the nearest tag and the short commit hash.
+extern const char* const kDsperateVersion;
+extern const char* const kDsperateCommit;
+
 namespace {
 
 // Startup chatter and hotkey echoes: useful at a terminal, pure noise on a
@@ -94,6 +98,7 @@ const char* kUsage =
     "  --config F      settings file (default ~/.config/dsperate/dsperate.ini; every\n"
     "                  option below has a key there; games/<rom name>.ini and games/<CODE>.ini\n"
     "                  override it per game, the filename one winning)\n"
+    "  --version       print the release tag and the commit this was built from, and exit\n"
     "  --write-config F  write the default settings file (all keys commented) to F and exit\n"
     "  --dsi-mode      boot a DSi from its NAND (boot2, then the DSi Launcher) instead of the DS menu; no\n"
     "                  ROM. Needs --bios9i F --bios7i F (the DSi BIOS pair) and --dsi-nand F (a nand.bin\n"
@@ -1256,6 +1261,7 @@ int main(int argc, char** argv) {
     else if (flag("--no-aa")) cli.set("video.aa", "off");
     // The two halves of Timing OC separately: they pull in opposite directions
     // on Golden Sun, so the bundled flag reads flat while neither half is.
+    else if (flag("--version")) { std::printf("DSperate %s (%s)\n", kDsperateVersion, kDsperateCommit); return 0; }
     else if (flag("--help")) { std::fputs(kUsage, stderr); return 0; }
     else if (argv[i][0] == '-' && argv[i][1] == '-') { std::fprintf(stderr, "unknown option %s\n", argv[i]); std::fputs(kUsage, stderr); return 2; }
     else rom = argv[i];
