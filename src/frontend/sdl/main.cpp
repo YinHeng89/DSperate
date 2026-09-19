@@ -4044,6 +4044,13 @@ sdl_ready:
           }
           display.draw(fb);
           if (dual_window) display2.draw(fb);
+          // The GPU present stage pipelines a frame deep: present() submits
+          // this frame and hands its buffer to the tier only when the NEXT
+          // frame is presented -- which, paused, is the next menu change. So
+          // the menu came up one press late until it was pushed here, the
+          // same as the lazily flipping tier above.
+          display.flush();
+          if (dual_window) display2.flush();
         }
       }
 #if DSPERATE_CHEEVOS
