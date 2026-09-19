@@ -15,11 +15,13 @@ layout(std430, binding = 5) readonly buffer EdgeIn { uint ein[]; };     // the r
 // The smooth filter's edge record rides in the output's alpha byte, which
 // nothing downstream used: bit 0 right run (else left), bit 1 X-major, bit 2
 // covered half is the top, bits 3-7 coverage. 0xFF = no edge (a record's
-// coverage is never 31, so no edge encodes to 0xFF).
+// coverage is never 31, so no edge encodes to 0xFF). The plane's word
+// (post.comp) holds the unblended pixel in bits 0-22 and the record above.
 uint edge_byte(uint e) {
-  if ((e & 3u) == 0u || ((e >> 8) & 31u) == 31u) return 0xFFu;
-  return ((e & 2u) != 0u ? 1u : 0u) | ((e & 0x2000u) != 0u ? 2u : 0u) | ((e & 0x4000u) != 0u ? 4u : 0u) | (((e >> 8) & 31u) << 3);
+  if ((e & 0x80000000u) == 0u) return 0xFFu;
+  return ((e >> 28) & 7u) | (((e >> 23) & 31u) << 3);
 }
+uint edge_pixel(uint e) { return (e & 0x3Fu) | (((e >> 6) & 0x3Fu) << 8) | (((e >> 12) & 0x3Fu) << 16) | (((e >> 18) & 0x1Fu) << 24); }
 layout(push_constant) uniform P { uint scale; uint fb_base; uint dispcnt3d; uint flags; } pc;
 
 const uint P_TOP = 0u, P_SECOND = 49152u, P_META = 98304u, P_WIN = 147456u, P_LINE = 196608u, P_MB = 196800u;
@@ -57,8 +59,15 @@ void main() {
   uint l = pl[P_LINE + ny], bldcnt = l & 0xFFFFu, eva = (l >> 16) & 0x1Fu, evb = (l >> 21) & 0x1Fu, evy = (l >> 26) & 0x1Fu;
   if (kind == K_3D) {
     uint px3 = l3d[p.y * W + p.x];
-    if (((px3 >> 24) & 0x1Fu) == 0u) { a = b; kind = 0u; t1 = t2 >> 8; }   // transparent at this subpixel: the layer beneath
-    else { a = px3; if ((pc.flags & 1u) != 0u) e = ein[p.y * W + p.x]; }
+    if ((pc.flags & 1u) != 0u) {
+      // An edge pixel of the smooth filter: the polygon's own pixel, not the
+      // anti-aliased blend the layer holds; the filter gives the outside part
+      // of the pixel to the neighbour at panel resolution.
+      uint rec = ein[p.y * W + p.x];
+      if ((rec & 0x80000000u) != 0u) { px3 = edge_pixel(rec); e = rec; }
+    }
+    if (((px3 >> 24) & 0x1Fu) == 0u) { a = b; kind = 0u; t1 = t2 >> 8; e = 0u; }   // transparent at this subpixel: the layer beneath
+    else a = px3;
   }
   uint effect = (bldcnt >> 6) & 3u;
   uint o = a;

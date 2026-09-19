@@ -903,3 +903,17 @@ was reverted.
 
 P4 status: LCD grid and the smooth-3D edge filter done; bilinear, the box
 filter and chunky remain (chunky cells are still CPU-only).
+
+### Smooth 3D: the layer keeps its AA blend (2026-09-19)
+
+The user saw the picture looking "non-composited" with the filter on. The
+raster's final pass had been skipping the anti-aliasing blend whenever the
+filter was on, so the layer the CPU consumes -- the CPU composite of any
+frame the present stage does not composite, display capture, save states --
+carried hard, unblended edges. Now the edge plane holds the UNBLENDED pixel
+(RGB666 + alpha, 23 bits) beside its record, the final pass blends the layer
+as it always did (stage 2 runs again), and composite.comp substitutes the
+plane's pixel for the layer's at edge pixels. Verified on the device under
+the user's own config with --dual-window: frames the display does not
+composite are now identical with the filter on and off; composited frames
+differ by the outlines only; no measurable cost change.

@@ -1335,13 +1335,13 @@ bool Raster::submit(u32 npoly, u32 nvert, u32 ntexels, const GpuFrame& frame_in)
                            0, 1, &mb, 0, nullptr, 0, nullptr);
     a.vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, d.layout, 0, 1, &d.set[back], 0, nullptr);
     GpuFrame fpost = frame; if (aa_frame) fpost.flags |= DS_FF_AA; if (aa_fast) fpost.flags |= DS_FF_AAFAST;
-    if (d.smooth) fpost.flags2 |= DS_FF2_SMOOTH;   // stage 1 writes the edge plane and the unblended pixel; no stage 2
+    if (d.smooth) fpost.flags2 |= DS_FF2_SMOOTH;   // stage 1 also writes the edge plane (the unblended pixel and its record)
     a.vkCmdPushConstants(cb, d.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(GpuFrame), &fpost);
     stamp(cb, 6);
     a.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, d.pipe_post);
     const u32 px = 256 * scale_ * 192 * scale_;
     a.vkCmdDispatch(cb, (px + 63) / 64, 1, 1);
-    if (aa_fast && !d.smooth) {
+    if (aa_fast) {
       // Stage 2: the neighbour blend, reading stage 1's scratch plane.
       VkMemoryBarrier mb2{}; mb2.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER; mb2.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT; mb2.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
       a.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb2, 0, nullptr, 0, nullptr);

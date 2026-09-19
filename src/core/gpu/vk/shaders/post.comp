@@ -26,7 +26,14 @@ layout(std430, binding = 7)          buffer Attr  { uint abuf[]; };
 layout(std430, binding = 17)          buffer UCol  { uint ucol[]; };    // the pixel underneath (the exact anti-aliasing pass, DS_FF_AA); the scratch plane of the fast one
 layout(std430, binding = 18) readonly buffer UAttr { uint uattr[]; };
 layout(std430, binding = 19) readonly buffer UZ    { uint uz[]; };
-layout(std430, binding = 20) writeonly buffer Edge { uint edge[]; };   // the smooth filter's edge plane (DS_FF2_SMOOTH): attribute bits 0-3, 8-14 of edge pixels, 0 elsewhere
+// The smooth filter's edge plane (DS_FF2_SMOOTH), for the present stage's
+// composite alone: per edge pixel the UNBLENDED pixel (RGB666 in bits 0-17,
+// alpha in 18-22) and its edge record (coverage 23-27, right run 28, X-major
+// 29, covered half is the top 30), bit 31 set; 0 elsewhere. The layer itself
+// (fb) still gets the anti-aliasing blend: the CPU composite, display
+// capture and save states read it, and a frame the present stage does not
+// composite would otherwise show hard edges.
+layout(std430, binding = 20) writeonly buffer Edge { uint edge[]; };
 layout(push_constant) uniform Push { GpuFrame f; } pc;
 
 // 15-bit colour channel -> 6 bits: bits 1-5 of the field, +1 when non-zero.
@@ -155,11 +162,13 @@ void main() {
   }
 
   if (fast && (pc.f.flags2 & DS_FF2_SMOOTH) != 0u) {
-    // The smooth filter resolves the edge itself, at panel resolution: the
-    // pixel stays unblended (no stage 2) and its edge record goes to the plane.
-    edge[i] = ((attr & 0xFu) != 0u && ((attr >> 8) & 0x1Fu) != 0x1Fu) ? (attr & 0x7F0Fu) : 0u;
-    fb[i] = color;
-    return;
+    // The smooth filter resolves the edge itself, at panel resolution, from
+    // the unblended pixel and its record; stage 2 still blends the layer.
+    uint cov = (attr >> 8) & 0x1Fu;
+    edge[i] = ((attr & 0xFu) != 0u && cov != 0x1Fu)
+      ? ((color & 0x3Fu) | (((color >> 8) & 0x3Fu) << 6) | (((color >> 16) & 0x3Fu) << 12) | (((color >> 24) & 0x1Fu) << 18) |
+         (cov << 23) | (((attr & 2u) != 0u) ? 1u << 28 : 0u) | (((attr & 0x2000u) != 0u) ? 1u << 29 : 0u) | (((attr & 0x4000u) != 0u) ? 1u << 30 : 0u) | 0x80000000u)
+      : 0u;
   }
   if (fast) { ucol[i] = color; return; }   // stage 1 of the fast anti-aliasing: stage 2 reads the neighbours from here
   fb[i] = color;
