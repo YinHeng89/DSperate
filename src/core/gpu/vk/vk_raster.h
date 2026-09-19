@@ -55,6 +55,7 @@ public:
   // not write one), and whether the filter is on (DS_VK_SMOOTH3D at creation).
   u64 output_edge_handle() const;
   bool smooth() const;
+  void set_smooth(bool on);   // live (the menu); 1x only -- at S >= 2 it stays off
 
   // Whether the order-free prefix goes through the visibility pass
   // (vis.comp / resolve.comp) rather than the ordered loop. Needs 64-bit

@@ -24,6 +24,7 @@ const Choice kCpuOc[] = {{"false", "OFF"}, {"underclock", "UNDERCLOCK"}, {"overc
 const Choice kLimiter[] = {{"auto", "CONSOLE (59.8)"}, {"30", "30"}, {"60", "60"}, {"120", "120"},
                            {"144", "144"}, {"240", "240"}, {"off", "UNLIMITED"}};
 const Choice kIntScale[] = {{"off", "OFF"}, {"under", "UNDER"}, {"over", "OVER"}};
+const Choice kIntRes[]   = {{"1", "1X"}, {"2", "2X"}, {"3", "3X"}, {"4", "4X"}};
 const Choice kSeam[]     = {{"dark", "DARK"}, {"blend", "BLEND"}, {"blend_linear", "BLEND LINEAR"}};
 // The file's own words on the left. "mean" is the ordinary cell and reads as
 // DEFAULT; the rest are named for what they do rather than how they do it.
@@ -169,6 +170,16 @@ const Setting kVideoSettings[] = {
           "RASTERISE 3D ON THE GPU WHERE THE FRAME ALLOWS IT. NEEDS VULKAN"),
   boolean("video.gpu_defer", "GPU 3D DEFER", "false", FlagDeferred, Dep::None,
           "SHOW THE GPU 3D LAYER A FRAME LATE SO NOTHING WAITS FOR IT. ADDS A FRAME OF LAG"),
+  pick("video.internal_res", "GPU 3D RESOLUTION", kIntRes, 4, "1", FlagRestart, Dep::GpuRaster,
+       "DRAW 3D AT A MULTIPLE OF THE DS'S RESOLUTION. 2X COSTS MOST OF A FRAME ON HEAVY SCENES"),
+  // The present stage reopens with the display (Host::reopen), like the
+  // scaler effects above it.
+  boolean("video.gpu_present", "GPU PRESENT", "false", FlagDeferred, Dep::None,
+          "SCALE AND LAY OUT THE SCREENS ON THE GPU. NEEDS VULKAN AND A DIRECT-TO-PANEL DISPLAY"),
+  // Live: the raster flips a flag and the present stage reads the edge plane
+  // when it is handed one.
+  boolean("video.smooth3d", "SMOOTH 3D EDGES", "false", FlagLive, Dep::GpuPath,
+          "REBUILD POLYGON EDGES AT PANEL RESOLUTION FROM THE DS'S OWN COVERAGE. 2D STAYS SHARP"),
   boolean("video.fps", "FPS COUNTER", "false", FlagLive, Dep::None,
           "FRAMES PER SECOND IN THE CORNER OF THE SCREEN"),
   boolean("video.fullscreen", "FULLSCREEN", "false", FlagDeferred, Dep::Windowed, nullptr),

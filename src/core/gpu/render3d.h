@@ -92,6 +92,10 @@ public:
   // makes it opt-in (video.aa), the headless frontend has --no-aa for measurement.
   void set_aa(bool on) { aa_ = on; }
   bool aa() const { return aa_; }
+  // The smooth-3D present filter (video.smooth3d): the GPU raster writes its
+  // edge plane. Live; kept for a raster opened later.
+  void set_smooth3d(bool on);
+  bool smooth3d() const { return smooth3d_; }
 
   // The GPU 3D raster (docs/gpu-raster-scoping.md, P1). Off unless a frontend
   // asks for it, and it may decline: no libvulkan, no device, no memory type
@@ -409,7 +413,8 @@ private:
 
   const Gpu3D* gx_ = nullptr;
   const RenderState* rs_ = nullptr;
-  bool aa_ = true, aa_rendered_ = true;   // aa_rendered_: the setting the kept frame was drawn with
+  bool aa_ = true, aa_rendered_ = true;
+  bool smooth3d_ = false;   // aa_rendered_: the setting the kept frame was drawn with
   // DISP3DCNT as the raster sees it this frame: rs_->dispcnt with bit 4
   // cleared when AA is off. Every AA decision in the raster reads this, so
   // one place decides. With the bit clear the whole under layer (the second

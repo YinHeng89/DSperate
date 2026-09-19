@@ -3736,6 +3736,7 @@ bool Renderer3D::set_gpu_raster(bool on, std::string* why) {
     if (!vk_dev_) { if (why) *why = reason; return false; }
   }
   vk_raster_ = vk::Raster::create(*vk_dev_, &reason);
+  if (vk_raster_) vk_raster_->set_smooth(smooth3d_);
   if (!vk_raster_) { if (why) *why = reason; vk_dev_.reset(); return false; }
   if (!vk_raster_->ready()) {
     // The backend built its buffers but cannot draw yet. Keep it -- it is
@@ -3852,6 +3853,8 @@ u32 Renderer3D::gpu_bands() const {
   return 0;
 #endif
 }
+
+void Renderer3D::set_smooth3d(bool on) { smooth3d_ = on; if (vk_raster_) vk_raster_->set_smooth(on); }
 
 bool Renderer3D::gpu_raster_active() const {
   return vk_raster_ != nullptr && vk_raster_->ready();

@@ -618,8 +618,8 @@ std::unique_ptr<Raster> Raster::create(Device& dev, std::string* why) {
     // is ~0.15 ms of GPU, the strided gather lands on the thread that reads
     // the line -- st 2x +0.5 ms median. Opt-in for a host with CPU to spare.
     d.cpu_down = self->scale_ > 1 && std::getenv("DS_VK_CPU_DOWNSAMPLE");
-    d.smooth = self->scale_ == 1 && std::getenv("DS_VK_SMOOTH3D") != nullptr && std::strcmp(std::getenv("DS_VK_SMOOTH3D"), "0") != 0;
-    d.edge[i] = dev.alloc(d.smooth ? out_bytes : 4096, Access::CpuWrite);   // GPU-only; a token binding when the filter is off
+    d.smooth = self->scale_ == 1 && std::getenv("DS_VK_SMOOTH3D") != nullptr && std::strcmp(std::getenv("DS_VK_SMOOTH3D"), "0") != 0;   // the frontend sets it through set_smooth; the environment is the override
+    d.edge[i] = dev.alloc(out_bytes, Access::CpuWrite);   // GPU-only; allocated whether or not the filter is on, so the menu can turn it on
     if (!d.edge[i]) return set_why("edge plane allocation failed");
     if (i == 0) {
       d.order = dev.alloc(sizeof(u32) * DS_MAX_POLYS, Access::CpuWrite); if (!d.order) return set_why("order buffer allocation failed");
@@ -1495,5 +1495,6 @@ u64 Raster::output_hires_handle() const { return d_->out[(d_->gen + 2) % 3].hand
 size_t Raster::output_hires_bytes() const { return d_->out[0].size; }
 u64 Raster::output_edge_handle() const { const u32 s = (d_->gen + 2) % 3; return d_->edge_valid[s] ? d_->edge[s].handle : 0; }
 bool Raster::smooth() const { return d_->smooth; }
+void Raster::set_smooth(bool on) { if (std::getenv("DS_VK_SMOOTH3D")) return; d_->smooth = on && scale_ == 1; }
 
 } // namespace ds::gpu::vk

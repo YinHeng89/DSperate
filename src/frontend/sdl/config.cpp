@@ -268,6 +268,11 @@ R"(# DSperate settings. Command-line flags override this file. Two files next
                                 # (2x2 DS pixels) | N (or the nearest size below N that divides the screen)
 # aa = false                    # 3D edge anti-aliasing as the hardware does it. Off is cheaper and is
                                 # what most emulators show
+# gpu_raster = false            # draw 3D on the GPU (Vulkan) where the frame allows it; the software
+                                # raster stays the exact reference and takes the frames the GPU declines
+# internal_res = 1              # with gpu_raster: 3D drawn at 1..4 times the DS's resolution (read at start)
+# gpu_present = false           # scale, lay out and rotate the screens on the GPU, straight into the
+                                # panel's buffer (Vulkan dma-buf import; needs a direct-to-panel display)
 # smooth3d = false              # with gpu_raster and gpu_present: polygon edges rebuilt at the panel's
                                 # resolution from the DS's own edge coverage, so a 4x upscale shows a
                                 # slanted edge instead of a four-pixel staircase. Textures, interiors

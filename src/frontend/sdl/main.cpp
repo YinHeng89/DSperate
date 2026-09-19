@@ -1677,8 +1677,8 @@ int main(int argc, char** argv) {
   // (docs/gpu-path-scoping.md P1); Display falls back to the scanline
   // scaler when the tier has no dma-buf or the driver cannot import one.
   { const std::string g = cfg.str("video.gpu_present"); vs.gpu_present = g == "true" || g == "on" || g == "1"; }
-  // The smooth-3D filter (P4): needs the GPU raster and the GPU present stage.
-  vs.smooth3d = cfg.flag("video.smooth3d", false) && cfg.flag("video.gpu_raster", false);
+  // The smooth-3D filter (P4): the display passes the raster's edge plane on; without the GPU raster there is none.
+  vs.smooth3d = cfg.flag("video.smooth3d", false);
 
   // The fbdev tier (display_fbdev.h) owns fb0 the same way. auto takes it
   // only where SDL2 was built with the mali video driver -- the BaseOS
@@ -2023,6 +2023,7 @@ sdl_ready:
   nds.gpu3d.set_geometry_worker(timing_oc || cfg.flag("emu.gx_worker", false) || cpu_oc_mode(cfg.str("emu.cpu_tuning")) != 0);   // DS_GX_THREAD: 0 never, 1 per-frame shape controller, 2 always
   nds.io.set_cart_bulk(cfg.flag("emu.fast_load", false));   // may introduce accuracy issues, see config.cpp
   nds.gpu3d.renderer().set_aa(cfg.flag("video.aa", false));   // opt-in: see config.cpp
+  nds.gpu3d.renderer().set_smooth3d(cfg.flag("video.smooth3d", false));   // the smooth-3D filter (P4); the raster picks it up when it opens below
   // The GPU 3D raster, opt-in and allowed to decline. Deferred rather than
   // live because it opens a Vulkan device, and the reason it could not is
   // worth printing once at startup rather than swallowing: on a device with
@@ -2031,8 +2032,6 @@ sdl_ready:
     // video.internal_res: the triangle path's internal resolution (1..4). The
     // raster reads it as DS_VK_SCALE at creation; an explicit environment wins.
     if (!std::getenv("DS_VK_SCALE")) { const int ir = std::atoi(cfg.str("video.internal_res", "1").c_str()); if (ir >= 2 && ir <= 4) setenv("DS_VK_SCALE", std::to_string(ir).c_str(), 1); }
-    // video.smooth3d: the raster writes its edge plane (DS_VK_SMOOTH3D at creation, the same way).
-    if (!std::getenv("DS_VK_SMOOTH3D") && cfg.flag("video.smooth3d", false)) setenv("DS_VK_SMOOTH3D", "1", 1);
     std::string why;
     const bool on = nds.gpu3d.renderer().set_gpu_raster(true, &why);
     std::fprintf(stderr, "gpu raster: %s%s%s\n", on ? "on" : "OFF -- software raster",
@@ -2966,6 +2965,15 @@ sdl_ready:
         return (net_live && *net_live) ? "NOT DURING A NETWORK SESSION" : "";
       case ds::sdl::Dep::ShortcutsPath:
         return shortcuts_dir(cfg).empty() ? "NEEDS PATHS.DSI_SHORTCUTS OR PATHS.GAMES" : "";
+      case ds::sdl::Dep::GpuRaster:
+        return flag("video.gpu_raster", false) ? "" : "ONLY WITH GPU 3D RASTER ON";
+      case ds::sdl::Dep::GpuPath:
+        // The session, not the file: the raster and the present stage may each
+        // have declined (no Vulkan, no dma-buf), and the row only works when
+        // both are actually up.
+        if (!nds.gpu3d.renderer().gpu_raster_active()) return "NEEDS THE GPU 3D RASTER RUNNING";
+        if (!display.gpu_present()) return "NEEDS GPU PRESENT RUNNING";
+        return cfg.str("video.internal_res", "1") == "1" ? "" : "ONLY AT 1X GPU 3D RESOLUTION";
       }
       return "";
     }
@@ -3049,6 +3057,8 @@ sdl_ready:
     if (is("emu.ff_skip")) { ff_skip = std::atoi(v.c_str()); return; }
     if (is("emu.autosave")) { autosave = on; return; }
     if (is("video.aa")) { nds.gpu3d.renderer().set_aa(on); return; }
+    if (is("video.smooth3d")) { nds.gpu3d.renderer().set_smooth3d(on); vs.smooth3d = on; display.set_smooth3d(on); display2.set_smooth3d(on); return; }
+    if (is("video.gpu_present")) { host.reopen_wanted = true; return; }
     if (is("video.fps")) { fps_osd = on; if (on && !show_fps) { fps_mark = SDL_GetPerformanceCounter(); emu_ticks = draw_ticks = wait_ticks = 0; } return; }
     if (is("video.pip_touch_hold")) { pip_touch_hold = std::max(0, std::atoi(v.c_str())); return; }
     // Everything below moves the picture about, so it is only noted here and
