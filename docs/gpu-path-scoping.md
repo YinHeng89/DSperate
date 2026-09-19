@@ -966,3 +966,15 @@ hi-res picture. TRAP found on the way: the push constant's scale was only
 sent with a composited frame, so a pass-through frame divided by zero in
 the shader and read off the end of the buffer (JOB_READ_FAULT, device
 lost); the scale now goes with every frame.
+
+### Smooth 3D: coverage at panel resolution (2026-09-19)
+
+With the edge in the right place the user still saw it "basically the
+same": each panel pixel was decided all-or-nothing against the crossing,
+which leaves a one-panel-pixel staircase along the slant. Now each panel
+pixel takes its coverage of the polygon -- its centre's distance past the
+reconstructed crossing in panel pixels, clamped to [0, 1] -- and blends
+the polygon's colour with the outside neighbour's by it: screen-space
+anti-aliasing of the reconstructed edge at the panel's resolution. The DS
+coverage still places the edge; the panel's own pixels shade it. Interiors,
+textures and 2D untouched as before. Spirit Tracks 17.88 ms against 17.75.
