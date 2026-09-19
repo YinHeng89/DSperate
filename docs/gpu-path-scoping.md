@@ -791,3 +791,21 @@ per-pixel resolve. A software 2x for us would be ~75 ms of worker time a
 frame. The GPU path is the only 2x route, and on Golden Sun it now sits at
 20.4 ms paced against DraStic's 15.3 unthrottled CPU; DraStic's CPU
 emulation alone is 8.3 ms there against our ~13.
+
+### DraStic live, not benchmarked (2026-09-18, user-verified)
+
+DraStic's on-screen overlay's first number is emulation SPEED (the user
+confirmed audio skips whenever it is under 100 %): on the Golden Sun title
+scene with hires_3d + threaded_3d on ROCKNIX it reads 64.8 % (grim
+screenshot), on the light 2D title card 99.7 %, with the process at ~210 %
+CPU across its threads under the ondemand governor. So live, presenting
+two 1024x768 panels through its SDL NEON scaler and playing audio, DraStic
+hi-res runs the hardest scene at two thirds speed: ~25.7 ms a frame, not
+the 15.3 ms its --benchmark reports (the benchmark skips the screen path).
+Ours on the same scene: 20.4 ms paced at 2x (about 82 % speed), 15.3 at 1x
+(full speed). The earlier reading of the benchmark table as "DraStic 4.5 ms
+ahead at every resolution" was wrong for live play: the CPU-emulation gap
+is real (8.3 vs ~13 ms), but DraStic spends it and more again on its CPU
+present path, and on the heaviest scene our GPU path at 2x is ahead of
+DraStic's hi-res, at 1x comfortably so. On the scenes people cite (NSMB,
+Etrian, Spirit Tracks) both hold 60 at 2x.
