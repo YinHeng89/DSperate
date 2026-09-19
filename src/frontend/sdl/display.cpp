@@ -164,7 +164,10 @@ void Display::natural_size(const Layout& l, double scale, int& w, int& h) {
     case Mode::DominantH:  fw = sw * (1 + (l.dominant_auto ? l.dominant_min : l.dominant)); break;
     case Mode::Count: break;
   }
-  w = static_cast<int>(fw); h = static_cast<int>(fh);
+  // The gap is not scaled: it is a distance on the glass, not part of the DS.
+  if (l.mode == Mode::Vertical || l.mode == Mode::DominantV) fh += l.gap;
+  if (l.mode == Mode::Horizontal || l.mode == Mode::DominantH) fw += l.gap;
+  w = std::max(1, static_cast<int>(fw)); h = std::max(1, static_cast<int>(fh));
 }
 
 double Display::dominant_ratio() const {
@@ -427,7 +430,14 @@ void Display::place(const Layout& layout_, int w, int h, View views_[SCREENS], I
   // tables, touch map and margins built from them -- follows. The pair and
   // dominant layouts stay centred as a whole, so an overscale crop takes
   // equally from the outer edges and the edge between the screens is kept.
-  auto fit = [&](double cols, double rows) { return snap_scale(std::min(w / (sw * cols), h / (sh * rows)), snap); };
+  // video.screen_gap: the pair is fitted into the room the gap leaves along
+  // it, and the second screen starts that much further on. Single and PiP
+  // have no pair to part.
+  const bool pair_across = layout_.mode == Mode::Horizontal || layout_.mode == Mode::DominantH;
+  const bool pair = pair_across || layout_.mode == Mode::Vertical || layout_.mode == Mode::DominantV;
+  const int gap = pair ? layout_.gap : 0;
+  const int fw = pair_across ? std::max(1, w - gap) : w, fh = pair && !pair_across ? std::max(1, h - gap) : h;
+  auto fit = [&](double cols, double rows) { return snap_scale(std::min(fw / (sw * cols), fh / (sh * rows)), snap); };
   auto rect = [&](double x, double y, double s) { return SDL_Rect{static_cast<int>(x), static_cast<int>(y), static_cast<int>(sw * s), static_cast<int>(sh * s)}; };
   const int p = layout_.primary, q = 1 - p;
   // Views are drawn in order, so the inset goes last; map_point() looks from
@@ -437,10 +447,10 @@ void Display::place(const Layout& layout_, int w, int h, View views_[SCREENS], I
       const bool across = layout_.mode == Mode::Horizontal;
       const double s = across ? fit(2, 1) : fit(1, 2);
       const double dw = sw * s, dh = sh * s;
-      const double x = (w - dw * (across ? 2 : 1)) / 2, y = (h - dh * (across ? 1 : 2)) / 2;
+      const double x = (w - dw * (across ? 2 : 1) - (across ? gap : 0)) / 2, y = (h - dh * (across ? 1 : 2) - (across ? 0 : gap)) / 2;
       for (int i = 0; i < SCREENS; ++i) {
         const int screen = i == 0 ? p : q;
-        views_[i] = View{screen, across ? rect(x + dw * i, y, s) : rect(x, y + dh * i, s), true, true};
+        views_[i] = View{screen, across ? rect(x + (dw + gap) * i, y, s) : rect(x, y + (dh + gap) * i, s), true, true};
       }
       break;
     }
@@ -465,15 +475,15 @@ void Display::place(const Layout& layout_, int w, int h, View views_[SCREENS], I
       const bool across = layout_.mode == Mode::DominantH;
       double s = 0, s2 = 0;    // the primary's and the secondary's scale
       if (!layout_.dominant_auto) { s = across ? fit(1 + layout_.dominant, 1) : fit(1, 1 + layout_.dominant); s2 = s * layout_.dominant; }
-      else dominant_auto(layout_, w, h, across, snap, s, s2);
+      else dominant_auto(layout_, fw, fh, across, snap, s, s2);
       const double sc[2] = {p == 0 ? s : s2, p == 1 ? s : s2};
       if (!across) {
-        double y = (h - sh * (s + s2)) / 2;
-        for (int i = 0; i < SCREENS; ++i) { views_[i] = View{i, rect((w - sw * sc[i]) / 2, y, sc[i]), true, true}; y += sh * sc[i]; }
+        double y = (h - sh * (s + s2) - gap) / 2;
+        for (int i = 0; i < SCREENS; ++i) { views_[i] = View{i, rect((w - sw * sc[i]) / 2, y, sc[i]), true, true}; y += sh * sc[i] + gap; }
       } else {
-        double x = (w - sw * (s + s2)) / 2;
+        double x = (w - sw * (s + s2) - gap) / 2;
         const double bottom = (h - sh * s) / 2 + sh * s;
-        for (int i = 0; i < SCREENS; ++i) { views_[i] = View{i, rect(x, bottom - sh * sc[i], sc[i]), true, true}; x += sw * sc[i]; }
+        for (int i = 0; i < SCREENS; ++i) { views_[i] = View{i, rect(x, bottom - sh * sc[i], sc[i]), true, true}; x += sw * sc[i] + gap; }
       }
       break;
     }

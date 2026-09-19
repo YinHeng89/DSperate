@@ -130,6 +130,8 @@ const char* kUsage =
     "  --fullscreen    start fullscreen\n"
     "  --layout L      vertical (default) | horizontal | single | pip | dominant_v | dominant_h\n"
     "  --screen S      top (default) or bottom: the screen shown alone, large or dominant\n"
+    "  --screen-gap N  pixels between the two screens in the stacked, side-by-side and dominant layouts\n"
+    "                  (video.screen_gap; any whole number, a negative one overlaps them)\n"
     "  --pip-alpha X   opacity of the PiP inset at rest, 0..1 (default 1; it comes up to opaque\n"
     "                  while the bottom screen is touched)\n"
     "  --dominant-ratio R  the dominant layouts' secondary, relative to the dominant screen: auto\n"
@@ -354,9 +356,11 @@ void write_save(NDS& nds, const std::string& path) {
 // seams, which a screenshot of the game does not want. On a scanline tier
 // those framebuffers are only filled by an unscaled frame, which is why the
 // hotkey defers a frame (shot_pending). Straight RGBA, alpha forced opaque.
-bool write_png(NDS& nds, const std::string& path, const ds::sdl::Display::Layout& layout) {
+bool write_png(NDS& nds, const std::string& path, const ds::sdl::Display::Layout& shown) {
   using Disp = ds::sdl::Display;
   int w = 0, h = 0;
+  Disp::Layout layout = shown;
+  layout.gap = 0;   // video.screen_gap is a distance on the panel, not part of the game's picture
   Disp::natural_size(layout, 1.0, w, h);
   Disp::View views[Disp::SCREENS];
   Disp::place(layout, w, h, views);
@@ -1008,6 +1012,7 @@ bool parse_video(const ds::sdl::Config& cfg, VideoSetup& vs) {
     if (vs.layout_cycle.empty()) vs.layout_cycle.push_back(vs.layout.mode);
     vs.layout.pip = std::clamp(cfg.real("video.pip_scale", 1.0 / 3.0), 0.1, 0.9);
     vs.layout.pip_alpha = std::clamp(cfg.real("video.pip_alpha", 1.0), 0.0, 1.0);
+    vs.layout.gap = cfg.num("video.screen_gap", 0);   // the menu bounds it; the file and --screen-gap take anything, overlap included
     const std::string dr = cfg.str("video.dominant_ratio", "auto");
     vs.layout.dominant_auto = dr == "auto";
     if (!vs.layout.dominant_auto) {
@@ -1186,6 +1191,7 @@ static int run(int argc, char** argv) {
     else if (arg("--layout")) cli.set("video.layout", argv[++i]);
     else if (arg("--screen")) cli.set("video.screen", argv[++i]);
     else if (arg("--pip-alpha")) cli.set("video.pip_alpha", argv[++i]);
+    else if (arg("--screen-gap")) cli.set("video.screen_gap", argv[++i]);
     else if (arg("--dominant-ratio")) cli.set("video.dominant_ratio", argv[++i]);
     else if (arg("--dominant-threshold")) cli.set("video.dominant_threshold", argv[++i]);
     else if (flag("--integer-scale")) cli.set("video.integer_scale", optional("under"));
@@ -1318,7 +1324,7 @@ static int run(int argc, char** argv) {
     // the NAND boot and a launch from the DSi Menu (docs/dsiware-scoping.md,
     // section 5 item 8). --interp and --lockstep still pick the reference.
   }
-  auto apply_cli = [&] { for (const char* k : {"paths.bios9", "paths.bios7", "paths.firmware", "video.scale", "video.dual_window", "video.layout", "video.screen", "video.pip_alpha", "video.dominant_ratio", "video.dominant_threshold", "video.integer_scale",
+  auto apply_cli = [&] { for (const char* k : {"paths.bios9", "paths.bios7", "paths.firmware", "video.scale", "video.dual_window", "video.layout", "video.screen", "video.pip_alpha", "video.screen_gap", "video.dominant_ratio", "video.dominant_threshold", "video.integer_scale",
                                               "video.fullscreen", "video.linear", "video.lcd_grid", "video.chunky", "video.chunky_threshold", "video.chunky_cell", "video.seam", "video.disp", "video.fbdev", "video.vsync", "audio.enabled", "audio.volume",
                                               "audio.mic", "emu.jit", "emu.quantum", "emu.speed", "emu.limiter", "emu.pacing", "audio.buffer_size", "audio.latency_frames", "emu.timing_oc", "emu.gx_worker", "emu.cpu_tuning", "emu.fast_load", "emu.frameskip", "emu.frameskip_mode", "emu.frameskip_capture", "video.aa", "emu.autosave_png", "emu.autoload", "cheevos.enabled", "cheevos.token_file", "cheevos.username"}) if (cli.has(k)) cfg.set(k, cli.str(k)); };
   apply_cli();
@@ -2482,6 +2488,7 @@ sdl_ready:
   Disp::Layout loaded_layout = layout; bool got_layout = false;   // from `layout`: a state carries no pip_alpha, the config's stays
   auto apply_loaded_layout = [&] {
     if (!got_layout || dual_window) return;
+    loaded_layout.gap = display.current_layout().gap;   // not in a state either, and the menu may have moved it since
     display.set_layout(loaded_layout);
     apply_visibility();
     menu_dirty = true;
@@ -3023,7 +3030,7 @@ sdl_ready:
       return;
     }
     if (is("video.layout") || is("video.screen") || is("video.pip_corner") || is("video.pip_scale") ||
-        is("video.pip_alpha") || is("video.dominant_ratio") || is("video.dominant_threshold")) {
+        is("video.pip_alpha") || is("video.screen_gap") || is("video.dominant_ratio") || is("video.dominant_threshold")) {
       host.layout_wanted = true;
       return;
     }

@@ -56,6 +56,7 @@ public:
     bool   dominant_auto = true; // pick the primary's whole scale instead (see above); a ratio when false
     double dominant_min = 0.25;  // auto: the smallest secondary the primary may leave
     double pip_alpha = 1.0;      // inset opacity at rest, 0..1 (see set_inset_alpha)
+    int    gap = 0;              // video.screen_gap: pixels between the two screens of a pair (negative overlaps)
   };
   // Forced integer scaling of the full-size views (the ones drawn at the
   // layout's fit; the PiP inset and the dominant layouts' secondary keep

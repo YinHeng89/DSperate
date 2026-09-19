@@ -250,6 +250,8 @@ R"(# DSperate settings. Command-line flags override this file. Two files next
 # dominant_threshold of it, and the other grows into the room left
 # dominant_threshold = 0.25     # auto: the smallest secondary it accepts, 0.1..0.99
 # dual_window = false           # one window per panel (dual-screen handhelds)
+# screen_gap = 0                # pixels between the two screens (vertical, horizontal, dominant_*); the menu offers
+                                # 0-128, the file takes any whole number and a negative one overlaps them
 # integer_scale = off           # off | under | over: whole panel pixels per DS pixel -- under letterboxes at the
                                 # largest that fits, over crops at the smallest that covers (the edge between
                                 # the screens is kept: a stacked pair crops its outer edges, a dual-window top

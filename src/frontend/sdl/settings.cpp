@@ -165,6 +165,8 @@ const Setting kVideoSettings[] = {
        "DRAW BLOCKS OF DS PIXELS AS ONE FLAT CELL, FOR PANELS AT ODD SCALES"),
   number("video.chunky_cell", "CHUNKY CELL", 2, 8, 1, "auto", FlagDeferred, Dep::ChunkyCell,
          "PANEL PIXELS PER CELL", "auto", "AUTO"),
+  number("video.screen_gap", "SCREEN GAP", 0, 128, 4, "0", FlagDeferred, Dep::OneWindow,
+         "PANEL PIXELS BETWEEN THE TWO SCREENS WHEN THEY ARE STACKED OR SIDE BY SIDE"),
   pick("video.aa", "ANTI-ALIASING", kAa, 3, "off", FlagLive, Dep::None,
        "SMOOTH DRAWS 3D EDGES AT PANEL RESOLUTION. ACCURATE BLENDS THEM AS THE HARDWARE DID"),
   boolean("video.fps", "FPS COUNTER", "false", FlagLive, Dep::None,
