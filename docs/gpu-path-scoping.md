@@ -978,3 +978,34 @@ the polygon's colour with the outside neighbour's by it: screen-space
 anti-aliasing of the reconstructed edge at the panel's resolution. The DS
 coverage still places the edge; the panel's own pixels shade it. Interiors,
 textures and 2D untouched as before. Spirit Tracks 17.88 ms against 17.75.
+
+## P4 probe: post-process AA at panel resolution, GPU versus NEON (2026-09-19)
+
+The user's next ask was a real screen-space anti-aliasing pass over the
+nearest-scaled 3D layer (FXAA/SMAA family), so that texels and interior
+polygon boundaries stop reading as 4x4 cells, and asked for a probe of the
+GPU against a NEON kernel before building it. tools/aa_probe.c: one FXAA
+3.11-quality kernel (luma edge detect, direction, 12-step end search each
+way, sub-pixel blend) as a compute shader (tools/aa_probe_fxaa.comp; the
+two-pass form with a luma plane, aa_probe_luma.comp + aa_probe_fxaa2.comp)
+and as C built -O3 for the A55, over a synthetic 1024x768 frame with a
+game's edge statistics (60 flat/textured triangles at 1x, nearest 4x;
+5.2 % of pixels touched). RG DS Plus:
+
+  one A55 core, scalar -O3   luma plane 2.8 ms + FXAA 46.7 ms = 49.5 ms per panel
+  (memcpy of one panel 1.1 ms: the floor for any CPU pass)
+  Mali-G52, one pass         10.6 ms per panel (ondemand = performance)
+  Mali-G52, luma plane       2.1 ms per panel  (one read, one write a pixel)
+  Mali-G52, FXAA from plane  8.2 ms per panel  (10.3 for both passes)
+
+Conclusion: a full-panel post-process pass is not affordable on this
+device on either processor. The GPU's floor for ANY pass over a panel is
+~2 ms (3 MB in, 3 MB out), and the 9-tap detect that every pixel pays puts
+FXAA at 8-10 ms a panel, 16-20 ms for the two; a hand-NEON version of the
+walk would gain 2-3x on 47 ms and still be far outside the budget, on
+cores the emulator is already using. What is affordable is work that
+scales with DS pixels, not panel pixels: the current edge filter (edge
+pixels only, ~1 % of the panel), or a per-pixel interior blend done inside
+the present pass that is already reading every panel pixel (bilinear
+between the polygon's own texels, stopped at the edge records) -- a blur
+family, not an AA, but it removes the cells at ~4 taps a 3D pixel.
