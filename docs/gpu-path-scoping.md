@@ -917,3 +917,19 @@ plane's pixel for the layer's at edge pixels. Verified on the device under
 the user's own config with --dual-window: frames the display does not
 composite are now identical with the filter on and off; composited frames
 differ by the outlines only; no measurable cost change.
+
+### Smooth 3D: the edge as a curve (2026-09-19)
+
+The user asked for the reconstruction to use the panel's pixels rather
+than sticking to one straight segment per DS pixel. present.comp now fits a
+parabola through the crossings of the previous, current and next row (or
+column, for X-major runs) of the same edge; three collinear crossings give
+the straight edge back exactly, and at a vertex of the silhouette the
+curve bends through the corner across the two neighbouring DS pixels
+instead of stepping. One neighbour missing falls back to the linear
+interpolation towards the other. One extra neighbour read on edge pixels
+only: Spirit Tracks 16.78 ms median against 16.81 before. The gain over
+the linear form is modest by eye (the wheel rim and the cab roof read as
+more continuous); the kinks that remain are where an edge changes from
+Y-major to X-major around a corner, which the record's kind test stops
+the curve from crossing -- the next step if more rounding is wanted.

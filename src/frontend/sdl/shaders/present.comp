@@ -34,6 +34,52 @@ layout(push_constant) uniform P {
 // `sx, sy`: the source pixel (at S x); `nx, ny` its native pixel; `fx, fy`
 // this panel pixel's centre inside the native pixel, in [0, 1).
 float edge_q(uint e) { return float(((e >> 3) & 31u) + 1u) / 32.0; }   // the covered fraction
+// The crossing of the same edge in the adjacent row (Y-major) or column
+// (X-major), `step` away: within one pixel along the other axis, since a
+// major-axis slope moves less than a pixel a step. `found` false if the
+// edge ends there (a vertex, or another polygon).
+float edge_cross(uint kind, bool left, bool top, bool xmajor, int S, int W, int H, int sx, int sy, int step, out bool found) {
+  found = false;
+  if (!xmajor) {
+    int qy = sy + step * S;
+    if (qy < 0 || qy >= H) return 0.0;
+    for (int k = -1; k <= 1; ++k) {
+      int qx = sx + k * S;
+      if (qx < 0 || qx >= W) continue;
+      uint n = comp[uint(qy) * uint(W) + uint(qx)] >> 24;
+      if (n == 0xFFu || (n & 7u) != kind) continue;
+      found = true;
+      return float(sx / S + k) + (left ? 1.0 - edge_q(n) : edge_q(n));
+    }
+  } else {
+    int qx = sx + step * S;
+    if (qx < 0 || qx >= W) return 0.0;
+    for (int k = -1; k <= 1; ++k) {
+      int qy = sy + k * S;
+      if (qy < 0 || qy >= H) continue;
+      uint n = comp[uint(qy) * uint(W) + uint(qx)] >> 24;
+      if (n == 0xFFu || (n & 7u) != kind) continue;
+      found = true;
+      return float(sy / S + k) + (top ? edge_q(n) : 1.0 - edge_q(n));
+    }
+  }
+  return 0.0;
+}
+// The edge through this pixel as a curve in the panel's resolution rather
+// than a straight segment per DS pixel: a parabola through the crossings of
+// the previous, this and the next row (or column). Three collinear
+// crossings give the straight edge back exactly; at a vertex of the
+// silhouette, where the slope changes, the curve bends through the corner
+// across the two neighbouring DS pixels instead of taking it as a step --
+// which is what makes a wheel of twelve edges read as round. With one
+// neighbour missing (the edge ends) it is the linear interpolation towards
+// the other; with both missing, a constant.
+float edge_curve(float c0, bool fp, float cp, bool fn, float cn, float t) {   // t in [-0.5, 0.5): the position inside the pixel relative to its centre
+  if (fp && fn) return c0 + t * 0.5 * (cn - cp) + t * t * 0.5 * (cn - 2.0 * c0 + cp);
+  if (fn) return mix(c0, cn, max(t, 0.0));
+  if (fp) return mix(c0, cp, max(-t, 0.0));
+  return c0;
+}
 uint smooth_pick(uint s, int S, int W, int H, int sx, int sy, float fx, float fy) {
   uint e = s >> 24;
   if (e == 0xFFu) return s;
@@ -42,50 +88,24 @@ uint smooth_pick(uint s, int S, int W, int H, int sx, int sy, float fx, float fy
   uint kind = e & 7u;
   float q = edge_q(e);
   bool inside; int ox = 0, oy = 0;
+  bool fp, fn;
   if (!xmajor) {
     // A near-vertical edge: the polygon is to the right of a left run's
-    // crossing, to the left of a right run's. The adjacent row's pixel of
-    // the same edge is within one pixel in x (a Y-major slope moves less
-    // than a pixel a row).
+    // crossing, to the left of a right run's.
     float c0 = float(nx) + (left ? 1.0 - q : q);
-    float c1 = c0;
-    int dy = fy < 0.5 ? -1 : 1;
-    int qy = sy + dy * S;
-    if (qy >= 0 && qy < H) {
-      for (int k = -1; k <= 1; ++k) {
-        int qx = sx + k * S;
-        if (qx < 0 || qx >= W) continue;
-        uint n = comp[uint(qy) * uint(W) + uint(qx)] >> 24;
-        if (n == 0xFFu || (n & 7u) != kind) continue;
-        float qn = edge_q(n);
-        c1 = float(nx + k) + (left ? 1.0 - qn : qn);
-        break;
-      }
-    }
-    float c = mix(c0, c1, abs(fy - 0.5));
+    float cp = edge_cross(kind, left, top, xmajor, S, W, H, sx, sy, -1, fp);
+    float cn = edge_cross(kind, left, top, xmajor, S, W, H, sx, sy, 1, fn);
+    float c = edge_curve(c0, fp, cp, fn, cn, fy - 0.5);
     float ax = float(nx) + fx;
     inside = left ? (ax >= c) : (ax < c);
     ox = left ? -1 : 1;
   } else {
     // A near-horizontal edge: the polygon is below the crossing when the
-    // covered part is the bottom, above it otherwise; the neighbour of the
-    // same edge is in the adjacent column, within one pixel in y.
+    // covered part is the bottom, above it otherwise.
     float c0 = float(ny) + (top ? q : 1.0 - q);
-    float c1 = c0;
-    int dx = fx < 0.5 ? -1 : 1;
-    int qx = sx + dx * S;
-    if (qx >= 0 && qx < W) {
-      for (int k = -1; k <= 1; ++k) {
-        int qy = sy + k * S;
-        if (qy < 0 || qy >= H) continue;
-        uint n = comp[uint(qy) * uint(W) + uint(qx)] >> 24;
-        if (n == 0xFFu || (n & 7u) != kind) continue;
-        float qn = edge_q(n);
-        c1 = float(ny + k) + (top ? qn : 1.0 - qn);
-        break;
-      }
-    }
-    float c = mix(c0, c1, abs(fx - 0.5));
+    float cp = edge_cross(kind, left, top, xmajor, S, W, H, sx, sy, -1, fp);
+    float cn = edge_cross(kind, left, top, xmajor, S, W, H, sx, sy, 1, fn);
+    float c = edge_curve(c0, fp, cp, fn, cn, fx - 0.5);
     float ay = float(ny) + fy;
     inside = top ? (ay < c) : (ay >= c);
     oy = top ? 1 : -1;
@@ -95,18 +115,6 @@ uint smooth_pick(uint s, int S, int W, int H, int sx, int sy, float fx, float fy
   return comp[uint(py) * uint(W) + uint(px)];
 }
 
-// The LCD grid, as kern::scale_row_grid draws it on the scanline tiers: the
-// FIRST panel pixel of a source pixel's run, and the first panel row of a
-// source line, dimmed to f/256 (opaque black at f = 0). Which columns and
-// rows those are is a property of the view's size alone, so the CPU
-// computes them once a frame as bitmasks (GpuPresent::present; the run
-// rules are there) and this tests two bits a pixel -- Mali has no integer
-// divide, and the arithmetic form cost 3 ms a panel. Even so the grid is
-// about 1 ms of GPU a frame on the RG DS Plus: at 1.5 M panel pixels a
-// frame every instruction here is ~40 us.
-bool grid_seam(int v, int d, int axis) {
-  return ((tab[v * 64 + axis * 32 + (d >> 5)] >> uint(d & 31)) & 1u) != 0u;
-}
 void main() {
   uvec2 p = gl_GlobalInvocationID.xy;
   if (p.x >= pc.a.x || p.y >= pc.a.y) return;
