@@ -749,7 +749,7 @@ overlapping the main thread where it can):
 | Spirit Tracks intro | 15.4 ms (3D 6.7, 2D 8.8) | 7.1 ms (3D 0.2, 2D 1.3) | 17.3 | 15.0 |
 | Etrian | 13.7 (3D 8.7, 2D 11.0) | 5.6 (3D 2.2, 2D 2.9) | 5.4 | 5.2 |
 | NSMB | ~9.5 (phase 5) | ~7.6 | 14.2 | 13.9 |
-| Golden Sun | (no DraStic state yet) | | 20.4 | 15.3 |
+| Golden Sun | 15.3 (3D 2.6, 2D 6.4, geometry 2.4; 22.0 with threaded_3d off, 3D 9.5) | 10.8 (3D 0.1, 2D 2.0) | 20.4 | 15.3 |
 
 Not the same metric (theirs unthrottled CPU, ours a paced wall frame with
 the GPU overlapped), but the shape is clear: DraStic's hi-res mode DOUBLES
@@ -765,3 +765,29 @@ flight (gsdd fence wait 8.1 ms at 1x), where the paced frame hides it. Two
 consequences worth remembering: fast-forward with the GPU raster on is
 slower than the software raster, and the DraStic-style benchmark cannot
 rank the two paths.
+
+### DraStic's threading versus ours (2026-09-18)
+
+TheGammaSqueeze's GammaOS runner (GammaOSDrasticRunner.cpp, read in full)
+patches DraStic in memory: its threaded 3D is a band pipeline -- the frame
+is kicked at scanline 214 of the previous frame, rasteriser threads draw
+interleaved 32-hi-res-line bands and set a bit per band, and the engine-A
+compose waits per band on that mask (sched_yield spin), with the line
+fetch patched to read the in-flight buffer so the original one-frame lag
+goes away; engine B composes on a 2D worker; edge marking is off by
+default; a non-temporal-store cave for the hi-res 2D compose is off by
+default; no affinity or RT policy beyond SCHED_RR 5 inherited by the
+workers. That is our software raster's shape already (band workers kicked
+at line 215, per-line band waits, engine B on the line worker), so there is
+nothing in the threading to adopt.
+
+What differs is the cost per pixel. DS_PROFILE on the device, 1x, our
+software raster: Golden Sun 19 ms of band-worker CPU per frame (bands 0
+and 1 at 9.5 ms each, band 2 idle: the scene fills the top two thirds),
+Spirit Tracks 17 ms. DraStic's whole hi-res (2x) raster is 9.5 ms of CPU
+per frame on Golden Sun (its unthreaded figure), so per pixel it is about
+eight times cheaper than ours -- the price of the exact span rules and the
+per-pixel resolve. A software 2x for us would be ~75 ms of worker time a
+frame. The GPU path is the only 2x route, and on Golden Sun it now sits at
+20.4 ms paced against DraStic's 15.3 unthrottled CPU; DraStic's CPU
+emulation alone is 8.3 ms there against our ~13.
