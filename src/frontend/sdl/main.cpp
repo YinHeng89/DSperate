@@ -2310,7 +2310,7 @@ sdl_ready:
   session.load_enabled(nds);
   // The library the loader cart's picker offers. Only read when there is a
   // loader cart to raise it: a normal session never shows the list.
-  // NAND DSIWARE SHORTCUTS (emu.dsi_nand_shortcuts): a .dspr.nds file in the
+  // DSI NAND LINKS (emu.dsi_nand_shortcuts): a .dspr.nds file in the
   // shortcut folder (shortcuts_dir) for every DSiWare title on paths.dsi_nand while it is on,
   // none while it is off (io/dsi_nand_launch.h). Brought up to date at every
   // start, so a title installed or removed since is picked up, and when the

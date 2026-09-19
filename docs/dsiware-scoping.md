@@ -210,7 +210,7 @@ of it.
     The menu also fades white at boot and after Health and Safety, so a
     fade alone is not enough.
   - A DS game picked there leaves the DSi machine for a DS.
-- **NAND shortcuts** (`emu.dsi_nand_shortcuts`, row NAND DSIWARE SHORTCUTS,
+- **NAND shortcuts** (`emu.dsi_nand_shortcuts`, row DSI NAND LINKS,
   greyed out without `paths.games`):
   - For each title on `paths.dsi_nand`, the frontend keeps a 64-byte
     `<banner title>.dspr.nds` in the games folder. It holds `DSPRSTUB`, a
