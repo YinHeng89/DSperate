@@ -249,6 +249,7 @@ private:
   u32  held_ = 0;              // SDL pad buttons currently down (bit per button)
   int  deadzone_ = 12000;
   int  stylus_x_ = 0, stylus_y_ = 0;          // raw stick
+  int  dstick_x_ = 0, dstick_y_ = 0;          // raw d-pad stick: it moves the pen while the chord is held
   double stylus_fx_ = 128, stylus_fy_ = 96;    // pen position, DS pixels
   double stylus_speed_ = 4.0;
   int  stylus_size_ = 2;

@@ -388,6 +388,28 @@ void test_stick_dpad_names_a_stick() {
     T::axis(in, SDL_CONTROLLER_AXIS_RIGHTY, -30000); CHECK((in.frame().buttons & kDpad) == 0); }
 }
 
+// Under the pad.stylus_dpad chord the d-pad stick is the pen's, as the d-pad
+// is: the game lets go of it for as long as the chord is held, and a stick
+// still tilted on release is the d-pad again without having to move.
+void test_stick_dpad_moves_the_pen_under_the_chord() {
+  constexpr u32 kRight = 1u << B::BTN_RIGHT, kDpad = kRight | (1u << B::BTN_LEFT) | (1u << B::BTN_UP) | (1u << B::BTN_DOWN);
+  Rig r; r.set("pad.stylus_dpad", "leftshoulder"); Input& in = r.go();
+  T::axis(in, SDL_CONTROLLER_AXIS_LEFTX, 30000);
+  CHECK((in.frame().buttons & kDpad) == kRight);
+  const int x0 = in.stylus_x();
+  in.update_stylus(); CHECK(in.stylus_x() == x0);                          // no chord: not the pen's
+  CHECK(T::pad(in, SDL_CONTROLLER_BUTTON_LEFTSHOULDER, true));
+  CHECK((in.frame().buttons & kDpad) == 0);                                // held across the press, and let go
+  for (int i = 0; i < 8; ++i) in.update_stylus();
+  CHECK(in.stylus_x() > x0);
+  T::axis(in, SDL_CONTROLLER_AXIS_LEFTX, 30001);
+  CHECK((in.frame().buttons & kDpad) == 0);
+  CHECK(T::pad(in, SDL_CONTROLLER_BUTTON_LEFTSHOULDER, false));
+  CHECK((in.frame().buttons & kDpad) == kRight);
+  const int x1 = in.stylus_x();
+  in.update_stylus(); CHECK(in.stylus_x() == x1);
+}
+
 // pad.axis_<name>: a pad whose left stick SDL reports rotated (X on lefty,
 // Y on leftx backwards) is put right by naming the physical axis per
 // remapped one; everything downstream sees the corrected stick.
@@ -439,6 +461,7 @@ int main() {
   ds::sdl::test_stylus_tap_alt_binding();
   ds::sdl::test_stick_face_buttons();
   ds::sdl::test_stick_dpad_names_a_stick();
+  ds::sdl::test_stick_dpad_moves_the_pen_under_the_chord();
   ds::sdl::test_axis_remap();
   std::printf("input tests passed\n");
   return 0;

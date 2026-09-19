@@ -216,6 +216,7 @@ void Input::configure(const Config& cfg) {
   }
   deadzone_ = cfg.num("pad.stick_deadzone", 12000);
   stick_ = stick_prev_ = face_stick_ = 0;   // a stick held across a reconfigure re-asserts itself on its next motion
+  dstick_x_ = dstick_y_ = 0;
   stylus_x_ = stylus_y_ = 0;   // and the pen's tilt is not kept by a stick that is no longer the pen's
   warn_collisions();
 }
@@ -408,6 +409,14 @@ bool Input::pad_down(const Bind& b, bool down) {
   if (same(stylus_chord_) && (stylus_chord_down_ || (down && !pad_mod_down_))) {
     stylus_chord_down_ = down;
     if (!down) stylus_dpad_ = 0;
+    // The d-pad stick follows the d-pad: under the chord it is the pen's
+    // (update_stylus), so the game lets go of it, and gets it back on release.
+    stick_ = 0;
+    if (!down && stick_dpad_ != StylusAxis::None && stick_dpad_ != stylus_axis_) {
+      stick_as_buttons(stick_, static_cast<Sint16>(dstick_x_), B::BTN_LEFT, B::BTN_RIGHT);
+      stick_as_buttons(stick_, static_cast<Sint16>(dstick_y_), B::BTN_UP, B::BTN_DOWN);
+    }
+    stick_prev_ = stick_;
     return true;
   }
   if (stylus_chord_down_) {
@@ -487,7 +496,8 @@ void Input::axis(Uint8 which, Sint16 value) {
   };
   // A stick as the d-pad, and a stick as the face buttons laid out as the DS
   // has them: X up, B down, Y left, A right. The pen's stick stays the pen's.
-  if (on_stick(stick_dpad_)) stick_as_buttons(stick_, value, x_axis ? B::BTN_LEFT : B::BTN_UP, x_axis ? B::BTN_RIGHT : B::BTN_DOWN);
+  if (on_stick(stick_dpad_)) { if (x_axis) dstick_x_ = value; else dstick_y_ = value; }
+  if (on_stick(stick_dpad_) && !stylus_chord_down_) stick_as_buttons(stick_, value, x_axis ? B::BTN_LEFT : B::BTN_UP, x_axis ? B::BTN_RIGHT : B::BTN_DOWN);
   if (on_stick(stick_face_)) stick_as_buttons(face_stick_, value, x_axis ? B::BTN_Y : B::BTN_X, x_axis ? B::BTN_A : B::BTN_B);
   const Uint8 px = pen_left ? SDL_CONTROLLER_AXIS_LEFTX : SDL_CONTROLLER_AXIS_RIGHTX, py = pen_left ? SDL_CONTROLLER_AXIS_LEFTY : SDL_CONTROLLER_AXIS_RIGHTY;
   if (stylus_axis_ != StylusAxis::None && (which == px || which == py)) {
@@ -528,7 +538,8 @@ void Input::update_stylus() {
   auto axis = [&](int v) { return (v > deadzone_ || v < -deadzone_) ? static_cast<double>(v) / 32767.0 : 0.0; };
   const double ddx = ((stylus_dpad_ >> B::BTN_RIGHT) & 1) - static_cast<double>((stylus_dpad_ >> B::BTN_LEFT) & 1);
   const double ddy = ((stylus_dpad_ >> B::BTN_DOWN) & 1) - static_cast<double>((stylus_dpad_ >> B::BTN_UP) & 1);
-  const double dx = (axis(stylus_x_) + ddx) * stylus_speed_, dy = (axis(stylus_y_) + ddy) * stylus_speed_;
+  const double sdx = stylus_chord_down_ ? axis(dstick_x_) : 0.0, sdy = stylus_chord_down_ ? axis(dstick_y_) : 0.0;
+  const double dx = (axis(stylus_x_) + ddx + sdx) * stylus_speed_, dy = (axis(stylus_y_) + ddy + sdy) * stylus_speed_;
   if (dx != 0 || dy != 0 || stylus_down_) stylus_idle_ = 0; else if (stylus_idle_ < (1 << 30)) ++stylus_idle_;
   stylus_fx_ += dx;
   stylus_fy_ += dy;

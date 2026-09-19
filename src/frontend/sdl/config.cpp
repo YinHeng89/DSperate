@@ -462,7 +462,7 @@ R"(# DSperate settings. Command-line flags override this file. Two files next
                                     # right (X) or down (Y), or pressing the trigger.
 # stylus_axis = right           # right | left | none: the stick that moves the pen over the
                                 # bottom screen (left takes the stick away from the d-pad)
-# stylus_dpad = none            # a button; while held the d-pad moves the pen (e.g. leftshoulder)
+# stylus_dpad = none            # a button; while held the d-pad, and the stick_dpad stick, move the pen (e.g. leftshoulder)
 # stylus_button = rightstick    # touches at the pen's position; mod+<it> is free for a hotkey
 # stylus_button.alt = none      # a second tap control, like a hotkey's .alt (e.g. +righttrigger)
 # stylus_speed = 4.0            # pen pixels per frame at full tilt
