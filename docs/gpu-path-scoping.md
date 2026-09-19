@@ -918,18 +918,51 @@ the user's own config with --dual-window: frames the display does not
 composite are now identical with the filter on and off; composited frames
 differ by the outlines only; no measurable cost change.
 
-### Smooth 3D: the edge as a curve (2026-09-19)
+### Smooth 3D: the edge as a curve (2026-09-19) -- and the shader that never built
 
 The user asked for the reconstruction to use the panel's pixels rather
-than sticking to one straight segment per DS pixel. present.comp now fits a
+than sticking to one straight segment per DS pixel. present.comp fits a
 parabola through the crossings of the previous, current and next row (or
 column, for X-major runs) of the same edge; three collinear crossings give
 the straight edge back exactly, and at a vertex of the silhouette the
 curve bends through the corner across the two neighbouring DS pixels
 instead of stepping. One neighbour missing falls back to the linear
-interpolation towards the other. One extra neighbour read on edge pixels
-only: Spirit Tracks 16.78 ms median against 16.81 before. The gain over
-the linear form is modest by eye (the wheel rim and the cab roof read as
-more continuous); the kinks that remain are where an edge changes from
-Y-major to X-major around a corner, which the record's kind test stops
-the curve from crossing -- the next step if more rounding is wanted.
+interpolation towards the other.
+
+TRAP, and the record of 168ec78 is wrong because of it: the edit that
+added the curve cut grid_seam out of the file, glslang rejected the
+shader, and tools/gen_shaders.sh sent the compiler's output (which goes to
+stdout) to /dev/null and did not stop the pipeline, so the device kept
+running the previous SPIR-V. The "curve" crops and the cost figure in that
+commit are the old shader. The script now prints the compiler's log and
+exits non-zero on the first failure. Rebuilt and measured properly, the
+curve differs from the linear form by 91 panel pixels on the Spirit Tracks
+frame -- modest, as the eye said. The kinks that remain are where an edge
+changes from Y-major to X-major around a corner, which the record's kind
+test stops the curve from crossing.
+
+### The capture pass-through (2026-09-19)
+
+Why the user saw the staircase live where the dumps showed the slant:
+Spirit Tracks renders the 3D on one screen and shows the previous frame's
+DISPLAY CAPTURE of it on the other, swapping every frame, so each panel
+alternates between the composited frame (smooth) and the game's own
+DS-resolution bitmap copy of it (stepped), at 30 Hz. The copy carries no
+edge information; no filter can recover it. But the present stage still
+holds the previous frame's composite at panel resolution, and the copy IS
+that picture. So present() keeps a cached copy of each frame's two DS
+screens and, for a screen it is not compositing this frame, compares the
+new DS frame against the screen the previous slot composited (every other
+row, every third pixel, 12/255 a channel: the capture keeps 5 bits of the
+composite's 6); a match shows the previous composite again (binding 5,
+view bit 2), with its smooth records (bit 3). Gated on the filter or S > 1
+(at 1x without the filter the copy is the same picture). Verified: on the
+3D panel, presented frames 400 and 401 are now pixel-identical (before,
+401 was the stepped copy); no change to composited frames; the grid still
+right. Cost: smooth + pass-through 17.75 ms against 16.9 without the
+filter (the copy and the compare are ~0.5 ms of that; a cheaper compare is
+possible). At S >= 2 the same mechanism gives the captured screen the
+hi-res picture. TRAP found on the way: the push constant's scale was only
+sent with a composited frame, so a pass-through frame divided by zero in
+the shader and read off the end of the buffer (JOB_READ_FAULT, device
+lost); the scale now goes with every frame.

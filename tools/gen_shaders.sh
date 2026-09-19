@@ -36,7 +36,7 @@ for f in "$DIR"/src/frontend/sdl/shaders/*.comp; do
   out="${f%.comp}.spv"
   case "$GV" in
     *glslc) "$GV" -O --target-env=vulkan1.1 "$f" -o "$out" ;;
-    *)      "$GV" -V --target-env vulkan1.1 "$f" -o "$out" >/dev/null ;;
+    *)      log=$("$GV" -V --target-env vulkan1.1 "$f" -o "$out") || { echo "$log" >&2; echo "gen_shaders: $f FAILED" >&2; exit 1; } ;;
   esac
   if command -v spirv-val >/dev/null 2>&1; then spirv-val "$out"; fi
 done
@@ -45,7 +45,7 @@ for f in "$SRC"/*.vert "$SRC"/*.frag; do
   out="${f%.*}_${f##*.}.spv"
   case "$GV" in
     *glslc) "$GV" -O --target-env=vulkan1.1 "-I$INC" "$f" -o "$out" ;;
-    *)      "$GV" -V --target-env vulkan1.1 "-I$INC" "$f" -o "$out" >/dev/null ;;
+    *)      log=$("$GV" -V --target-env vulkan1.1 "-I$INC" "$f" -o "$out") || { echo "$log" >&2; echo "gen_shaders: $f FAILED" >&2; exit 1; } ;;
   esac
   if command -v spirv-val >/dev/null 2>&1; then spirv-val "$out"; fi
 done
@@ -53,7 +53,7 @@ for f in "$SRC"/*.comp; do
   out="${f%.comp}.spv"
   case "$GV" in
     *glslc) "$GV" -O --target-env=vulkan1.1 "-I$INC" "$f" -o "$out" ;;
-    *)      "$GV" -V --target-env vulkan1.1 "-I$INC" "$f" -o "$out" >/dev/null ;;
+    *)      log=$("$GV" -V --target-env vulkan1.1 "-I$INC" "$f" -o "$out") || { echo "$log" >&2; echo "gen_shaders: $f FAILED" >&2; exit 1; } ;;
   esac
   if command -v spirv-val >/dev/null 2>&1; then spirv-val "$out"; fi
   printf '%-16s %6d bytes\n' "$(basename "$out")" "$(wc -c < "$out")"

@@ -8,15 +8,18 @@
 layout(local_size_x = 16, local_size_y = 8) in;
 layout(binding = 0, rgba8) uniform writeonly image2D dst;
 layout(std430, binding = 1) readonly buffer Src { uint src[]; };   // slot base + screen * 49152 + y * 256 + x, 0xAARRGGBB
-layout(std430, binding = 2) readonly buffer Comp { uint comp[]; };  // the composited screen 0 at S x, when b.w bit 31 is set
+layout(std430, binding = 2) readonly buffer Comp { uint comp[]; };  // this frame's composited screen at S x (view bit 0); b.w bits 24-30 carry S every frame
+layout(std430, binding = 5) readonly buffer PComp { uint pcomp[]; };   // the PREVIOUS frame's (view bit 2): a screen showing the game's own capture of what that composite drew takes it again, at panel resolution
+bool g_prev = false;
 layout(std430, binding = 3) readonly buffer Over { uint over[]; };  // the frontend's overlay (OSD, menu) in the logical frame, 0xAARRGGBB; b.z bit 8 says it has content
 layout(std430, binding = 4) readonly buffer Tab  { uint tab[]; };   // the LCD grid's seam bitmasks: per view, 32 words of columns then 32 of rows
 layout(push_constant) uniform P {
   uvec4 a;        // presented w, h; logical w, h
-  uvec4 b;        // rotation (0/90/180/270), nviews, inset alpha 0..255 | 1 << 8 (overlay drawn) | 1 << 9 (smooth 3D) | grid brightness 0..256 << 16 (256 = off), source base (words) | S << 24 | 1 << 31 when screen 0 is the composited buffer
+  uvec4 b;        // rotation (0/90/180/270), nviews, inset alpha 0..255 | 1 << 8 (overlay drawn) | grid brightness 0..256 << 16 (256 = off), source base (words) | S << 24 | 1 << 31 when screen 0 is the composited buffer
   ivec4 rect[2];  // x, y, w, h in the logical frame, draw order
-  ivec4 view[2];  // screen, shown, blends (inset), bit 0 the composited screen | bit 1 the LCD grid applies
+  ivec4 view[2];  // screen, shown, blends (inset), bit 0 this frame's composited screen | bit 1 the LCD grid applies | bit 2 the previous frame's composite shown again | bit 3 the smooth filter's records are in that composite
 } pc;
+uint rd(uint i) { return g_prev ? pcomp[i] : comp[i]; }
 // The smooth-3D filter (b.z bit 9). A polygon's edge pixel carries, in the
 // composited pixel's alpha byte (composite.comp's edge_byte, from the
 // raster's span table), which side of the polygon it is on (bit 0: a right
@@ -46,7 +49,7 @@ float edge_cross(uint kind, bool left, bool top, bool xmajor, int S, int W, int 
     for (int k = -1; k <= 1; ++k) {
       int qx = sx + k * S;
       if (qx < 0 || qx >= W) continue;
-      uint n = comp[uint(qy) * uint(W) + uint(qx)] >> 24;
+      uint n = rd(uint(qy) * uint(W) + uint(qx)) >> 24;
       if (n == 0xFFu || (n & 7u) != kind) continue;
       found = true;
       return float(sx / S + k) + (left ? 1.0 - edge_q(n) : edge_q(n));
@@ -57,7 +60,7 @@ float edge_cross(uint kind, bool left, bool top, bool xmajor, int S, int W, int 
     for (int k = -1; k <= 1; ++k) {
       int qy = sy + k * S;
       if (qy < 0 || qy >= H) continue;
-      uint n = comp[uint(qy) * uint(W) + uint(qx)] >> 24;
+      uint n = rd(uint(qy) * uint(W) + uint(qx)) >> 24;
       if (n == 0xFFu || (n & 7u) != kind) continue;
       found = true;
       return float(sy / S + k) + (top ? edge_q(n) : 1.0 - edge_q(n));
@@ -112,7 +115,20 @@ uint smooth_pick(uint s, int S, int W, int H, int sx, int sy, float fx, float fy
   }
   if (inside) return s;
   int px = clamp(sx + ox * S, 0, W - 1), py = clamp(sy + oy * S, 0, H - 1);
-  return comp[uint(py) * uint(W) + uint(px)];
+  return rd(uint(py) * uint(W) + uint(px));
+}
+
+// The LCD grid, as kern::scale_row_grid draws it on the scanline tiers: the
+// FIRST panel pixel of a source pixel's run, and the first panel row of a
+// source line, dimmed to f/256 (opaque black at f = 0). Which columns and
+// rows those are is a property of the view's size alone, so the CPU
+// computes them once a frame as bitmasks (GpuPresent::present; the run
+// rules are there) and this tests two bits a pixel -- Mali has no integer
+// divide, and the arithmetic form cost 3 ms a panel. Even so the grid is
+// about 1 ms of GPU a frame on the RG DS Plus: at 1.5 M panel pixels a
+// frame every instruction here is ~40 us.
+bool grid_seam(int v, int d, int axis) {
+  return ((tab[v * 64 + axis * 32 + (d >> 5)] >> uint(d & 31)) & 1u) != 0u;
 }
 
 void main() {
@@ -129,11 +145,12 @@ void main() {
     ivec4 r = pc.rect[v]; ivec4 vi = pc.view[v];
     if (vi.y == 0 || lx < r.x || ly < r.y || lx >= r.x + r.z || ly >= r.y + r.w) continue;
     uint s;
-    if ((vi.w & 1) != 0) {   // the composited screen (engine A's)
+    if ((vi.w & 5) != 0) {   // a composited screen: this frame's (bit 0) or the previous frame's shown again (bit 2)
+      g_prev = (vi.w & 4) != 0;
       int S = int((pc.b.w >> 24) & 0x7Fu);
       int sx = (lx - r.x) * 256 * S / r.z, sy = (ly - r.y) * 192 * S / r.w;
-      s = comp[uint(sy) * uint(256 * S) + uint(sx)];
-      if ((pc.b.z & 0x200u) != 0u && (s >> 24) != 0xFFu) {   // an edge pixel of the smooth filter
+      s = rd(uint(sy) * uint(256 * S) + uint(sx));
+      if ((vi.w & 8) != 0 && (s >> 24) != 0xFFu) {   // an edge pixel of the smooth filter (bit 3: that composite carries the records)
         float fx = (float(lx - r.x) + 0.5) * 256.0 / float(r.z) - float(sx / S);
         float fy = (float(ly - r.y) + 0.5) * 192.0 / float(r.w) - float(sy / S);
         s = smooth_pick(s, S, 256 * S, 192 * S, sx, sy, fx, fy);
