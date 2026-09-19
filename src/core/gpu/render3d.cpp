@@ -3869,7 +3869,11 @@ bool Renderer3D::gpu_raster_active() const {
 // them is alone.
 u32 Renderer3D::gpu_supported(const Polygon* const* polys, u32 npoly) const {
   const u32 d = dispcnt_;
-  if (d & (1u << 4)) return GpuAA;           // anti-aliasing: the two-deep pixel stack
+#if DSPERATE_VULKAN
+  if ((d & (1u << 4)) && !(vk_raster_ && vk_raster_->aa_supported())) return GpuAA;   // anti-aliasing: the two-deep pixel stack (the triangle path has it at 1x)
+#else
+  if (d & (1u << 4)) return GpuAA;
+#endif
   if (d & (1u << 14)) return GpuRearBitmap;  // rear plane from a bitmap rather than a clear colour
   // Edge marking (bit 5) and fog (bit 7) are implemented: the raster writes
   // its depth and attribute planes and post.comp applies them. They were the

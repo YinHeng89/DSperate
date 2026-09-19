@@ -154,6 +154,9 @@ public:
   // a loss -- the gather lands on the reading thread and the dispatch it
   // saves is ~0.15 ms of a 6 ms fence wait (docs/gpu-path-scoping.md).
   void reduce_line(const u32* nat, u32 y);
+  // Whether frames with DISP3DCNT anti-aliasing can be drawn here (the
+  // triangle path's AA pass, 1x only); else the gate keeps them on the CPU.
+  bool aa_supported() const;
   void reduce_all(const u32* nat);
 
   // GPU time per pass, summed over the frames read back so far, when

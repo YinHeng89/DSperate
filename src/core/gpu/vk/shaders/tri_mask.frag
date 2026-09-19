@@ -15,13 +15,26 @@
 layout(input_attachment_index = 1, set = 1, binding = 1) uniform usubpassInput in_attr;
 layout(input_attachment_index = 2, set = 1, binding = 2) uniform usubpassInput in_z;
 layout(location = 3) out uint o_sh;
+layout(std430, binding = 1) readonly buffer Verts { GpuVert verts[]; };
+#include "ds_span.glsl"
 void main() {
   GpuPoly p = polys[v_poly];
+  bool row_z = false; int rz = 0;
+  if ((pc.f.flags & DS_FF_SPANCULL) != 0u) {
+    // The AA pass grows polygons by a pixel: keep the DS span only, and take
+    // the depth from the row as the AA shaders do.
+    int x = int(gl_FragCoord.x), y = int(gl_FragCoord.y);
+    int y0 = max(p.ytop, 0);
+    if (y < y0 || y > min(p.ybot, 191)) discard;
+    GpuRow r = rows_c[p.row_base + uint(y - y0)];
+    if ((r.fl & 1u) == 0u || x < max(r.xstart, 0) || x > r.xend) discard;
+    Interp ix = row_interp(r); interp_set_x(ix, x); rz = interp_z(ix, r.zl, r.zr); row_z = true;
+  }
   uint alpha = (p.attr >> 16) & 0x1Fu;
   if (alpha == 0u) alpha = 31u;   // wireframe: the DS fills a mask polygon regardless
   if (alpha <= pc.f.alpha_ref) discard;
   bool wbuf = (pc.f.flags & DS_FF_WBUFFER) != 0u;
-  uint z = uint(clamp(round(wbuf ? v_zp : v_z), 0.0, 16777215.0));
+  uint z = row_z ? uint(clamp(rz, 0, 16777215)) : uint(clamp(round(wbuf ? v_zp : v_z), 0.0, 16777215.0));
   uint dz = subpassLoad(in_z).r;
   uint dattr = subpassLoad(in_attr).r;
   // Renderer3D::depth_pass: mode 1 (a front-facing polygon over an opaque

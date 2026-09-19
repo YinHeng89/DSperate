@@ -17,7 +17,40 @@ layout(location = 5) in float v_zp;
 layout(location = 0) out uint o_col;     // the 3D layer record: RGB666 + alpha5 << 24
 layout(location = 1) out uint o_attr;    // the attribute plane the final pass reads
 layout(location = 2) out uint o_z;       // the depth plane (DS z, or w in W-buffer mode)
+layout(std430, binding = 9) readonly buffer RowsC { GpuRow rows_c[]; };
+// This pixel's edge flags (1 left run, 2 right run, 4 top row, 8 bottom row)
+// and coverage from its polygon's span-table row (Renderer3D::resolve_span's
+// rules); `inside` says whether the DS span reaches the pixel at all. At
+// S >= 2 the caller passes the native pixel (x / S, y / S).
+uint row_edge(GpuPoly p, int x, int y, out uint cov, out bool inside, out GpuRow row) {
+  cov = 31u; inside = false;
+  int y0 = max(p.ytop, 0);
+  int ylast = min(p.ybot, 191);
+  if (y < y0 || y > ylast) return 0u;
+  GpuRow r = rows_c[p.row_base + uint(y - y0)];
+  row = r;
+  if ((r.fl & 1u) == 0u) return 0u;
+  uint yedge = (r.fl >> 5) & 0xFu;
+  int xa = max(r.xstart, 0);
+  if (x < xa || x > r.xend) return 0u;
+  inside = true;
+  if (x < r.lim0) {
+    int c = int(r.lcov);
+    if ((c & int(0x80000000u)) != 0) { int xcov = (c >> 12) & 0x3FF; if (xcov == 0x3FF) xcov = 0; xcov += (x - xa) * (c & 0x3FF); cov = uint(min(xcov >> 5, 31)); }
+    else cov = uint(c & 0x1F);
+    return yedge | 1u;
+  }
+  if (x >= r.lim1) {
+    int c = int(r.rcov);
+    if ((c & int(0x80000000u)) != 0) { int xcov = (c >> 12) & 0x3FF; if (xcov == 0x3FF) xcov = 0; xcov += (x - r.lim1) * (c & 0x3FF); cov = uint(max(31 - (xcov >> 5), 0)); }
+    else cov = uint(c & 0x1F);
+    return yedge | 2u;
+  }
+  return yedge;
+}
+#ifndef DS_AA_PASS
 layout(location = 4) out uint o_touch;   // the native tail pass (DS_FF_TAIL1X): 1 where the tail wrote the pixel, for expand.comp (no such attachment in the hi-res pass: the write is dropped)
+#endif
 #include "ds_shade.glsl"
 struct Frag { uint src; uint alpha; uint polyattr; uint depth; };
 Frag shade_fragment(GpuPoly p) {

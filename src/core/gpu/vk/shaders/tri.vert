@@ -52,6 +52,14 @@ void main() {
   // the second and third vertices step across, whichever way it winds.
   if (p.xmax == p.xmin) ox = (vi == 1u || vi == 2u) ? 1.001 : 0.0;
   if (p.ybot == p.ytop) oy = (vi == 1u || vi == 2u) ? 1.0 : 0.0;
+  if ((pc.f.flags & DS_FF_SPANCULL) != 0u) {
+    // Over-cover by a pixel in every direction; the fragment shader trims to
+    // the DS span, so the pixels the DS draws and the hardware would not
+    // (the inclusive last column, the ends of X-major runs) exist.
+    float cy = 0.5 * float(p.ytop + p.ybot) / S;
+    ox += (sxf > cx) ? 1.0 : ((sxf < cx) ? -1.0 : 0.0);
+    oy += (syf > cy) ? 1.0 : ((syf < cy) ? -1.0 : 0.0);
+  }
   float x = (sxf + ox) / W * 2.0 - 1.0, y = (syf + oy) / H * 2.0 - 1.0;
   float z = clamp(float(vt.z), 0.0, 16777215.0);
   // Z-buffer: z / w after the divide is z / 2^24, linear in screen space,

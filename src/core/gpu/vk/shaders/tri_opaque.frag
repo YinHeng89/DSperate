@@ -21,6 +21,15 @@ void main() {
   // the outline marks. melonDS's GL renderer makes the same approximation.
   // (Anti-aliasing reads these bits as coverage; the AA gate keeps such
   // frames off this path.)
-  o_attr = f.polyattr | 0xFu;
+  uint edge = 0xFu;
+  if ((pc.f.flags & DS_FF_ROWS) != 0u) {
+    // The span table is here (edge marking or anti-aliasing on): the DS's
+    // own edge flags, and its coverage for the fast anti-aliasing.
+    uint cov; bool inside; GpuRow r;
+    int S = int(pc.f.scale);
+    edge = row_edge(p, int(gl_FragCoord.x) / S, int(gl_FragCoord.y) / S, cov, inside, r);
+    if (edge != 0u && (pc.f.dispcnt & 16u) != 0u) edge |= (cov << 8);
+  }
+  o_attr = f.polyattr | edge;
   o_z = f.depth;
 }

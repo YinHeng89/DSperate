@@ -139,6 +139,7 @@ struct GpuRow {
   uint   rcp;           // and its reciprocal-of-xdiff
   uint   fl;            // 1 valid, 2 l_fill, 4 r_fill, 8 w-buffer, 16 linear, 5-8 yedge, 512 mask, 1024 shadow
   uint   poly;          // the polygon this row belongs to, so a pass driven by rows can find it
+  uint   lcov, rcov;    // anti-aliasing coverage of the left and right edge runs, as Renderer3D::Slope::edge_params packs it (bit 31: X-major, start << 12 | increment)
 };
 
 // The visibility pass's workgroup: DS_VIS_ROWS span rows per workgroup, a
@@ -193,6 +194,11 @@ struct GpuFrame {
 #define DS_FF_SORTED   0x100u  // the triangle path: this draw's instance i is polygon order[i] (the opaque prefix near to far)
 #define DS_FF_TAIL1X   0x200u  // the translucent tail drawn at native resolution on the shrunk planes (tri.vert divides positions by scale; tri_tail.frag depth-tests in the shader)
 #define DS_FF_SHRINK3  0x400u  // downsample.comp: shrink the attribute and depth records too (before the native tail)
+#define DS_FF_SPANCULL 0x1000u // the AA pass: tri.vert grows every polygon by a pixel and the fragment shader keeps only the pixels of its DS span (tri_aa_common.glsl) -- the DS's coverage, not the hardware's
+#define DS_FF_ROWS     0x2000u // the span table holds this frame's rows: the fragment shaders take edge flags and coverage from it (edge marking, fast AA)
+#define DS_FF_AAFAST   0x4000u // post.comp: the fast anti-aliasing -- edge pixels blended with their outside neighbour, in two stages
+#define DS_FF_POST2    0x8000u // post.comp: stage 2 of the fast anti-aliasing (stage 1 wrote fogged, edge-marked pixels to the scratch plane)
+#define DS_FF_AA       0x800u  // the anti-aliasing pass ran: the final pass blends edge pixels with the layer underneath (post.comp)
 #define DS_FF_TEX0     0x20u  // attribution (DS_VK_TRI_TEX0=1): every texel fetch reads the polygon's first texel (the fetch without its cache misses)
 #define DS_FF_NOTEX    0x10u  // attribution (DS_VK_TRI_NOTEX=1): shade every polygon as untextured
 #define DS_FF_IDCOLOUR 0x2u  // debugging (DS_VK_TRI_IDCOL=1): the opaque draw writes the polygon INDEX as its colour (r = i & 63, g = i >> 6 & 63, b = i >> 12 & 63)
