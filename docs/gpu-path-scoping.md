@@ -1009,3 +1009,32 @@ pixels only, ~1 % of the panel), or a per-pixel interior blend done inside
 the present pass that is already reading every panel pixel (bilinear
 between the polygon's own texels, stopped at the edge records) -- a blur
 family, not an AA, but it removes the cells at ~4 taps a 3D pixel.
+
+## The 1x verdict: software raster + GPU present (2026-09-19)
+
+The user asked for GPU raster + GPU present + AA against software raster +
+GPU present + AA at 1x, Spirit Tracks intro, dual window, the device's
+config:
+
+  gpu raster, fast AA      work 15.9 ms median
+  software raster, DS AA   work 15.6 ms median
+
+Equal cost -- and the pictures are not equal. The software raster's DS
+anti-aliasing gives the soft silhouettes the user has been asking for all
+along; the triangle path's fast AA barely changes the edges. The reason:
+the soft part of the DS's AA is the partially covered edge pixels, whose
+centres lie OUTSIDE the triangle, and the hardware rasteriser never
+produces them; the fast path blends only the pixels it did draw. The exact
+AA pass gets them by growing each polygon a pixel and culling to the DS
+span (DS_FF_SPANCULL), at 12.8 ms on Golden Sun.
+
+Tried and reverted: DS_FF_SPANCULL on the fast path (opaque and tail
+shaders culling to the span, tail opaque pixels given edge records).
+Extrapolated hardware depth on the grown pixels undercut coplanar decals
+(the light polygon on the ground: speckles, a chewed corner); taking every
+pixel's depth from the span row through gl_FragDepth did not cure it and
+cost early-Z (raster fence 0.08 -> 1.39 ms, work 17.2). Left as a known
+gap: the triangle path has no cheap DS-exact AA. (DECISION, user: at 1x the
+target is the SOFTWARE raster through the GPU present stage -- exact DS AA,
+the GPU scaler, the grid, the pass-through and the pause-menu fix all
+apply; the GPU raster stays the opt-in route to 2x and the smooth filter.)
