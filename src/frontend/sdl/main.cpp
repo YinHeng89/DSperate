@@ -1113,7 +1113,12 @@ const char* extra_default(const char* key, bool pad, const ds::sdl::Config& cfg)
 
 } // namespace
 
-int main(int argc, char** argv) {
+namespace {
+// RESET on a game started from the game list: main() starts the process over.
+bool g_restart = false;
+}
+
+static int run(int argc, char** argv) {
   const char* rom = nullptr;
   const char* config_arg = nullptr;
   long frame_limit = 0;
@@ -2382,8 +2387,10 @@ sdl_ready:
   // is taken from fb_ after one deliberately unscaled frame, not read back
   // from the panel.
   bool shot_pending = false;
-  auto refresh_slots = [&] { for (int i = 0; i < 10; ++i) {
-    FILE* f = std::fopen(state_path(nds, session.states_dir, i).c_str(), "rb");
+  // Slot kAutoSlot is the auto state, which the slot page lists for deletion.
+  auto slot_path = [&](int i) { return i == Menu::kAutoSlot ? auto_state_path(nds, session.states_dir) : state_path(nds, session.states_dir, i); };
+  auto refresh_slots = [&] { for (int i = 0; i <= Menu::kAutoSlot; ++i) {
+    FILE* f = std::fopen(slot_path(i).c_str(), "rb");
     menu.set_slot_used(i, f != nullptr);
     if (f) std::fclose(f);
   }
@@ -3610,6 +3617,7 @@ sdl_ready:
   // overlay over a running game, because the session cannot be stopped.
   // Starting a game from the loader cart's picker (and DS_LAUNCH_AT, which
   // does the same from a script).
+  bool from_list = false;   // the game running was picked from the list: RESET goes back to the firmware
   auto launch_game = [&](const std::string& pick) {
     VLOG("launcher: %s\n", pick.c_str());
     // DSiWare runs on the DSi machine with the launcher hand-off and a
@@ -3724,6 +3732,7 @@ sdl_ready:
     // it pins one file, and it was given for the ROM on the command
     // line, not for whatever the player picks here.
     launcher = false;
+    from_list = true;
     session.open(nds, cfg, pick, nullptr);
 #if DSPERATE_CHEEVOS
     // The picked game is a different identity from the loader: drop any set
@@ -3807,6 +3816,52 @@ sdl_ready:
         break;
       case Menu::Result::Launch: launch_game(menu.chosen()); break;
       case Menu::Result::Quit: input.request_quit(); break;
+      case Menu::Result::Delete: {
+        const std::string path = slot_path(menu.doomed_slot());
+        if (std::remove(path.c_str()) != 0) std::fprintf(stderr, "state: cannot delete %s: %s\n", path.c_str(), std::strerror(errno));
+        else std::fprintf(stderr, "state: deleted %s\n", path.c_str());
+        // The auto state's thumbnail, where it is kept beside it (autosave_now).
+        if (menu.doomed_slot() == Menu::kAutoSlot) { std::string png = path; png.replace(png.size() - 3, 3, "png"); std::remove(png.c_str()); }
+        if (menu.doomed_slot() == menu.slot()) g_state_refused.clear();
+        refresh_slots();
+        break;
+      }
+      // The same guards as a load, which is what a reset is to a replay, a
+      // recording or a session: the run stops being the one it was.
+      case Menu::Result::Reset:
+        if (net_live) { std::fprintf(stderr, "reset: not during a network session\n"); break; }
+        if (save_readonly) { std::fprintf(stderr, "reset: not during a replay\n"); break; }
+        if (log.writing()) { std::fprintf(stderr, "reset: not while recording\n"); break; }
+        if (from_list) {
+          // Back to the firmware the list came from: see main().
+          std::fprintf(stderr, "reset: back to the firmware\n");
+          g_restart = true;
+          input.request_quit();
+          break;
+        }
+        // The game named on the command line, or the firmware itself, from
+        // the top: what the power-off path below does, without the autosave
+        // -- a reset that left a state to resume into would not be one.
+        std::fprintf(stderr, "reset\n");
+        flush_save();
+#if DSPERATE_JIT
+        if (jit) ds::jit::flush_all();
+#endif
+        nds.reset();
+        if (!boot_firmware || nds.dsi) nds.setup_direct_boot();
+        if (nds.dsi && dsi_title_lo && !dsi_menu) nds.dsi_autoload(dsi_title_lo);
+        mp_ever = false;
+#if DSPERATE_CHEEVOS
+        if (cheevos_on) cheevos.reset();
+#endif
+        sram_writes_seen = nds.cart ? nds.cart->sram_writes() : 0;
+        menu.set_open(false);
+        display.set_page(false);
+        set_paused(false);
+        audio.clear();
+        pacer.reset();
+        fs_debt_ms = 0;
+        break;
       }
   };
   while (!input.quit() && !g_signalled && (frame_limit == 0 || frames < static_cast<u64>(frame_limit))) {
@@ -4698,4 +4753,20 @@ sdl_ready:
   display2.close();
   SDL_Quit();
   return 0;
+}
+
+// RESET from a game the list started goes back to the firmware the list came
+// from, and the way back is this process again. launch_game is a one-way
+// trip -- a DSiWare pick swaps the BIOS pair, the firmware, the NAND and the
+// machine itself -- and the same command line is the one description of where
+// it set out from that cannot drift. run() has returned, so everything it
+// owned has been flushed and closed the way quitting does it.
+int main(int argc, char** argv) {
+  const int rc = run(argc, argv);
+  if (g_restart && rc == 0) {
+    execv("/proc/self/exe", argv);
+    std::perror("reset: exec");
+    return 1;
+  }
+  return rc;
 }

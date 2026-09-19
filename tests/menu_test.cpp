@@ -33,7 +33,43 @@ void test_root_rows() {
   m.input(press(B::BTN_DOWN));
   CHECK(m.input(press(B::BTN_A)) == Menu::Result::Resume);        // row 3
   m.input(press(B::BTN_DOWN));
-  CHECK(m.input(press(B::BTN_A)) == Menu::Result::Quit);          // row 4
+  CHECK(m.input(press(B::BTN_A)) == Menu::Result::Reset);         // row 4
+  m.input(press(B::BTN_DOWN));
+  CHECK(m.input(press(B::BTN_A)) == Menu::Result::Quit);          // row 5
+}
+
+// The slot page's delete mode: Y in, A arms a used slot, A again deletes it.
+// Anything in between disarms, an empty slot cannot be armed, and the auto
+// state's cell is reachable in this mode alone.
+void test_slot_delete() {
+  Menu m;
+  m.set_open(true);
+  m.set_slot_used(1, true);
+  m.set_slot_used(Menu::kAutoSlot, true);
+  m.input(press(B::BTN_DOWN)); m.input(press(B::BTN_DOWN));
+  m.input(press(B::BTN_A));                                       // the slot page, on slot 0
+  m.input(press(B::BTN_Y));
+  CHECK(m.input(press(B::BTN_A)) == Menu::Result::None);          // slot 0 is empty: nothing to arm
+  CHECK(m.input(press(B::BTN_A)) == Menu::Result::None);
+  m.input(press(B::BTN_DOWN));
+  CHECK(m.input(press(B::BTN_A)) == Menu::Result::None);          // armed
+  CHECK(m.input(press(B::BTN_B)) == Menu::Result::None);          // disarmed, still in delete mode
+  CHECK(m.input(press(B::BTN_A)) == Menu::Result::None);          // armed again
+  CHECK(m.input(press(B::BTN_A)) == Menu::Result::Delete);
+  CHECK(m.doomed_slot() == 1);
+  CHECK(m.slot() == 0);                                           // deleting selects nothing
+  m.input(press(B::BTN_UP)); m.input(press(B::BTN_UP));           // 1 -> 0 -> wraps to the auto cell
+  m.input(press(B::BTN_A));
+  CHECK(m.input(press(B::BTN_A)) == Menu::Result::Delete);
+  CHECK(m.doomed_slot() == Menu::kAutoSlot);
+  m.input(press(B::BTN_Y));                                       // out of delete mode: off the auto cell
+  m.input(press(B::BTN_A));                                       // an ordinary pick
+  CHECK(m.slot() == 0);
+  // Outside delete mode the left column is five cells and A never deletes.
+  m.input(press(B::BTN_A));
+  m.input(press(B::BTN_UP));
+  m.input(press(B::BTN_A));
+  CHECK(m.slot() == 4);
 }
 
 
@@ -75,7 +111,7 @@ void test_root_rows_without_states() {
   // under the selection, and it must not be left pointing past the end.
   Menu m4;
   m4.set_open(true);
-  for (int i = 0; i < 4; ++i) m4.input(press(B::BTN_DOWN));   // down to QUIT
+  for (int i = 0; i < 5; ++i) m4.input(press(B::BTN_DOWN));   // down to QUIT
   m4.set_network_session(true);
   const Menu::Result r = m4.input(press(B::BTN_A));
   CHECK(r == Menu::Result::Quit || r == Menu::Result::Resume);   // a real row, either way
@@ -382,7 +418,7 @@ void test_wrap_and_back() {
   m.input(press(B::BTN_UP));                                      // wraps to the last row
   CHECK(m.input(press(B::BTN_A)) == Menu::Result::Quit);
   m.set_open(true);
-  for (int i = 0; i < 5; ++i) m.input(press(B::BTN_DOWN));        // a full cycle
+  for (int i = 0; i < 6; ++i) m.input(press(B::BTN_DOWN));        // a full cycle
   CHECK(m.input(press(B::BTN_A)) == Menu::Result::Save);
   // B on the root page leaves the menu; on the slot page it only goes back.
   CHECK(m.input(press(B::BTN_B)) == Menu::Result::Resume);
@@ -1492,6 +1528,7 @@ void test_canvas_sizes() {
 
 int main() {
   test_root_rows();
+  test_slot_delete();
   test_root_rows_without_states();
   test_wrap_and_back();
   test_slot_selection();

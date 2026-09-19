@@ -144,8 +144,9 @@ Rect toast_rect(const Canvas& d, const char* header, const char* title, const ch
 class Menu {
 public:
   // What the frontend should do after input(). Save/Load act on slot();
-  // Launch acts on chosen().
-  enum class Result : u8 { None, Resume, Save, Load, Quit, Launch };
+  // Launch acts on chosen(); Delete acts on doomed_slot(). Reset restarts
+  // whatever was booted: the game, or the firmware the game list came from.
+  enum class Result : u8 { None, Resume, Save, Load, Quit, Launch, Reset, Delete };
 
   // One game in the picker. `title` is what the list shows -- the ROM
   // header's own title where it could be read, the filename otherwise -- and
@@ -204,9 +205,14 @@ public:
   const std::string& chosen() const { return chosen_; }
 
   int  slot() const { return slot_; }
+  // The slot whose state the player confirmed away, valid when update()
+  // returned Delete; kAutoSlot for the auto state. Not slot(): deleting one
+  // does not select it.
+  int  doomed_slot() const { return slot_row_; }
   void set_slot(int s) { slot_ = s; }
   // Shown on the root row so the player can see what a save would overwrite.
-  void set_slot_used(int s, bool used) { if (s >= 0 && s < 10) used_[s] = used; }
+  // kAutoSlot is the auto state: on the slot page only so it can be deleted.
+  void set_slot_used(int s, bool used) { if (s >= 0 && s <= kAutoSlot) used_[s] = used; }
   // A short word shown after "SLOT < n >" when a state was refused rather
   // than loaded -- an autoloaded slot that silently started the game from
   // the beginning is otherwise invisible. Cleared as soon as the player acts
@@ -231,8 +237,9 @@ public:
   // The root page is a table in menu.cpp (kRoot); this is its length, and the
   // panel grows with it. Adding a row is one entry there: the panel is sized
   // at draw time from the canvas, so a page no longer has a fixed ceiling.
-  static constexpr int kRootRows = 8;
+  static constexpr int kRootRows = 9;
   static constexpr int kSlotRows = 5;   // ten slots as two columns of five
+  static constexpr int kAutoSlot = 10;  // the auto state, in a row under both columns
 
 private:
   // A page stack rather than a flat state, so B pops wherever it is pressed
@@ -253,8 +260,13 @@ private:
   int  row_ = 0;        // the root page's selection
   int  slot_row_ = 0;   // the slot page's, kept apart so backing out lands where it left
   int  slot_ = 0;
+  // The slot page's delete mode (Y toggles it): A on a used slot arms it --
+  // the row reads SURE? in red -- and a second A is the delete. Anything else
+  // disarms. Two presses because a state cannot be got back. The auto state
+  // can only be deleted, so its cell is reachable in this mode alone.
+  bool slot_delete_ = false, slot_armed_ = false;
   std::string slot_notice_;
-  bool used_[10] = {};
+  bool used_[kAutoSlot + 1] = {};
 
   std::vector<cheat::Code>* codes_ = nullptr;
   const std::vector<cheat::Group>* groups_ = nullptr;

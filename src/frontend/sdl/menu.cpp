@@ -193,6 +193,7 @@ void fill_rect(const Canvas& d, int x, int y, int w, int h, u32 colour) {
 
 constexpr u32 kInk = 0xFFFFFFFF, kDim = 0xFF909090, kPanel = 0xFF101018, kEdge = 0xFF5060A0, kSel = 0xFF3050A0;
 constexpr u32 kEdgeText = 0xFFA0B0E0, kPanelEdgeDim = 0xFF303040;   // group headings; the scroll-bar track
+constexpr u32 kDanger = 0xFFFF5050;  // the slot page's delete mode, and the slot about to go
 constexpr u32 kWarn = 0xFFFFC050;   // the slot row when a state was refused
 
 // The panel every page sits in: a filled box with a one-pixel edge.
@@ -236,6 +237,7 @@ constexpr struct RootItem { const char* label; Menu::Result result; } kRoot[] = 
   {"OPTIONS",    Menu::Result::None},
   {"ACHIEVEMENTS", Menu::Result::None},
   {"RESUME",     Menu::Result::Resume},
+  {"RESET",      Menu::Result::Reset},
   {"QUIT",       Menu::Result::Quit},
 };
 static_assert(static_cast<int>(std::size(kRoot)) == Menu::kRootRows, "kRootRows must match the table");
@@ -306,8 +308,9 @@ void Menu::set_cheats(std::vector<cheat::Code>* codes, const std::vector<cheat::
 // when no database matched, options when the frontend gave no host -- so what
 // is on screen is a subset of the table and the two have to be mapped.
 bool Menu::root_visible(int item) const {
+  // RESET goes with the state rows: it ends a session just as surely.
   if (kRoot[item].result == Result::Save || kRoot[item].result == Result::Load ||
-      item == kSlotRow)
+      kRoot[item].result == Result::Reset || item == kSlotRow)
     return have_states();
   if (item == kCheatRow) return have_cheats();
   if (item == kOptionsRow) return have_options();
@@ -488,9 +491,38 @@ Menu::Result Menu::handle(u32 presses) {
     // right. It is not row_, which is the root page's selection: they used to
     // share one variable and be reset on every entry and exit, which a page
     // stack cannot do -- popping has to leave the page below as it was.
-    if (hit(B::BTN_UP))    slot_row_ = (slot_row_ % kSlotRows == 0) ? slot_row_ + kSlotRows - 1 : slot_row_ - 1;
-    if (hit(B::BTN_DOWN))  slot_row_ = (slot_row_ % kSlotRows == kSlotRows - 1) ? slot_row_ - kSlotRows + 1 : slot_row_ + 1;
-    if (hit(B::BTN_LEFT) || hit(B::BTN_RIGHT)) slot_row_ = (slot_row_ + kSlotRows) % 10;
+    // Delete mode: Y in and out, B out. A arms a used slot and A again is the
+    // delete; any other press in between disarms it.
+    const bool confirm = hit(B::BTN_A) || hit(B::BTN_START);
+    if (slot_armed_ && presses && !confirm) { slot_armed_ = false; return Result::None; }   // the press that backs out does only that
+    if (hit(B::BTN_Y)) {
+      slot_delete_ = !slot_delete_;
+      slot_armed_ = false;
+      if (!slot_delete_ && slot_row_ == kAutoSlot) slot_row_ = slot_;
+      return Result::None;
+    }
+    if (slot_delete_ && hit(B::BTN_B)) {
+      slot_delete_ = false;
+      if (slot_row_ == kAutoSlot) slot_row_ = slot_;
+      return Result::None;
+    }
+    if (slot_delete_ && confirm) {
+      if (!used_[slot_row_]) return Result::None;
+      if (!slot_armed_) { slot_armed_ = true; return Result::None; }
+      slot_armed_ = false;
+      if (slot_row_ == slot_) slot_notice_.clear();
+      return Result::Delete;
+    }
+    // Both columns are a cell longer in delete mode: the auto state's row.
+    {
+      int col = slot_row_ == kAutoSlot ? 0 : slot_row_ / kSlotRows;
+      int r = slot_row_ == kAutoSlot ? kSlotRows : slot_row_ % kSlotRows;
+      const int len = kSlotRows + (slot_delete_ ? 1 : 0);
+      if (hit(B::BTN_UP))   r = (r + len - 1) % len;
+      if (hit(B::BTN_DOWN)) r = (r + 1) % len;
+      if ((hit(B::BTN_LEFT) || hit(B::BTN_RIGHT)) && r < kSlotRows) col ^= 1;
+      slot_row_ = r == kSlotRows ? kAutoSlot : col * kSlotRows + r;
+    }
     if (hit(B::BTN_B)) { pop(); return Result::None; }
     if (hit(B::BTN_A) || hit(B::BTN_START)) { slot_ = slot_row_; slot_notice_.clear(); pop(); }
     return Result::None;
@@ -537,7 +569,7 @@ Menu::Result Menu::handle(u32 presses) {
   }
   if (hit(B::BTN_B)) return Result::Resume;
   if (!hit(B::BTN_A) && !hit(B::BTN_START)) return Result::None;
-  if (item == kSlotRow) { push(Page::Slot); slot_row_ = slot_; return Result::None; }
+  if (item == kSlotRow) { push(Page::Slot); slot_row_ = slot_; slot_delete_ = slot_armed_ = false; return Result::None; }
   if (item == kCheatRow) {
     build_lines();
     cheat_row_ = 0;
@@ -1595,7 +1627,7 @@ void Menu::draw(const Canvas& d) const {
   if (page() == Page::TextEdit) { draw_text_edit(d); return; }
   const bool slots = page() == Page::Slot;
   Metrics m = metrics(d);
-  const int rows = slots ? kSlotRows : root_rows();   // the slot page stacks its ten in two columns
+  const int rows = slots ? kSlotRows + 2 : root_rows();   // the slot page stacks its ten in two columns, over the auto state and a help line
   // How wide the rows actually need to be. It used to be a flat 75 glyphs, on
   // the reasoning that every label was short -- and then "ACHIEVEMENTS"
   // arrived and ran off the right edge. Measured now, with the old width as a
@@ -1627,33 +1659,42 @@ void Menu::draw(const Canvas& d) const {
   // Not PAUSED during a network session: the game behind this page is still
   // running, because a console that stops for the length of a menu visit has
   // left the session.
-  const char* title = slots ? "STATE SLOT" : (net_session_ ? "MENU" : "PAUSED");
-  draw_text(d, px0 + (panel_w - text_width(scale, title)) / 2, py0 + title_y, scale, kInk, title);
+  const char* title = slots ? (slot_delete_ ? "DELETE STATE" : "STATE SLOT") : (net_session_ ? "MENU" : "PAUSED");
+  draw_text(d, px0 + (panel_w - text_width(scale, title)) / 2, py0 + title_y, scale, slots && slot_delete_ ? kDanger : kInk, title);
+  if (slots) {
+    // The pip is the DS's Y, on the left of the diamond, as on the Controls page.
+    const char* help = slot_delete_ ? "\x03 DONE" : "\x03 DELETE";
+    draw_text(d, px0 + (panel_w - text_width(scale, help)) / 2, py0 + rows_y + (kSlotRows + 1) * row_h, scale, kDim, help);
+  }
   fill_rect(d, px0 + m.pad, py0 + rule_y, panel_w - 2 * m.pad, std::max(1, m.s / 2), kEdge);
 
   char buf[24];
-  for (int i = 0; i < (slots ? 10 : root_rows()); ++i) {
-    // Slots fill a column at a time: 0-4 on the left, 5-9 on the right.
-    const int col = slots ? i / kSlotRows : 0;
-    const int cell_w = slots ? (panel_w - 2 * m.pad) / 2 : panel_w - 2 * m.pad;
+  for (int i = 0; i < (slots ? kAutoSlot + 1 : root_rows()); ++i) {
+    // Slots fill a column at a time: 0-4 on the left, 5-9 on the right, and
+    // the auto state in a row of its own under both.
+    const int col = slots && i != kAutoSlot ? i / kSlotRows : 0;
+    const int cell_w = slots && i != kAutoSlot ? (panel_w - 2 * m.pad) / 2 : panel_w - 2 * m.pad;
     const int cell_x = px0 + m.pad + col * cell_w;
-    const int ry = py0 + rows_y + (slots ? i % kSlotRows : i) * row_h;
+    const int ry = py0 + rows_y + (slots ? (i == kAutoSlot ? kSlotRows : i % kSlotRows) : i) * row_h;
     if (i == (slots ? slot_row_ : row_)) fill_rect(d, cell_x, ry - m.s, cell_w, row_h, kSel);
     const char* label = buf;
     const int item = slots ? i : root_item(i);
-    if (slots) std::snprintf(buf, sizeof buf, "%d %s", i, used_[i] ? "USED" : "EMPTY");
+    const bool doomed = slots && slot_armed_ && i == slot_row_;
+    const char* tag = doomed ? "SURE?" : used_[i] ? "USED" : "EMPTY";
+    if (slots && i == kAutoSlot) std::snprintf(buf, sizeof buf, "AUTO %s", tag);
+    else if (slots) std::snprintf(buf, sizeof buf, "%d %s", i, tag);
     else if (item == kSlotRow) std::snprintf(buf, sizeof buf, "SLOT < %d >%s%s", slot_,
                                              slot_notice_.empty() ? "" : " ", slot_notice_.c_str());
     else label = kRoot[item].label;
     // Loading an empty slot, and every empty slot in the list, reads dimmer:
     // the menu says what is there before the player commits to it.
-    const bool weak = (slots && !used_[i]) || (!slots && kRoot[item].result == Result::Load && !used_[slot_]);
+    const bool weak = (slots && (!used_[i] || (i == kAutoSlot && !slot_delete_))) || (!slots && kRoot[item].result == Result::Load && !used_[slot_]);
     // A refused state is the one thing on this page the player did not ask
     // for and cannot see the consequence of -- the game just started at the
     // beginning -- so the slot row says so in warning colour until they move
     // off it. The console log says which BIOS, and why.
     const bool warn = !slots && item == kSlotRow && !slot_notice_.empty();
-    const u32 ink = warn ? kWarn : (weak && i != (slots ? slot_row_ : row_) ? kDim : kInk);
+    const u32 ink = doomed ? kDanger : warn ? kWarn : (weak && i != (slots ? slot_row_ : row_) ? kDim : kInk);
     draw_text(d, cell_x + 3 * m.s, ry, scale, ink, label);
   }
 }
