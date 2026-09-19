@@ -551,7 +551,7 @@ void Gpu::begin_frame() {
   // The frame whose display lines were just output keeps its layer for the
   // frontend: run_frame returns from line 0 AFTER this, so ref3d_ already
   // names the coming frame when the frontend asks (frame_hires).
-  shown_hires_ = ref3d_.hires; shown_hires_bytes_ = ref3d_.hires_bytes; shown_scale_ = ref3d_.scale;
+  shown_hires_ = ref3d_.hires; shown_hires_bytes_ = ref3d_.hires_bytes; shown_scale_ = ref3d_.scale; shown_edge_ = ref3d_.edge;
   ref3d_ = nds_.gpu3d.frame_ref(defer_3d_ && !capture_on_ && !capture_recent_ && !run_fifo_);
   update_phase();
   // Frameskip, for this frame's display lines: what the raster at line 215

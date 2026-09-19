@@ -809,3 +809,68 @@ is real (8.3 vs ~13 ms), but DraStic spends it and more again on its CPU
 present path, and on the heaviest scene our GPU path at 2x is ahead of
 DraStic's hi-res, at 1x comfortably so. On the scenes people cite (NSMB,
 Etrian, Spirit Tracks) both hold 60 at 2x.
+
+## P4: the smooth-3D present filter (2026-09-18)
+
+The user's observation: most of the remaining jaggedness at 4x panel scale
+is the nearest upscale of a 1x frame, and the DS's own anti-aliasing only
+tints the edge pixel. The question was whether a cheap edge pass over the
+polygon bounds with a filter could help without rendering higher. The
+answer is better than a filter, because the detection already exists: the
+triangle path's attribute plane carries, per native pixel and from the DS
+span table, which run of its polygon the pixel is on and the DS's 5-bit
+coverage -- the fraction of the pixel the polygon covers. That places the
+true edge inside the pixel to 1/32, so the present shader can split the
+4x4 panel block of an edge pixel along it: the panel pixels on the
+polygon's side keep its colour, the rest take the outside neighbour's (the
+pixel the fast AA blended with), and the crossing is interpolated towards
+the adjacent pixel of the same edge so a diagonal is a line, not steps.
+
+What it changes and what it does not: polygon silhouettes and the
+boundaries between polygons. Textures, interiors, text drawn as polygons
+and everything the 2D engines draw stay pixel-exact -- which is what the
+user wants (2D and text blocky, 3D edges clean), and what post-process AA
+cannot promise.
+
+Plumbing (`video.smooth3d`, `--smooth-3d`, needs `gpu_raster` + `gpu_present`,
+1x only):
+* span.comp records each run's slope direction in the row flags (bits
+  11/12: the edge runs down-left); tri_opaque.frag adds to the attribute
+  bits 13 (X-major run) and 14 (the covered half is the top: a left run's
+  edge running down-right leaves the polygon above it, a right run's below).
+* The raster draws every frame as an anti-aliased one (the coverage has to
+  exist whether or not the game enabled DISP3DCNT AA). The fast AA's final
+  pass, under DS_FF2_SMOOTH (`GpuFrame::flags2`; `flags` was full), writes
+  the unblended pixel and the edge record to a per-slot edge plane in ONE
+  stage -- no scratch plane, no stage 2 -- and `Raster::output_edge_handle`
+  names it beside the hi-res layer (FrameRef::edge -> Gpu::frame_hires ->
+  Display -> GpuPresent::present).
+* composite.comp packs the record into the composited pixel's alpha byte
+  (unused before): right-run, X-major, top, coverage; 0xFF = no edge (a
+  record never has coverage 31). So present.comp reads nothing it did not
+  read already; the float work and the neighbour reads run on edge pixels
+  only (~1 % of the panel).
+
+Measured on the RG DS Plus, Spirit Tracks intro, dual window, 1x, work ms
+median over 1500 frames: no AA 16.2, fast AA 16.7, smooth 16.5-16.6. The
+first cut cost 17.1 (a separate edge plane read per panel pixel, the
+per-pixel float set-up, and the AA stage 2): packing the record into the
+alpha byte, doing the set-up only on edge pixels and folding the final pass
+into one stage took it under the fast AA it replaces. The present's
+previous-frame fence wait on the second panel: 0.47 ms no AA, 0.64-0.75
+fast AA, 0.71-0.77 smooth.
+
+Verified with DS_GPU_COMP_DUMP panel dumps at frame 400: the difference
+mask against the nearest present is the polygon outlines and nothing else;
+the light square's diagonal and the tender's bar are straight lines where
+nearest has four-pixel steps; Golden Sun's title scene (fog, translucent
+mist) shows no artefacts.
+
+Not done: S >= 2. There the hardware's own edge at S x and the native
+record's reconstruction disagree inside an edge pixel (a 2-pixel
+sawtooth); culling every polygon to its DS span (DS_FF_SPANCULL) would
+make the sub-pixels agree, but tri.vert's grow is 1x code and at 2x it
+scattered the geometry (giant black polygons), so the filter is gated to
+1x in the raster and the present, and the hi-res path keeps its hardware
+edges. Also open: the mask shader's span-cull branch now divides by S
+(it read hi-res coordinates as native rows).

@@ -174,6 +174,8 @@ const char* kUsage =
     "  --fast-load     cart DMA reads the card without its clock (may affect accuracy); emu.fast_load\n"
     "  --aa / --no-aa  3D anti-aliasing on (hardware behaviour) or off; video.aa, off by default\n"
     "  --gpu-raster    rasterise 3D on the GPU (Vulkan compute) where the frame allows it; video.gpu_raster, off by default\n"
+    "  --smooth-3d     with the GPU raster and present: rebuild polygon edges at panel resolution from the\n"
+    "                  DS's own edge coverage (2D stays pixel-exact); video.smooth3d, off by default\n"
     "  --lockstep      128-cycle CPU interleave (melonDS lockstep) instead of event-bound; --quantum N for any value\n"
     "  --frameskip N   skip drawing up to N frames in N+1 (0 = off); emu.frameskip. Skipping runs\n"
     "                  in whole display periods, so on a game that drives its screens on\n"
@@ -913,7 +915,7 @@ struct VideoSetup {
   ds::sdl::Display::Layout layout;
   std::vector<ds::sdl::Display::Mode> layout_cycle;
   // Boot-only, see above.
-  bool   use_disp = false, use_fbdev = false, gpu_present = false;
+  bool   use_disp = false, use_fbdev = false, gpu_present = false, smooth3d = false;
   int    bottom_display = 1;
 };
 
@@ -1006,6 +1008,7 @@ bool parse_video(const ds::sdl::Config& cfg, VideoSetup& vs) {
 // change can close the windows and come back through here with new values.
 bool open_displays(const VideoSetup& vs, ds::sdl::Display& display, ds::sdl::Display& display2) {
   display.set_gpu_present(vs.gpu_present); display2.set_gpu_present(vs.gpu_present);
+  display.set_smooth3d(vs.smooth3d); display2.set_smooth3d(vs.smooth3d);
   if (vs.dual_window) {
     display.set_chunky(vs.chunky != 0, vs.chunky_cell); display2.set_chunky(vs.chunky != 0, vs.chunky_cell);
     display.set_grid_strength(vs.linear ? 0.0 : vs.grid_s); display2.set_grid_strength(vs.linear ? 0.0 : vs.grid_s);
@@ -1240,6 +1243,8 @@ int main(int argc, char** argv) {
     else if (flag("--aa")) cli.set("video.aa", "true");
     else if (flag("--no-aa")) cli.set("video.aa", "false");
     else if (flag("--gpu-raster")) cli.set("video.gpu_raster", "true");
+    else if (flag("--smooth-3d")) cli.set("video.smooth3d", "true");
+    else if (flag("--no-smooth-3d")) cli.set("video.smooth3d", "false");
     else if (flag("--no-gpu-raster")) cli.set("video.gpu_raster", "false");
     else if (arg("--internal-res")) cli.set("video.internal_res", argv[++i]);
     // The two halves of Timing OC separately: they pull in opposite directions
@@ -1297,7 +1302,7 @@ int main(int argc, char** argv) {
   }
   auto apply_cli = [&] { for (const char* k : {"paths.bios9", "paths.bios7", "paths.firmware", "video.scale", "video.dual_window", "video.layout", "video.screen", "video.pip_alpha", "video.dominant_ratio", "video.dominant_threshold", "video.integer_scale",
                                               "video.fullscreen", "video.linear", "video.lcd_grid", "video.chunky", "video.chunky_threshold", "video.chunky_cell", "video.seam", "video.disp", "video.fbdev", "video.gpu_present", "video.vsync", "audio.enabled", "audio.volume",
-                                              "audio.mic", "emu.jit", "emu.quantum", "emu.speed", "emu.limiter", "emu.pacing", "audio.buffer_size", "audio.latency_frames", "emu.timing_oc", "emu.gx_worker", "emu.cpu_tuning", "emu.fast_load", "emu.frameskip", "emu.frameskip_mode", "emu.frameskip_capture", "video.aa", "video.gpu_raster", "video.gpu_defer", "video.internal_res", "emu.autosave_png", "emu.autoload", "cheevos.enabled", "cheevos.token_file", "cheevos.username"}) if (cli.has(k)) cfg.set(k, cli.str(k)); };
+                                              "audio.mic", "emu.jit", "emu.quantum", "emu.speed", "emu.limiter", "emu.pacing", "audio.buffer_size", "audio.latency_frames", "emu.timing_oc", "emu.gx_worker", "emu.cpu_tuning", "emu.fast_load", "emu.frameskip", "emu.frameskip_mode", "emu.frameskip_capture", "video.aa", "video.gpu_raster", "video.gpu_defer", "video.internal_res", "video.smooth3d", "emu.autosave_png", "emu.autoload", "cheevos.enabled", "cheevos.token_file", "cheevos.username"}) if (cli.has(k)) cfg.set(k, cli.str(k)); };
   apply_cli();
   const std::string bios9 = cfg.str("paths.bios9"), bios7 = cfg.str("paths.bios7");
   // The DSi's own firmware, for a session that is a DSi from the start, unless
@@ -1672,6 +1677,8 @@ int main(int argc, char** argv) {
   // (docs/gpu-path-scoping.md P1); Display falls back to the scanline
   // scaler when the tier has no dma-buf or the driver cannot import one.
   { const std::string g = cfg.str("video.gpu_present"); vs.gpu_present = g == "true" || g == "on" || g == "1"; }
+  // The smooth-3D filter (P4): needs the GPU raster and the GPU present stage.
+  vs.smooth3d = cfg.flag("video.smooth3d", false) && cfg.flag("video.gpu_raster", false);
 
   // The fbdev tier (display_fbdev.h) owns fb0 the same way. auto takes it
   // only where SDL2 was built with the mali video driver -- the BaseOS
@@ -1910,7 +1917,7 @@ sdl_ready:
         if (dual_window) display2.present();
         set_scale_targets(target, false);
       } else {
-        { size_t hb = 0; ds::u32 hs = 1; int hsc = 0; const ds::u64 hh = nds.gpu.frame_hires(&hb, &hs, &hsc); display.set_gpu_layer(hh, hb, hs, hsc); display2.set_gpu_layer(hh, hb, hs, hsc); }
+        { size_t hb = 0; ds::u32 hs = 1; int hsc = 0; ds::u64 he = 0; const ds::u64 hh = nds.gpu.frame_hires(&hb, &hs, &hsc, &he); display.set_gpu_layer(hh, hb, hs, hsc, he); display2.set_gpu_layer(hh, hb, hs, hsc, he); }
         display.draw(fb);
         if (dual_window) display2.draw(fb);
       }
@@ -2024,6 +2031,8 @@ sdl_ready:
     // video.internal_res: the triangle path's internal resolution (1..4). The
     // raster reads it as DS_VK_SCALE at creation; an explicit environment wins.
     if (!std::getenv("DS_VK_SCALE")) { const int ir = std::atoi(cfg.str("video.internal_res", "1").c_str()); if (ir >= 2 && ir <= 4) setenv("DS_VK_SCALE", std::to_string(ir).c_str(), 1); }
+    // video.smooth3d: the raster writes its edge plane (DS_VK_SMOOTH3D at creation, the same way).
+    if (!std::getenv("DS_VK_SMOOTH3D") && cfg.flag("video.smooth3d", false)) setenv("DS_VK_SMOOTH3D", "1", 1);
     std::string why;
     const bool on = nds.gpu3d.renderer().set_gpu_raster(true, &why);
     std::fprintf(stderr, "gpu raster: %s%s%s\n", on ? "on" : "OFF -- software raster",
@@ -4468,7 +4477,7 @@ sdl_ready:
         // limit until the overlays get their own plane: on a 3D line the
         // composite takes the exported planes, so an OSD label or the save
         // flash drawn into screen 0's copy does not show there.
-        { size_t hb = 0; ds::u32 hs = 1; int hsc = 0; const ds::u64 hh = nds.gpu.frame_hires(&hb, &hs, &hsc); display.set_gpu_layer(hh, hb, hs, hsc); display2.set_gpu_layer(hh, hb, hs, hsc); }
+        { size_t hb = 0; ds::u32 hs = 1; int hsc = 0; ds::u64 he = 0; const ds::u64 hh = nds.gpu.frame_hires(&hb, &hs, &hsc, &he); display.set_gpu_layer(hh, hb, hs, hsc, he); display2.set_gpu_layer(hh, hb, hs, hsc, he); }
         display.draw(fb);
         if (dual_window) display2.draw(fb);
       }

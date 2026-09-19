@@ -268,6 +268,10 @@ R"(# DSperate settings. Command-line flags override this file. Two files next
                                 # (2x2 DS pixels) | N (or the nearest size below N that divides the screen)
 # aa = false                    # 3D edge anti-aliasing as the hardware does it. Off is cheaper and is
                                 # what most emulators show
+# smooth3d = false              # with gpu_raster and gpu_present: polygon edges rebuilt at the panel's
+                                # resolution from the DS's own edge coverage, so a 4x upscale shows a
+                                # slanted edge instead of a four-pixel staircase. Textures, interiors
+                                # and everything the 2D engines draw stay pixel-exact
 # disp = auto                   # present through the display engine's hardware scaler (Miyoo A30 and
                                 # other Allwinner boards): auto (wherever /dev/disp answers) | true | false
 # fbdev = auto                  # present straight through /dev/fb0 (the H700 handhelds' mali-only SDL2):

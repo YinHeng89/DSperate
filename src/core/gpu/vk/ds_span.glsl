@@ -350,7 +350,9 @@ GpuRow compute_row(GpuPoly p, int y) {
   GpuVert alv, alw, arv, arw;
   bool aa = (pc.f.dispcnt & 16u) != 0u;
   int l_cov = 0, r_cov = 0;
+  bool l_neg, r_neg;   // the run's edge runs down-left (x falls as y grows): the smooth filter's covered half
   if (xstart > xend) {
+    l_neg = sr.negative; r_neg = sl.negative;
     alv = vcr; alw = vnr; arv = vcl; arw = vnl;
     istart = sr.ip; iend = sl.ip;
     if (aa) { l_cov = edge_cov(sr, 1, true, edge_rawlen(sr, 1)); r_cov = edge_cov(sl, 0, true, 0); }
@@ -365,6 +367,7 @@ GpuRow compute_row(GpuPoly p, int y) {
       r_fill = (!sl.negative && sl.xmajor) || (!(sl.negative && sl.xmajor) && r_incr0) || (bottom_fill && sl.xmajor);
     }
   } else {
+    l_neg = sl.negative; r_neg = sr.negative;
     alv = vcl; alw = vnl; arv = vcr; arw = vnr;
     istart = sl.ip; iend = sr.ip;
     if (aa) { l_cov = edge_cov(sl, 0, false, edge_rawlen(sl, 0)); r_cov = edge_cov(sr, 1, false, edge_rawlen(sr, 1)); }
@@ -408,6 +411,7 @@ GpuRow compute_row(GpuPoly p, int y) {
   uint yedge = (y == p.ytop) ? 4u : ((y == p.ybot - 1) ? 8u : 0u);
   o.fl = 1u | (l_fill ? 2u : 0u) | (r_fill ? 4u : 0u) | (wbuf ? 8u : 0u) |
          (ix.linear ? 16u : 0u) | (yedge << 5) |
+         (l_neg ? 2048u : 0u) | (r_neg ? 4096u : 0u) |
          ((p.flags & DS_PF_SHADOW_MASK) != 0u ? 512u : 0u) |
          ((p.flags & DS_PF_SHADOW) != 0u ? 1024u : 0u);
   return o;

@@ -52,8 +52,10 @@ public:
   // exported planes and that layer (shaders/composite.comp) instead of
   // taken from fb[0].
   // `drawn`: the rectangle of the overlay the frontend drew this frame (see overlay()).
+  // `edge`: the raster's edge plane of the same frame (Raster::output_edge_handle);
+  // non-zero turns the smooth-3D filter on for that screen (present.comp).
   bool present(ScanoutOut& out, const u32* const fb[2], const View* views, int nviews, int rot, int lw, int lh, u8 inset_alpha,
-               u64 hires = 0, size_t hires_bytes = 0, u32 scale = 1, int hires_screen = 0, SDL_Rect drawn = SDL_Rect{0, 0, 0, 0});
+               u64 hires = 0, size_t hires_bytes = 0, u32 scale = 1, int hires_screen = 0, SDL_Rect drawn = SDL_Rect{0, 0, 0, 0}, u64 edge = 0);
   // The canvas the frontend draws its overlays on (the OSD, the pause menu,
   // notices) for the coming frame, in the logical frame at `lw` x `lh`
   // pixels, pitch `lw`, 0xAARRGGBB with the alpha honoured. Host-cached

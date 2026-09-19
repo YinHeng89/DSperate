@@ -3315,6 +3315,7 @@ Renderer3D::FrameRef Renderer3D::frame_ref(bool allow_defer) const {
     f.gpu = vk_raster_.get();
     f.hires = vk_raster_->output_hires_handle();
     f.hires_bytes = vk_raster_->output_hires_bytes();
+    f.edge = vk_raster_->output_edge_handle();
     f.scale = vk_raster_->scale();
     f.nbins = vk_raster_->frame_bands();
     if (f.nbins > MAX_BINS) f.nbins = MAX_BINS;

@@ -36,7 +36,7 @@ void main() {
   if (f.alpha == 31u) { o_col = f.src; o_attr = f.polyattr; o_z = f.depth; return; }
   uint dattr = subpassLoad(in_attr).r;
   uint dcol = subpassLoad(in_col).r;
-  uint attr = (f.polyattr & 0xE0F0u) | ((f.polyattr >> 8) & 0xFF0000u) | (1u << 22) | (dattr & 0xFF001F0Fu);
+  uint attr = (f.polyattr & 0xE0F0u) | ((f.polyattr >> 8) & 0xFF0000u) | (1u << 22) | (dattr & 0xFF007F0Fu);   // the opaque pixel's edge record stays (bits 0-3, 8-14)
   // Equal ids do not blend. A shadow compares against whichever id the
   // destination carries -- translucent if it has one, otherwise the opaque
   // one -- which is what stops a shadow darkening the polygon that cast it.

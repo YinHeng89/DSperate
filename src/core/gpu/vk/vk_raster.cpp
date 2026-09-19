@@ -39,7 +39,7 @@ constexpr size_t kTilesHeader = sizeof(u32) * DS_TILE_COUNT + sizeof(u32) * 4;
 
 enum Binding { B_POLYS = 0, B_VERTS = 1, B_TILES = 2, B_TEXELS = 3, B_OUT = 4,
                B_POST = 5, B_DEPTH = 6, B_ATTR = 7, B_SHCLEAR = 8, B_ROWS = 9, B_KEYS = 10, B_ROWPOLY = 11, B_OUTNAT = 12, B_ORDER = 13, B_NATATTR = 14, B_NATZ = 15, B_TOUCH = 16,
-               B_UCOL = 17, B_UATTR = 18, B_UZ = 19, B_COUNT = 20 };
+               B_UCOL = 17, B_UATTR = 18, B_UZ = 19, B_EDGE = 20, B_COUNT = 21 };
 
 // DS_VK_VIS: 0 sends the whole list through the ordered loop, as before the
 // visibility pass existed. Attribution and a safety valve, not a feature: the
@@ -112,6 +112,13 @@ struct Raster::Impl {
   // depth record -- as three more attachments aliased on these buffers, which
   // post.comp then reads for the coverage blend.
   Buffer ucol, uattr, uz;
+  // The smooth filter's edge plane (DS_VK_SMOOTH3D=1, video.smooth3d): one
+  // per output slot, written by the final pass, read by the present stage's
+  // composite for the frame output_hires_handle() names. edge_valid says
+  // whether the slot's frame wrote it (a frame with no final pass did not).
+  Buffer edge[3];
+  bool edge_valid[3] = {false, false, false};
+  bool smooth = false;
   VkRenderPass rp_aa = VK_NULL_HANDLE;
   VkFramebuffer fb_aa[3] = {VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE};
   VkDescriptorSet set_in_aa[3] = {VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE};
@@ -261,7 +268,7 @@ bool Raster::tri_setup(Impl& d, Device& dev, std::string* why) {
   d.set_in = got[3];
   for (int i = 0; i < 3; ++i) {
     VkDescriptorBufferInfo bi[B_COUNT]{};
-    const Buffer* src[B_COUNT] = {&d.polys, &d.verts, &d.tiles, &d.texels, &d.out[i], &d.post, &d.depth, &d.attr, &d.shclear, &d.rows, &d.keys, &d.rowpoly, &d.out_nat[i], &d.order, &d.nat_attr, &d.nat_z, &d.touch, &d.ucol, &d.uattr, &d.uz};
+    const Buffer* src[B_COUNT] = {&d.polys, &d.verts, &d.tiles, &d.texels, &d.out[i], &d.post, &d.depth, &d.attr, &d.shclear, &d.rows, &d.keys, &d.rowpoly, &d.out_nat[i], &d.order, &d.nat_attr, &d.nat_z, &d.touch, &d.ucol, &d.uattr, &d.uz, &d.edge[i]};
     VkWriteDescriptorSet w[B_COUNT]{};
     for (u32 b = 0; b < B_COUNT; ++b) {
       bi[b].buffer = vk_buf(*src[b]); bi[b].range = VK_WHOLE_SIZE;
@@ -611,6 +618,9 @@ std::unique_ptr<Raster> Raster::create(Device& dev, std::string* why) {
     // is ~0.15 ms of GPU, the strided gather lands on the thread that reads
     // the line -- st 2x +0.5 ms median. Opt-in for a host with CPU to spare.
     d.cpu_down = self->scale_ > 1 && std::getenv("DS_VK_CPU_DOWNSAMPLE");
+    d.smooth = self->scale_ == 1 && std::getenv("DS_VK_SMOOTH3D") != nullptr && std::strcmp(std::getenv("DS_VK_SMOOTH3D"), "0") != 0;
+    d.edge[i] = dev.alloc(d.smooth ? out_bytes : 4096, Access::CpuWrite);   // GPU-only; a token binding when the filter is off
+    if (!d.edge[i]) return set_why("edge plane allocation failed");
     if (i == 0) {
       d.order = dev.alloc(sizeof(u32) * DS_MAX_POLYS, Access::CpuWrite); if (!d.order) return set_why("order buffer allocation failed");
       const size_t nat_bytes = 256 * 192 * sizeof(u32) + 16384;   // the alias slack, as out_bytes
@@ -746,7 +756,7 @@ std::unique_ptr<Raster> Raster::create(Device& dev, std::string* why) {
   for (int i = 0; i < 3; ++i) {
     VkDescriptorBufferInfo bi[B_COUNT]{};
     const Buffer* src[B_COUNT] = {&d.polys, &d.verts, &d.tiles, &d.texels, &d.out[i],
-                                  &d.post, &d.depth, &d.attr, &d.shclear, &d.rows, &d.keys, &d.rowpoly, &d.out_nat[i], &d.order, &d.nat_attr, &d.nat_z, &d.touch, &d.ucol, &d.uattr, &d.uz};
+                                  &d.post, &d.depth, &d.attr, &d.shclear, &d.rows, &d.keys, &d.rowpoly, &d.out_nat[i], &d.order, &d.nat_attr, &d.nat_z, &d.touch, &d.ucol, &d.uattr, &d.uz, &d.edge[i]};
     VkWriteDescriptorSet w[B_COUNT]{};
     for (u32 b = 0; b < B_COUNT; ++b) {
       bi[b].buffer = vk_buf(*src[b]);
@@ -867,6 +877,7 @@ Raster::~Raster() {
   d.dev->free(d.rowpoly);
   d.dev->free(d.depth);
   d.dev->free(d.attr);
+  for (auto& e : d.edge) if (e) d.dev->free(e);
   if (d.host_textures) d.dev->free(d.host_textures);
 }
 
@@ -975,6 +986,13 @@ bool Raster::submit(u32 npoly, u32 nvert, u32 ntexels, const GpuFrame& frame_in)
   // coverage from the span table on the hardware-depth path, the final pass
   // blending each edge pixel with its outside neighbour). Either way, and
   // for edge marking too, the span pass runs so the rows exist.
+  // The smooth filter draws every frame as an anti-aliased one: the span
+  // table's coverage is what it reconstructs the edges from.
+  // 1x only: at S >= 2 the hardware's own edge (at S x) and the native
+  // record's reconstruction disagree inside an edge pixel (a sawtooth), and
+  // culling the polygons to their DS span (DS_FF_SPANCULL) is 1x code in
+  // tri.vert. The hi-res path keeps its hardware edges until that is done.
+  if (d.smooth && d.tri) { frame.dispcnt |= 1u << 4; frame.flags2 |= DS_FF2_SMOOTH; }
   const bool aa_frame = d.tri && d.aa_ok && (frame.dispcnt & (1u << 4)) != 0u;
   const bool aa_fast = d.tri && !aa_frame && (frame.dispcnt & (1u << 4)) != 0u;
   const bool rows_frame = d.tri && !aa_frame && (frame.dispcnt & ((1u << 4) | (1u << 5))) != 0u;
@@ -983,6 +1001,7 @@ bool Raster::submit(u32 npoly, u32 nvert, u32 ntexels, const GpuFrame& frame_in)
 
   const int st = stages();
   const u32 back = static_cast<u32>(d.gen % 3);
+  d.edge_valid[back] = d.smooth && aa_fast;
   const u32 rows = DS_TILES_Y / d.bands;
   if (d.cpu_down) for (auto& f : d.nat_done[back]) f.store(0, std::memory_order_relaxed);   // this slot now holds a new frame
 
@@ -1316,12 +1335,13 @@ bool Raster::submit(u32 npoly, u32 nvert, u32 ntexels, const GpuFrame& frame_in)
                            0, 1, &mb, 0, nullptr, 0, nullptr);
     a.vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, d.layout, 0, 1, &d.set[back], 0, nullptr);
     GpuFrame fpost = frame; if (aa_frame) fpost.flags |= DS_FF_AA; if (aa_fast) fpost.flags |= DS_FF_AAFAST;
+    if (d.smooth) fpost.flags2 |= DS_FF2_SMOOTH;   // stage 1 writes the edge plane and the unblended pixel; no stage 2
     a.vkCmdPushConstants(cb, d.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(GpuFrame), &fpost);
     stamp(cb, 6);
     a.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, d.pipe_post);
     const u32 px = 256 * scale_ * 192 * scale_;
     a.vkCmdDispatch(cb, (px + 63) / 64, 1, 1);
-    if (aa_fast) {
+    if (aa_fast && !d.smooth) {
       // Stage 2: the neighbour blend, reading stage 1's scratch plane.
       VkMemoryBarrier mb2{}; mb2.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER; mb2.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT; mb2.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
       a.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb2, 0, nullptr, 0, nullptr);
@@ -1473,5 +1493,7 @@ void Raster::reduce_all(const u32* nat) {
 
 u64 Raster::output_hires_handle() const { return d_->out[(d_->gen + 2) % 3].handle; }
 size_t Raster::output_hires_bytes() const { return d_->out[0].size; }
+u64 Raster::output_edge_handle() const { const u32 s = (d_->gen + 2) % 3; return d_->edge_valid[s] ? d_->edge[s].handle : 0; }
+bool Raster::smooth() const { return d_->smooth; }
 
 } // namespace ds::gpu::vk

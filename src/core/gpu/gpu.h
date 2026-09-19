@@ -230,7 +230,8 @@ public:
   // at begin_frame, which runs at line 0 before run_frame returns.
   // `screen`: the screen engine A (the one with the 3D layer) displayed on
   // this frame -- POWCNT1 bit 15, which Spirit Tracks flips every frame.
-  u64 frame_hires(size_t* bytes, u32* scale, int* screen = nullptr) const { if (bytes) *bytes = shown_hires_bytes_; if (scale) *scale = shown_scale_; if (screen) *screen = layer_screen_; return shown_hires_; }
+  // `edge`: the smooth filter's edge plane of the same frame (0 when none).
+  u64 frame_hires(size_t* bytes, u32* scale, int* screen = nullptr, u64* edge = nullptr) const { if (bytes) *bytes = shown_hires_bytes_; if (scale) *scale = shown_scale_; if (screen) *screen = layer_screen_; if (edge) *edge = shown_edge_; return shown_hires_; }
   // Both screens or neither: pass a null `px` to go back to fb_.
   void set_scale_target(int screen, const ScaleTarget& t) { scale_[screen] = t; if (scale_[screen].y_hi == 0) scale_[screen].y_hi = t.h; }
   // Run a whole DS-resolution image through the scanline scaler, for a
@@ -447,7 +448,7 @@ private:
   struct StashedLine { u32 line; int screen; alignas(16) u32 px[SCREEN_W]; };
   LayerExport layer_;
   int layer_screen_ = 0;   // engine A's screen on the frame's first line (frame_hires)
-  u64 shown_hires_ = 0; size_t shown_hires_bytes_ = 0; u32 shown_scale_ = 1;   // the layer of the frame whose lines were just output (begin_frame latches it)
+  u64 shown_hires_ = 0; size_t shown_hires_bytes_ = 0; u32 shown_scale_ = 1; u64 shown_edge_ = 0;   // the layer of the frame whose lines were just output (begin_frame latches it)
   StashedLine bscale_[SCREEN_H];
   u32  bscale_n_ = 0;                   // lines stashed for the job being built / in flight
   bool bscale_defer_ = false;           // output_engine stashes engine B's line instead of scaling it

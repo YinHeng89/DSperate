@@ -23,7 +23,8 @@ void main() {
   if ((pc.f.flags & DS_FF_SPANCULL) != 0u) {
     // The AA pass grows polygons by a pixel: keep the DS span only, and take
     // the depth from the row as the AA shaders do.
-    int x = int(gl_FragCoord.x), y = int(gl_FragCoord.y);
+    int S = int(pc.f.scale);   // the rows are native: the smooth filter sets this at S >= 2 too
+    int x = int(gl_FragCoord.x) / S, y = int(gl_FragCoord.y) / S;
     int y0 = max(p.ytop, 0);
     if (y < y0 || y > min(p.ybot, 191)) discard;
     GpuRow r = rows_c[p.row_base + uint(y - y0)];

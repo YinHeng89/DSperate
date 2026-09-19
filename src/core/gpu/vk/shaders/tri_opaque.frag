@@ -28,7 +28,19 @@ void main() {
     uint cov; bool inside; GpuRow r;
     int S = int(pc.f.scale);
     edge = row_edge(p, int(gl_FragCoord.x) / S, int(gl_FragCoord.y) / S, cov, inside, r);
-    if (edge != 0u && (pc.f.dispcnt & 16u) != 0u) edge |= (cov << 8);
+    if (edge != 0u && (pc.f.dispcnt & 16u) != 0u) {
+      edge |= (cov << 8);
+      // For the smooth filter: whether this run's edge is X-major (the
+      // coverage is then a vertical fraction) and which half of the pixel
+      // the polygon covers (see present.comp). A left run's edge running
+      // down-right leaves the polygon above it; a right run's, below.
+      if ((edge & 3u) != 0u) {
+        bool left = (edge & 1u) != 0u;
+        bool xmajor = ((left ? r.lcov : r.rcov) & 0x80000000u) != 0u;
+        bool neg = (r.fl & (left ? 2048u : 4096u)) != 0u;
+        if (xmajor) edge |= 0x2000u | ((left != neg) ? 0x4000u : 0u);
+      }
+    }
   }
   o_attr = f.polyattr | edge;
   o_z = f.depth;

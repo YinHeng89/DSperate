@@ -49,7 +49,7 @@ struct Push {
   s32 rect[2][4];
   s32 view[2][4];
 };
-struct CompPush { u32 scale, fb_base, dispcnt3d, pad; };
+struct CompPush { u32 scale, fb_base, dispcnt3d, flags; };   // flags: 1 = the edge plane is bound (smooth filter)
 
 __asm__(".section .rodata\n.balign 4\n.globl ds_composite_spv_data\nds_composite_spv_data:\n"
         ".incbin \"" DSPERATE_PRESENT_SHADER_DIR "/composite.spv\"\n"
@@ -381,9 +381,9 @@ std::unique_ptr<GpuPresent> GpuPresent::open(ScanoutOut& out, std::string* why) 
     VkShaderModuleCreateInfo csi{}; csi.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
     csi.codeSize = static_cast<size_t>(ds_composite_spv_end - ds_composite_spv_data); csi.pCode = reinterpret_cast<const u32*>(ds_composite_spv_data);
     if (d.a->vkCreateShaderModule(d.vk->dev, &csi, nullptr, &d.cmod) != VK_SUCCESS) return fail("composite.spv rejected by the driver");
-    VkDescriptorSetLayoutBinding cb[4]{};
-    for (u32 i = 0; i < 4; ++i) { cb[i].binding = i + 1; cb[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; cb[i].descriptorCount = 1; cb[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT; }
-    VkDescriptorSetLayoutCreateInfo cdl{}; cdl.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO; cdl.bindingCount = 4; cdl.pBindings = cb;
+    VkDescriptorSetLayoutBinding cb[5]{};
+    for (u32 i = 0; i < 5; ++i) { cb[i].binding = i + 1; cb[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; cb[i].descriptorCount = 1; cb[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT; }
+    VkDescriptorSetLayoutCreateInfo cdl{}; cdl.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO; cdl.bindingCount = 5; cdl.pBindings = cb;
     if (d.a->vkCreateDescriptorSetLayout(d.vk->dev, &cdl, nullptr, &d.cdsl) != VK_SUCCESS) return fail("composite descriptor layout failed");
     VkPushConstantRange cpcr{}; cpcr.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT; cpcr.size = sizeof(CompPush);
     VkPipelineLayoutCreateInfo cpl{}; cpl.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO; cpl.setLayoutCount = 1; cpl.pSetLayouts = &d.cdsl; cpl.pushConstantRangeCount = 1; cpl.pPushConstantRanges = &cpcr;
@@ -392,7 +392,7 @@ std::unique_ptr<GpuPresent> GpuPresent::open(ScanoutOut& out, std::string* why) 
     ccp.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO; ccp.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT; ccp.stage.module = d.cmod; ccp.stage.pName = "main"; ccp.layout = d.clayout;
     if (d.a->vkCreateComputePipelines(d.vk->dev, VK_NULL_HANDLE, 1, &ccp, nullptr, &d.cpipe) != VK_SUCCESS) return fail("composite pipeline failed to compile");
   }
-  VkDescriptorPoolSize ps[2] = {{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, kMaxBufs * kSlots}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, kMaxBufs * kSlots * 3 + kSlots * 4}};
+  VkDescriptorPoolSize ps[2] = {{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, kMaxBufs * kSlots}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, kMaxBufs * kSlots * 3 + kSlots * 5}};
   VkDescriptorPoolCreateInfo dp{}; dp.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO; dp.maxSets = kMaxBufs * kSlots + kSlots; dp.poolSizeCount = 2; dp.pPoolSizes = ps;
   if (d.a->vkCreateDescriptorPool(d.vk->dev, &dp, nullptr, &d.pool) != VK_SUCCESS) return fail("descriptor pool failed");
   {
@@ -465,7 +465,7 @@ bool GpuPresent::reimport(ScanoutOut& out) {
 void GpuPresent::flush(ScanoutOut& out) { d_->retire(out); }
 
 bool GpuPresent::present(ScanoutOut& out, const u32* const fb[2], const View* views, int nviews, int rot, int lw, int lh, u8 inset_alpha,
-                         u64 hires, size_t hires_bytes, u32 scale, int hires_screen, SDL_Rect drawn) {
+                         u64 hires, size_t hires_bytes, u32 scale, int hires_screen, SDL_Rect drawn, u64 edge) {
   Impl& d = *d_;
   const Api& a = *d.a;
   ++d.presented;
@@ -499,16 +499,19 @@ bool GpuPresent::present(ScanoutOut& out, const u32* const fb[2], const View* vi
   const bool do_comp = shows && hires != 0 && scale >= 1 && scale <= kMaxScale;
   if (do_comp) {
     d.dev->flush(d.planes->buf, 0, sizeof(u32) * kPlaneWords);
-    VkDescriptorBufferInfo ci[4]{};
+    VkDescriptorBufferInfo ci[5]{};
     ci[0].buffer = gpu::vk::vk_buf(d.src); ci[0].range = VK_WHOLE_SIZE;
     ci[1].buffer = gpu::vk::vk_buf(d.planes->buf); ci[1].range = VK_WHOLE_SIZE;
     ci[2].buffer = reinterpret_cast<VkBuffer>(hires); ci[2].range = hires_bytes;
     ci[3].buffer = gpu::vk::vk_buf(d.comp[slot]); ci[3].range = VK_WHOLE_SIZE;
-    VkWriteDescriptorSet cw[4]{};
-    for (u32 i = 0; i < 4; ++i) { cw[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; cw[i].dstSet = d.cset[slot]; cw[i].dstBinding = i + 1; cw[i].descriptorCount = 1; cw[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; cw[i].pBufferInfo = &ci[i]; }
-    a.vkUpdateDescriptorSets(d.vk->dev, 4, cw, 0, nullptr);
+    // The raster's edge plane, when this frame has one; else the output plane stands in (never read).
+    ci[4].buffer = edge ? reinterpret_cast<VkBuffer>(edge) : gpu::vk::vk_buf(d.comp[slot]); ci[4].range = VK_WHOLE_SIZE;
+    VkWriteDescriptorSet cw[5]{};
+    for (u32 i = 0; i < 5; ++i) { cw[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; cw[i].dstSet = d.cset[slot]; cw[i].dstBinding = i + 1; cw[i].descriptorCount = 1; cw[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; cw[i].pBufferInfo = &ci[i]; }
+    a.vkUpdateDescriptorSets(d.vk->dev, 5, cw, 0, nullptr);
   }
   d.dump_scale = do_comp ? scale : 0;
+  const bool smooth = do_comp && edge != 0 && scale == 1;   // the raster only writes the plane at 1x (vk_raster.cpp)
 
   Push pc{};
   pc.a[0] = d.w; pc.a[1] = d.h; pc.a[2] = static_cast<u32>(lw); pc.a[3] = static_cast<u32>(lh);
@@ -523,7 +526,7 @@ bool GpuPresent::present(ScanoutOut& out, const u32* const fb[2], const View* vi
     u64 nz = 0; if (d.over[slot]) { const u32* o = static_cast<const u32*>(d.over[slot].ptr); for (int i = 0; i < lw * lh; ++i) nz += (o[i] >> 24) != 0; }
     std::fprintf(stderr, "gpu present: overlay at frame %llu -- drawn %d,%d %dx%d, has_over %d, geometry %dx%d (recorded %dx%d), buffer %zu bytes, tier %ux%u, %llu pixels with alpha\n", static_cast<unsigned long long>(d.composited), drawn.x, drawn.y, drawn.w, drawn.h, has_over ? 1 : 0, lw, lh, d.over_lw, d.over_lh, d.over[slot].size, d.w, d.h, static_cast<unsigned long long>(nz));
   }
-  pc.b[0] = static_cast<u32>(rot); pc.b[1] = static_cast<u32>(nviews > 2 ? 2 : nviews); pc.b[2] = inset_alpha | (has_over ? 0x100u : 0u);
+  pc.b[0] = static_cast<u32>(rot); pc.b[1] = static_cast<u32>(nviews > 2 ? 2 : nviews); pc.b[2] = inset_alpha | (has_over ? 0x100u : 0u) | (smooth ? 0x200u : 0u);
   pc.b[3] = static_cast<u32>(slot) * kSlotWords | (do_comp ? ((scale << 24) | 0x80000000u) : 0u);
   for (int v = 0; v < static_cast<int>(pc.b[1]); ++v) {
     pc.rect[v][0] = views[v].rect.x; pc.rect[v][1] = views[v].rect.y; pc.rect[v][2] = views[v].rect.w; pc.rect[v][3] = views[v].rect.h;
@@ -548,7 +551,7 @@ bool GpuPresent::present(ScanoutOut& out, const u32* const fb[2], const View* vi
     // own writes before the present reads them.
     VkMemoryBarrier mb0{}; mb0.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER; mb0.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT; mb0.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
     a.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb0, 0, nullptr, 0, nullptr);
-    CompPush cp{scale, static_cast<u32>(slot) * kSlotWords + static_cast<u32>(hires_screen) * kFrameWords, 0, 0};
+    CompPush cp{scale, static_cast<u32>(slot) * kSlotWords + static_cast<u32>(hires_screen) * kFrameWords, 0, smooth ? 1u : 0u};
     a.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, d.cpipe);
     a.vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, d.clayout, 0, 1, &d.cset[slot], 0, nullptr);
     a.vkCmdPushConstants(cb, d.clayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof cp, &cp);
@@ -585,7 +588,7 @@ std::unique_ptr<GpuPresent> GpuPresent::open(ScanoutOut&, std::string* why) { if
 GpuPresent::~GpuPresent() = default;
 bool GpuPresent::reimport(ScanoutOut&) { return false; }
 void GpuPresent::flush(ScanoutOut&) {}
-bool GpuPresent::present(ScanoutOut&, const u32* const*, const View*, int, int, int, int, u8, u64, size_t, u32, SDL_Rect) { return false; }
+bool GpuPresent::present(ScanoutOut&, const u32* const*, const View*, int, int, int, int, u8, u64, size_t, u32, int, SDL_Rect, u64) { return false; }
 u32* GpuPresent::overlay(int, int) { return nullptr; }
 GpuPresent::LayerPtrs GpuPresent::layer_ptrs() { return {}; }
 const std::string& GpuPresent::device_name() const { static const std::string none; return none; }

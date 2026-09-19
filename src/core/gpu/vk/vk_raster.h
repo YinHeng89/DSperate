@@ -51,6 +51,10 @@ public:
   // it is the same buffer output() maps.
   u64 output_hires_handle() const;
   size_t output_hires_bytes() const;
+  // The smooth filter's edge plane of that same frame (0 when the frame did
+  // not write one), and whether the filter is on (DS_VK_SMOOTH3D at creation).
+  u64 output_edge_handle() const;
+  bool smooth() const;
 
   // Whether the order-free prefix goes through the visibility pass
   // (vis.comp / resolve.comp) rather than the ordered loop. Needs 64-bit

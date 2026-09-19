@@ -11,7 +11,16 @@ layout(std430, binding = 1) readonly buffer Src    { uint fb[]; };      // the f
 layout(std430, binding = 2) readonly buffer Planes { uint pl[]; };      // top | second | meta | win (49152 each) | line[192] | mbright[192]
 layout(std430, binding = 3) readonly buffer L3D    { uint l3d[]; };     // 256S x 192S RGB666 + alpha5 << 24
 layout(std430, binding = 4) writeonly buffer Dst   { uint dst[]; };     // 256S x 192S 0xAARRGGBB
-layout(push_constant) uniform P { uint scale; uint fb_base; uint dispcnt3d; uint pad; } pc;
+layout(std430, binding = 5) readonly buffer EdgeIn { uint ein[]; };     // the raster's edge plane (the smooth filter; pc.flags bit 0 says it is bound)
+// The smooth filter's edge record rides in the output's alpha byte, which
+// nothing downstream used: bit 0 right run (else left), bit 1 X-major, bit 2
+// covered half is the top, bits 3-7 coverage. 0xFF = no edge (a record's
+// coverage is never 31, so no edge encodes to 0xFF).
+uint edge_byte(uint e) {
+  if ((e & 3u) == 0u || ((e >> 8) & 31u) == 31u) return 0xFFu;
+  return ((e & 2u) != 0u ? 1u : 0u) | ((e & 0x2000u) != 0u ? 2u : 0u) | ((e & 0x4000u) != 0u ? 4u : 0u) | (((e >> 8) & 31u) << 3);
+}
+layout(push_constant) uniform P { uint scale; uint fb_base; uint dispcnt3d; uint flags; } pc;
 
 const uint P_TOP = 0u, P_SECOND = 49152u, P_META = 98304u, P_WIN = 147456u, P_LINE = 196608u, P_MB = 196800u;
 const uint K_OBJ_SEMI = 1u, K_OBJ_BITMAP = 2u, K_3D = 3u;
@@ -41,14 +50,15 @@ void main() {
   if (p.x >= W || p.y >= H) return;
   uint nx = p.x / S, ny = p.y / S, ni = ny * 256u + nx;
   uint mb = pl[P_MB + ny];
-  if ((mb & 0x80000000u) == 0u) { dst[p.y * W + p.x] = fb[pc.fb_base + ni]; return; }
+  uint e = 0u;
+  if ((mb & 0x80000000u) == 0u) { dst[p.y * W + p.x] = fb[pc.fb_base + ni] | 0xFF000000u; return; }
   uint a = pl[P_TOP + ni], b = pl[P_SECOND + ni], m = pl[P_META + ni];
   uint t1 = m & 0xFFu, kind = (m >> 8) & 0xFFu, talpha = (m >> 16) & 0xFFu, t2 = ((m >> 24) & 0xFFu) << 8;
   uint l = pl[P_LINE + ny], bldcnt = l & 0xFFFFu, eva = (l >> 16) & 0x1Fu, evb = (l >> 21) & 0x1Fu, evy = (l >> 26) & 0x1Fu;
   if (kind == K_3D) {
     uint px3 = l3d[p.y * W + p.x];
     if (((px3 >> 24) & 0x1Fu) == 0u) { a = b; kind = 0u; t1 = t2 >> 8; }   // transparent at this subpixel: the layer beneath
-    else a = px3;
+    else { a = px3; if ((pc.flags & 1u) != 0u) e = ein[p.y * W + p.x]; }
   }
   uint effect = (bldcnt >> 6) & 3u;
   uint o = a;
@@ -68,5 +78,5 @@ void main() {
   if (mode == 1u) { uint rb = o & 0x3F003Fu, g = o & 0x3F00u; rb += ((((0x3F003Fu - rb) * factor) >> 4) & 0x3F003Fu); g += ((((0x3F00u - g) * factor) >> 4) & 0x3F00u); o = rb | g; }
   else if (mode == 2u) { uint rb = o & 0x3F003Fu, g = o & 0x3F00u; rb -= ((((rb * factor) + (0xFu * 0x010001u)) >> 4) & 0x3F003Fu); g -= ((((g * factor) + (0xFu * 0x000100u)) >> 4) & 0x3F00u); o = rb | g; }
   uint v = ((o & 0x3Fu) << 18) | ((o & 0x3F00u) << 2) | ((o & 0x3F0000u) >> 14);
-  dst[p.y * W + p.x] = v | ((v & 0xC0C0C0u) >> 6) | 0xFF000000u;
+  dst[p.y * W + p.x] = v | ((v & 0xC0C0C0u) >> 6) | (edge_byte(e) << 24);
 }
