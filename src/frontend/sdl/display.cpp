@@ -522,8 +522,10 @@ void Display::draw_gpu(const u32* const fb[SCREENS]) {
   int lw = 0, lh = 0;
   out_size(lw, lh);
   GpuPresent::View v[SCREENS];
-  for (int i = 0; i < nviews_; ++i) v[i] = GpuPresent::View{views_[i].screen, views_[i].rect, views_[i].shown, !views_[i].direct};
-  gpu_->present(*out_, fb, v, nviews_, rot_, lw, lh, inset_alpha_, gpu_layer_, gpu_layer_bytes_, gpu_layer_scale_, gpu_layer_screen_, canvas_drawn_, smooth3d_ ? gpu_layer_edge_ : 0);
+  for (int i = 0; i < nviews_; ++i) v[i] = GpuPresent::View{views_[i].screen, views_[i].rect, views_[i].shown, !views_[i].direct, grid_on(views_[i].screen)};
+  // The LCD grid as the scanline tiers draw it (kern::scale_row_grid): the brightness kept on a seam.
+  const u32 grid = grid_strength_ > 0.0 ? static_cast<u32>(std::lround((1.0 - grid_strength_) * 256.0)) : 256u;
+  gpu_->present(*out_, fb, v, nviews_, rot_, lw, lh, inset_alpha_, gpu_layer_, gpu_layer_bytes_, gpu_layer_scale_, gpu_layer_screen_, canvas_drawn_, smooth3d_ ? gpu_layer_edge_ : 0, grid);
   canvas_drawn_ = SDL_Rect{0, 0, 0, 0};
 }
 

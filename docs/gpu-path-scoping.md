@@ -874,3 +874,32 @@ scattered the geometry (giant black polygons), so the filter is gated to
 1x in the raster and the present, and the hi-res path keeps its hardware
 edges. Also open: the mask shader's span-cull branch now divides by S
 (it read hi-res coordinates as native rows).
+
+### P4: the LCD grid on the GPU present (2026-09-18)
+
+`video.lcd_grid` now applies on the GPU present tier, as kern::scale_row_grid
+draws it on the scanline tiers: the first panel pixel of a source pixel's
+run and the first panel row of a source line dimmed to f/256 (opaque black
+at full strength), only for runs at least ceil(scale) wide, on every other
+DS pixel at exactly 2x, per axis, with Display::grid_on's per-view rule
+(full strength needs 2x, a dimmed grid applies from 1x). Verified against
+the CPU rule pixel for pixel on the RG DS Plus panel dumps at full and half
+strength (0 mismatches over a 1/35 sample of the panel).
+
+Three shapes were measured, Spirit Tracks 1x dual window, work ms median:
+* arithmetic per pixel (eight integer divides): +6 ms -- Mali emulates
+  integer division; the float form was still +2.5 ms;
+* per-view seam bitmasks built on the CPU each frame (two bit tests a
+  pixel) with integer dimming: +0.9 ms at full strength, +1.6 at half;
+* the same with the dimming as a float multiply after the colour
+  conversion: +0.5 ms at either strength (16.9-17.1 -> 17.4-17.5).
+Attribution probes (view flag off / seams black / no table read) put the
+cost in the shader itself, not the CPU tables: at 1.5 M panel pixels a
+frame every instruction in present.comp is ~40 us on this GPU, which is
+also the reason the smooth filter and any future filter must stay off the
+common per-pixel path. Replacing the base nearest map's integer divides
+with (exact) float division measured a loss (retire 0.77 -> 1.13 ms) and
+was reverted.
+
+P4 status: LCD grid and the smooth-3D edge filter done; bilinear, the box
+filter and chunky remain (chunky cells are still CPU-only).

@@ -41,7 +41,7 @@ public:
   // After the tier reopened at a new size: drop and re-import its buffers.
   bool reimport(ScanoutOut& out);
 
-  struct View { int screen; SDL_Rect rect; bool shown; bool blends; };
+  struct View { int screen; SDL_Rect rect; bool shown; bool blends; bool grid = false; };   // grid: the LCD grid applies to this view (Display::grid_on)
   // One frame: take a buffer from the tier, upload fb[0..1], dispatch into
   // that buffer, submit. `lw` x `lh` is the logical (unrotated) frame the
   // rects are laid out in; `rot` maps it onto the presented buffer. False
@@ -54,8 +54,9 @@ public:
   // `drawn`: the rectangle of the overlay the frontend drew this frame (see overlay()).
   // `edge`: the raster's edge plane of the same frame (Raster::output_edge_handle);
   // non-zero turns the smooth-3D filter on for that screen (present.comp).
+  // `grid`: the LCD grid's brightness kept on a seam, 0..256 (256 = off), as Gpu::ScaleTarget::grid.
   bool present(ScanoutOut& out, const u32* const fb[2], const View* views, int nviews, int rot, int lw, int lh, u8 inset_alpha,
-               u64 hires = 0, size_t hires_bytes = 0, u32 scale = 1, int hires_screen = 0, SDL_Rect drawn = SDL_Rect{0, 0, 0, 0}, u64 edge = 0);
+               u64 hires = 0, size_t hires_bytes = 0, u32 scale = 1, int hires_screen = 0, SDL_Rect drawn = SDL_Rect{0, 0, 0, 0}, u64 edge = 0, u32 grid = 256);
   // The canvas the frontend draws its overlays on (the OSD, the pause menu,
   // notices) for the coming frame, in the logical frame at `lw` x `lh`
   // pixels, pitch `lw`, 0xAARRGGBB with the alpha honoured. Host-cached
