@@ -24,6 +24,8 @@ const Choice kCpuOc[] = {{"false", "OFF"}, {"underclock", "UNDERCLOCK"}, {"overc
 const Choice kLimiter[] = {{"auto", "CONSOLE (59.8)"}, {"30", "30"}, {"60", "60"}, {"120", "120"},
                            {"144", "144"}, {"240", "240"}, {"off", "UNLIMITED"}};
 const Choice kIntScale[] = {{"off", "OFF"}, {"under", "UNDER"}, {"over", "OVER"}};
+// 3D edges. "true"/"false" are the old boolean and read as accurate/off (aa_mode in main.cpp).
+const Choice kAa[]       = {{"off", "OFF"}, {"smooth", "SMOOTH"}, {"accurate", "ACCURATE"}};
 const Choice kSeam[]     = {{"dark", "DARK"}, {"blend", "BLEND"}, {"blend_linear", "BLEND LINEAR"}};
 // The file's own words on the left. "mean" is the ordinary cell and reads as
 // DEFAULT; the rest are named for what they do rather than how they do it.
@@ -163,8 +165,8 @@ const Setting kVideoSettings[] = {
        "DRAW BLOCKS OF DS PIXELS AS ONE FLAT CELL, FOR PANELS AT ODD SCALES"),
   number("video.chunky_cell", "CHUNKY CELL", 2, 8, 1, "auto", FlagDeferred, Dep::ChunkyCell,
          "PANEL PIXELS PER CELL", "auto", "AUTO"),
-  boolean("video.aa", "ANTI-ALIASING", "false", FlagLive, Dep::None,
-          "SMOOTH 3D EDGES AS THE HARDWARE DID. OFF IS CHEAPER"),
+  pick("video.aa", "ANTI-ALIASING", kAa, 3, "off", FlagLive, Dep::None,
+       "SMOOTH DRAWS 3D EDGES AT PANEL RESOLUTION. ACCURATE BLENDS THEM AS THE HARDWARE DID"),
   boolean("video.fps", "FPS COUNTER", "false", FlagLive, Dep::None,
           "FRAMES PER SECOND IN THE CORNER OF THE SCREEN"),
   boolean("video.fullscreen", "FULLSCREEN", "false", FlagDeferred, Dep::Windowed, nullptr),

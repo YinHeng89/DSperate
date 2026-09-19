@@ -229,6 +229,15 @@ public:
   // screen has no scale target (the renderer tier, or a hidden screen).
   void scale_image(int screen, const u32* src);
   bool scaling() const { return scale_[0].px && scale_[1].px; }
+  // Sub-pixel polygon edges: the 3D raster's split map (Renderer3D::
+  // extract_splits) cuts an edge pixel's panel cell at the polygon's real
+  // boundary instead of showing it as one colour. Only the scanline scaler's
+  // nearest / grid / seam paths show it, and only where the 3D layer is what
+  // the pixel shows; 2D is never touched. Every polygon edge is drawn (the
+  // AA fill rule), so the 3D picture is not the hardware's when the game left
+  // anti-aliasing and edge marking off.
+  void set_subpixel(bool on);
+  bool subpixel() const { return subpixel_; }
   u16 line() const { return line_; }
 
   Engine2D engine[2];
@@ -305,6 +314,33 @@ private:
   // target is scanout memory (uncached CMA on the handhelds), and copying a
   // row to its duplicates below straight out of it reads that memory back.
   alignas(16) u32 row_scratch_[2][SCALED_ROW_MAX];
+  // Sub-pixel edges (emit_splits). A cut whose uncovered part takes the line
+  // below waits in sp_pend_ until that line is composed.
+  struct SplitRec { u8 x, side, unc; s8 slope, src; };   // side: SPLIT_* | 0x80 weak | 0x40 spill | 0x20 edge-marked (unc = position + 32) | 0x10 a band's reach from the line above; unc 0..32; src: see Renderer3D::extract_splits
+  bool subpixel_ = false;
+  const u32* split3d_ = nullptr;          // split map of line3d_ (null: none this frame)
+  SplitRec sp_pend_[2][4 * SCREEN_W];
+  u32 sp_pend_n_[2] = {0, 0}, sp_pend_line_[2] = {~0u, ~0u};
+  alignas(16) u32 sp_prev_[2][SCREEN_W];  // the previous composed line, for cuts that take the line above
+  u32 sp_prev_line_[2] = {~0u, ~0u};
+  void emit_splits(int screen, u32 line, const u32* dst, const Pixel* composed, bool shown, u64 key);
+  // The carry through display capture (carry_store): per frame generation, a
+  // content-keyed table of split lines.
+  static constexpr u32 kSplitGens = 4;
+  struct SplitGen {
+    struct Slot { u64 key = 0; u32 off = 0; u16 n = 0; };
+    u64 frame = ~u64{0};
+    u32 used = 0;
+    std::array<Slot, 512> slot{};
+    std::array<SplitRec, 16384> recs{};
+  };
+  std::vector<SplitGen> sp_gen_;          // kSplitGens of them once the mode is on (set_subpixel)
+  u64 sp_last_store_ = 0;
+  static bool split_admit(const SplitRec& r, const u32* own, const u32* other, u32 ox, bool horiz);
+  void emit_splits_b(int screen, u32 line, const u32* dst, u64 key);
+  void carry_store(u64 key, const SplitRec* recs, u32 n);
+  u32 carry_find(u64 key, const SplitRec** recs) const;
+  void patch_cell(const ScaleTarget& t, u32 line, const SplitRec& r, u32 nb);
   const u32* line3d_ = nullptr;   // 3D output for the line being drawn (whichever thread draws engine A)
 
   // Lazy-2D state for the frame in progress.
@@ -425,7 +461,7 @@ private:
   // mode stash their output instead of scaling it (output_engine); the
   // worker scales the stash after engine A's lines. On Golden Sun's title
   // that is ~1.1 ms a frame off the emulation thread with two panels.
-  struct StashedLine { u32 line; int screen; alignas(16) u32 px[SCREEN_W]; };
+  struct StashedLine { u32 line; int screen; u64 key; alignas(16) u32 px[SCREEN_W]; };   // key: see emit_splits
   StashedLine bscale_[SCREEN_H];
   u32  bscale_n_ = 0;                   // lines stashed for the job being built / in flight
   bool bscale_defer_ = false;           // output_engine stashes engine B's line instead of scaling it

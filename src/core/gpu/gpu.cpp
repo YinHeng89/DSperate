@@ -611,7 +611,11 @@ void Gpu::worker_job(void* self) {
   Gpu& g = *static_cast<Gpu*>(self);
   for (int e = 0; e < 2; ++e)
     for (u32 l = g.job_first_[e]; l <= g.job_last_[e]; ++l) g.step_engine(e, l);
-  for (u32 i = 0; i < g.bscale_n_; ++i) g.emit_scaled(g.bscale_[i].screen, g.bscale_[i].line, g.bscale_[i].px);
+  for (u32 i = 0; i < g.bscale_n_; ++i) {
+    const StashedLine& st = g.bscale_[i];
+    g.emit_scaled(st.screen, st.line, st.px);
+    if (g.subpixel_) g.emit_splits_b(st.screen, st.line, st.px, st.key);
+  }
 }
 
 void Gpu::join_worker() {
@@ -747,7 +751,7 @@ void Gpu::step_engine(int e, u32 line) {
   // Reading the 3D line joins the raster bands, so a skipped frame (whose
   // raster never ran) must not ask for it; capture, which also reads it, is
   // never on for a skipped frame.
-  if (e == 0 && (draw || capture_render_)) { prof::Scope l3(prof::R3D_LINE); line3d_ = nds_.gpu3d.line(ref3d_, line); en.set_3d_line(line3d_); }
+  if (e == 0 && (draw || capture_render_)) { prof::Scope l3(prof::R3D_LINE); line3d_ = nds_.gpu3d.line(ref3d_, line); en.set_3d_line(line3d_); split3d_ = subpixel_ ? nds_.gpu3d.split_line(ref3d_, line) : nullptr; }
   if (draw) { en.render_line(line); output_engine(e, line); }
   // A skipped frame has nothing to capture: its destination bank keeps the
   // picture it last captured, and display_phase_period() is what stops an
@@ -759,6 +763,29 @@ void Gpu::step_engine(int e, u32 line) {
     en.render_sprites(line + 1);
   }
   { prof::Scope jn(prof::JOURNAL); en.post_draw(false); }
+}
+
+// A line's identity for the carry: its colours at the 15 bits a capture keeps.
+// Rotate-xor over the line in 64-bit pairs with one multiply-mix to finish: the keys only have
+// to tell apart the few hundred lines of the last frames, and this runs on every shown line.
+static inline u64 key_finish(u64 h) { h ^= h >> 29; h *= 0xFF51AFD7ED558CCDull; return (h ^ (h >> 32)) | 1; }   // 0 = empty slot
+static u64 line_key(const u32* px) {
+  u64 h = 0x9E3779B97F4A7C15ull;
+  for (u32 i = 0; i < SCREEN_W; i += 2) {
+    const u64 v = (px[i] & 0x3E3E3Eu) | (static_cast<u64>(px[i + 1] & 0x3E3E3Eu) << 32);
+    h = ((h << 7) | (h >> 57)) ^ v;
+  }
+  return key_finish(h);
+}
+static u64 line_key15(const u16* px) {
+  // The same value line_key gives the line once it is RGB666: 5 bits a channel at bits 1, 9, 17.
+  auto c = [](u32 v) -> u32 { return ((v & 0x1Fu) << 1) | ((v & 0x3E0u) << 4) | ((v & 0x7C00u) << 7); };
+  u64 h = 0x9E3779B97F4A7C15ull;
+  for (u32 i = 0; i < SCREEN_W; i += 2) {
+    const u64 v = c(px[i]) | (static_cast<u64>(c(px[i + 1])) << 32);
+    h = ((h << 7) | (h >> 57)) ^ v;
+  }
+  return key_finish(h);
 }
 
 // The output stage for one engine's line: display mode, master brightness,
@@ -787,8 +814,294 @@ void Gpu::output_engine(int e, u32 line) {
     if (e == 1 && bscale_defer_ && bscale_n_ < SCREEN_H) {
       StashedLine& st = bscale_[bscale_n_++];
       st.line = line; st.screen = screen;
+      st.key = subpixel_ && screens_on_ && ((en.dispcnt() >> 16) & 1) && sp_last_store_ + kSplitGens > nds_.frame_count ? line_key(en.output()) : 0;
       std::memcpy(st.px, dst, sizeof st.px);
-    } else emit_scaled(screen, line, dst);
+    } else {
+      emit_scaled(screen, line, dst);
+      if (subpixel_) {
+        // Engine A's composed line carries the 3D splits when it is shown (normal display) or
+        // captured; any other shown line may be a remembered one (see carry_store).
+        const u32 mode = e == 0 ? (en.dispcnt() >> 16) & 3 : ((en.dispcnt() >> 16) & 1);
+        const bool a_3d = e == 0 && split3d_ && (mode == 1 || capture_render_);
+        u64 key = 0;
+        if (!(a_3d && mode == 1) && screens_on_ && sp_last_store_ + kSplitGens > nds_.frame_count) {
+          if (mode == 1) key = line_key(en.output());
+          else if (e == 0 && mode == 2) {
+            const u32 bank = (en.dispcnt() >> 18) & 3;
+            const VramMap& vm = nds_.bus.vram_map();
+            if (vm.lcdc_mask & (1u << bank)) key = line_key15(reinterpret_cast<const u16*>(vm.bank(bank)) + line * 256);
+          }
+        }
+        emit_splits(screen, line, dst, a_3d ? en.output() : nullptr, mode == 1, key);
+      }
+    }
+  }
+}
+
+static inline bool row_kept(const Gpu::ScaleTarget& t, u32 y) { return y >= t.y_lo && y < t.y_hi; }
+static inline u32* row_at(const Gpu::ScaleTarget& t, u32 y) { return t.px + (static_cast<size_t>(y) - t.y_lo) * t.pitch; }
+
+// ---- sub-pixel edges ------------------------------------------------------------
+// After a line's rows are out, the cells of its split pixels are patched in
+// place: the part of the cell the polygon does not cover takes the composed
+// colour of the neighbour on that side (what is really there -- another
+// polygon, the 2D layer behind a transparent clear). Write-only: colours come
+// from the source lines, never from the target.
+void Gpu::set_subpixel(bool on) {
+  if (on && sp_gen_.empty()) sp_gen_.resize(kSplitGens);
+  subpixel_ = on;
+  nds_.gpu3d.renderer().set_subpixel(on);
+  for (int s = 0; s < 2; ++s) { sp_pend_n_[s] = 0; sp_pend_line_[s] = sp_prev_line_[s] = ~0u; }
+}
+
+static inline u32 rgb_dist(u32 a, u32 b) {
+  auto d = [](u32 x, u32 y) { return x > y ? x - y : y - x; };
+  return d(a & 0xFF, b & 0xFF) + d((a >> 8) & 0xFF, (b >> 8) & 0xFF) + d((a >> 16) & 0xFF, (b >> 16) & 0xFF);
+}
+constexpr u32 kSplitContrast = 24;   // summed RGB888 distance below which a cut would not show
+constexpr u32 kSplitStep = 60;       // and what a weak record's step must reach (see split_admit)
+constexpr u32 kSplitBold = 120;      // a step this big is a boundary whatever runs along it
+
+// The carry. A game that shows its 3D through a display capture (GSDD: engine
+// A captures its own picture to a bank, shows the bank a frame later, and
+// copies it to the other engine's bitmap by DMA) never shows the split lines
+// themselves. So a captured line's splits are remembered under the line's
+// content, and any line either engine later shows with that content -- VRAM
+// display, a bitmap BG, a guest copy -- gets them back. Generations by frame:
+// the one being written is never read, so the two engines' threads do not meet.
+void Gpu::carry_store(u64 key, const SplitRec* recs, u32 n) {
+  const u64 frame = nds_.frame_count;
+  SplitGen& g = sp_gen_[frame % kSplitGens];
+  if (g.frame != frame) { g.frame = frame; g.used = 0; for (auto& sl : g.slot) sl.key = 0; }
+  if (g.used + n > g.recs.size()) return;
+  for (u32 probe = 0; probe < 8; ++probe) {
+    auto& sl = g.slot[((key >> 8) + probe) & (g.slot.size() - 1)];
+    if (sl.key && sl.key != key) continue;
+    sl.key = key; sl.off = g.used; sl.n = static_cast<u16>(n);
+    std::memcpy(&g.recs[g.used], recs, n * sizeof(SplitRec));
+    g.used += n;
+    sp_last_store_ = frame;
+    return;
+  }
+}
+
+u32 Gpu::carry_find(u64 key, const SplitRec** recs) const {
+  const u64 frame = nds_.frame_count;
+  for (u32 k = 1; k < kSplitGens; ++k) {
+    const SplitGen& g = sp_gen_[(frame + kSplitGens - k) % kSplitGens];
+    if (g.frame + kSplitGens <= frame || g.frame >= frame) continue;     // stale, or the one being written
+    for (u32 probe = 0; probe < 8; ++probe) {
+      const auto& sl = g.slot[((key >> 8) + probe) & (g.slot.size() - 1)];
+      if (!sl.key) break;
+      if (sl.key == key) { *recs = &g.recs[sl.off]; return sl.n; }
+    }
+  }
+  return 0;
+}
+
+// Whether a cut shows and should. `own` is the cell's line, `other` the line
+// the test may also look at (a vertical cut: the line above, for what runs
+// along the edge; a horizontal cut: the line the uncovered part takes from),
+// `ox` the column of the neighbour it takes. A strong record needs only
+// contrast. A weak one must be a step and not texture: the colour across the
+// cut has to stand well clear of how much either side varies *along* the
+// edge, where a real boundary is steady and a texture is as busy as across.
+bool Gpu::split_admit(const SplitRec& r, const u32* own, const u32* other, u32 ox, bool horiz) {
+  const u32 x = r.x;
+  const u32 p = own[x], o = horiz ? other[ox] : own[ox];
+  const u32 across = rgb_dist(p, o);
+  if (across < kSplitContrast) return false;
+  if (!(r.side & 0x80)) return true;
+  if (across < kSplitStep) return false;
+  if (across >= kSplitBold) return true;
+  auto nearest = [](u32 c, const u32* row, u32 cx, bool self) {
+    u32 best = ~0u;
+    for (s32 d = -1; d <= 1; ++d) {
+      if (d == 0 && !self) continue;
+      const s32 xi = static_cast<s32>(cx) + d;
+      if (xi < 0 || xi >= static_cast<s32>(SCREEN_W)) continue;
+      best = std::min(best, rgb_dist(c, row[xi]));
+    }
+    return best;
+  };
+  u32 noise;
+  if (horiz) noise = std::max(nearest(p, own, x, false), nearest(o, other, ox, false));   // along = the same lines, x +- 1
+  else {
+    if (!other) return false;                                                             // along = the line above
+    noise = std::max(nearest(p, other, x, true), nearest(o, other, ox, true));
+  }
+  return across > 3 * noise;
+}
+
+void Gpu::emit_splits_b(int screen, u32 line, const u32* dst, u64 key) {
+  emit_splits(screen, line, dst, nullptr, true, key);   // no composed line: engine A's split map is not read
+}
+
+// `composed`: engine A's composed line when it is what the screen shows (normal
+// display) or what a capture takes; `key`: the shown line's content key when it
+// is not engine A's own 3D (0 = none).
+void Gpu::emit_splits(int screen, u32 line, const u32* dst, const Pixel* composed, bool shown, u64 key) {
+  const ScaleTarget& t = scale_[screen];
+  const bool usable = !t.bilinear && !t.chunky && t.h >= SCREEN_H && t.xrun[SCREEN_W] >= SCREEN_W;
+  // Cuts of the line above that were waiting for this one.
+  if (sp_pend_n_[screen]) {
+    if (usable && sp_pend_line_[screen] + 1 == line)
+      for (u32 i = 0; i < sp_pend_n_[screen]; ++i) {
+        const SplitRec& r = sp_pend_[screen][i];
+        // An outline's band reaching down into this line (see the marked case below): this
+        // line's cell, its upper part, the outline's colour from the line above.
+        if (r.side & 0x10) { patch_cell(t, line, r, sp_prev_[screen][r.x]); continue; }
+        // The cell's own line is sp_prev_ by now, the line it takes from is this one.
+        if (split_admit(r, sp_prev_[screen], dst, r.x, true)) patch_cell(t, line - 1, r, dst[r.x]);
+      }
+    sp_pend_n_[screen] = 0;
+  }
+  // This line's splits: engine A's own 3D, or a remembered line's.
+  SplitRec own[2 * SCREEN_W]; u32 n = 0;
+  const SplitRec* recs = own;
+  const u32* const sm = composed ? split3d_ : nullptr;   // engine A's thread only
+  const u32* const l3 = composed ? line3d_ : nullptr;
+  if (composed && sm && l3) {
+    for (u32 i = 0; i < 2 * SCREEN_W && n < 2 * SCREEN_W; ++i) {   // two slots a pixel: its own cut, then a spill into it
+      const u32 v = sm[i], x = i >> 1;
+      if (!v) continue;
+      // The 3D layer must be what shows, unblended, at the polygon's pixel: the cell itself,
+      // or for a spill the pixel the colour comes from.
+      const s32 src = static_cast<s32>(static_cast<s8>(((v >> 16) & 7) << 5) >> 5);
+      const u32 px = (v & Renderer3D::SPLIT_SPILL) ? x + static_cast<u32>(src) : x;
+      if (px >= SCREEN_W || ((composed[px] ^ l3[px]) & 0x3F3F3F) || ((l3[px] >> 24) & 0x1F) != 31) continue;
+      const bool marked = v & Renderer3D::SPLIT_MARKED;
+      const u8 side = static_cast<u8>((v & 7) | ((v & Renderer3D::SPLIT_WEAK) ? 0x80 : 0) | ((v & Renderer3D::SPLIT_SPILL) ? 0x40 : 0) | (marked ? 0x20 : 0));
+      own[n++] = SplitRec{static_cast<u8>(x), side, static_cast<u8>(marked ? (v >> 19) & 0x7F : (v >> 3) & 0x3F), static_cast<s8>(static_cast<s8>(((v >> 9) & 0x7F) << 1) >> 1), static_cast<s8>(src)};
+    }
+    // A plain capture of this picture: remember the line as the bank will hold it.
+    if (n && capture_render_ && ((capcnt_render_ >> 29) & 3) == 0 && !(capcnt_render_ & (1u << 24)) && ((capcnt_render_ >> 20) & 3) == 3)
+      carry_store(line_key(composed), own, n);
+    if (!shown) n = 0;
+  }
+  if (!n && key && sp_last_store_ + kSplitGens > nds_.frame_count) n = carry_find(key, &recs);
+  if (usable && n) {
+    const bool have_prev = sp_prev_line_[screen] + 1 == line;
+    for (u32 i = 0; i < n; ++i) {
+      const SplitRec& r = recs[i];
+      const u32 x = r.x;
+      const u32* const prev = have_prev ? sp_prev_[screen] : nullptr;
+      u32 nb; bool ok;
+      if (r.side & 0x20) {
+        // An edge-marked pixel. The outline is a pixel wide and stays one: the band starts at
+        // the edge, `pos` in from this pixel's outer boundary (-32..64, see Renderer3D::
+        // note_edge_part), the outside comes up to it, and it reaches as far into the next
+        // pixel in as it left this one. All half-plane patches of whole cells.
+        const s32 pos = static_cast<s32>(r.unc) - 32;
+        const u32 s3 = r.side & 7;
+        const bool low = s3 == 1 || s3 == 3;
+        const s32 sg = low ? -1 : 1;
+        const u8 outer = static_cast<u8>(s3), inner = static_cast<u8>(s3 == 1 ? 2 : s3 == 2 ? 1 : s3 == 3 ? 4 : 3);
+        auto half = [&](u32 cx, u32 cline, u8 sd, s32 amount, u32 colour) {
+          if (cx >= SCREEN_W || amount <= 0) return;
+          SplitRec h{static_cast<u8>(cx), sd, static_cast<u8>(std::min(32, amount)), amount >= 32 ? s8{0} : r.slope, 0};
+          patch_cell(t, cline, h, colour);
+        };
+        if (s3 <= 2) {
+          const u32 xo = x + static_cast<u32>(sg), xi = x - static_cast<u32>(sg), xii = x - static_cast<u32>(2 * sg);
+          if (xo >= SCREEN_W || xi >= SCREEN_W) continue;
+          const u32 O = dst[xo], C = dst[x], I = dst[xi];
+          if (!split_admit(r, dst, prev, xo, false)) continue;
+          if (pos < 0) { half(xo, line, inner, -pos, C); half(x, line, inner, -pos, I); }        // the band starts in the pixel beyond
+          else if (pos <= 32) { half(x, line, outer, pos, O); half(xi, line, outer, pos, C); }
+          else { half(x, line, outer, 32, O); half(xi, line, outer, 32, C); half(xi, line, outer, pos - 32, O); half(xii, line, outer, pos - 32, C); }
+        } else if (pos > 0 && pos <= 32) {
+          // Horizontal cuts never saturate. The outside part waits for / comes from the other
+          // line as any cut does; the band's reach into the line further in is the extra.
+          if (s3 == 3) {                     // uncovered above: outside from the line above, band into the line below
+            if (prev && split_admit(r, dst, prev, x, true)) {
+              patch_cell(t, line, SplitRec{r.x, 3, static_cast<u8>(pos), r.slope, -1}, prev[x]);
+              if (line + 1 < SCREEN_H) sp_pend_[screen][sp_pend_n_[screen]++] = SplitRec{r.x, static_cast<u8>(3 | 0x10), static_cast<u8>(pos), r.slope, -1};
+            }
+          } else {                           // uncovered below: band into the line above now, outside when the next line comes
+            if (line + 1 < SCREEN_H) sp_pend_[screen][sp_pend_n_[screen]++] = SplitRec{r.x, static_cast<u8>(4 | (r.side & 0x80)), static_cast<u8>(pos), r.slope, 1};
+            if (line > 0 && prev) patch_cell(t, line - 1, SplitRec{r.x, 4, static_cast<u8>(pos), r.slope, 1}, dst[x]);
+          }
+        }
+        (void)inner;
+        continue;
+      }
+      switch (r.side & 7) {
+      case 1: case 2: {
+        const u32 sx = x + static_cast<u32>(static_cast<s32>(r.src));
+        if (sx >= SCREEN_W) continue;
+        nb = dst[sx]; ok = split_admit(r, dst, prev, sx, false);
+        break;
+      }
+      case 3: if (!prev) continue; nb = prev[x]; ok = split_admit(r, dst, prev, x, true); break;
+      case 4: if (line + 1 < SCREEN_H) sp_pend_[screen][sp_pend_n_[screen]++] = r; continue;
+      default: continue;
+      }
+      if (ok) patch_cell(t, line, r, nb);
+    }
+    sp_pend_line_[screen] = line;
+  }
+  std::memcpy(sp_prev_[screen], dst, sizeof sp_prev_[screen]);
+  sp_prev_line_[screen] = line;
+}
+
+// The cell of DS pixel r.x on `line`: panel columns [xrun[x], xrun[x+1]) by the
+// line's rows. Along the cut's axis the uncovered part is the low side (left,
+// up) up to `bound`, or the high side from it; across the axis the bound moves
+// by the slope. All in 1/32 of a cell, sampled at panel pixel centres.
+void Gpu::patch_cell(const ScaleTarget& t, u32 line, const SplitRec& r, u32 nb) {
+  const u32 xa = t.xrun[r.x], xb = t.xrun[r.x + 1];
+  const u32 ya = (line * t.h + SCREEN_H - 1) / SCREEN_H, yb = ((line + 1) * t.h + SCREEN_H - 1) / SCREEN_H;
+  if (xa >= xb || ya >= yb) return;
+  const s32 cw = static_cast<s32>(xb - xa), ch = static_cast<s32>(yb - ya);
+  const s32 unc = r.unc;
+  const u32 side = r.side & 7;
+  const bool low = side == 1 || side == 3, horiz = side >= 3;
+  const s32 bound0 = low ? unc : 32 - unc;
+  // The grid's seams (see emit_scaled): the leading column / row of a wide enough cell.
+  const bool grid = t.grid < 256 && !t.blend;
+  u32 nbd = nb;
+  bool seam_col = false, seam_row = false;
+  if (grid) {
+    const u32 w = t.xrun[SCREEN_W];
+    const u32 min_run = std::max<u32>(2, (w + SCREEN_W - 1) / SCREEN_W), min_rows = std::max<u32>(2, (t.h + SCREEN_H - 1) / SCREEN_H);
+    seam_col = static_cast<u32>(cw) >= min_run && r.x % (w == 2 * SCREEN_W ? 2u : 1u) == 0;
+    seam_row = static_cast<u32>(ch) >= min_rows && line % (t.h == 2 * SCREEN_H ? 2u : 1u) == 0;
+    const u32 f = t.grid;
+    nbd = f ? ((nb & 0xFF000000u) | (((nb & 0x00FF00FFu) * f >> 8) & 0x00FF00FFu) | (((nb & 0x0000FF00u) * f >> 8) & 0x0000FF00u)) : 0xFF000000u;
+  }
+  // Pixel centres in 1/32 of the cell. Cells are a few pixels each way; anything larger takes
+  // the first kMax (no panel we drive scales a DS pixel past that).
+  constexpr s32 kMax = 16;
+  const s32 nw = std::min(cw, kMax), nh = std::min(ch, kMax);
+  s32 cx[kMax], cy[kMax];
+  for (s32 i = 0; i < nw; ++i) cx[i] = ((2 * i + 1) * 32) / (2 * cw);
+  for (s32 j = 0; j < nh; ++j) cy[j] = ((2 * j + 1) * 32) / (2 * ch);
+  const s32 sl = r.slope;
+  if (!horiz) {
+    // A vertical cut: each row is a run from one end of the cell.
+    for (s32 j = 0; j < nh; ++j) {
+      const u32 y = ya + static_cast<u32>(j);
+      if (!row_kept(t, y)) continue;
+      const s32 bound = bound0 + (sl * (cy[j] - 16)) / 32;
+      s32 k = 0;
+      while (k < nw && cx[k] < bound) ++k;                 // pixels [0, k) are before the cut
+      u32* const row = row_at(t, y) + xa;
+      const bool srow = seam_row && j == 0;
+      for (s32 i = low ? 0 : k, e = low ? k : nw; i < e; ++i) row[i] = (srow || (seam_col && i == 0)) ? nbd : nb;
+    }
+  } else {
+    s32 bnd[kMax];
+    for (s32 i = 0; i < nw; ++i) bnd[i] = bound0 + (sl * (cx[i] - 16)) / 32;
+    for (s32 j = 0; j < nh; ++j) {
+      const u32 y = ya + static_cast<u32>(j);
+      if (!row_kept(t, y)) continue;
+      u32* const row = row_at(t, y) + xa;
+      const bool srow = seam_row && j == 0;
+      const s32 f = cy[j];
+      for (s32 i = 0; i < nw; ++i)
+        if (low ? f < bnd[i] : f >= bnd[i]) row[i] = (srow || (seam_col && i == 0)) ? nbd : nb;
+    }
   }
 }
 
@@ -917,8 +1230,6 @@ bool Gpu::build_cell_axis(u32 src_n, u32 cells, u32 cell_px, CellAxis& a) {
 // when the grid is on) through the grid kernel with the cells' xrun.
 // A rect row's pixels in the frontend's buffer, valid only for rows the
 // crop window keeps (see ScaleTarget::y_lo).
-static inline bool row_kept(const Gpu::ScaleTarget& t, u32 y) { return y >= t.y_lo && y < t.y_hi; }
-static inline u32* row_at(const Gpu::ScaleTarget& t, u32 y) { return t.px + (static_cast<size_t>(y) - t.y_lo) * t.pitch; }
 
 void Gpu::emit_cells(int screen, u32 line, const u32* src) {
   const ScaleTarget& t = scale_[screen];

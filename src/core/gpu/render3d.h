@@ -79,6 +79,12 @@ public:
   // what the hardware draws, so the core default is on; the SDL frontend
   // makes it opt-in (video.aa), the headless frontend has --no-aa for measurement.
   void set_aa(bool on) { aa_ = on; }
+  // Sub-pixel edges: the raster also produces a split map (see extract_splits) for the
+  // scanline scaler. It draws every polygon edge, as the hardware does with anti-aliasing or
+  // edge marking on, so with both off the 3D picture is NOT the hardware's while this is on.
+  void set_subpixel(bool on) { if (on) for (auto& v : split_) if (v.empty()) v.assign(512 * 192, 0); subpix_ = on; }
+  bool subpixel() const { return subpix_; }
+  enum : u32 { SPLIT_NONE = 0, SPLIT_LEFT = 1, SPLIT_RIGHT = 2, SPLIT_UP = 3, SPLIT_DOWN = 4, SPLIT_MARKED = 1u << 29, SPLIT_SPILL = 1u << 30, SPLIT_WEAK = 1u << 31 };   // see extract_splits
   bool aa() const { return aa_; }
 
 private:
@@ -122,6 +128,8 @@ private:
   // one; a FrameRef taken before that keeps naming the old buffer, which is
   // what lets the compositor of frame N run on past line 215 of frame N.
   std::array<u32, 256 * 192> out_[2]{};
+  std::array<u8, 192> split_any_[2]{};      // per line: it has records (extract_splits), so the scaler can skip the rest
+  std::vector<u32> split_[2];               // split map of out_[i], two slots a pixel (extract_splits); allocated by set_subpixel   // split map of out_[i]; only written in sub-pixel mode
   u32 display_ = 0;
   std::array<u8, 256 * RING> stencil_{};   // one row per ring line: see render_chunk
   // "the polygon drawn immediately before this one on THIS line was a shadow
@@ -160,6 +168,7 @@ public:
   struct Shade {
     u32 blendmode, polyalpha, polyattr;
     bool highlight, textured, wireframe, shadow, polyattr_z;   // polyattr_z: translucent pixels update depth
+    bool subpix;                                                 // edge parts are noted for the split map (note_edge_part)
     u32 dispcnt, alpha_ref;
     const u16* toon;
     // Texture: format, VRAM base, size, wrap/flip, transparent-colour-0 alpha, palette base.
@@ -269,6 +278,8 @@ private:
 
   const Gpu3D* gx_ = nullptr;
   const RenderState* rs_ = nullptr;
+  bool subpix_ = false, subpix_rendered_ = false;
+  bool game_aa_ = false;                  // the AA blend runs (the game asked and aa_ allows): dispcnt_ bit 4 alone no longer says so
   bool aa_ = true, aa_rendered_ = true;   // aa_rendered_: the setting the kept frame was drawn with
   // DISP3DCNT as the raster sees it this frame: rs_->dispcnt with bit 4
   // cleared when AA is off. Every AA decision in the raster reads this, so
@@ -515,6 +526,9 @@ public:
   // nothing outstanding (rendered inline, kept, or ablated) has nbins 0.
   struct FrameRef {
     const u32* out = nullptr;
+    const u32* split = nullptr;               // null unless the frame was rendered in sub-pixel mode
+    const u8* split_any = nullptr;
+    const u32* split_line(u32 y) const { return split && split_any[y] ? split + y * 512 : nullptr; }   // null: no records on this line
     u64 gen = 0;
     u32 nbins = 0;
     std::array<s32, MAX_BINS + 1> bin_y{};
@@ -540,6 +554,15 @@ private:
 
   u32  edge_count_ = 0;
   u32* out_dst_ = nullptr;                              // where final_pass writes
+  u32* split_dst_ = nullptr;
+  u8* split_any_dst_ = nullptr;
+  std::array<u8, RING> erow_{};                           // ring rows that had an edge noted since their clear                            // and extract_splits
+  void extract_splits(s32 y);
+  void note_edge_part(const SpanBuf& sb, s32 y, s32 xa, s32 xb, int part, s32 cov, u32 attr_key, const u8* drawn);
+  // What is known of each top-layer pixel's edge (note_edge_part); sub-pixel mode only.
+  std::array<u8, RSIZE> eside_{};
+  std::array<s8, RSIZE> epos_{}, eslope_{};
+  std::array<s32, RSIZE> ez_{};
   const std::vector<const u32*>* texels_in_ = nullptr;  // decoded textures per polygon (render() records them)
   // The polygon list this frame draws, latched once by the coordinator after
   // sync_all and handed to every band. Workers never read it off the engine:
@@ -581,7 +604,9 @@ private:
     std::array<s32, MAX_BINS + 1> bin_y{};
     u32 nbins = 0;
     u32* dst = nullptr;
-    bool aa = false;
+    u32* split = nullptr;
+    u8* split_any = nullptr;
+    bool aa = false, subpix = false;
   };
   DispatchCtx ctx_[2];
   struct StealBand { std::unique_ptr<Renderer3D> band; std::atomic<bool> busy{false}; u64 gen = ~u64{0}; };

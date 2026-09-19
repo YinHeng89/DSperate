@@ -199,7 +199,8 @@ public:
   // frontend until this was subtracted.
   void note_external_ns(u64 ns) { external_ns_ += ns; }
   u64 last_raster_ns() const { return renderer_.last_band_sum_ns(); }
-  const u32* line(const Renderer3D::FrameRef& f, u32 y);   // 3D output for display line y, X-scrolled (RGB666 + 5-bit alpha at 24-28)
+  const u32* line(const Renderer3D::FrameRef& f, u32 y);
+  const u32* split_line(const Renderer3D::FrameRef& f, u32 y);   // the line's split map, scrolled the same way (after line(); null = none)   // 3D output for display line y, X-scrolled (RGB666 + 5-bit alpha at 24-28)
   // Force the asynchronous raster to finish. Called wherever something is
   // about to change what its workers are reading -- in practice only
   // Bus::update_vram, since texture VRAM is unreachable any other way.
@@ -421,6 +422,7 @@ private:
   u16 render_xpos_ = 0;
   std::atomic<bool> render_on_{false};
   alignas(16) u32 scrolled_[256] = {};
+  u32 scrolled_split_[512] = {};
 
   // Matrices (20.12, row-major: m[row*4+col]).
   u32 matrix_mode_ = 0;

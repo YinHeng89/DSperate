@@ -251,6 +251,7 @@ void entry_snap_cb(ds::CpuContext& cpu, ds::u32, void* user) {
 
 int main(int argc, char** argv) {
   ds::mem::fmc::init();   // before any Bus exists: the census counts page-table churn from reset on
+  bool subpixel = false; int scaled_n = 0; const char* scaled_path = nullptr;
   const char *rom = nullptr, *bios9 = nullptr, *bios7 = nullptr, *fw = nullptr, *trace = nullptr, *dump = nullptr, *dump_audio = nullptr, *replay = nullptr, *save = nullptr;
   const char* load_state = nullptr; const char* save_state_path = nullptr; int save_state_at = -1;
   const char* hide_screen = nullptr;
@@ -346,6 +347,8 @@ int main(int argc, char** argv) {
     else if (arg("--trace")) trace = argv[++i];
     else if (arg("--max")) ts.max = std::strtoull(argv[++i], nullptr, 0);
     else if (arg("--dump-frames")) dump = argv[++i];
+    else if (flag("--subpixel")) subpixel = true;                            // sub-pixel polygon edges (Gpu::set_subpixel), hardware AA off as video.aa = smooth has it; only a scaled dump shows them
+    else if (arg("--dump-scaled")) { scaled_n = std::atoi(argv[++i]); scaled_path = argv[++i]; }   // N FILE: both screens through the scanline scaler at Nx, raw BGRA, the --dump-from/--dump-count window
     else if (arg("--dump-from")) dump_from = std::atoi(argv[++i]);    // first frame to dump
     else if (arg("--dump-count")) dump_count = std::atoi(argv[++i]);  // how many (0 = to the end)
     else if (arg("--dump-audio")) dump_audio = argv[++i];   // raw s16 stereo, 32768 Hz
@@ -552,7 +555,22 @@ int main(int argc, char** argv) {
   // Geometry worker + per-frame shape controller, with either inexact tier
   // (no-FIFO, or the FIFO kept with the cull priced by ratio under --cpu-oc).
   nds.gpu3d.set_geometry_worker(timing_oc || gx_worker || cpu_oc != 0);   // DS_GX_THREAD: 0 never, 1 per-frame shape controller, 2 always
-  nds.gpu3d.renderer().set_aa(!no_aa);
+  nds.gpu3d.renderer().set_aa(!no_aa && !subpixel);   // the SDL frontend's video.aa = smooth: never with the hardware blend
+  nds.gpu.set_subpixel(subpixel);
+  // --dump-scaled: a panel-sized target per screen, as the SDL frontend's scanline tiers set one.
+  std::vector<ds::u32> scaled_px[2]; std::vector<ds::u16> scaled_xrun; FILE* scaled_out = nullptr;
+  if (scaled_n > 0 && scaled_path) {
+    const ds::u32 W = ds::SCREEN_W * scaled_n, H = ds::SCREEN_H * scaled_n;
+    scaled_xrun.resize(ds::SCREEN_W + 1);
+    for (ds::u32 x = 0; x <= ds::SCREEN_W; ++x) scaled_xrun[x] = static_cast<ds::u16>(x * scaled_n);
+    for (int k = 0; k < 2; ++k) {
+      scaled_px[k].assign(static_cast<size_t>(W) * H, 0xFF000000u);
+      ds::gpu::Gpu::ScaleTarget t; t.px = scaled_px[k].data(); t.pitch = W; t.h = H; t.xrun = scaled_xrun.data();
+      nds.gpu.set_scale_target(k, t);
+    }
+    scaled_out = std::fopen(scaled_path, "wb");
+    if (!scaled_out) { std::fprintf(stderr, "could not open %s\n", scaled_path); return 1; }
+  }
 
   if (rom && cheat_db) {
     ds::cheat::GameCheats found;
@@ -870,6 +888,8 @@ int main(int argc, char** argv) {
         std::fwrite(nds.bus.arm7_wram.get(), 1, 64u << 10, f); std::fwrite(nds.bus.dtcm.get(), 1, 16u << 10, f); std::fclose(f);
       }
     }
+    if (scaled_out && i >= dump_from && (dump_count <= 0 || i < dump_from + dump_count))
+      for (int k = 0; k < 2; ++k) std::fwrite(scaled_px[k].data(), 4, scaled_px[k].size(), scaled_out);
     if (dump_out && i >= dump_from && (dump_count <= 0 || i < dump_from + dump_count)) {
       // raw 0xAARRGGBB, top screen then bottom, 256x192 each, one record per frame
       std::fwrite(nds.gpu.framebuffer(0), 4, ds::SCREEN_W * ds::SCREEN_H, dump_out);
@@ -934,6 +954,7 @@ int main(int argc, char** argv) {
     else std::fprintf(stderr, "firmware override: saved %s\n", fw_override);
   }
   if (dump_out) std::fclose(dump_out);
+  if (scaled_out) std::fclose(scaled_out);
   if (audio_out) std::fclose(audio_out);
   if (ts.pc_hist) {
     for (int c = 0; c < 2; ++c) {

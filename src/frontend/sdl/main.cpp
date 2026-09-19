@@ -170,7 +170,8 @@ const char* kUsage =
     "  --cpu-oc        CPU tuning, overclock: recompiled data accesses priced as main RAM, geometry on its\n                  own thread with every polygon priced as drawn (less accurate); emu.cpu_tuning = overclock\n"
     "  --cpu-uc        CPU tuning, underclock: for the harder to run games and/or the lowest end devices.\n                  The game's CPUs run slower than a console's, so there is less to emulate a frame\n                  (less accurate; a game can miss VBlanks); emu.cpu_tuning = underclock\n"
     "  --fast-load     cart DMA reads the card without its clock (may affect accuracy); emu.fast_load\n"
-    "  --aa / --no-aa  3D anti-aliasing on (hardware behaviour) or off; video.aa, off by default\n"
+    "  --aa [off|smooth|accurate] / --no-aa  3D edges; video.aa, off by default. smooth: polygon edges drawn at panel\n"
+    "                  resolution (scanline tiers, nearest/grid/seam; 2D untouched). accurate (bare --aa): the hardware's blend\n"
     "  --lockstep      128-cycle CPU interleave (melonDS lockstep) instead of event-bound; --quantum N for any value\n"
     "  --frameskip N   skip drawing up to N frames in N+1 (0 = off); emu.frameskip. Skipping runs\n"
     "                  in whole display periods, so on a game that drives its screens on\n"
@@ -285,6 +286,21 @@ bool peek_game_code(const std::string& rom, char out[4]) {
 // Battery save: next to the ROM, or under [paths] saves.
 std::string save_path(const std::string& rom, const std::string& dir) {
   return dir.empty() ? rom_stem(rom) + ".sav" : dir + "/" + base_name(rom_stem(rom)) + ".sav";
+}
+
+// video.aa: 0 off, 1 smooth, 2 accurate. Smooth is the sub-pixel edge mode
+// (Gpu::set_subpixel) with the hardware blend off -- it looks best unblended,
+// and the two are never on together (user decision). Accurate is the
+// hardware's anti-aliasing. The old boolean reads as accurate / off.
+constexpr const char* kAaNames[3] = {"off", "smooth", "accurate"};
+int aa_mode(const std::string& v) {
+  if (v == "smooth") return 1;
+  if (v == "accurate" || v == "true" || v == "1" || v == "yes" || v == "on") return 2;
+  return 0;
+}
+void apply_aa(NDS& nds, int mode) {
+  nds.gpu3d.renderer().set_aa(mode == 2);
+  nds.gpu.set_subpixel(mode == 1);
 }
 
 void load_save(NDS& nds, const std::string& path) {
@@ -1231,8 +1247,13 @@ int main(int argc, char** argv) {
     else if (arg("--frameskip-mode")) cli.set("emu.frameskip_mode", argv[++i]);
     else if (flag("--frameskip-capture")) cli.set("emu.frameskip_capture", "true");
     else if (flag("--no-frameskip-capture")) cli.set("emu.frameskip_capture", "false");
-    else if (flag("--aa")) cli.set("video.aa", "true");
-    else if (flag("--no-aa")) cli.set("video.aa", "false");
+    else if (flag("--aa")) {
+      // Bare --aa is what it always was (the hardware blend); a mode word may follow.
+      const char* m = i + 1 < argc ? argv[i + 1] : "";
+      if (!std::strcmp(m, "off") || !std::strcmp(m, "smooth") || !std::strcmp(m, "accurate")) { cli.set("video.aa", m); ++i; }
+      else cli.set("video.aa", "accurate");
+    }
+    else if (flag("--no-aa")) cli.set("video.aa", "off");
     // The two halves of Timing OC separately: they pull in opposite directions
     // on Golden Sun, so the bundled flag reads flat while neither half is.
     else if (flag("--help")) { std::fputs(kUsage, stderr); return 0; }
@@ -1967,7 +1988,10 @@ sdl_ready:
   // (no-FIFO, or the FIFO kept with the cull priced by ratio under --cpu-oc).
   nds.gpu3d.set_geometry_worker(cfg.flag("emu.timing_oc", false) || cfg.flag("emu.gx_worker", false) || cpu_oc_mode(cfg.str("emu.cpu_tuning")) != 0);   // DS_GX_THREAD: 0 never, 1 per-frame shape controller, 2 always
   nds.io.set_cart_bulk(cfg.flag("emu.fast_load", false));   // may introduce accuracy issues, see config.cpp
-  nds.gpu3d.renderer().set_aa(cfg.flag("video.aa", false));   // opt-in: see config.cpp
+  // One row, three mutually exclusive modes (see config.cpp); the file's old boolean is rewritten
+  // so the menu shows a mode rather than "true".
+  cfg.set("video.aa", kAaNames[aa_mode(cfg.str("video.aa", "off"))]);
+  apply_aa(nds, aa_mode(cfg.str("video.aa", "off")));
   if (!boot_firmware || nds.dsi) nds.setup_direct_boot();   // on a DSi this is the NAND boot (NDS::boot_dsi_nand)
   // A DSiWare title given with --dsi-mode starts straight away (the TLNC
   // autoload the launcher reads), unless --dsi-menu asks for the menu with it.
@@ -2973,7 +2997,7 @@ sdl_ready:
     if (is("emu.ff_speed")) { ff_speed = std::atoi(v.c_str()); return; }
     if (is("emu.ff_skip")) { ff_skip = std::atoi(v.c_str()); return; }
     if (is("emu.autosave")) { autosave = on; return; }
-    if (is("video.aa")) { nds.gpu3d.renderer().set_aa(on); return; }
+    if (is("video.aa")) { apply_aa(nds, aa_mode(v)); return; }
     if (is("video.fps")) { fps_osd = on; if (on && !show_fps) { fps_mark = SDL_GetPerformanceCounter(); emu_ticks = draw_ticks = wait_ticks = 0; } return; }
     if (is("video.pip_touch_hold")) { pip_touch_hold = std::max(0, std::atoi(v.c_str())); return; }
     // Everything below moves the picture about, so it is only noted here and

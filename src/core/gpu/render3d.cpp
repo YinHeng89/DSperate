@@ -28,6 +28,15 @@
 
 namespace ds::gpu {
 
+// DS_EDGE_MOCK=<file>: turns the sub-pixel edge mode on and appends, per rendered
+// frame, the 3D output (u32) and its split map (two u32 slots a pixel) for tools/edge_mock.py.
+// Record i is frame i, so it lines up with --dump-frames; DS_EDGE_MOCK_FROM
+// skips the records before it.
+namespace edge_mock {
+const char* path() { static const char* p = std::getenv("DS_EDGE_MOCK"); return p; }
+bool on() { static const bool v = path() != nullptr; return v; }
+}
+
 #if DSPERATE_NEON
 // The A64-only NEON intrinsics the kernels use, in both spellings.
 namespace compat = kern::compat;
@@ -184,7 +193,7 @@ void Renderer3D::Slope<side>::edge_params(bool aa, s32* length, s32* coverage) c
       if (negative) startx = xlen - startx;
       if (side) startx = startx - *length + 1;
       const s32 startcov = (((startx << 10) + 0x1FF) * ylen) / xlen;
-      *coverage = static_cast<s32>(0x80000000u) | ((startcov & 0x3FF) << 12) | (xcov_incr & 0x3FF);
+      *coverage = static_cast<s32>(0x80000000u) | (negative ? 0x40000000 : 0) | ((startcov & 0x3FF) << 12) | (xcov_incr & 0x3FF);   // bit 30: the slope's sign, for note_edge_part
     } else *coverage = 0;
     if (swapped) *length = 1;
     return;
@@ -193,11 +202,20 @@ void Renderer3D::Slope<side>::edge_params(bool aa, s32* length, s32* coverage) c
   if (!aa) { *coverage = 0; return; }
   if (increment == 0) { *coverage = swapped ? 0 : 31; return; }
   s32 cov = ((dx >> 9) + (increment >> 10)) >> 4;
-  if ((cov >> 5) != (dx >> 18)) cov = 31;
+  // The edge's position is taken mid-line. When that is already in the next pixel along its
+  // travel, the hardware calls this pixel fully covered (and never draws that next one); the
+  // split map wants to know where the edge really is, so the coverage it would have had in
+  // that pixel rides along in bits 16-20 with bit 21 set (see extract_splits). The hardware's
+  // own value comes out 31 for an edge travelling outwards and 0 for one travelling inwards.
+  const bool sat = (cov >> 5) != (dx >> 18);
+  s32 raw = cov & 0x1F;
+  if (sat) cov = 31;
   cov &= 0x1F;
-  if (swapped) { if (side ^ static_cast<int>(negative)) cov = 0x1F - cov; }
-  else { if (!(side ^ static_cast<int>(negative))) cov = 0x1F - cov; }
-  *coverage = cov;
+  if (swapped) { if (side ^ static_cast<int>(negative)) { cov = 0x1F - cov; raw = 0x1F - raw; } }
+  else { if (!(side ^ static_cast<int>(negative))) { cov = 0x1F - cov; raw = 0x1F - raw; } }
+  // Bits 8-15: dx/dy in 1/32 pixel per line, signed, for note_edge_part; readers of the coverage mask it off.
+  const s32 sl = std::min(63, increment >> 13);
+  *coverage = cov | (((negative ? -sl : sl) & 0xFF) << 8) | (sat ? (1 << 21) | (raw << 16) : 0);
 }
 
 // ---- pixel pipeline ---------------------------------------------------------------
@@ -904,7 +922,7 @@ void Renderer3D::render_shadow_mask_line(Edge& e, s32 y) {
   if (e.right.increment == 0 && (e.left.increment != 0 || xstart != xend) && xend != 0) --xend;
 
   bool l_fill, r_fill; s32 l_len, r_len, l_cov, r_cov;
-  const bool always_fill = (dispcnt_ & ((1 << 4) | (1 << 5))) || (polyalpha < 31 && (dispcnt_ & (1 << 3))) || wireframe;
+  const bool always_fill = (dispcnt_ & ((1 << 4) | (1 << 5))) || (polyalpha < 31 && (dispcnt_ & (1 << 3))) || wireframe || subpix_;
   // The stencil pass needs the edge lengths only, never the coverage.
   if (xstart > xend) {
     const Vertex &vlnext = gx_->vertex(p.vtx[e.next_vr]), &vrnext = gx_->vertex(p.vtx[e.next_vl]);
@@ -990,6 +1008,11 @@ void Renderer3D::resolve_span(const Shade& sh, const SpanBuf& sb, s32 y, s32 xa,
   const u8* ra = sb.vr; const u8* ga = sb.vg; const u8* ba = sb.vb;
   const s16* sa = sb.sc; const s16* ta = sb.tc;
   u32 resolved = 0;                // counted once after the loop, not per pixel
+  // Sub-pixel edges: which pixels of an edge part the polygon really draws (the alpha test),
+  // whether or not it wins them -- the batch path's pass plane says as much by itself.
+  const bool note = sh.subpix && part != 1 && !shadow;
+  u8 drawn[256];
+  if (note) std::memset(drawn + xa, 0, static_cast<size_t>(xb - xa));
   for (s32 x = xa; x < xb; ++x) {
     const u32 i = static_cast<u32>(x - sb.x0);
     if (!sb.pass[i]) continue;    // neither the top pixel nor the one underneath can take it
@@ -1005,6 +1028,7 @@ void Renderer3D::resolve_span(const Shade& sh, const SpanBuf& sb, s32 y, s32 xa,
     // Failing against the top pixel, try the one underneath -- which only
     // exists with AA (dispcnt_); without it the pre-pass never named it.
     if (!depth_pass<mode>(addr, z, dstattr)) {
+      if (note && (shade_pixel<textured>(sh, ra[i], ga[i], ba[i], sa[i], ta[i]) >> 24) > sh.alpha_ref) drawn[x] = 1;
       if (!aa || !(dstattr & 0xF) || addr >= static_cast<u32>(RSIZE)) continue;
       addr += RSIZE;
       dstattr = attr_[addr];
@@ -1016,6 +1040,7 @@ void Renderer3D::resolve_span(const Shade& sh, const SpanBuf& sb, s32 y, s32 xa,
     ++resolved;
     const u32 alpha = color >> 24;
     if (alpha <= sh.alpha_ref) continue;
+    if (note) drawn[x] = 1;
     if (alpha == 31) {
       u32 attr = polyattr | edge;
       bool push = false;
@@ -1027,7 +1052,7 @@ void Renderer3D::resolve_span(const Shade& sh, const SpanBuf& sb, s32 y, s32 xa,
             if (part == 0) { cov = xcov >> 5; if (cov > 31) cov = 31; xcov += (l_cov & 0x3FF); }
             else { cov = 0x1F - (xcov >> 5); if (cov < 0) cov = 0; xcov += (r_cov & 0x3FF); }
           }
-          attr |= (cov << 8);
+          attr |= ((cov & 0x1F) << 8);
           push = true;
         }
       }
@@ -1042,6 +1067,7 @@ void Renderer3D::resolve_span(const Shade& sh, const SpanBuf& sb, s32 y, s32 xa,
     }
   }
   if (resolved) prof::add(prof::C_RESOLVED_PIXELS, resolved);
+  if (note) note_edge_part(sb, y, xa, xb, part, part == 0 ? l_cov : r_cov, polyattr | static_cast<u32>(edge), drawn);
 }
 
 // The texture half of a Shade: format, size, VRAM addressing and the direct
@@ -1098,6 +1124,7 @@ void Renderer3D::setup_shade(Shade& sh, const Polygon& p) {
   sh.wireframe = sh.polyalpha == 0;
   sh.shadow = p.shadow;
   sh.dispcnt = dispcnt_;   // AA bit as the raster honours it, not as written
+  sh.subpix = subpix_;
   sh.alpha_ref = rs_->alpha_ref;
   sh.blendmode = (p.attr >> 4) & 3;
   sh.highlight = sh.dispcnt & (1 << 1);
@@ -1127,7 +1154,7 @@ void Renderer3D::setup_shade(Shade& sh, const Polygon& p) {
   sh.gather4 = nullptr;
   sh.vec = false;
 #endif
-  sh.always_fill = (sh.dispcnt & ((1 << 4) | (1 << 5))) || (sh.polyalpha < 31 && (sh.dispcnt & (1 << 3))) || sh.wireframe;
+  sh.always_fill = (sh.dispcnt & ((1 << 4) | (1 << 5))) || (sh.polyalpha < 31 && (sh.dispcnt & (1 << 3))) || sh.wireframe || sh.subpix;   // sub-pixel edges: every edge drawn, as AA has it
   // Provably all-opaque batch: with the polygon's alpha at 31, decal writes
   // exactly that alpha for every pixel, and every texture format except
   // A3I5 / A5I3 carries only 0-or-31 texel alpha, which modulate preserves.
@@ -1562,7 +1589,9 @@ template <int mode, bool textured, bool aa, bool opq>
   bool cov_accum = false;
   if (aa) {
     if (part == 1) { if (attr_base & 0xF) { attr_base |= (0x1F << 8); push = true; } }
-    else { push = true; cov_accum = cov_sel & static_cast<s32>(0x80000000u); if (!cov_accum) attr_base |= (cov_sel << 8); }
+    else {
+      push = true; cov_accum = cov_sel & static_cast<s32>(0x80000000u); if (!cov_accum) attr_base |= ((cov_sel & 0x1F) << 8);
+    }
   }
   const s32 cov_step = cov_sel & 0x3FF;
   const bool blend_on = sh.dispcnt & (1 << 3);
@@ -1782,6 +1811,7 @@ template <int mode, bool textured, bool aa, bool opq>
     else { step(std::integral_constant<u32, 2>{}, x, rem); x += 8; }
   }
   if (pe) prof::add(prof::C_RESOLVED_PIXELS, resolved_px);
+  if (sh.subpix && part != 1) note_edge_part(sb, y, xa, xb, part, cov_sel, attr_base, nullptr);
 }
 #endif
 // Derive scanlines [y0, y1) of the polygon on `e` into lines_[].
@@ -1848,7 +1878,7 @@ void Renderer3D::precompute_lines(Edge& e, s32 y0, s32 y1) {
   const Shade& sh = e.sh;
   const bool always_fill = sh.always_fill;
   const bool wireframe = sh.wireframe;
-  const bool aa = sh.dispcnt & (1 << 4);   // coverage is only read by the AA resolve
+  const bool aa = (sh.dispcnt & (1 << 4)) || sh.subpix;   // coverage is only read by the AA resolve, and by note_edge_part
   const bool flat = p.ytop == p.ybot;
   const s32 ybot1 = p.ybot - 1;
   const s32 ytop = p.ytop;
@@ -1952,7 +1982,7 @@ void Renderer3D::precompute_lines(Edge& e, s32 y0, s32 y1) {
   const Shade& sh = e.sh;
   const bool always_fill = sh.always_fill;
   const bool wireframe = sh.wireframe;
-  const bool aa = sh.dispcnt & (1 << 4);   // coverage is only read by the AA resolve
+  const bool aa = (sh.dispcnt & (1 << 4)) || sh.subpix;   // coverage is only read by the AA resolve, and by note_edge_part
   const bool flat = p.ytop == p.ybot;
   const s32 ybot1 = p.ybot - 1;
   const s32 ytop = p.ytop;
@@ -2389,6 +2419,142 @@ u32 Renderer3D::fog_density(u32 addr) const {
   return d;
 }
 
+// Sub-pixel edges. An opaque edge pixel is a cell the polygon only partly
+// covers; the scaler can cut its panel cell where the edge really runs instead
+// of showing one colour. Where that is, is gathered as edge parts are plotted
+// (note_edge_part) into side planes over the top layer -- eside_ (SPLIT_*: the
+// side the polygon does NOT cover), epos_ (the edge's position from the pixel's
+// outer boundary, inwards, in 1/32 pixel), eslope_, ez_ -- and turned into the
+// split map a line at a time (extract_splits).
+//
+// Why at plot time and not from the pixel's final owner: a silhouette is often
+// a fan of thin polygons. Line by line a different one owns the outermost
+// pixel, each knowing only its own edge, and one that loses the depth test to
+// its neighbour by a hair takes its knowledge with it -- the cut then hops
+// about by a pixel from line to line. So polygons of one surface (same side,
+// depth within a hair) pool what they know: the outermost edge wins.
+//
+// epos_ runs past the pixel both ways, because the hardware places a Y-major
+// edge by where it is mid-line and calls the pixel covered (31) or not (0)
+// when that is already in the next one (edge_params): -32..0 = the edge is in
+// the pixel beyond, which was never drawn (a spill: that cell's near part is
+// this polygon's); 1..32 = in this pixel; 33..64 = in the next pixel in.
+static inline bool same_surface(s32 za, s32 zb) { const s32 d = za > zb ? za - zb : zb - za; return d <= (std::min(za, zb) >> 6) + 0x200; }
+
+void Renderer3D::note_edge_part(const SpanBuf& sb, s32 y, s32 xa, s32 xb, int part, s32 cov, u32 attr_key, const u8* drawn) {
+  const bool xmajor = cov & static_cast<s32>(0x80000000u);
+  u8 side; s8 slope;
+  if (xmajor) {
+    side = ((part == 0) == ((cov & 0x40000000) != 0)) ? SPLIT_UP : SPLIT_DOWN;
+    const s32 m = std::min(63, (cov & 0x3FF) >> 5);                  // dy/dx, from the coverage increment (1/1024)
+    slope = static_cast<s8>((cov & 0x40000000) ? -m : m);
+  } else {
+    side = part == 0 ? SPLIT_LEFT : SPLIT_RIGHT;
+    slope = static_cast<s8>(cov >> 8);                                // dx/dy (edge_params)
+  }
+  const u32 row0 = row_of(y) + 1;
+  s32 xcov0 = (cov >> 12) & 0x3FF; if (xcov0 == 0x3FF) xcov0 = 0;
+  for (s32 x = xa; x < xb; ++x) {
+    const u32 i = static_cast<u32>(x - sb.x0);
+    if (drawn ? !drawn[x] : !sb.pass[i]) continue;   // `drawn`: the scalar resolve's word on the alpha test (the batch path's pass plane has it)
+    const u32 addr = row0 + static_cast<u32>(x);
+    const u32 a = attr_[addr];
+    const s32 z = sb.z[i];
+    const bool owner = depth_[addr] == static_cast<u32>(z) && ((a ^ attr_key) & 0x3F40800Fu) == 0;
+    s32 pos;
+    if (xmajor) {
+      // The hardware's ramp: the run's first pixel at the start value, a step a pixel (it
+      // stalls on pixels that do not plot; by position is the geometry, and needs no AA raster).
+      if (!owner) continue;
+      const s32 xc = (xcov0 + (x - xa) * (cov & 0x3FF)) >> 5;
+      const s32 c = part == 0 ? std::min(xc, 31) : std::max(0, 31 - xc);
+      pos = c == 0 ? 32 : 31 - c;
+    }
+    else {
+      const s32 c = cov & 0x1F, there = ((cov >> 16) & 0x1F) + 1;
+      pos = !(cov & (1 << 21)) ? (c == 0 ? 32 : 31 - c) : c == 0x1F ? -there : 64 - there;
+    }
+    const bool pooled = eside_[addr] == side && same_surface(ez_[addr], z);
+    if (!owner && !(pooled && (a & 0xF) && !(a & (1u << 22)))) continue;   // lost the pixel, and not to its own surface's edge
+    if (pooled && epos_[addr] <= pos) continue;                              // the one already known is further out
+    eside_[addr] = side; epos_[addr] = static_cast<s8>(pos); eslope_[addr] = slope; erow_[(y + 1) & (RING - 1)] = 1;
+    if (owner || !pooled) ez_[addr] = z;
+  }
+}
+
+// Two record slots (u32) per pixel, its own cut and a neighbour's spill into it (a cell can
+// need both: a thin polygon's outer edge, and the next polygon's edge reaching into it).
+// A record is a cut through that pixel's cell: bits 0-2 the side
+// of the cell that is replaced (SPLIT_*), bits 3-8 how much of the cell that is
+// (0..32, mid-cell), bits 9-15 the cut's signed slope in 1/32 cell per cell
+// across, bits 16-18 where the replacing colour comes from, in pixels along the
+// cut's axis (signed: -2..2), SPLIT_SPILL = the replacing colour is the
+// polygon's own (the cut lies in a neighbour's cell) and SPLIT_WEAK. A strong record
+// is a silhouette by depth: the step to
+// the uncovered side dwarfs the step to the covered side. Everything else is
+// weak -- an interior mesh edge, where cutting only drags texels along the
+// triangulation (GSDD's terrain), but also a crease between two surfaces, a
+// rounded silhouette whose own depth runs away at the rim, and one model in
+// front of another close behind it, all of which should cut. Depth cannot
+// tell those apart; the colours can, so the scaler decides (Gpu::emit_splits).
+//
+// SPLIT_MARKED: the pixel carries the game's edge marking. The outline is a
+// pixel wide and must stay one, so it is not cut but moved: the record holds
+// the edge position whole (bits 19-25, epos_ + 32) and the scaler lays the
+// band from there, the outside before it and the interior after.
+void Renderer3D::extract_splits(s32 y) {
+  u32* const out = &split_dst_[y * 512];   // two slots a pixel: [2x] its own cut, [2x+1] a neighbour's spill into it
+  u8& any = split_any_dst_[y];
+  // Nothing noted on this row: no records, and the line's old ones only need wiping if it had any.
+  if (!erow_[(y + 1) & (RING - 1)]) { if (any) { std::memset(out, 0, 512 * sizeof(u32)); any = 0; } return; }
+  std::memset(out, 0, 512 * sizeof(u32));
+  u32 made = 0;
+  const u32 base = row_of(y) + 1;
+  const u32 rows[3] = {row_of(y - 1) + 1, base, row_of(y + 1) + 1};
+  auto rec = [](u32 side, s32 unc, s32 slope, s32 src, u32 flags) -> u32 {
+    return side | (static_cast<u32>(unc) << 3) | (static_cast<u32>(slope & 0x7F) << 9) | (static_cast<u32>(src & 7) << 16) | flags;
+  };
+  for (s32 x = 0; x < 256; ++x) {
+    const u32 a = attr_[base + x];
+    if (!(a & 0xF)) continue;                               // not an edge pixel
+    // A translucent polygon over the edge (a cloud, smoke, glass) does not hide it: the pixel
+    // and the neighbour the cut borrows from both show through the same veil, so the cut
+    // stands. It keeps the opaque pixel's edge flags; what it may have replaced is the depth,
+    // and then neither the owner check nor the silhouette test below can be asked.
+    const bool veiled = a & (1u << 22);
+    const u32 side = eside_[base + x];
+    const bool known = same_surface(ez_[base + x], static_cast<s32>(depth_[base + x]));
+    if (side == SPLIT_NONE || (!known && !veiled)) continue;   // nothing known of this owner
+    const s32 pos = epos_[base + x];
+    if (pos == 0) continue;                                 // wholly covered
+    const bool horiz = side >= SPLIT_UP;                    // the cut is horizontal
+    const s32 sgn = (side == SPLIT_LEFT || side == SPLIT_UP) ? -1 : 1;   // towards the uncovered side
+    if (horiz ? (y + sgn < 0 || y + sgn > 191) : (x + sgn < 0 || x + sgn > 255)) continue;
+    const u32 o_addr = horiz ? rows[1 + sgn] + x : base + x + sgn;
+    const u32 i_addr = horiz ? rows[1 - sgn] + x : base + x - sgn;
+    const s64 z = depth_[base + x];
+    const s64 d_out = std::abs(z - static_cast<s64>(depth_[o_addr])), d_in = std::abs(z - static_cast<s64>(depth_[i_addr]));
+    const u32 weak = (!known || d_out <= 4 * d_in + 0x200) ? SPLIT_WEAK : 0u;
+    const s32 slope = std::max(-63, std::min(63, static_cast<s32>(eslope_[base + x])));
+    ++made;
+    if (a & 0x80) { out[2 * x] = rec(side, 0, slope, sgn, weak | SPLIT_MARKED) | (static_cast<u32>(pos + 32) << 19); continue; }
+    if (pos > 0 && pos <= 32) { out[2 * x] = rec(side, pos, slope, sgn, weak); continue; }
+    const u32 other = side == SPLIT_LEFT ? SPLIT_RIGHT : SPLIT_LEFT;
+    if (pos < 0) {
+      // The pixel beyond, which the hardware never drew, is partly this polygon's: its near
+      // part takes this pixel's colour.
+      out[2 * (x + sgn) + 1] = rec(other, -pos, slope, -sgn, weak | SPLIT_SPILL);
+    } else {
+      // This pixel is all but uncovered, and the cut is in the next one in, whose outer part
+      // takes the colour from beyond this pixel. (That pixel is this polygon's interior, or a
+      // later pixel of this loop that then writes its own cut over this one.)
+      out[2 * x] = rec(side, 32, 0, sgn, weak);
+      if (x - sgn >= 0 && x - sgn <= 255) out[2 * (x - sgn)] = rec(side, pos - 32, slope, 2 * sgn, weak);
+    }
+  }
+  any = made != 0;
+}
+
 // The scalar passes: the specification the NEON final_pass is checked against
 // (selftest_final_pass), and the whole of final_pass on non-NEON builds.
 void Renderer3D::final_pass_ref(s32 y) {
@@ -2401,7 +2567,7 @@ void Renderer3D::final_pass_ref(s32 y) {
     const bool clear_fog = (rs_->dispcnt & (1 << 14)) || (rs_->clear_attr1 & 0x8000);
     work = (dispcnt & (1 << 7)) && clear_fog;
   }
-  if (!work) { std::memcpy(&out_dst_[y * 256], &color_[row_of(y) + 1], 256 * sizeof(u32)); return; }
+  if (!work) { std::memcpy(&out_dst_[y * 256], &color_[row_of(y) + 1], 256 * sizeof(u32)); if (subpix_ && split_any_dst_[y]) { std::memset(&split_dst_[y * 512], 0, 512 * sizeof(u32)); split_any_dst_[y] = 0; } return; }
   if (dispcnt & (1 << 5)) {
     // Edge marking on the topmost pixels, against the four neighbours.
     const u32 up = row_of(y - 1) + 1, dn = row_of(y + 1) + 1;
@@ -2415,7 +2581,7 @@ void Renderer3D::final_pass_ref(s32 y) {
           (id != (attr_[up + x] >> 24) && z < depth_[up + x]) || (id != (attr_[dn + x] >> 24) && z < depth_[dn + x])) {
         u32 r, g, b; rgb15_to_666(rs_->edge[id >> 3], r, g, b);
         color_[addr] = r | (g << 8) | (b << 16) | (color_[addr] & 0xFF000000);
-        attr_[addr] = (attr & 0xFFFFE0FF) | 0x00001000;    // coverage broken for the AA pass
+        attr_[addr] = subpix_ ? attr | 0x80u : (attr & 0xFFFFE0FF) | 0x00001000;    // coverage broken for the AA pass; sub-pixel mode, which runs without that pass, tags the pixel instead (bit 7: extract_splits)
       }
     }
   }
@@ -2446,7 +2612,7 @@ void Renderer3D::final_pass_ref(s32 y) {
       if (attr_[addr] & (1 << 15)) apply(addr);
     }
   }
-  if (dispcnt & (1 << 4)) {
+  if (game_aa_) {
     // Anti-aliasing: blend edge pixels with the pixel underneath by coverage.
     for (int x = 0; x < 256; ++x) {
       const u32 addr = row_of(y) + 1 + x;
@@ -2468,6 +2634,7 @@ void Renderer3D::final_pass_ref(s32 y) {
       color_[addr] = tr | (tg << 8) | (tb << 16) | (ta << 24);
     }
   }
+  if (subpix_) extract_splits(y);
   std::memcpy(&out_dst_[y * 256], &color_[row_of(y) + 1], 256 * sizeof(u32));
 }
 
@@ -2482,7 +2649,7 @@ void Renderer3D::final_pass(s32 y) {
     const bool clear_fog = (rs_->dispcnt & (1 << 14)) || (rs_->clear_attr1 & 0x8000);
     work = (dispcnt & (1 << 7)) && clear_fog;
   }
-  if (!work) { std::memcpy(&out_dst_[y * 256], &color_[row_of(y) + 1], 256 * sizeof(u32)); return; }
+  if (!work) { std::memcpy(&out_dst_[y * 256], &color_[row_of(y) + 1], 256 * sizeof(u32)); if (subpix_ && split_any_dst_[y]) { std::memset(&split_dst_[y * 512], 0, 512 * sizeof(u32)); split_any_dst_[y] = 0; } return; }
   // The three passes as 16-pixel byte-plane kernels: a record's four bytes
   // (r g b a, and edge-flags / coverage+fog / translucent id / opaque id for
   // an attribute) are deinterleaved by one ld4 into planes, the maths is done
@@ -2531,7 +2698,8 @@ void Renderer3D::final_pass(s32 y) {
       c.val[2] = vbslq_u8(mark, compat::tbl1q_u8(ebl, idx), c.val[2]);
       vst4q_u8(cb + addr * 4, c);
       // attr = (attr & 0xFFFFE0FF) | 0x1000: byte 1 keeps bits 5-7, coverage 0x10.
-      at.val[1] = vbslq_u8(mark, vorrq_u8(vandq_u8(at.val[1], vdupq_n_u8(0xE0)), vdupq_n_u8(0x10)), at.val[1]);
+      if (subpix_) at.val[0] = vorrq_u8(at.val[0], vandq_u8(mark, vdupq_n_u8(0x80)));   // sub-pixel mode tags the pixel instead: see final_pass_ref
+      else at.val[1] = vbslq_u8(mark, vorrq_u8(vandq_u8(at.val[1], vdupq_n_u8(0xE0)), vdupq_n_u8(0x10)), at.val[1]);
       vst4q_u8(ab + addr * 4, at);
     }
   }
@@ -2611,7 +2779,7 @@ void Renderer3D::final_pass(s32 y) {
       if (compat::maxv_u8(ufog)) apply16(under, ufog);
     }
   }
-  if (dispcnt & (1 << 4)) {
+  if (game_aa_) {
     // Anti-aliasing: blend edge pixels with the pixel underneath by coverage.
     // Coverage 31 keeps the top pixel, 0 takes the one underneath whole;
     // otherwise (cov + 1) / 32 of the top over the rest of the bottom, the
@@ -2639,6 +2807,7 @@ void Renderer3D::final_pass(s32 y) {
       vst4q_u8(cb + addr * 4, o);
     }
   }
+  if (subpix_) extract_splits(y);
   std::memcpy(&out_dst_[y * 256], &color_[row_of(y) + 1], 256 * sizeof(u32));
 }
 #else
@@ -2659,7 +2828,7 @@ u32 Renderer3D::selftest_final_pass(u32 seed, u32 dispcnt) {
   rs.fog_offset = rnd() & 0x7FFF; rs.fog_shift = rnd() & 0xF;
   const RenderState* saved = rs_;
   const u32 saved_dispcnt = dispcnt_;
-  rs_ = &rs; dispcnt_ = dispcnt;
+  rs_ = &rs; dispcnt_ = dispcnt; game_aa_ = dispcnt & (1u << 4);
   expand_toon();   // the edge colour planes come from rs_
   u32 diffs = 0;
   for (s32 y = 0; y < 8; ++y) {
@@ -2713,6 +2882,7 @@ void Renderer3D::clear_line(s32 y) {
   const u32 row = row_of(y);
   color_[row] = 0; depth_[row] = clearz; attr_[row] = polyid;
   color_[row + 257] = 0; depth_[row + 257] = clearz; attr_[row + 257] = polyid;
+  if (subpix_ && erow_[(y + 1) & (RING - 1)]) { std::memset(&eside_[row], 0, W); erow_[(y + 1) & (RING - 1)] = 0; }   // what the row's last use knew of its edges
   u32* color = &color_[row + 1]; u32* depth = &depth_[row + 1]; u32* attr = &attr_[row + 1];
   if (rs_->dispcnt & (1 << 14)) {
     // Clear image from texture slots 2 (colour) and 3 (depth), scrolled. The
@@ -2762,6 +2932,16 @@ void Renderer3D::render(const Gpu3D& gx) {
   // this object's state, and the identical-frame path below mutates the cache
   // even when it renders nothing.
   sync_all();
+  if (edge_mock::on()) {
+    set_subpixel(true);
+    static const u64 from = [] { const char* e = std::getenv("DS_EDGE_MOCK_FROM"); return e ? static_cast<u64>(std::atoll(e)) : 0ull; }();
+    static u64 rec = 0;
+    const u64 i = rec++;
+    if (std::FILE* f = i >= from ? std::fopen(edge_mock::path(), i == from ? "wb" : "ab") : nullptr) {
+      std::fwrite(out_[display_].data(), 4, 256 * 192, f); std::fwrite(split_[display_].data(), 4, 512 * 192, f);
+      std::fclose(f);
+    }
+  }
   // Everything from here to the band dispatch -- the identical-frame check,
   // the texture cache validation and the resolve -- is R3D_PREP; the band
   // workers account for themselves.
@@ -2783,7 +2963,8 @@ void Renderer3D::render(const Gpu3D& gx) {
   if (no_raster) return;
   rs_frame_ = gx.render_state();
   rs_ = &rs_frame_;
-  dispcnt_ = rs_->dispcnt & (aa_ ? ~0u : ~(1u << 4));
+  game_aa_ = aa_ && (rs_->dispcnt & (1u << 4));
+  dispcnt_ = rs_->dispcnt & (aa_ ? ~0u : ~(1u << 4));   // sub-pixel mode asks for nothing here: it fills every edge (always_fill) and notes the edges itself
   expand_toon();
   vm_ = &nds_.bus.vram_map();
   texv_ = &vm_->texture;
@@ -2799,7 +2980,7 @@ void Renderer3D::render(const Gpu3D& gx) {
   // (a memcmp per texture, once) settles that, and when nothing had to be
   // re-decoded the previous colour buffer is kept; games that run their 3D
   // at 30 fps then cost half.
-  if (gx.render_identical() && texcache_.enabled() && rendered_once_ && aa_ == aa_rendered_) {
+  if (gx.render_identical() && texcache_.enabled() && rendered_once_ && aa_ == aa_rendered_ && subpix_ == subpix_rendered_) {
     for (u32 i = 0; i < gx.render_polygon_count(); ++i) {
       const Polygon& p = *polys[i];
       const u32 fmt = (p.texparam >> 26) & 7;
@@ -2810,7 +2991,7 @@ void Renderer3D::render(const Gpu3D& gx) {
     if (texcache_.decodes_this_frame() == 0) { prof::add(prof::C_R3D_FRAMES_KEPT, 1); return; }
   }
   rendered_once_ = true;
-  aa_rendered_ = aa_;
+  aa_rendered_ = aa_; subpix_rendered_ = subpix_;
   // What the emulation thread does itself is only what it must: resolve the
   // (non-thread-safe) texture cache to plain pointers, in list order, and
   // count the polygons that draw. Edge setup -- the per-polygon slopes,
@@ -2851,7 +3032,9 @@ void Renderer3D::render(const Gpu3D& gx) {
   // The buffer the display is not reading; it becomes the displayed one once
   // the frame is dispatched (its lines are then waited for per band).
   u32* const dst = out_[display_ ^ 1].data();
-  if (maxb == 0) { pending_bands_ = 0; wait_ns_.store(0, std::memory_order_relaxed); build_edges(); render_band(0, 192, dst); display_ ^= 1; return; }
+  u32* const sdst = split_[display_ ^ 1].data();
+  u8* const adst = split_any_[display_ ^ 1].data();
+  if (maxb == 0) { pending_bands_ = 0; wait_ns_.store(0, std::memory_order_relaxed); build_edges(); split_dst_ = sdst; split_any_dst_ = adst; render_band(0, 192, dst); display_ ^= 1; return; }
 
   // The pool is always the maximum size and only `nb` of it is given work, so
   // ramping the thread count costs a dispatch flag rather than creating and
@@ -2859,7 +3042,7 @@ void Renderer3D::render(const Gpu3D& gx) {
   if (bands_.size() < maxb - 1) {
     while (bands_.size() < maxb - 1) bands_.push_back(std::make_unique<Renderer3D>(nds_));
   }
-  for (auto& b : bands_) b->aa_ = aa_;   // the setting can change between frames
+  for (auto& b : bands_) { b->aa_ = aa_; b->subpix_ = subpix_; }   // the setting can change between frames
   // Never replaced once it is big enough: the compositor thread may be
   // waiting on it for the previous frame's bands (sync_line). So it is made
   // once, for the most workers any frame gets by default -- three, whatever
@@ -2885,7 +3068,7 @@ void Renderer3D::render(const Gpu3D& gx) {
   // Each worker takes bins until they run out, rather than owning one band,
   // so an uneven split costs the frame nothing: whoever is free next picks up
   // the next strip of the frame.
-  job_fn_ = [this, &gxr, dst](u32 w) {
+  job_fn_ = [this, &gxr, dst, sdst, adst](u32 w) {
     const auto t0 = std::chrono::steady_clock::now();
     Renderer3D* r = this;
     if (w != 0) { r = bands_[w - 1].get(); r->prepare_worker(gxr, list_polys_, list_count_, &poly_texels_, &rs_frame_); }
@@ -2894,7 +3077,7 @@ void Renderer3D::render(const Gpu3D& gx) {
       const u32 b = pool_->claim();
       if (b >= nbins_) break;
       const s32 y0 = bin_y_[b], y1 = bin_y_[b + 1];
-      if (y0 < y1) r->render_band(y0, y1, dst);
+      if (y0 < y1) { r->split_dst_ = sdst; r->split_any_dst_ = adst; r->render_band(y0, y1, dst); }
       pool_->mark_done(b);
     }
     // Per worker now, not per bin: what a thread spent on the frame. Each
@@ -2910,7 +3093,7 @@ void Renderer3D::render(const Gpu3D& gx) {
     // generation two back is still reading it.
     DispatchCtx& c = ctx_[(gen_ + 1) & 1];
     c.gx = &gx; c.polys = list_polys_; c.npoly = list_count_; c.texels = poly_texels_; c.rs = rs_frame_;
-    c.bin_y = bin_y_; c.nbins = nbins_; c.dst = dst; c.aa = aa_;
+    c.bin_y = bin_y_; c.nbins = nbins_; c.dst = dst; c.split = sdst; c.split_any = adst; c.aa = aa_; c.subpix = subpix_;
   }
   gen_ = pool_->dispatch(job_fn_, nb, nbins_);
   display_ ^= 1;
@@ -3083,6 +3266,8 @@ void Renderer3D::debug_dump(FILE* f) {
 Renderer3D::FrameRef Renderer3D::frame_ref() const {
   FrameRef f;
   f.out = out_[display_].data();
+  f.split = subpix_rendered_ ? split_[display_].data() : nullptr;
+  f.split_any = split_any_[display_].data();
   f.gen = gen_;
   f.nbins = pending_bands_;
   if (pending_bands_) f.bin_y = bin_y_;
@@ -3161,12 +3346,12 @@ bool Renderer3D::steal_bins(u64 gen, u32 upto) {
     if (c >= cx.nbins) { result = pool_->done(gen, mask); break; }
     if (sb->gen != gen) {
       if (!sb->band) sb->band = std::make_unique<Renderer3D>(nds_);
-      sb->band->aa_ = cx.aa;
+      sb->band->aa_ = cx.aa; sb->band->subpix_ = cx.subpix;
       sb->band->prepare_worker(*cx.gx, cx.polys, cx.npoly, &cx.texels, &cx.rs);
       sb->gen = gen;
     }
     const s32 y0 = cx.bin_y[c], y1 = cx.bin_y[c + 1];
-    if (y0 < y1) sb->band->render_band(y0, y1, cx.dst);
+    if (y0 < y1) { sb->band->split_dst_ = cx.split; sb->band->split_any_dst_ = cx.split_any; sb->band->render_band(y0, y1, cx.dst); }
     pool_->thief_done(c);
     prof::add(prof::C_R3D_STOLEN, 1);
   }
@@ -3322,7 +3507,8 @@ void Renderer3D::prepare_worker(const Gpu3D& gx, const Polygon* const* polys, u3
   gx_ = &gx;
   list_polys_ = polys; list_count_ = npoly;
   rs_ = rs;
-  dispcnt_ = rs_->dispcnt & (aa_ ? ~0u : ~(1u << 4));
+  game_aa_ = aa_ && (rs_->dispcnt & (1u << 4));
+  dispcnt_ = rs_->dispcnt & (aa_ ? ~0u : ~(1u << 4));   // sub-pixel mode asks for nothing here: it fills every edge (always_fill) and notes the edges itself
   expand_toon();
   vm_ = &nds_.bus.vram_map();
   texv_ = &vm_->texture;

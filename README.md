@@ -136,6 +136,20 @@ hardware. No DraStic code is in this tree. See [docs/techniques](docs/techniques
 - **Scaling filters** applied per scanline straight into the presented buffer:
   nearest, bilinear, LCD grid, box-filter seams (sharp, shimmer-free), and
   chunky 2x2 cells; optional integer scaling (letterbox or crop).
+- **Smooth 3D edges** (`video.aa = smooth`, `--aa smooth`, the ANTI-ALIASING menu
+  row: OFF / SMOOTH / ACCURATE). The rasteriser knows where a polygon's edge
+  really falls inside a DS pixel, and the scaler cuts that pixel's panel cell
+  along it, so 3D silhouettes come out at the panel's resolution instead of the
+  DS's -- straight lines where there were staircases, at 2.5x as much as at 4x.
+  Only polygon edges move: textures, 2D layers, sprites and text drawn in 3D
+  stay exactly as pixelated as they were. It follows the picture through
+  display capture (games that show their 3D a frame late, or on both screens),
+  under translucent effects, and shifts toon outlines rather than cutting them.
+  Works with nearest, LCD grid and seams; costs about what ACCURATE does
+  (0.2-0.6 ms a frame on an RK3566). ACCURATE is the hardware's own
+  anti-aliasing blend; the two are alternatives, not a stack. SMOOTH draws
+  every polygon edge the way the hardware does with anti-aliasing on, so its
+  3D picture is not pixel-exact; OFF and ACCURATE are.
 - **Fastest path to the panel, chosen automatically:** the display engine's
   hardware scaler on Allwinner handhelds (Miyoo A30), fbdev on the H700 boards,
   zero-copy dmabuf under Wayland with direct scanout where allowed, our own page
@@ -194,7 +208,8 @@ documented where they are read. `ctest` runs the unit tests in
 against portable references, page table, scheduler, I/O, SPU, 2D/3D pipelines
 and the texture cache. [tools/](tools/) holds the frame/trace/audio comparison
 scripts, the exactness checks over the recorded scenes, the PGO refresh
-scripts, and `mkcart.py` for building a custom loader cart.
+scripts, `edge_mock.py` for looking at what the smooth-edge mode decided per
+pixel, and `mkcart.py` for building a custom loader cart.
 
 ## Licence
 
