@@ -736,3 +736,32 @@ the passes are cheaper: expand only inside the tail's bounding rows, or
 fold the shrink into pass A's store. The user's next step is a like-for-
 like DraStic comparison (its --benchmark from matching save states) before
 deciding how much further 2x is worth pushing.
+
+## DraStic hi-res 3D beside ours (2026-09-18)
+
+DraStic on the same RG DS Plus, `--benchmark 600` from the user's slot-0
+save states (it loads slot 0 by itself; unthrottled, no screen path, so
+its "Full run time" is CPU per frame with its threaded 3D raster
+overlapping the main thread where it can):
+
+| scene | DraStic hires_3d=1 | DraStic hires_3d=0 | ours 2x (paced work median) | ours 1x |
+| --- | --- | --- | --- | --- |
+| Spirit Tracks intro | 15.4 ms (3D 6.7, 2D 8.8) | 7.1 ms (3D 0.2, 2D 1.3) | 17.3 | 15.0 |
+| Etrian | 13.7 (3D 8.7, 2D 11.0) | 5.6 (3D 2.2, 2D 2.9) | 5.4 | 5.2 |
+| NSMB | ~9.5 (phase 5) | ~7.6 | 14.2 | 13.9 |
+| Golden Sun | (no DraStic state yet) | | 20.4 | 15.3 |
+
+Not the same metric (theirs unthrottled CPU, ours a paced wall frame with
+the GPU overlapped), but the shape is clear: DraStic's hi-res mode DOUBLES
+its frame (its "2D" then composites at hi-res too, 1.3 -> 8.8 ms on st),
+while ours costs +2.3 ms on st and nothing on Etrian, where DraStic hi-res
+is 2.5x slower than we are. The cases where DraStic's hi-res still holds
+60 are the ones where it had 8 ms of headroom to spend.
+
+Our own unthrottled headless numbers on the device are NOT comparable and
+are worse than the software raster (st 20.8 vs 16.0, gsdd 26.2 vs 16.4):
+without pacing the emulation thread runs straight into the GPU frame in
+flight (gsdd fence wait 8.1 ms at 1x), where the paced frame hides it. Two
+consequences worth remembering: fast-forward with the GPU raster on is
+slower than the software raster, and the DraStic-style benchmark cannot
+rank the two paths.
