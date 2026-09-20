@@ -46,9 +46,10 @@ interleave-sensitive between the two CPUs that only appears when both run at
 recompiled granularity. `jit_test.cpp` checks each translator against the
 interpreter instruction by instruction and would not catch this.
 
-**Caveat, and it matters before anyone spends a day on it:** this is measured
-under `qemu-aarch64`, and the one thing qemu models differently from real
-hardware is exactly the thing a recompiler depends on — self-modifying code
-and instruction-cache maintenance. `--interp` being clean under the same qemu
-rules out qemu in general but not a qemu/JIT-specific interaction. **Confirm
-on the RG DS before treating this as a hardware bug.**
+**Confirmed on hardware, 2026-09-20.** The qemu caveat that was here — that
+qemu models self-modifying code and icache maintenance differently from a real
+A55, which is what a recompiler leans on — is resolved. The same four runs on
+the RG DS Plus (ROCKNIX 7.0.2, Cortex-A55, glibc 2.41) reproduce the table
+above *digit for digit*: 645 distinct and 181/180 late for `--interp`,
+`--jit9` and `--jit7`; 167 distinct and 1/0 late with both. This is a real
+defect, and qemu reproduces it faithfully, so it can be bisected off-device.

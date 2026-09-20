@@ -30,7 +30,14 @@ logo and stops is low blank with frozen near 1.0 and distinct ~2; one that
 hangs produces too few frames for the run it was asked for.
 """
 import argparse, hashlib, json, sys
-import numpy as np
+
+# numpy makes the flat-colour test quicker but is not required: this has to
+# run on the handheld, where there is no numpy, and the test is a min/max over
+# a subsample either way.
+try:
+    import numpy as np
+except ImportError:
+    np = None
 
 W, H = 256, 192
 SCREEN = W * H * 4
@@ -53,12 +60,16 @@ def main():
             d = f.read(FRAME)
             if len(d) < FRAME:
                 break
-            a = np.frombuffer(d, np.uint8)
             # Subsample for the flat-colour test: a screen that is one colour
             # is one colour everywhere, and every 16th pixel says so 16x faster.
-            top = a[0:SCREEN:64]
-            bot = a[SCREEN::64]
-            if top.ptp() < 2 and bot.ptp() < 2:
+            if np is not None:
+                a = np.frombuffer(d, np.uint8)
+                top, bot = a[0:SCREEN:64], a[SCREEN::64]
+                flat = int(top.max()) - int(top.min()) < 2 and int(bot.max()) - int(bot.min()) < 2
+            else:
+                top, bot = d[0:SCREEN:64], d[SCREEN::64]
+                flat = max(top) - min(top) < 2 and max(bot) - min(bot) < 2
+            if flat:
                 blank += 1
             h = hashlib.blake2b(d, digest_size=8).digest()
             hashes.add(h)
