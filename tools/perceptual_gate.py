@@ -119,6 +119,9 @@ def main():
     ap.add_argument('--frames', help='range A-B (inclusive)')
     ap.add_argument('--floors', help='JSON of per-scene floors; without it the tool only reports')
     ap.add_argument('--json', help='write the per-scene summary here')
+    ap.add_argument('--fault-persist', type=int, default=4,
+                    help='consecutive frames a structural fault must hold before it is reported (default 4); '
+                         'a shorter run is timing skew at a transition, not a regression')
     ap.add_argument('--region-limit', type=float, default=0.02,
                     help='largest wrong connected region, as a fraction of a screen, before it is a structural fault (default 0.02)')
     ap.add_argument('--verbose', action='store_true', help='one line per frame')
@@ -132,7 +135,12 @@ def main():
     hi = min(hi, ncand - 1)
 
     ssims, psnrs = [], []
-    faults = {'blank': [], 'frozen': [], 'swapped': [], 'region': []}
+    # Per-frame flags; collapsed into consecutive runs below. A single frame
+    # is not a fault: golden and candidate differ in *when* a transition
+    # lands, so a screen that is briefly blank, briefly frozen or briefly
+    # missing a region in one run and not the other is timing skew, not a
+    # regression. A dead engine, a stuck screen or a dropped layer persists.
+    marks = {'blank': [], 'frozen': [], 'swapped': [], 'region': []}
     prev_cand = None
     prev_ref = None
     shifts = []
@@ -168,19 +176,37 @@ def main():
 
         for s, name in enumerate(('top', 'bottom')):
             if is_blank(cl[s]) and not is_blank(rl[s]):
-                faults['blank'].append((f, name))
+                marks['blank'].append((f, name))
             if largest_bad_region(rl[s], cl[s]) > args.region_limit:
-                faults['region'].append((f, name))
+                marks['region'].append((f, name))
         # Frozen: the candidate repeated a frame exactly while the reference moved.
         if prev_cand is not None and np.array_equal(cand[f], prev_cand) and not np.array_equal(rl, prev_ref):
-            faults['frozen'].append((f, 'both'))
+            marks['frozen'].append((f, 'both'))
         # Swapped: each candidate screen scores better against the other reference screen.
         if min(ssim(rl[1], cl[0]), ssim(rl[0], cl[1])) > max(fs) + 0.05:
-            faults['swapped'].append((f, 'both'))
+            marks['swapped'].append((f, 'both'))
         prev_cand = np.array(cand[f]); prev_ref = rl
 
         if args.verbose:
             print(f'frame {f}: ssim {min(fs):.4f} psnr {min(fp):5.1f} shift {best - base:+d}')
+
+    # Collapse each fault's frames into consecutive runs per screen, and keep
+    # only runs at least --fault-persist long.
+    faults = {}
+    for kind, hits in marks.items():
+        runs = []
+        for screen in ('top', 'bottom', 'both'):
+            fr = sorted(f for f, sc in hits if sc == screen)
+            i = 0
+            while i < len(fr):
+                j = i
+                while j + 1 < len(fr) and fr[j + 1] == fr[j] + 1:
+                    j += 1
+                length = j - i + 1
+                if length >= args.fault_persist:
+                    runs.append((fr[i], screen, length))
+                i = j + 1
+        faults[kind] = sorted(runs)
 
     if not ssims:
         sys.exit('no frames compared')
@@ -204,8 +230,12 @@ def main():
           f"{summary['exact_frames']} exact, {summary['shift_nonzero']} realigned")
     for k, v in faults.items():
         if v:
-            where = ', '.join(f'{fr}/{sc}' for fr, sc in v[:6])
-            print(f"  FAULT {k}: {len(v)} ({where}{', ...' if len(v) > 6 else ''})")
+            where = ', '.join(f'{fr}/{sc}x{n}' for fr, sc, n in v[:6])
+            print(f"  FAULT {k}: {len(v)} run(s) ({where}{', ...' if len(v) > 6 else ''})")
+    transient = {k: len(m) for k, m in marks.items() if m and not faults[k]}
+    if transient:
+        print('  (transient, under --fault-persist: '
+              + ', '.join(f'{k} {n} frame(s)' for k, n in transient.items()) + ')')
 
     if args.json:
         with open(args.json, 'w') as fh:

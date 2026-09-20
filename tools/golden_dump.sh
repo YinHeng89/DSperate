@@ -71,12 +71,13 @@ else
 fi
 [ -f "$ROM" ] || { echo "no ROM for $SCENE at $ROM (set $OVERRIDE_VAR to point at it)" >&2; exit 3; }
 
+# gsdd's state file is not named after the scene, so it is tested first -- the
+# generic branches below exit when neither scenes/<name>.dsin nor .dss exists.
 ENTRY=()
-if   [ -f "$HERE/scenes/$SCENE.dsin" ]; then ENTRY=(--replay "$HERE/scenes/$SCENE.dsin")
+if   [ "$SCENE" = gsdd ];               then ENTRY=(--load-state "$HERE/scenes/gsdd-phase2.dss")
+elif [ -f "$HERE/scenes/$SCENE.dsin" ]; then ENTRY=(--replay "$HERE/scenes/$SCENE.dsin")
 elif [ -f "$HERE/scenes/$SCENE.dss" ];  then ENTRY=(--load-state "$HERE/scenes/$SCENE.dss")
 else echo "no scenes/$SCENE.dsin or .dss" >&2; exit 4; fi
-# gsdd's state file is not named after the scene.
-[ "$SCENE" = gsdd ] && ENTRY=(--load-state "$HERE/scenes/gsdd-phase2.dss")
 SAVE=(); [ -f "$HERE/scenes/$SCENE.sav" ] && SAVE=(--save "$HERE/scenes/$SCENE.sav")
 
 exec env DS_R3D_THREADS=0 DS_2D_THREAD=0 DS_2D_LAZY=0 DS_SPU_BATCH=1 \

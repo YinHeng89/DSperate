@@ -87,16 +87,29 @@ def main():
     out = run(ref, c)
     results.append(check('swapped screens', out, 'swapped'))
 
-    # frozen: the candidate repeats a frame the reference moved past.
-    c = ref.copy(); c[15] = c[14]
+    # frozen: the candidate sticks on one frame while the reference moves on.
+    c = ref.copy()
+    for i in range(15, 21): c[i] = c[14]
     out = run(ref, c, extra=('--align', '0'))
-    results.append(check('frozen frame', out, 'frozen'))
+    results.append(check('frozen screen', out, 'frozen'))
 
     # region: one large contiguous area wrong -- what a dropped layer looks
     # like. 60x60 of 256x192 is 7.3 %, over the 2 % default limit.
-    c = ref.copy(); c[18:20, 1, 40:100, 40:100, :3] = 0
+    c = ref.copy(); c[14:20, 1, 40:100, 40:100, :3] = 0
     out = run(ref, c, extra=('--align', '0'))
     results.append(check('dropped region', out, 'region'))
+
+    # The persistence rule, from the other side: a transition-length blip must
+    # NOT be reported. This is the guard that matters in practice -- golden and
+    # candidate differ in when a transition lands, and etody's frame 196 blanked
+    # in one run and not the other for exactly this reason.
+    c = ref.copy(); c[7, 0, ..., :3] = 0
+    out = run(ref, c, extra=('--align', '0'))
+    results.append(check('one-frame blank (transient)', out, want_clean=True))
+
+    c = ref.copy(); c[9:11, 1, 40:100, 40:100, :3] = 0
+    out = run(ref, c, extra=('--align', '0'))
+    results.append(check('two-frame region (transient)', out, want_clean=True))
 
     bad = results.count(False)
     print(f"\n{len(results) - bad}/{len(results)} detector checks passed")
