@@ -251,6 +251,59 @@ intro at 30 Hz against SDL's 60 Hz. Two consequences, both now in the plan:
    `dbori`'s intro is its first test case. This is unbudgeted work discovered
    by building P0 — which is the argument for having built it first.
 
+### 3.2 The cost model, measured — and Phase 2's target with it
+
+Measured 2026-09-20, `qemu-aarch64` 9.1.0 with the `libinsn` TCG plugin
+against the AArch64 cross build (`jit+neon`), 200 frames, `DS_R3D_THREADS=0`
+`DS_2D_THREAD=0` so the count is single-threaded and free of spin noise.
+`DS_JIT_COSTPROBE` emits the per-access cost model a second time into a dead
+scratch: the emulated cycle count is unchanged, so the delta is the model's
+own cost and nothing else.
+
+| sm64 | insns | delta | share | per frame |
+|---|---|---|---|---|
+| baseline | 1,333,161,382 | | | 6,665,807 |
+| `PART=1` (the table lookup) | 1,384,310,100 | +51,148,718 | +3.84 % | 255,744 |
+| `PART=2` (the charge arithmetic) | 1,355,833,188 | +22,671,806 | +1.70 % | 113,359 |
+| `PART=3` (both) | 1,406,984,441 | +73,823,059 | **+5.54 %** | 369,115 |
+
+Parts 1 and 2 sum to 73,820,524 against part 3's 73,823,059 — additive to
+0.003 %, which is the check that the probe measures what it claims. meteos,
+the same run: +24,220,890, **+2.33 %**, 121,104 insn/frame. The share tracks
+memory-access density rather than rendering load, which is why the lighter
+scene scores lower.
+
+**So the whole per-access cost model is 2.3-5.5 % of emulated instructions.**
+At the ~0.5 IPC the device implies (sm64's 6.67 M insn/frame against its
+measured 7.01 ms headless), removing it entirely is worth roughly **0.2-0.4 ms
+a frame, not the 3.5 ms Phase 2 was scoped for.** One caveat pushes the other
+way and cannot be settled here: the lookup is a *dependent load* through
+`R_TIM`, and on an in-order A55 a dependent load can cost far more than its
+instruction count — the whole of `docs/techniques` insists on exactly this
+point. The device number could therefore be higher than the instruction share
+suggests. It is not going to be ten times higher.
+
+**Two things this changes.**
+
+1. **Phase 2 loses its best-founded lever**, which is risk 1 materialising
+   exactly as written. The remaining levers — the four open JIT rows (1.5,
+   1.12, 1.23, 1.26), the fallback rate, LDM/STM page crossings, wider idle
+   skipping — are all still unmeasured, and none of them has an argument
+   behind it as strong as the one the cost model just lost. Phase 2 should be
+   rescoped to "census first, commit second": run `perf` on the device against
+   the ARM9 row and find where the 6.7 ms actually is, before planning weeks
+   of work against it. If §4's arithmetic has to survive on Phases 1 and 3
+   alone it lands near 12 ms, which is inside the 16.74 ms budget but without
+   the margin the plan assumed.
+2. **`DS_JIT_FASTCOST` is not the floor**, and the earlier draft of this
+   document was wrong to call it one. Measured, it is +3.16 % *slower* than
+   the exact model. Reading the emitter says why: `fastcost` always emits
+   `add_imm` + `sub_reg`, two instructions, while the exact path's common ARM9
+   case (`numC <= 1`) emits a single `sub_reg`. It is an alternative inexact
+   model that happens to cost more in the common case, not a cheaper one. The
+   real floor is `const_nd >= 0`, which emits no cost code at the site at all,
+   and the probe above already bounds what reaching it is worth.
+
 ### Phase 1 — Geometry as a replayed log (weeks 1-2) — target **-3.0 ms**
 
 The largest single win, and the one already measured: `--timing-oc` alone is
@@ -315,7 +368,7 @@ frontend**, because no headless gate can settle cadence (§3.1). The picture
 and swap counts under `--timing-oc` are already clean, so a regression here
 means the synthesised `GXSTAT` was weakened.
 
-### Phase 2 — The ARM9 at 6.7 ms (weeks 2-4) — target **-3.5 ms**
+### Phase 2 — The ARM9 at 6.7 ms (weeks 2-4) — target **revised, see §3.2**
 
 The biggest row, and the one with the least prior work, because the JIT was
 already audited as close to DraStic (`06` rows 1.1-1.29 are mostly `same`).
@@ -348,9 +401,9 @@ Candidate levers, in the order the evidence currently favours:
 * **Coarsen the cycle model.** We reproduce the interpreter's per-page timing
   formulas exactly (row 1.8). DraStic uses a per-CPU model with a handful of
   per-game hacks. Accuracy of the cycle count is no longer a goal in itself —
-  only "games run at the right speed and do not desync" is. `DS_JIT_FASTCOST`
-  (already in the tree, "inexact: numC + numD") is the intermediate step
-  between today's model and a constant.
+  only "games run at the right speed and do not desync" is. Not via
+  `DS_JIT_FASTCOST`, which measured *slower* than the exact model (§3.2); the
+  target is `const_nd`, which emits nothing at the site.
 * **The four open JIT rows**: tag-free ITCM direct tables (1.12), three code
   arenas with separate flushes (1.23 — this one also removes a real failure
   mode, a full arena throwing away every translation), known-constant tracking
@@ -559,9 +612,10 @@ extend the phase.
    must produce that census before Phase 2 is committed to; if it shows the
    time is in translated guest code rather than around it, this plan's largest
    line item has no lever and the schedule changes. The cost-model lever is
-   the best-founded part of it and `DS_JIT_COSTPROBE` prices it in an
-   afternoon — do that first, because it is the cheapest way to find out
-   whether the 3.5 ms target is real.
+   **This has now happened.** `DS_JIT_COSTPROBE` was run (§3.2) and the cost
+   model is 2.3-5.5 % of instructions, worth perhaps 0.2-0.4 ms — not 3.5 ms.
+   Phase 2 is rescoped to census-first; the device `perf` run against the
+   ARM9 row is now the gating task, not an optional one.
    *(This risk was already sharpened once: the plan's first draft proposed the
    `jit-timing-fold` approach, which fastmem has obsoleted. Assume other
    pre-fastmem assumptions in the JIT notes are stale too, and re-read the

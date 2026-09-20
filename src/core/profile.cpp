@@ -2,6 +2,8 @@
 // DSperate - Nintendo DS emulator. Copyright (C) 2026 DSperate contributors.
 #include "core/profile.h"
 
+#include <cstring>
+
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -23,6 +25,20 @@ const char* const names[COUNT] = {
   "gx worker join",
   "sched slice loop", "events (timers, dma, fifo; not spu)", "gpu line hooks", "line-0 worker join", "begin_frame", "gx vblank (sort, join)",
   "2d journal/latches", "3d line wait", "3d prep (texcache)", "gpu upload",
+};
+
+// Stable machine keys for the same stages (DS_PROFILE_LINE). Display names
+// above are prose and change; these are a diff key across the whole rework
+// and must not, so a stage that is renamed keeps its key and a stage that is
+// removed leaves a hole rather than shifting its neighbours.
+const char* const stage_keys[COUNT] = {
+  "cpu9", "cpu7", "dma", "gx_geom",
+  "bg_draw", "obj_draw", "window", "select", "effects", "output", "capture",
+  "r3d_clear", "r3d_spans", "r3d_final", "r3d_wait", "spu",
+  "jit_tx",
+  "gx_join",
+  "sched", "events", "gpu_line", "join0", "begin_frame", "gx_vblank",
+  "journal", "r3d_line", "r3d_prep", "gpu_upload",
 };
 
 const char* const count_names[] = {"3d polygon lines", "3d span pixels", "3d resolved pixels",
@@ -188,6 +204,73 @@ void frame_breakdown(const std::vector<double>& frame_ms) {
       std::fprintf(stderr, " %s %.3f", names[top[s]], frame_series[i].ns[top[s]] / 1e6);
     std::fprintf(stderr, " untimed %.3f\n", frame_ms[i] - timed);
   }
+
+  // DS_PROFILE_LINE: the same run as one line of JSON, so a phase's claim is
+  // a diff of two lines rather than an eyeball over two tables
+  // (docs/speed-first-rework-scoping.md Phase 0). "-" or "1" goes to stderr;
+  // anything else is a path, appended to, so a sweep accumulates one line per
+  // run. DS_PROFILE_LABEL names the run.
+  const char* line_to = std::getenv("DS_PROFILE_LINE");
+  if (!line_to || !*line_to) return;
+  std::FILE* out = stderr;
+  bool close_out = false;
+  if (std::strcmp(line_to, "-") != 0 && std::strcmp(line_to, "1") != 0) {
+    out = std::fopen(line_to, "a");
+    if (!out) { std::fprintf(stderr, "[profile] cannot append to %s\n", line_to); return; }
+    close_out = true;
+  }
+  u64 counts[C_COUNT] = {};
+  {
+    std::lock_guard<std::mutex> lk(detail::accs_mutex());
+    for (const Accum* a : detail::accs())
+      for (u32 i = 0; i < C_COUNT; ++i) counts[i] += a->count[i];
+  }
+  auto pct = [&](double q) {
+    const size_t k = std::min(n - 1, static_cast<size_t>(q * static_cast<double>(n - 1) + 0.5));
+    return frame_ms[order[k]];
+  };
+  const char* label = std::getenv("DS_PROFILE_LABEL");
+  if (close_out) std::fprintf(out, "%s", "");
+  std::fprintf(out, "{\"label\":\"%s\",\"frames\":%zu", label ? label : "", n);
+  std::fprintf(out, ",\"ms\":{\"mean\":%.4f,\"median\":%.4f,\"p90\":%.4f,\"p99\":%.4f,\"max\":%.4f}",
+               m.ms, pct(0.50), pct(0.90), pct(0.99), frame_ms[order[n - 1]]);
+  // Typical group (the middle fifth): the emulation thread's critical path.
+  std::fprintf(out, ",\"typ\":{");
+  bool first = true;
+  for (u32 i = 0; i < COUNT; ++i) {
+    if (m.stage[i] < 5e-5) continue;   // below a twentieth of a microsecond a frame, not signal
+    std::fprintf(out, "%s\"%s\":%.4f", first ? "" : ",", stage_keys[i], m.stage[i]);
+    first = false;
+  }
+  std::fprintf(out, "},\"typ_untimed\":%.4f,\"typ_workers\":%.4f", m.untimed, m.workers);
+  // The p99 group too: the tail is what a player feels, and a change that
+  // improves the median while worsening this one is not an improvement.
+  std::fprintf(out, ",\"p99\":{");
+  first = true;
+  for (u32 i = 0; i < COUNT; ++i) {
+    if (t.stage[i] < 5e-5) continue;
+    std::fprintf(out, "%s\"%s\":%.4f", first ? "" : ",", stage_keys[i], t.stage[i]);
+    first = false;
+  }
+  std::fprintf(out, "},\"p99_untimed\":%.4f,\"p99_workers\":%.4f", t.untimed, t.workers);
+  // A fixed, small set of workload counters. Fixed because the point is to
+  // diff two runs: a counter that appears only sometimes cannot be diffed,
+  // and one that says how much work the guest asked for is what tells a real
+  // saving apart from the game simply drawing less (the swap-count trap in
+  // docs/frame-profile-2026-09-16.md).
+  struct { const char* k; Counter c; } kCounts[] = {
+    {"slices", C_SLICES}, {"gx_swap", C_GX_SWAP}, {"gx_read_gxstat", C_GX_READ_GXSTAT},
+    {"poly_lines", C_POLY_LINES}, {"span_px", C_SPAN_PIXELS}, {"resolved_px", C_RESOLVED_PIXELS},
+    {"2d_lines", C_2D_LINES}, {"2d_lazy_frames", C_2D_LAZY_FRAMES}, {"2d_trap_hits", C_2D_TRAP_HITS},
+    {"dma_starts", C_DMA_STARTS}, {"cyc_total", C_CYC_TOTAL}, {"cyc_idle_skipped", C_CYC_IDLE_SKIPPED},
+  };
+  std::fprintf(out, ",\"counts\":{");
+  for (size_t i = 0; i < sizeof(kCounts) / sizeof(*kCounts); ++i)
+    std::fprintf(out, "%s\"%s\":%llu", i ? "" : "", kCounts[i].k, (unsigned long long)counts[kCounts[i].c]),
+    std::fprintf(out, "%s", i + 1 < sizeof(kCounts) / sizeof(*kCounts) ? "," : "");
+  std::fprintf(out, "}}\n");
+  if (close_out) std::fclose(out);
+  else std::fflush(out);
 }
 
 // Sum every thread's accumulator. Called from the emulation thread after the
