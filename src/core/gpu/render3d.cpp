@@ -1067,7 +1067,10 @@ void Renderer3D::resolve_span(const Shade& sh, const SpanBuf& sb, s32 y, s32 xa,
     }
   }
   if (resolved) prof::add(prof::C_RESOLVED_PIXELS, resolved);
-  if (note) note_edge_part(sb, y, xa, xb, part, part == 0 ? l_cov : r_cov, polyattr | static_cast<u32>(edge), drawn);
+  if (note) {
+    note_edge_part(sb, y, xa, xb, part, part == 0 ? l_cov : r_cov, polyattr | static_cast<u32>(edge), drawn);
+    if (part == 0) note_edge_overlap(sb, y, xa, xb, r_cov, polyattr | static_cast<u32>(edge), drawn);
+  }
 }
 
 // The texture half of a Shade: format, size, VRAM addressing and the direct
@@ -1811,7 +1814,10 @@ template <int mode, bool textured, bool aa, bool opq>
     else { step(std::integral_constant<u32, 2>{}, x, rem); x += 8; }
   }
   if (pe) prof::add(prof::C_RESOLVED_PIXELS, resolved_px);
-  if (sh.subpix && part != 1) note_edge_part(sb, y, xa, xb, part, cov_sel, attr_base, nullptr);
+  if (sh.subpix && part != 1) {
+    note_edge_part(sb, y, xa, xb, part, cov_sel, attr_base, nullptr);
+    if (part == 0) note_edge_overlap(sb, y, xa, xb, r_cov, attr_base, nullptr);
+  }
 }
 #endif
 // Derive scanlines [y0, y1) of the polygon on `e` into lines_[].
@@ -2181,6 +2187,7 @@ template <typename Range>
   // Put the origin back where this span's pixels are: buffer index for
   // screen x is j.off + (x - j.ca).
   spanbuf_.x0 = j.ca - static_cast<s32>(j.off);
+  spanbuf_.e_l0 = j.xdraw; spanbuf_.e_r0 = j.lim1;
   s32 x = j.xdraw, xcov = 0;
   auto draw_span = [&](s32 xlimit, int part, int edge) {
     if (x >= xlimit) return;
@@ -2442,6 +2449,19 @@ u32 Renderer3D::fog_density(u32 addr) const {
 static inline bool same_surface(s32 za, s32 zb) { const s32 d = za > zb ? za - zb : zb - za; return d <= (std::min(za, zb) >> 6) + 0x200; }
 
 void Renderer3D::note_edge_part(const SpanBuf& sb, s32 y, s32 xa, s32 xb, int part, s32 cov, u32 attr_key, const u8* drawn) {
+  note_edge_run(sb, y, xa, xb, part, cov, part == 0 ? sb.e_l0 : sb.e_r0, attr_key, drawn, false);
+}
+
+// A span no wider than its two edge runs together draws the shared pixels as the left run
+// only, and what the right edge knows of them would be lost -- on a sliver at a silhouette
+// that is the very edge that shows (the cut then lands a pixel in, on the next polygon's
+// edge). The batch walk hands the right edge's coverage over for those pixels.
+void Renderer3D::note_edge_overlap(const SpanBuf& sb, s32 y, s32 xa, s32 xb, s32 r_cov, u32 attr_key, const u8* drawn) {
+  const s32 lo = std::max(xa, sb.e_r0);
+  if (lo < xb) note_edge_run(sb, y, lo, xb, 2, r_cov, sb.e_r0, attr_key, drawn, true);
+}
+
+void Renderer3D::note_edge_run(const SpanBuf& sb, s32 y, s32 xa, s32 xb, int part, s32 cov, s32 start, u32 attr_key, const u8* drawn, bool second) {
   const bool xmajor = cov & static_cast<s32>(0x80000000u);
   u8 side; s8 slope;
   if (xmajor) {
@@ -2465,8 +2485,9 @@ void Renderer3D::note_edge_part(const SpanBuf& sb, s32 y, s32 xa, s32 xb, int pa
     if (xmajor) {
       // The hardware's ramp: the run's first pixel at the start value, a step a pixel (it
       // stalls on pixels that do not plot; by position is the geometry, and needs no AA raster).
+      // From the run's own start, not the range's: the depth pre-pass clips the range.
       if (!owner) continue;
-      const s32 xc = (xcov0 + (x - xa) * (cov & 0x3FF)) >> 5;
+      const s32 xc = (xcov0 + (x - start) * (cov & 0x3FF)) >> 5;
       const s32 c = part == 0 ? std::min(xc, 31) : std::max(0, 31 - xc);
       pos = c == 0 ? 32 : 31 - c;
     }
@@ -2474,6 +2495,9 @@ void Renderer3D::note_edge_part(const SpanBuf& sb, s32 y, s32 xa, s32 xb, int pa
       const s32 c = cov & 0x1F, there = ((cov >> 16) & 0x1F) + 1;
       pos = !(cov & (1 << 21)) ? (c == 0 ? 32 : 31 - c) : c == 0x1F ? -there : 64 - there;
     }
+    // The polygon's other edge through a pixel its left run has just noted: the one that
+    // leaves more of the pixel uncovered is the one to show.
+    if (second && eside_[addr] != SPLIT_NONE && eside_[addr] != side && ez_[addr] == z && epos_[addr] >= pos) continue;
     const bool pooled = eside_[addr] == side && same_surface(ez_[addr], z);
     if (!owner && !(pooled && (a & 0xF) && !(a & (1u << 22)))) continue;   // lost the pixel, and not to its own surface's edge
     if (pooled && epos_[addr] <= pos) continue;                              // the one already known is further out

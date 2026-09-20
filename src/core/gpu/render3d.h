@@ -317,6 +317,7 @@ private:
   static constexpr u32 BATCH_CAP = BATCH_PX + 256 + 16;
   struct SpanBuf {
     s32 x0;
+    s32 e_l0, e_r0;                      // where the span's left and right edge runs begin, unclipped (note_edge_part)
     // Every array carries sixteen entries of slack: the stages round the span
     // length up to their vector width (four, eight or sixteen pixels) and write
     // whole vectors, so the tail of a short span runs past `n`.
@@ -559,6 +560,8 @@ private:
   std::array<u8, RING> erow_{};                           // ring rows that had an edge noted since their clear                            // and extract_splits
   void extract_splits(s32 y);
   void note_edge_part(const SpanBuf& sb, s32 y, s32 xa, s32 xb, int part, s32 cov, u32 attr_key, const u8* drawn);
+  void note_edge_overlap(const SpanBuf& sb, s32 y, s32 xa, s32 xb, s32 r_cov, u32 attr_key, const u8* drawn);
+  void note_edge_run(const SpanBuf& sb, s32 y, s32 xa, s32 xb, int part, s32 cov, s32 start, u32 attr_key, const u8* drawn, bool second);
   // What is known of each top-layer pixel's edge (note_edge_part); sub-pixel mode only.
   std::array<u8, RSIZE> eside_{};
   std::array<s8, RSIZE> epos_{}, eslope_{};
