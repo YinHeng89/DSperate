@@ -172,7 +172,6 @@ const char* kUsage =
     "  --no-mic        do not open the microphone (M still fakes one)\n"
     "  --no-vsync      present without waiting for the display refresh\n"
     "  --interp        interpreter instead of the recompiler\n"
-    "  --timing-oc     Timing OC: no GX FIFO, untimed geometry (faster, less accurate; DraStic's model).\n"
     "                  emu.timing_oc in the config\n"
     "  --cpu-oc        CPU tuning, overclock: recompiled data accesses priced as main RAM, geometry on its\n                  own thread with every polygon priced as drawn (less accurate); emu.cpu_tuning = overclock\n"
     "  --cpu-uc        CPU tuning, underclock: for the harder to run games and/or the lowest end devices.\n                  The game's CPUs run slower than a console's, so there is less to emulate a frame\n                  (less accurate; a game can miss VBlanks); emu.cpu_tuning = underclock\n"
@@ -211,7 +210,7 @@ const char* kUsage =
     "  --netplay       local wireless with whoever is on the LAN: join a session heard within\n"
     "                  2.5 s, else host one (melonDS's LAN protocol; a melonDS can be the other end).\n"
     "                  The menu's NETWORK FEATURES row and net.mode do the same without a flag.\n"
-    "                  Any local wireless forces --cpu-oc, --timing-oc and --fast-load off: the\n"
+    "                  Any local wireless forces --cpu-oc and --fast-load off: the\n"
     "                  two consoles in a session have to keep the same time as each other\n"
     "  --lan-host NAME host a local-wireless session as NAME; --lan-join ADDR joins the one at ADDR;\n"
     "                  --lan-name NAME is our player name (default: the console's nickname)\n"
@@ -1260,8 +1259,6 @@ static int run(int argc, char** argv) {
     else if (flag("--interp")) cli.set("emu.jit", "false");
     else if (flag("--lockstep")) cli.set("emu.quantum", std::to_string(ds::LOCKSTEP_QUANTUM));
     else if (arg("--quantum")) cli.set("emu.quantum", argv[++i]);
-    else if (flag("--timing-oc")) cli.set("emu.timing_oc", "true");
-    else if (flag("--gx-worker")) cli.set("emu.gx_worker", "true");   // the geometry worker alone: FIFO, stall and swap timing kept, commands executed off-thread with the cull priced by the previous frame's ratio
     else if (flag("--cpu-oc")) cli.set("emu.cpu_tuning", "overclock");
     else if (flag("--cpu-uc")) cli.set("emu.cpu_tuning", "underclock");
     else if (flag("--fast-load")) cli.set("emu.fast_load", "true");
@@ -2006,10 +2003,6 @@ sdl_ready:
   session.open(nds, cfg, rom_path, save_arg);
 
   nds.sched.set_quantum(quantum);
-  nds.gpu3d.set_timing_oc(cfg.flag("emu.timing_oc", false));
-  // Geometry worker + per-frame shape controller, with either inexact tier
-  // (no-FIFO, or the FIFO kept with the cull priced by ratio under --cpu-oc).
-  nds.gpu3d.set_geometry_worker(cfg.flag("emu.timing_oc", false) || cfg.flag("emu.gx_worker", false) || cpu_oc_mode(cfg.str("emu.cpu_tuning")) != 0);   // DS_GX_THREAD: 0 never, 1 per-frame shape controller, 2 always
   nds.io.set_cart_bulk(cfg.flag("emu.fast_load", false));   // may introduce accuracy issues, see config.cpp
   // One row, three mutually exclusive modes (see config.cpp); the file's old boolean is rewritten
   // so the menu shows a mode rather than "true".
@@ -3000,11 +2993,8 @@ sdl_ready:
       ::ds::jit::set_cpu_oc(static_cast<::ds::jit::CpuOc>(cpu_oc_applied));
       ::ds::jit::flush_all();
 #endif
-      nds.gpu3d.set_geometry_worker(mode != 0 || cfg.flag("emu.timing_oc", false) || cfg.flag("emu.gx_worker", false));
       return;
     }
-    if (is("emu.timing_oc")) { nds.gpu3d.set_timing_oc(on); nds.gpu3d.set_geometry_worker(on || cfg.flag("emu.gx_worker", false) || cpu_oc_mode(cfg.str("emu.cpu_tuning")) != 0); return; }
-    if (is("emu.gx_worker")) { nds.gpu3d.set_geometry_worker(on || cfg.flag("emu.timing_oc", false) || cpu_oc_mode(cfg.str("emu.cpu_tuning")) != 0); return; }
     if (is("emu.fast_load")) { nds.io.set_cart_bulk(on); return; }
     if (is("emu.dsi_nand_shortcuts")) {
       shortcuts_note = sync_nand_shortcuts(on);   // shown by the frame loop's toast
@@ -4221,10 +4211,6 @@ sdl_ready:
     fb_current = present && !scaled;   // a skipped frame renders nothing
 
     const Uint64 t0 = SDL_GetPerformanceCounter();
-    // Everything since the last slice ended (present, buffer wait, pacing) is
-    // the frontend's, not the frame's: the 3D shape controller subtracts it.
-    static Uint64 last_slice_end = 0;
-    if (last_slice_end) nds.gpu3d.note_external_ns(static_cast<u64>((t0 - last_slice_end) / ticks_per_ns));
 #if DSPERATE_NET
     if (lan) lan->process();   // ENet and discovery, once per frame, on this thread
     // The stack's own timers and sockets. ap_recv pumps it too whenever the
@@ -4354,7 +4340,6 @@ sdl_ready:
     }
 
     const Uint64 t1 = SDL_GetPerformanceCounter();
-    last_slice_end = t1;
     if (present) {
       const bool cursor = input.stylus_visible() && !log.reading();
       // The crosshair is drawn in DS pixels, so on a bottom screen shown

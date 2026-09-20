@@ -67,7 +67,7 @@ void dump_cpu_timing(ds::NDS& nds, const char* when) {
   }
   { ds::u64 h = 1469598103934665603ull; const ds::u32* l = nds.gpu3d.line(nds.gpu3d.frame_ref(), 0); for (int x = 0; x < 256; ++x) h = (h ^ l[x]) * 1099511628211ull;
     std::fprintf(stderr, "[state %s] 3d line0 hash %016llx\n", when, (unsigned long long)h); }
-  std::fprintf(stderr, "[state %s] now %llu next %llu a7debt? gx stalled %d idle %d\n", when, (unsigned long long)nds.sched.now(), (unsigned long long)nds.sched.next_deadline(), nds.gpu3d.stalled(), nds.gpu3d.idle());
+  std::fprintf(stderr, "[state %s] now %llu next %llu a7debt? gx idle %d\n", when, (unsigned long long)nds.sched.now(), (unsigned long long)nds.sched.next_deadline(), nds.gpu3d.idle());
 }
 
 std::vector<ds::u8> slurp_file(const char* path) {
@@ -271,8 +271,6 @@ int main(int argc, char** argv) {
   long quantum = ds::LOCKSTEP_QUANTUM;
 #endif
   TraceState ts;
-  bool timing_oc = false;
-  bool gx_worker = false;   // --gx-worker: the geometry worker with the FIFO kept (the race-preserving tier, without --cpu-oc)
   bool rtc_host = false;              // --rtc-host: free-running clock seeded from the wall
   const char* fw_override = nullptr;  // --firmware-override: sidecar of changed firmware pages
   bool no_aa = false;
@@ -363,8 +361,6 @@ int main(int argc, char** argv) {
     else if (arg("--quantum")) quantum = std::atol(argv[++i]);                // CPU interleave in ARM9 cycles; 0 = event-bound (the frontends' mode)
     else if (flag("--rtc-host")) rtc_host = true;                            // INEXACT by construction: runs stop being reproducible
     else if (arg("--firmware-override")) fw_override = argv[++i];            // load it, and write back what the firmware changed
-    else if (flag("--timing-oc")) timing_oc = true;                          // no FIFO + untimed geometry (DraStic's model); see Gpu3D::set_timing_oc
-    else if (flag("--gx-worker")) gx_worker = true;                          // INEXACT (slightly): the geometry worker alone, FIFO and stall timing kept, cull priced by the previous frame's ratio
     else if (flag("--no-aa")) no_aa = true;                                  // 3D anti-aliasing off (Renderer3D::set_aa); inexact, for measurement
     else if (flag("--cpu-oc")) cpu_oc = 1;                                   // INEXACT: JIT data accesses priced as main RAM at translate time; see jit::set_cpu_oc
     else if (flag("--cpu-uc")) cpu_oc = 2;                                   // INEXACT: --cpu-oc's underclock tier (stores and the ARM7 at main RAM's bus cost)
@@ -552,10 +548,6 @@ int main(int argc, char** argv) {
     }
   }
   nds.sched.set_quantum(quantum);
-  nds.gpu3d.set_timing_oc(timing_oc);
-  // Geometry worker + per-frame shape controller, with either inexact tier
-  // (no-FIFO, or the FIFO kept with the cull priced by ratio under --cpu-oc).
-  nds.gpu3d.set_geometry_worker(timing_oc || gx_worker || cpu_oc != 0);   // DS_GX_THREAD: 0 never, 1 per-frame shape controller, 2 always
   nds.gpu3d.renderer().set_aa(!no_aa && !subpixel);   // the SDL frontend's video.aa = smooth: never with the hardware blend
   nds.gpu.set_subpixel(subpixel);
   nds.gpu.set_shape(shape && !subpixel);
@@ -909,9 +901,9 @@ int main(int argc, char** argv) {
       // DS_FRAME_SERIES=<path>: the run-order series ("ms polygons raster_ns gx_ns" per line),
       // for the shape of a tail -- alternation, bursts -- rather than its size.
       static FILE* series = [] { const char* p = std::getenv("DS_FRAME_SERIES"); return p ? std::fopen(p, "w") : nullptr; }();
-      // ms polygons raster_ns(serial, last synced frame) gx_worker_busy_ns
-      if (series) std::fprintf(series, "%.3f %u %llu %llu\n", frame_ms.back(), nds.gpu3d.render_polygon_count(),
-                               (unsigned long long)nds.gpu3d.last_raster_ns(), (unsigned long long)nds.gpu3d.take_worker_busy_ns());
+      // ms polygons raster_ns(serial, last synced frame)
+      if (series) std::fprintf(series, "%.3f %u %llu\n", frame_ms.back(), nds.gpu3d.render_polygon_count(),
+                               (unsigned long long)nds.gpu3d.last_raster_ns());
     }
     // The console has switched itself off. On a firmware boot that is the
     // firmware leaving its settings pages, with the pages it wrote already in

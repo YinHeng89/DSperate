@@ -334,15 +334,9 @@ int clip_polygon(Vertex* v, int nverts, int clipstart, bool far_clip) {
 
 } // namespace
 
-Gpu3D::~Gpu3D() { if (worker_on_) worker_join(); worker_stop(); renderer_.sync_all(); }
+Gpu3D::~Gpu3D() { renderer_.sync_all(); }
 
-Gpu3D::Gpu3D(NDS& nds) : nds_(nds), renderer_(nds) {
-  // Once, here rather than as a function-local static in the hot path: a
-  // local static costs an acquire load per use (the same reason
-  // Scheduler's constructor reads its knobs).
-  shape_log_ = std::getenv("DS_GX_SHAPE_LOG") != nullptr;
-  reset();
-}
+Gpu3D::Gpu3D(NDS& nds) : nds_(nds), renderer_(nds) { reset(); }
 
 void Gpu3D::reset_render_state() {
   render_count_.fill(0);
@@ -350,16 +344,10 @@ void Gpu3D::reset_render_state() {
 }
 
 void Gpu3D::reset() {
-  if (worker_on_) worker_join();
-  sh_ = Shadow{}; stack_err_ = 0; box_result_ = 0;
-  pr_poly_mode_ = pr_vertex_in_poly_ = pr_consecutive_polys_ = pr_polygon_attr_ = pr_cur_polygon_attr_ = pr_count_ = 0;
-  ring_rd_ = ring_wr_ = pipe_n_ = fifo_n_ = stall_n_ = 0; stalled_ = false;
+  stack_err_ = 0; box_result_ = 0;
+  ring_rd_ = ring_wr_ = n_ = 0;
   parse_ = GxParse{};
   exec_params_.fill(0); exec_count_ = 0;
-  timestamp_ = 0; cycle_count_ = 0;
-  vertex_pipeline_ = normal_pipeline_ = polygon_pipeline_ = 0;
-  vertex_slot_counter_ = 0; vertex_slots_free_ = 1;
-  num_pushpop_ = num_tests_ = 0;
   gxstat_ = 0; geometry_on_ = rendering_on_ = false; render_on_.store(false, std::memory_order_relaxed);
   dispcnt_ = 0; alpha_ref_val_ = alpha_ref_ = 0;
   toon_.fill(0); edge_.fill(0);
@@ -397,204 +385,47 @@ void Gpu3D::reset() {
 }
 
 void Gpu3D::set_powcnt(u16 value) {
-  if (worker_on_) worker_join();   // the worker reads rendering_on_ at a SWAP
   geometry_on_ = value & (1 << 3);
   rendering_on_ = value & (1 << 2); render_on_.store(rendering_on_, std::memory_order_relaxed);
   if (!rendering_on_) reset_render_state();
 }
 
-// ---- timing -------------------------------------------------------------------
-
-// A vertex submitted while a polygon is being set up waits for the next free
-// 9-cycle slot.
-void Gpu3D::next_vertex_slot() {
-  s32 n = (9 - vertex_slot_counter_) + 1;
-  for (;;) {
-    cycle_count_ += n;
-    if (vertex_pipeline_ > 0) vertex_pipeline_ = vertex_pipeline_ > n ? vertex_pipeline_ - n : 0;
-    if (polygon_pipeline_ > 0) {
-      if (polygon_pipeline_ > n) {
-        polygon_pipeline_ -= n;
-        vertex_slot_counter_ = 1;
-        vertex_slots_free_ >>= 1;
-        if (vertex_slots_free_ & 1) { vertex_slots_free_ &= ~1u; break; }
-        n = 9; continue;
-      }
-      polygon_pipeline_ = 0; vertex_slot_counter_ = 0; vertex_slots_free_ = 1;
-      break;
-    }
-    break;
-  }
-}
-
-void Gpu3D::tm_stall_polygon_pipeline(s32 delay, s32 nonstall_delay) {
-  if (polygon_pipeline_ > 0) {
-    cycle_count_ += polygon_pipeline_ + delay;
-    vertex_pipeline_ = 0; normal_pipeline_ = 0;
-    polygon_pipeline_ = 0; vertex_slot_counter_ = 0; vertex_slots_free_ = 1;
-  } else if (vertex_pipeline_ > nonstall_delay) tm_add_cycles((vertex_pipeline_ - nonstall_delay) + 1);
-  else tm_add_cycles(normal_pipeline_ + 1);
-}
-
-
-void Gpu3D::finish_work(s32 cycles) {
-  if (untimed_) {   // Timing OC: the pipelines the setters still write are never consumed; the engine is simply done
-    cycle_count_ = 0;
-    vertex_pipeline_ = normal_pipeline_ = polygon_pipeline_ = 0;
-    vertex_slot_counter_ = 0; vertex_slots_free_ = 1;
-    gxstat_ &= ~(1u << 27);
-    return;
-  }
-  add_cycles(cycles);
-  if (normal_pipeline_) normal_pipeline_ -= std::min(normal_pipeline_, cycles);
-  cycle_count_ = 0;
-  if (vertex_pipeline_ || normal_pipeline_ || polygon_pipeline_) return;
-  gxstat_ &= ~(1u << 27);
-}
-
-void Gpu3D::run_to_slow(u64 arm9_time) {
-  prof::add(prof::C_GX_RUN_SLOW, 1);
-  // The inline execution time is a DS_GX_SHAPE_LOG diagnostic and nothing
-  // else -- shape_step chooses its arm on `wall`. Two clock reads per call is
-  // too much to pay for a log line on a geometry firehose: Golden Sun's title
-  // makes 591 calls a frame, and on the A30 (no vDSO) a read is a syscall at
-  // ~370 ns, so ~440 us a frame. Ordinary scenes make 1-29 calls a frame, so
-  // this is worth ~2 % there and nothing anywhere else -- see
-  // docs/smoothness-scoping.md P8a for the measured table.
-  const bool timed = shape_log_ && worker_started_ && !worker_on_;
-  const auto t0 = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-  const u64 now = arm9_time >> 1;
-  cycle_count_ -= static_cast<s32>(now - timestamp_);
-  timestamp_ = now;
-  if (cycle_count_ <= 0 && pipe_n_) {
-    if (prof::enabled) prof::add(prof::C_GX_RUN_SLOW_EXEC, 1);
-    // The ring cursor and the three stage counts live in registers for the
-    // whole drain -- 78 commands a call on Golden Sun. Nothing a command can
-    // reach touches them: exec_single and exec_multi never push and never
-    // call into the rest of the machine, and no DMA runs here (run_to is
-    // called with the CPU stopped, and the re-arm deferred to the settle
-    // below only marks a channel runnable). The stall queue is the one path
-    // that moves them, and it writes them back first.
-    u32 rd = ring_rd_, pipe = pipe_n_, fifo = fifo_n_;
-    bool settle = drain_settle_;
-    // Both busy bits are clear far more often than not, and while they are
-    // clear nothing in the drain can set them -- only an enqueue does, and
-    // there are none here. So the state of the two bits is carried in a
-    // register instead of re-read from gxstat_ once per command.
-    bool busy = (gxstat_ & ((1u << 14) | (1u << 0))) != 0;
-    // One drain loop per route, so the per-entry test is hoisted: the exact
-    // model's loop is what it was before the worker existed.
-    auto drain = [&](auto&& sink) {
-    do {
-      // A bit clears one command *later* than the command that emptied its
-      // counter: a GXSTAT read landing between the two must still see it set.
-      if (busy) {
-        u32 g = gxstat_;
-        if (num_pushpop_ == 0) g &= ~(1u << 14);
-        if (num_tests_ == 0) g &= ~(1u << 0);
-        gxstat_ = g;
-        busy = (g & ((1u << 14) | (1u << 0))) != 0;
-      }
-      const Entry e = ring_[rd];
-      rd = (rd + 1) & (RING - 1);
-      --pipe;
-      if (pipe <= 2) {
-        // Refill the pipe with up to two FIFO entries: a count move, the
-        // entries are already in order behind it.
-        const u32 k = fifo < 2 ? fifo : 2;
-        pipe += k; fifo -= k;
-        if (stall_n_) { ring_rd_ = rd; pipe_n_ = pipe; fifo_n_ = fifo; promote_stalled(); rd = ring_rd_; pipe = pipe_n_; fifo = fifo_n_; }
-        // The DMA re-arm and the IRQ line are settled once, at the end of the
-        // drain, rather than on every pop. Nothing runs between the pops, and
-        // the level falls monotonically across a drain, so both IRQ
-        // conditions (level < 128, level == 0) can only turn *on* -- one check
-        // at the end lands on the same IF and the same armed DMA that a check
-        // per pop would have.
-        settle = true;
-      }
-      sink(e);
-    } while (cycle_count_ <= 0 && pipe);
-    };
-    if (worker_on_) drain([this](const Entry& e) { price_single(e.cmd, e.param); q_push(e); });
-    else drain([this](const Entry& e) { exec_single(e.cmd, e.param); });
-    ring_rd_ = rd; pipe_n_ = pipe; fifo_n_ = fifo; drain_settle_ = settle;
-  }
-  if (worker_on_) { if (q_pending_) q_publish(); }
-  else if (timed) gx_inline_ns_ += static_cast<u64>((std::chrono::steady_clock::now() - t0).count());
-  if (cycle_count_ <= 0 && pipe_n_ == 0) {
-    if (gxstat_ & (1u << 27)) finish_work(-cycle_count_); else cycle_count_ = 0;
-    if (num_pushpop_ == 0) gxstat_ &= ~(1u << 14);
-    if (num_tests_ == 0) gxstat_ &= ~(1u << 0);
-  }
-  if (drain_settle_) { drain_settle_ = false; check_fifo_dma(); check_fifo_irq_fast(); }
-}
-
 // ---- FIFO ---------------------------------------------------------------------
 
-// fifo_write's cold leg: the FIFO is full and the FIFO is modelled.
-void Gpu3D::fifo_write_full(const Entry& e) {
-  // The CPU stalls until the FIFO drains; writes already in flight (an
-  // STM's remaining registers) queue up behind it.
-  if (stall_n_ == STALL_DEPTH) { static int n = 0; if (n++ < 8) std::fprintf(stderr, "[gx] stall queue overflow: fifo %u running %d dma %d stalled %d now %llu\n", fifo_n_, nds_.sched.running() ? (nds_.sched.running()->which == Cpu::ARM9 ? 9 : 7) : 0, nds_.sched.in_dma(), stalled_, (unsigned long long)nds_.sched.now()); return; }
-  ring_push(e); ++stall_n_;
-  if (!stalled_) { stalled_ = true; nds_.sched.gx_fifo_full(); }
-}
-
-// Stalled writes enter the FIFO (or the pipe, if it has room) now that a pop
-// has made room, with the status side effects they were denied when they
-// arrived. Only reachable after the CPU has been stalled by a full FIFO.
-void Gpu3D::promote_stalled() {
-  u32 idx = (ring_rd_ + pipe_n_ + fifo_n_) & (RING - 1);
-  while (stall_n_ && fifo_n_ < FIFO_DEPTH) {
-    if (fifo_n_ == 0 && pipe_n_ < PIPE_DEPTH) ++pipe_n_; else ++fifo_n_;
-    --stall_n_;
-    note_enqueued(ring_[idx].cmd);
-    idx = (idx + 1) & (RING - 1);
-  }
-  if (stall_n_ == 0) stalled_ = false;
-}
-
+// Replay everything queued, now. Called at VBlank, whenever a read observes
+// the engine, and when the log nears full. No time passes: the engine is idle
+// the instant this returns, which is what lets read() report the matrix-stack
+// and test busy bits clear unconditionally.
 void Gpu3D::drain_all() {
   if (!geometry_on_) return;
-  const bool timed = shape_log_ && worker_started_;   // diagnostic only; see run_to_slow
-  const auto t0 = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-  const u64 now = nds_.sched.now();
-  // run_to_slow drains while its cycle deficit is non-positive; give it one
-  // it cannot exhaust and it runs the ring dry. A SWAP_BUFFERS ends a pass
-  // (it sets the count positive) after flipping the bank itself, so the loop
-  // simply goes round again for what follows it. Each pass retires at least
-  // one command, so it terminates.
-  while (pipe_n_ && !flush_request_) {
-    timestamp_ = now >> 1;
-    cycle_count_ = -(1 << 29);
-    run_to_slow(now);
-  }
-  // Everything queued has run and no time passes in this model, so the
-  // engine is idle: the busy bits clear as run_to_slow's tail would clear
-  // them once the last command's cycles had elapsed. (A pass that ended on
-  // a SWAP leaves the deficit positive, so that tail did not run.)
-  if (pipe_n_ == 0) {
-    if (gxstat_ & (1u << 27)) finish_work(1 << 29);
-    if (num_pushpop_ == 0) gxstat_ &= ~(1u << 14);
-    if (num_tests_ == 0) gxstat_ &= ~(1u << 0);
-  }
-  cycle_count_ = 0;
-  timestamp_ = now >> 1;
-  if (timed) gx_inline_ns_ += static_cast<u64>((std::chrono::steady_clock::now() - t0).count());
+  // A SWAP_BUFFERS inside the replay flips the bank and the commands after it
+  // build the next list, so the loop simply carries on; flush_request_ is
+  // cleared by the swap itself in the no-FIFO model, and only a VBlank-parked
+  // swap (the exact model's) ever left it set -- nothing sets it now.
+  if (!n_) return;   // the common case by far: dbori reads GXSTAT ~1.5 M times a run
+  do {
+    const Entry e = ring_[ring_rd_];
+    ring_rd_ = (ring_rd_ + 1) & (RING - 1);
+    --n_;
+    exec_single(e.cmd, e.param);
+  } while (n_);
+  // Only after something actually ran. The old drain settled the DMA re-arm
+  // and the IRQ line once per drain that popped an entry, not once per call:
+  // firing them on every observation of an empty log re-arms a GXFIFO DMA at
+  // a different point in the guest's polling loop, which moved SM64DS's
+  // picture and cut its GXSTAT reads by 17 %.
+  check_fifo_dma();
+  check_fifo_irq_fast();
 }
 
 void Gpu3D::check_fifo_irq() {
-  bool irq = false;
-  switch (gxstat_ >> 30) {
-  case 1: irq = no_fifo_ || fifo_n_ < 128; break;
-  case 2: irq = no_fifo_ || fifo_n_ == 0; break;
-  default: break;
-  }
-  nds_.io.set_irq_line(Cpu::ARM9, io::IRQ_GX_FIFO, irq);
+  // The FIFO always reads empty and under half full, so both IRQ modes are
+  // satisfied whenever either is selected.
+  nds_.io.set_irq_line(Cpu::ARM9, io::IRQ_GX_FIFO, (gxstat_ >> 30) != 0);
 }
 
 void Gpu3D::check_fifo_dma() {
-  if ((no_fifo_ || fifo_n_ < 128) && nds_.dma.gx_armed()) nds_.dma.check(Cpu::ARM9, dma::MODE9_GXFIFO);
+  if (nds_.dma.gx_armed()) nds_.dma.check(Cpu::ARM9, dma::MODE9_GXFIFO);
 }
 
 // Packed command port: up to four command bytes followed by their parameters.
@@ -641,41 +472,17 @@ void Gpu3D::gxfifo_write(u32 value) {
 
 // A GXFIFO DMA burst: `n` words from one direct-mapped source page.
 //
-// Nothing can observe the FIFO while the burst runs, which is what pays for
-// it. The CPU is stopped for the duration of a DMA, and the geometry engine
-// only drains from run_to() at a slice boundary, so the level rises
-// monotonically here. Both FIFO IRQ conditions (level < 128, level == 0) can
-// therefore only go *false*, and a falling line neither sets IF nor wakes a
-// halted core -- so the state at the end of the burst is the state every
-// intermediate check would have left. check_fifo_dma() is dead for the same
-// reason: it only ever fires on a falling level.
-//
-// The caller keeps `n` under fifo_burst_room(), so no entry can stall and the
-// stall queue is unreachable; what is left per entry is the ring write and the
-// two status classifications, with the assembly state and the ring cursor held
-// in registers across the whole run instead of reloaded per word.
+// Nothing can observe the log while the burst runs: the CPU is stopped for the
+// duration of a DMA and nothing replays here, so no IRQ condition and no DMA
+// trigger can change state mid-burst. The caller keeps `n` under
+// fifo_burst_room(), so the log cannot fill; what is left per entry is the
+// ring write alone, with the assembly state and the cursor held in registers
+// across the whole run instead of reloaded per word.
 void Gpu3D::gxfifo_dma_burst(const u8* src, u32 n) {
   if (!geometry_on_) return;
-  if (worker_on_ && no_fifo_) {
-    // Same walk, the queue as its sink; the shadow advances per entry inside
-    // q_push. Published at the end of the burst, not per word.
-    GxParse p = parse_;
-    for (u32 i = 0; i < n; ++i) {
-      u32 v;
-      std::memcpy(&v, src + i * 4, 4);
-      gxfifo_word(v, p, [this](const Entry& e) { q_push(e); });
-    }
-    parse_ = p;
-    if (q_pending_) q_publish();
-    return;
-  }
-  u32 wr = ring_wr_, pushed = 0, pushpop = 0, tests = 0;
+  u32 wr = ring_wr_, pushed = 0;
   Entry* const ring = ring_.data();
-  const auto sink = [&](const Entry& e) {
-    ring[wr] = e; wr = (wr + 1) & (RING - 1); ++pushed;
-    pushpop += static_cast<u8>(e.cmd - 0x11) <= 1;      // 0x11, 0x12
-    tests   += static_cast<u8>(e.cmd - 0x70) <= 2;      // 0x70-0x72
-  };
+  const auto sink = [&](const Entry& e) { ring[wr] = e; wr = (wr + 1) & (RING - 1); ++pushed; };
   // The parser state rides in registers for the whole run: the walk is a
   // static function of a local copy, written back once. Per word that is
   // the difference between ~10 loads and stores and none (the burst was
@@ -688,17 +495,7 @@ void Gpu3D::gxfifo_dma_burst(const u8* src, u32 n) {
   }
   parse_ = p;
   ring_wr_ = wr;
-  if (!pushed) return;
-  // Entries land in the pipe only while the FIFO is empty and the pipe has
-  // room; once either stops holding, every later entry goes to the FIFO. That
-  // is fifo_write()'s rule with the loop lifted out of it.
-  const u32 room = (fifo_n_ == 0 && pipe_n_ < PIPE_DEPTH) ? PIPE_DEPTH - pipe_n_ : 0;
-  const u32 to_pipe = pushed < room ? pushed : room;
-  pipe_n_ += to_pipe;
-  fifo_n_ += pushed - to_pipe;
-  gxstat_ |= (1u << 27);
-  if (pushpop) { gxstat_ |= (1u << 14); num_pushpop_ += pushpop; }
-  if (tests)   { gxstat_ |= (1u << 0);  num_tests_ += tests; }
+  n_ += pushed;
 }
 
 // ---- command execution --------------------------------------------------------
@@ -711,22 +508,21 @@ void Gpu3D::exec_accum(u8 cmd, u32 param) {
   exec_params_[exec_count_++] = param;
   if (exec_count_ == 1) {
     switch (cmd) {
-    case 0x23: vtx_cmd_submit(); break;
-    case 0x34: case 0x71: vtx_cmd_delayed8(); break;
-    case 0x70: stall_polygon_pipeline(10 + 1, 0); break;
-    default: vtx_cmd_delayed4(); break;
+    case 0x23: break;
+    case 0x34: case 0x71: break;
+    case 0x70: break;
+    default: break;
     }
   } else {
-    add_cycles(1);
     if (exec_count_ >= CMD_PARAMS[cmd]) { exec_count_ = 0; exec_multi(cmd); }
   }
 }
 
 void Gpu3D::exec_single(u8 cmd, u32 param) {
   switch (cmd) {
-  case 0x10: vtx_cmd_delayed4(); matrix_mode_ = param & 3; break;
+  case 0x10: matrix_mode_ = param & 3; break;
   case 0x11:   // push
-    vtx_cmd_delayed4(); if (!worker_on_) --num_pushpop_;
+    
     if (matrix_mode_ == 0) {
       if (proj_sp_ > 0) stack_err_ = 1u << 15;
       proj_stack_ = proj_; proj_sp_ = (proj_sp_ + 1) & 1;
@@ -738,28 +534,23 @@ void Gpu3D::exec_single(u8 cmd, u32 param) {
       pos_stack_[pos_sp_ & 0x1F] = pos_; vec_stack_[pos_sp_ & 0x1F] = vec_;
       pos_sp_ = (pos_sp_ + 1) & 0x3F;
     }
-    add_cycles(16);
     break;
   case 0x12:   // pop
-    vtx_cmd_delayed4(); if (!worker_on_) --num_pushpop_;
+    
     if (matrix_mode_ == 0) {
       if (proj_sp_ == 0) stack_err_ = 1u << 15;
       proj_sp_ = (proj_sp_ - 1) & 1; proj_ = proj_stack_; clip_dirty_ = true;
-      add_cycles(35);
     } else if (matrix_mode_ == 3) {
       if (tex_sp_ == 0) stack_err_ = 1u << 15;
       tex_sp_ = (tex_sp_ - 1) & 1; tex_ = tex_stack_;
-      add_cycles(17);
     } else {
       const s32 off = static_cast<s32>(param << 26) >> 26;
       pos_sp_ = (pos_sp_ - off) & 0x3F;
       if (pos_sp_ > 30) stack_err_ = 1u << 15;
       pos_ = pos_stack_[pos_sp_ & 0x1F]; vec_ = vec_stack_[pos_sp_ & 0x1F]; clip_dirty_ = true;
-      add_cycles(35);
     }
     break;
   case 0x13:   // store
-    vtx_cmd_delayed4();
     if (matrix_mode_ == 0) proj_stack_ = proj_;
     else if (matrix_mode_ == 3) tex_stack_ = tex_;
     else {
@@ -767,36 +558,29 @@ void Gpu3D::exec_single(u8 cmd, u32 param) {
       if (a > 30) stack_err_ = 1u << 15;
       pos_stack_[a] = pos_; vec_stack_[a] = vec_;
     }
-    add_cycles(16);
     break;
   case 0x14:   // restore
-    vtx_cmd_delayed4();
-    if (matrix_mode_ == 0) { proj_ = proj_stack_; clip_dirty_ = true; add_cycles(35); }
-    else if (matrix_mode_ == 3) { tex_ = tex_stack_; add_cycles(17); }
+    if (matrix_mode_ == 0) { proj_ = proj_stack_; clip_dirty_ = true; }
+    else if (matrix_mode_ == 3) { tex_ = tex_stack_; }
     else {
       const u32 a = param & 0x1F;
       if (a > 30) stack_err_ = 1u << 15;
       pos_ = pos_stack_[a]; vec_ = vec_stack_[a]; clip_dirty_ = true;
-      add_cycles(35);
     }
     break;
   case 0x15:   // identity
-    vtx_cmd_delayed4();
-    if (matrix_mode_ == 0) { mtx_identity(proj_.data()); clip_dirty_ = true; add_cycles(18); }
+    if (matrix_mode_ == 0) { mtx_identity(proj_.data()); clip_dirty_ = true; }
     else if (matrix_mode_ == 3) mtx_identity(tex_.data());
-    else { mtx_identity(pos_.data()); if (matrix_mode_ == 2) mtx_identity(vec_.data()); clip_dirty_ = true; add_cycles(18); }
+    else { mtx_identity(pos_.data()); if (matrix_mode_ == 2) mtx_identity(vec_.data()); clip_dirty_ = true; }
     break;
   case 0x20:   // colour
-    vtx_cmd_delayed6();
     vertex_color_[0] = param & 0x1F; vertex_color_[1] = (param >> 5) & 0x1F; vertex_color_[2] = (param >> 10) & 0x1F;
     break;
   case 0x21:   // normal
-    vtx_cmd_delayed4();
     normal_[0] = sext10(param & 0x3FF); normal_[1] = sext10((param >> 10) & 0x3FF); normal_[2] = sext10((param >> 20) & 0x3FF);
     calculate_lighting();
     break;
   case 0x22:   // texcoord
-    vtx_cmd_delayed4();
     raw_texcoords_[0] = static_cast<s16>(param & 0xFFFF); raw_texcoords_[1] = static_cast<s16>(param >> 16);
     if ((texparam_ >> 30) == 1) {
       texcoords_[0] = static_cast<s16>((raw_texcoords_[0] * tex_[0] + raw_texcoords_[1] * tex_[4] + tex_[8] + tex_[12]) >> 12);
@@ -804,39 +588,32 @@ void Gpu3D::exec_single(u8 cmd, u32 param) {
     } else { texcoords_[0] = raw_texcoords_[0]; texcoords_[1] = raw_texcoords_[1]; }
     break;
   case 0x24:   // 10-bit vertex
-    vtx_cmd_submit();
     cur_vertex_[0] = static_cast<s16>((param & 0x3FF) << 6); cur_vertex_[1] = static_cast<s16>((param & 0xFFC00) >> 4); cur_vertex_[2] = static_cast<s16>((param & 0x3FF00000) >> 14);
     submit_vertex();
     break;
-  case 0x25: vtx_cmd_submit(); cur_vertex_[0] = static_cast<s16>(param & 0xFFFF); cur_vertex_[1] = static_cast<s16>(param >> 16); submit_vertex(); break;
-  case 0x26: vtx_cmd_submit(); cur_vertex_[0] = static_cast<s16>(param & 0xFFFF); cur_vertex_[2] = static_cast<s16>(param >> 16); submit_vertex(); break;
-  case 0x27: vtx_cmd_submit(); cur_vertex_[1] = static_cast<s16>(param & 0xFFFF); cur_vertex_[2] = static_cast<s16>(param >> 16); submit_vertex(); break;
+  case 0x25: cur_vertex_[0] = static_cast<s16>(param & 0xFFFF); cur_vertex_[1] = static_cast<s16>(param >> 16); submit_vertex(); break;
+  case 0x26: cur_vertex_[0] = static_cast<s16>(param & 0xFFFF); cur_vertex_[2] = static_cast<s16>(param >> 16); submit_vertex(); break;
+  case 0x27: cur_vertex_[1] = static_cast<s16>(param & 0xFFFF); cur_vertex_[2] = static_cast<s16>(param >> 16); submit_vertex(); break;
   case 0x28:   // delta vertex
-    vtx_cmd_submit();
     cur_vertex_[0] = static_cast<s16>(cur_vertex_[0] + sext10(param & 0x3FF));
     cur_vertex_[1] = static_cast<s16>(cur_vertex_[1] + sext10((param >> 10) & 0x3FF));
     cur_vertex_[2] = static_cast<s16>(cur_vertex_[2] + sext10((param >> 20) & 0x3FF));
     submit_vertex();
     break;
-  case 0x29: vtx_cmd_delayed8(); polygon_attr_ = param; break;
-  case 0x2A: vtx_cmd_delayed8(); texparam_ = param; break;
-  case 0x2B: vtx_cmd_delayed8(); texpal_ = param & 0x1FFF; break;
+  case 0x29: polygon_attr_ = param; break;
+  case 0x2A: texparam_ = param; break;
+  case 0x2B: texpal_ = param & 0x1FFF; break;
   case 0x30:   // diffuse / ambient
-    vtx_cmd_delayed6();
     mat_diffuse_[0] = param & 0x1F; mat_diffuse_[1] = (param >> 5) & 0x1F; mat_diffuse_[2] = (param >> 10) & 0x1F;
     mat_ambient_[0] = (param >> 16) & 0x1F; mat_ambient_[1] = (param >> 21) & 0x1F; mat_ambient_[2] = (param >> 26) & 0x1F;
     if (param & 0x8000) { vertex_color_[0] = mat_diffuse_[0]; vertex_color_[1] = mat_diffuse_[1]; vertex_color_[2] = mat_diffuse_[2]; }
-    add_cycles(3);
     break;
   case 0x31:   // specular / emission
-    vtx_cmd_delayed6();
     mat_specular_[0] = param & 0x1F; mat_specular_[1] = (param >> 5) & 0x1F; mat_specular_[2] = (param >> 10) & 0x1F;
     mat_emission_[0] = (param >> 16) & 0x1F; mat_emission_[1] = (param >> 21) & 0x1F; mat_emission_[2] = (param >> 26) & 0x1F;
     use_shininess_ = (param & 0x8000) != 0;
-    add_cycles(3);
     break;
   case 0x32: {  // light vector
-    stall_polygon_pipeline(8 + 1, 2);
     const u32 l = param >> 30;
     const s16 d0 = sext10(param & 0x3FF), d1 = sext10((param >> 10) & 0x3FF), d2 = sext10((param >> 20) & 0x3FF);
     // Transformed by the vector matrix; the low 12 bits go before the
@@ -847,52 +624,34 @@ void Gpu3D::exec_single(u8 cmd, u32 param) {
     light_dir_[l][2] = s11(-((d0 * vec_[2] + d1 * vec_[6] + d2 * vec_[10]) >> 12));
     const s32 den = -((static_cast<s32>(static_cast<u32>(d0 * vec_[2] + d1 * vec_[6] + d2 * vec_[10]) << 9)) >> 21) + (1 << 9);
     spec_recip_[l] = den == 0 ? 0 : (1 << 18) / den;
-    add_cycles(5);
     break;
   }
   case 0x33: {  // light colour
-    vtx_cmd_delayed8();
     const u32 l = param >> 30;
     light_color_[l][0] = param & 0x1F; light_color_[l][1] = (param >> 5) & 0x1F; light_color_[l][2] = (param >> 10) & 0x1F;
-    add_cycles(1);
     break;
   }
   case 0x40:   // begin
-    stall_polygon_pipeline(1, 0);
     poly_mode_ = param & 3;
     vertex_num_ = 0; vertex_in_poly_ = 0; consecutive_polys_ = 0;
     last_strip_poly_ = nullptr;
     cur_polygon_attr_ = polygon_attr_;
     break;
-  case 0x41: vtx_cmd_delayed8(); break;   // end: no effect
+  case 0x41: break;   // end: no effect
   case 0x50:   // swap buffers
-    // FIFO kept + worker: the pricer set flush_request_ when it popped this
-    // entry and VBlank finalises and flips on the emulation thread after the
-    // join; the worker has nothing to do here.
-    if (worker_on_ && !no_fifo_) break;
-    vtx_cmd_delayed4();
-    flush_attr_ = param & 3;   // finalise_list's sort mode; the worker's own in the no-FIFO model
-    if (!worker_on_) {
-      flush_request_ = 1;
-      cycle_count_ = untimed_ ? 0 : 325;
-      vertex_pipeline_ = normal_pipeline_ = polygon_pipeline_ = 0;
-      vertex_slot_counter_ = 0; vertex_slots_free_ = 1;
-    }
-    if (no_fifo_) {
-      // Take effect now rather than parking the engine until VBlank: the
-      // list is finalised and the bank flips, the render happens at VBlank
-      // from the finalised list, and the commands that follow build the next
-      // list in the freed bank.
-      if (rendering_on_) finalise_list();
-      swapped_ = true;
-      swap_wait_ = true;
-      { std::lock_guard<std::mutex> lk(bank_mu_); render_bank_ = bank_; bank_ = next_write_bank(); }
-      num_vertices_ = num_polygons_ = num_opaque_ = 0;
-      flush_request_ = 0;
-    }
+    flush_attr_ = param & 3;   // finalise_list's sort mode
+    // Take effect now rather than parking the engine until VBlank: the list
+    // is finalised and the bank flips, the render happens at VBlank from the
+    // finalised list, and the commands that follow build the next list in the
+    // freed bank. swap_wait_ carries the busy bit until VBlank turns it into
+    // a deadline -- that synthesis is the whole of our GXSTAT contract.
+    if (rendering_on_) finalise_list();
+    swapped_ = true;
+    swap_wait_ = true;
+    { std::lock_guard<std::mutex> lk(bank_mu_); render_bank_ = bank_; bank_ = next_write_bank(); }
+    num_vertices_ = num_polygons_ = num_opaque_ = 0;
     break;
   case 0x60:   // viewport (Y is upside down)
-    vtx_cmd_delayed8();
     viewport_[0] = param & 0xFF;
     viewport_[1] = (191 - ((param >> 8) & 0xFF)) & 0xFF;
     viewport_[2] = (param >> 16) & 0xFF;
@@ -900,25 +659,24 @@ void Gpu3D::exec_single(u8 cmd, u32 param) {
     viewport_[4] = (viewport_[2] - viewport_[0] + 1) & 0x1FF;
     viewport_[5] = (viewport_[1] - viewport_[3] + 1) & 0xFF;
     break;
-  case 0x72: vtx_cmd_delayed6(); if (!worker_on_) --num_tests_; vec_test(param); break;
+  case 0x72: vec_test(param); break;
   // The commands that take more than one parameter. They sit in the same
   // switch so that a popped entry needs no CMD_PARAMS lookup to be dispatched.
   case 0x16: case 0x17: case 0x18: case 0x19: case 0x1A: case 0x1B: case 0x1C:
   case 0x23: case 0x34: case 0x70: case 0x71:
     exec_accum(cmd, param); break;
-  default: vtx_cmd_delayed4(); break;
+  default: break;
   }
 }
 
 void Gpu3D::exec_multi(u8 cmd) {
   const s32* p = reinterpret_cast<const s32*>(exec_params_.data());
   auto on_matrix = [&](auto&& op, s32 proj_cycles, s32 tex_cycles, s32 pos_cycles, s32 posvec_cycles) {
-    if (matrix_mode_ == 0) { op(proj_.data()); clip_dirty_ = true; add_cycles(proj_cycles); }
-    else if (matrix_mode_ == 3) { op(tex_.data()); add_cycles(tex_cycles); }
+    if (matrix_mode_ == 0) { op(proj_.data()); clip_dirty_ = true; }
+    else if (matrix_mode_ == 3) { op(tex_.data()); }
     else {
       op(pos_.data());
-      if (matrix_mode_ == 2) { op(vec_.data()); add_cycles(posvec_cycles); } else add_cycles(pos_cycles);
-      clip_dirty_ = true;
+      if (matrix_mode_ == 2) { op(vec_.data()); } else      clip_dirty_ = true;
     }
   };
   switch (cmd) {
@@ -928,9 +686,9 @@ void Gpu3D::exec_multi(u8 cmd) {
   case 0x19: on_matrix([&](s32* m) { mtx_mult_4x3(m, p); }, 35 - 12, 33 - 12, 35 - 12, 35 + 30 - 12); break;
   case 0x1A: on_matrix([&](s32* m) { mtx_mult_3x3(m, p); }, 35 - 9, 33 - 9, 35 - 9, 35 + 30 - 9); break;
   case 0x1B:   // scale: never applied to the vector matrix
-    if (matrix_mode_ == 0) { mtx_scale(proj_.data(), p); clip_dirty_ = true; add_cycles(35 - 3); }
-    else if (matrix_mode_ == 3) { mtx_scale(tex_.data(), p); add_cycles(33 - 3); }
-    else { mtx_scale(pos_.data(), p); clip_dirty_ = true; add_cycles(35 - 3); }
+    if (matrix_mode_ == 0) { mtx_scale(proj_.data(), p); clip_dirty_ = true; }
+    else if (matrix_mode_ == 3) { mtx_scale(tex_.data(), p); }
+    else { mtx_scale(pos_.data(), p); clip_dirty_ = true; }
     break;
   case 0x1C: on_matrix([&](s32* m) { mtx_translate(m, p); }, 35 - 3, 33 - 3, 35 - 3, 35 + 30 - 3); break;
   case 0x23:   // full vertex
@@ -945,12 +703,12 @@ void Gpu3D::exec_multi(u8 cmd) {
     }
     break;
   case 0x71:   // position test
-    if (!worker_on_) num_tests_ -= 2;
+    
     cur_vertex_[0] = static_cast<s16>(exec_params_[0] & 0xFFFF); cur_vertex_[1] = static_cast<s16>(exec_params_[0] >> 16);
     cur_vertex_[2] = static_cast<s16>(exec_params_[1] & 0xFFFF);
     pos_test();
     break;
-  case 0x70: if (!worker_on_) num_tests_ -= 3; box_test(exec_params_.data()); break;
+  case 0x70: box_test(exec_params_.data()); break;
   default: break;
   }
 }
@@ -1044,7 +802,6 @@ void Gpu3D::submit_vertex() {
     }
     break;
   }
-  if (exec_timed_) { vertex_pipeline_ = 7; tm_add_cycles(3); }
 }
 
 namespace {
@@ -1106,8 +863,6 @@ void Gpu3D::submit_polygon() {
 
   // Submitting a polygon starts the polygon pipeline; one vertex slot is
   // reserved now, more once it survives culling and clipping.
-  if (exec_timed_) tm_polygon_start();
-  ++w_polys_submitted_;
 
   // Strips share two unclipped vertices with the previous polygon. Decided
   // first because it decides which vertices the reject test covers; it
@@ -1186,8 +941,6 @@ void Gpu3D::emit_polygon_unclipped(const Vertex* const* src, int nverts, int cli
     if (zerodot && allbehind) { last_strip_poly_ = nullptr; return; }
   }
 
-  if (exec_timed_) tm_polygon_kept(nverts, poly_mode_);
-  ++w_polys_kept_;
 
   Polygon* poly = new_polygon(facing);
   for (int i = 0; i < clipstart; ++i) poly->vtx[i] = reused_idx[i];
@@ -1227,8 +980,6 @@ void Gpu3D::emit_polygon_clipped(const Vertex* const* src, int nverts, int clips
     if (zerodot && allbehind) { last_strip_poly_ = nullptr; return; }
   }
 
-  if (exec_timed_) tm_polygon_kept(nverts, poly_mode_);
-  ++w_polys_kept_;
 
   Polygon* poly = new_polygon(facing);
   Vertex* vr = cur_vram();
@@ -1339,11 +1090,9 @@ void Gpu3D::calculate_lighting() {
   }
   for (int c = 0; c < 3; ++c) vertex_color_[c] = (acc[c] >> 14) > 31 ? 31 : static_cast<u8>(acc[c] >> 14);
   if (count < 1) count = 1;
-  if (exec_timed_) { normal_pipeline_ = 7; tm_add_cycles(count); }
 }
 
 void Gpu3D::box_test(const u32* params) {
-  add_cycles(254);
   box_result_ = 0;
   const s16 x0 = static_cast<s16>(params[0] & 0xFFFF), y0 = static_cast<s16>(static_cast<s32>(params[0]) >> 16);
   const s16 z0 = static_cast<s16>(params[1] & 0xFFFF);
@@ -1371,7 +1120,6 @@ void Gpu3D::pos_test() {
   update_clip_matrix();
   for (int c = 0; c < 4; ++c)
     pos_test_[c] = static_cast<s32>((v[0] * clip_[c] + v[1] * clip_[4 + c] + v[2] * clip_[8 + c] + v[3] * clip_[12 + c]) >> 12);
-  add_cycles(5);
 }
 
 void Gpu3D::vec_test(u32 param) {
@@ -1380,7 +1128,6 @@ void Gpu3D::vec_test(u32 param) {
     vec_test_[c] = static_cast<s16>((n[0] * vec_[c] + n[1] * vec_[4 + c] + n[2] * vec_[8 + c]) >> 9);
     if (vec_test_[c] & 0x1000) vec_test_[c] |= static_cast<s16>(0xF000);
   }
-  add_cycles(4);
 }
 
 // ---- frame --------------------------------------------------------------------
@@ -1449,16 +1196,9 @@ void Gpu3D::vblank() {
   if (debug_gx)
     std::fprintf(stderr, "[gx] frame %llu geom %d rend %d flush %u attr %u polys %u verts %u disp3dcnt %04x alpharef %u clear %08x/%08x fifo %u gxstat %08x ie %08x if %08x\n",
                  static_cast<unsigned long long>(nds_.frame_count), geometry_on_, rendering_on_, flush_request_, flush_attr_, num_polygons_, num_vertices_,
-                 dispcnt_, alpha_ref_, clear_attr1_, clear_attr2_, fifo_n_, gxstat_, nds_.io.cpu_io[0].ie, nds_.io.cpu_io[0].if_);
+                 dispcnt_, alpha_ref_, clear_attr1_, clear_attr2_, n_, gxstat_, nds_.io.cpu_io[0].ie, nds_.io.cpu_io[0].if_);
   if (!geometry_on_) return;
-  if (worker_on_) {
-    worker_join();
-    if (!no_fifo_ && w_polys_submitted_) {   // the pricer's cull ratio for the next frame
-      pr_kept_num_ = w_polys_kept_; pr_kept_den_ = w_polys_submitted_;
-      if (pr_kept_acc_ >= pr_kept_den_) pr_kept_acc_ = 0;
-    }
-  } else if (no_fifo_) drain_all();
-  w_polys_submitted_ = w_polys_kept_ = 0;
+  drain_all();
   // The raster of the frame being displayed may still be running (nothing
   // on this thread waits for it any more): it reads its own copy of the
   // render state and a bank the swap below leaves alone (see raster_bank_).
@@ -1471,9 +1211,7 @@ void Gpu3D::vblank() {
       && std::equal(fog_density_.begin(), fog_density_.end(), rstate_.fog_density.begin() + 1);
     const bool same_et    = rstate_.edge == edge_ && rstate_.toon == toon_;
     const bool same_regs  = same_disp && same_clear && same_fog && same_et;
-    const bool swap = no_fifo_ ? swapped_ : flush_request_ != 0;
-    if (swap) {
-      if (!no_fifo_) finalise_list();   // no-FIFO: done at the SWAP command
+    if (swapped_) {   // the list was finalised at the SWAP command
       render_identical_ = skip_dup() && same_regs && list_same_;
     } else {
       // Same polygon list as last time; identical output if the render
@@ -1510,18 +1248,12 @@ void Gpu3D::vblank() {
     rstate_.fog_density[33] = fog_density_[31];
     rstate_.clear_attr1 = clear_attr1_; rstate_.clear_attr2 = clear_attr2_;
   }
-  if (flush_request_) {
-    render_bank_ = bank_; bank_ = next_write_bank();
-    num_vertices_ = num_polygons_ = num_opaque_ = 0;
-    flush_request_ = 0;
-  }
   swapped_ = false;
   if (swap_wait_) { swap_busy_until_ = nds_.sched.now() + 650; swap_wait_ = false; }
   // The list VCount 215 renders is fixed here. The worker is idle after the
   // join and nothing feeds it inside this call, so no lock is needed; it is
   // taken anyway so that every write to a bank role is under it.
   { std::lock_guard<std::mutex> lk(bank_mu_); pending_bank_ = render_bank_; }
-  if (worker_started_) shape_step();
 }
 
 void Gpu3D::render_frame() {
@@ -1575,349 +1307,22 @@ const u32* Gpu3D::line(const Renderer3D::FrameRef& f, u32 y) {
 void Gpu3D::stack_reset() {
   // Applied at once, ahead of anything queued -- what the sequential models
   // do too (the write does not drain first). Rare: once at init.
-  if (worker_on_) { worker_join(); sh_.proj_sp = sh_.tex_sp = 0; sh_.err = 0; }
   stack_err_ = 0; proj_sp_ = 0; tex_sp_ = 0;
 }
 
 // The shadow advances exactly the stack-pointer and overflow arithmetic of
 // exec_single's 0x10-0x14, nothing else; keep the two in step.
-void Gpu3D::set_geometry_worker(bool on) {
-  if (on == worker_started_) return;
-  if (on) {
-    static const int mode = [] { const char* e = std::getenv("DS_GX_THREAD"); return e ? std::atoi(e) : 1; }();
-    shape_mode_ = mode;
-    if (shape_mode_ == 0) return;
-    q_wr_local_ = q_rd_local_ = q_rd_seen_ = 0; q_pending_ = false;
-    q_wr_.store(0, std::memory_order_relaxed); q_rd_.store(0, std::memory_order_relaxed);
-    q_stop_ = false;
-    worker_started_ = true;
-    worker_thread_ = std::thread([this] { worker_loop(); });
-    worker_activate(true);       // B first: the worker's cost gets measured
-  } else {
-    if (worker_on_) { worker_join(); worker_activate(false); }
-    worker_stop();
-    worker_started_ = false;
-    renderer_.set_bands_next(0);
-  }
-}
-
-// Switch the command route. Only with the queue empty (after a join): the
-// worker's state and the ring's are then one consistent engine state, and
-// exec_single on this thread or on the worker continues it either way.
-void Gpu3D::worker_activate(bool on) {
-  if (on == worker_on_) return;
-  if (on) {
-    if (no_fifo_) drain_all();   // hand over an empty ring (with the FIFO kept the ring stays the emulation thread's)
-    worker_on_ = true;
-    exec_timed_ = false;
-    pricer_resync();
-    // The worker takes the third band worker's core on four. On two cores the
-    // band count stays: two workers beside the geometry worker measured
-    // best there, and the emulation thread's joins are what let the second
-    // band worker onto a core under SCHED_RR (A30, 2026-09-14).
-    renderer_.set_bands_next(host_cores() >= 4 ? 2 : 0);
-  } else {
-    worker_on_ = false;
-    exec_timed_ = !untimed_;
-    renderer_.set_bands_next(0);   // band_count's default
-  }
-}
-
-// The shape controller's step, at VBlank after the join (see the header).
-//
-// Empirical, not modelled: a cost model (emulation thread vs raster / bands)
-// was tried first and was off by 3 ms either way -- it overestimated the
-// two-band raster path on Spirit Tracks (band sums carry per-band setup) and
-// underestimated it on Golden Sun (the compositor tail follows the raster).
-// Frames are measured in pairs (see Arm): each arm is the pair of shapes for
-// the even and the odd interval, the pair's summed wall time is remembered,
-// the shortest arm is run and the others are probed again now and then.
-void Gpu3D::shape_step() {
-  const bool log = shape_log_;
-  const auto now = std::chrono::steady_clock::now();
-  const u64 waits = nds_.gpu.take_join_wait_ns() + renderer_.take_owner_wait_ns() + join_wait_ns_.exchange(0, std::memory_order_relaxed);
-  const u64 gx_worker = take_worker_busy_ns();
-  const u64 gx_inline = gx_inline_ns_; gx_inline_ns_ = 0;
-  u64 wall = frame_t0_valid_ ? static_cast<u64>((now - frame_t0_).count()) : 0;
-  const u64 external = external_ns_; external_ns_ = 0;
-  wall = wall > external ? wall - external : 0;
-  frame_t0_ = now; frame_t0_valid_ = true;
-  const u32 k = frame_idx_++;
-  const bool ran_b = worker_on_;
-  if (shape_mode_ != 1) return;    // 2: always the worker
-  // The first frames after a start or a load are translation bursts, not the
-  // scene (a 36 ms first measurement once locked a shape in for a whole run).
-  constexpr u32 kSettleFrames = 16;
-  const bool plausible = k >= kSettleFrames && wall && wall < 200000000;
-  if (ran_b != (((arm_now_ >> (k & 1)) & 1) != 0)) pair_clean_ = false;   // a mid-pair change (state load, reset)
-  if ((k & 1) == 0) {
-    // Even interval ended: half the pair. Plan nothing; the odd interval's
-    // shape is the arm's.
-    pair_even_ns_ = plausible ? wall : 0;
-    if (!plausible) pair_clean_ = false;
-    worker_activate((arm_now_ >> 1) & 1);
-    if (log) std::fprintf(stderr, "[shape] f%u ran %c wall %.2f waits %.2f gxw %.2f gxi %.2f list %u | arm %u, odd half -> %c\n",
-                          k, ran_b ? 'B' : 'A', wall / 1e6, waits / 1e6, gx_worker / 1e6, gx_inline / 1e6, render_count_[render_bank_], arm_now_, ((arm_now_ >> 1) & 1) ? 'B' : 'A');
-    return;
-  }
-  // Odd interval ended: the pair is complete. Record it, choose the next arm.
-  for (Arm& a : arms_) if (a.age != ~0u) ++a.age;
-  constexpr u32 kStale = 16;   // pairs
-  if (plausible && pair_clean_ && pair_even_ns_) {
-    Arm& a = arms_[arm_now_];
-    const u64 pair = pair_even_ns_ + wall;
-    a.wall_ns = (a.age == ~0u || a.age > kStale) ? pair : (a.wall_ns * 3 + pair) / 4;   // a probe re-measures; a fresh memory blends 1:3
-    a.age = 0;
-  }
-  pair_clean_ = true;
-  constexpr u64 kMargin = 500000;   // 0.5 ms per pair: do not flap on noise
-  constexpr u32 kProbeAfter = 96;   // pairs (~3 s) before an arm is re-measured
-  u32 best = arm_now_;
-  const char* why = "";
-  // Anything never measured comes first, BB (3) before the rest: the worker's
-  // own cost is the least predictable.
-  u32 unmeasured = ~0u;
-  for (u32 i = 4; i-- > 0;) if (arms_[i].age == ~0u) { unmeasured = i; break; }
-  if (unmeasured != ~0u) { best = unmeasured; why = " (first)"; }
-  else {
-    for (u32 i = 0; i < 4; ++i) if (arms_[i].wall_ns + kMargin < arms_[best].wall_ns) best = i;
-    // The stalest arm is probed once its memory is old enough.
-    u32 stalest = best; for (u32 i = 0; i < 4; ++i) if (arms_[i].age > arms_[stalest].age) stalest = i;
-    if (stalest != best && arms_[stalest].age > kProbeAfter) { best = stalest; why = " (probe)"; }
-  }
-  if (log) std::fprintf(stderr, "[shape] f%u ran %c wall %.2f waits %.2f gxw %.2f gxi %.2f list %u | pair %.2f under arm %u | AA %.2f AB %.2f BA %.2f BB %.2f -> arm %u (%c%c)%s\n",
-                        k, ran_b ? 'B' : 'A', wall / 1e6, waits / 1e6, gx_worker / 1e6, gx_inline / 1e6, render_count_[render_bank_],
-                        (pair_even_ns_ + wall) / 1e6, arm_now_, arms_[0].wall_ns / 1e6, arms_[2].wall_ns / 1e6, arms_[1].wall_ns / 1e6, arms_[3].wall_ns / 1e6,
-                        best, (best & 1) ? 'B' : 'A', (best & 2) ? 'B' : 'A', why);
-  arm_now_ = best;
-  worker_activate(best & 1);
-}
-
-// The queue is empty: the shadow and the pricer are functions of the executed state.
-void Gpu3D::pricer_resync() {
-  sh_.mode = matrix_mode_; sh_.proj_sp = proj_sp_; sh_.pos_sp = pos_sp_; sh_.tex_sp = tex_sp_; sh_.err = stack_err_; sh_.box_pending = false;
-  pr_poly_mode_ = poly_mode_; pr_vertex_in_poly_ = vertex_in_poly_; pr_consecutive_polys_ = consecutive_polys_;
-  pr_polygon_attr_ = polygon_attr_; pr_cur_polygon_attr_ = cur_polygon_attr_; pr_count_ = exec_count_;
-  w_polys_submitted_ = w_polys_kept_ = 0;
-  pr_kept_num_ = pr_kept_den_ = 1; pr_kept_acc_ = 0;   // no frame seen: kept
-}
-
-// ---- the pricer: exec_single's cycle model without its work -----------------
-//
-// One entry per command, in exec_single's order, mirroring only what the cycle
-// model reads: the matrix mode (from the shadow, which q_push advances after
-// this runs -- so for 0x10 itself it still holds the mode the command was
-// issued under, as exec_single's own switch does), the polygon mode and
-// vertex count, the polygon attribute's light bits. Every polygon is priced
-// as kept. Keep in step with exec_single / exec_accum / exec_multi.
-void Gpu3D::price_single(u8 cmd, u32 param) {
-  switch (cmd) {
-  case 0x10: tm_vtx_cmd_delayed4(); break;
-  case 0x11: tm_vtx_cmd_delayed4(); --num_pushpop_; tm_add_cycles(16); break;
-  case 0x12: tm_vtx_cmd_delayed4(); --num_pushpop_; tm_add_cycles(sh_.mode == 3 ? 17 : 35); break;
-  case 0x13: tm_vtx_cmd_delayed4(); tm_add_cycles(16); break;
-  case 0x14: tm_vtx_cmd_delayed4(); tm_add_cycles(sh_.mode == 3 ? 17 : 35); break;
-  case 0x15: tm_vtx_cmd_delayed4(); if (sh_.mode != 3) tm_add_cycles(18); break;
-  case 0x20: tm_vtx_cmd_delayed6(); break;
-  case 0x21: {   // normal: lighting costs one cycle per enabled light (at least one)
-    tm_vtx_cmd_delayed4();
-    s32 count = __builtin_popcount(pr_cur_polygon_attr_ & 0xF);
-    if (count < 1) count = 1;
-    normal_pipeline_ = 7; tm_add_cycles(count);
-    break;
-  }
-  case 0x22: tm_vtx_cmd_delayed4(); break;
-  case 0x24: case 0x25: case 0x26: case 0x27: case 0x28: tm_vtx_cmd_submit(); price_vertex(); break;
-  case 0x29: tm_vtx_cmd_delayed8(); pr_polygon_attr_ = param; break;
-  case 0x2A: case 0x2B: tm_vtx_cmd_delayed8(); break;
-  case 0x30: case 0x31: tm_vtx_cmd_delayed6(); tm_add_cycles(3); break;
-  case 0x32: tm_stall_polygon_pipeline(8 + 1, 2); tm_add_cycles(5); break;
-  case 0x33: tm_vtx_cmd_delayed8(); tm_add_cycles(1); break;
-  case 0x40:
-    tm_stall_polygon_pipeline(1, 0);
-    pr_poly_mode_ = param & 3; pr_vertex_in_poly_ = 0; pr_consecutive_polys_ = 0;
-    pr_cur_polygon_attr_ = pr_polygon_attr_;
-    break;
-  case 0x41: tm_vtx_cmd_delayed8(); break;
-  case 0x50:
-    tm_vtx_cmd_delayed4();
-    flush_request_ = 1; flush_attr_ = param & 3;
-    cycle_count_ = 325;
-    vertex_pipeline_ = normal_pipeline_ = polygon_pipeline_ = 0;
-    vertex_slot_counter_ = 0; vertex_slots_free_ = 1;
-    break;
-  case 0x60: tm_vtx_cmd_delayed8(); break;
-  case 0x72: tm_vtx_cmd_delayed6(); --num_tests_; tm_add_cycles(4); break;
-  case 0x16: case 0x17: case 0x18: case 0x19: case 0x1A: case 0x1B: case 0x1C:
-  case 0x23: case 0x34: case 0x70: case 0x71:
-    price_accum(cmd); break;
-  default: tm_vtx_cmd_delayed4(); break;
-  }
-}
-
-void Gpu3D::price_accum(u8 cmd) {
-  if (++pr_count_ == 1) {
-    switch (cmd) {
-    case 0x23: tm_vtx_cmd_submit(); break;
-    case 0x34: case 0x71: tm_vtx_cmd_delayed8(); break;
-    case 0x70: tm_stall_polygon_pipeline(10 + 1, 0); break;
-    default: tm_vtx_cmd_delayed4(); break;
-    }
-    return;
-  }
-  tm_add_cycles(1);
-  if (pr_count_ < CMD_PARAMS[cmd]) return;
-  pr_count_ = 0;
-  // exec_multi's costs: proj / tex / pos / pos+vec.
-  auto mtx = [&](s32 proj, s32 tex, s32 pos, s32 posvec) {
-    tm_add_cycles(sh_.mode == 0 ? proj : sh_.mode == 3 ? tex : sh_.mode == 2 ? posvec : pos);
-  };
-  switch (cmd) {
-  case 0x16: mtx(18, 10, 18, 18); break;
-  case 0x17: mtx(18, 7, 18, 18); break;
-  case 0x18: mtx(35 - 16, 33 - 16, 35 - 16, 35 + 30 - 16); break;
-  case 0x19: mtx(35 - 12, 33 - 12, 35 - 12, 35 + 30 - 12); break;
-  case 0x1A: mtx(35 - 9, 33 - 9, 35 - 9, 35 + 30 - 9); break;
-  case 0x1B: tm_add_cycles(sh_.mode == 3 ? 33 - 3 : 35 - 3); break;   // scale never touches the vector matrix
-  case 0x1C: mtx(35 - 3, 33 - 3, 35 - 3, 35 + 30 - 3); break;
-  case 0x23: price_vertex(); break;
-  case 0x34: break;
-  case 0x71: num_tests_ -= 2; tm_add_cycles(5); break;
-  case 0x70: num_tests_ -= 3; tm_add_cycles(254); break;
-  default: break;
-  }
-}
-
-// submit_vertex's completion rule, and its price: a completed polygon is
-// always priced as kept.
-void Gpu3D::price_vertex() {
-  ++pr_vertex_in_poly_;
-  const auto poly = [&](int nverts) {
-    pr_kept_acc_ += pr_kept_num_;
-    if (pr_kept_acc_ >= pr_kept_den_) { pr_kept_acc_ -= pr_kept_den_; tm_polygon_kept(nverts, pr_poly_mode_); }
-    else tm_polygon_start();   // culled: the 8-cycle start is all the hardware spends
-    ++pr_consecutive_polys_;
-  };
-  switch (pr_poly_mode_) {
-  case 0: if (pr_vertex_in_poly_ == 3) { pr_vertex_in_poly_ = 0; poly(3); } break;
-  case 1: if (pr_vertex_in_poly_ == 4) { pr_vertex_in_poly_ = 0; poly(4); } break;
-  case 2:
-    if (pr_consecutive_polys_ & 1) { pr_vertex_in_poly_ = 2; poly(3); }
-    else if (pr_vertex_in_poly_ == 3) { pr_vertex_in_poly_ = 2; poly(3); }
-    break;
-  case 3: if (pr_vertex_in_poly_ == 4) { pr_vertex_in_poly_ = 2; poly(4); } break;
-  }
-  vertex_pipeline_ = 7; tm_add_cycles(3);
-}
-
-void Gpu3D::worker_stop() {
-  if (!worker_thread_.joinable()) return;
-  { std::lock_guard<std::mutex> lk(q_mu_); q_stop_ = true; }
-  q_cv_.notify_all();
-  worker_thread_.join();
-}
-
-// Make the entries written since the last publish visible, and wake the
-// worker if it went to sleep on an empty queue. The sleep flag is checked
-// after the cursor is published and the worker re-checks the cursor under the
-// lock after raising the flag, so one of the two always sees the other.
-void Gpu3D::q_publish() {
-  q_pending_ = false;
-  q_wr_.store(q_wr_local_, std::memory_order_seq_cst);
-  std::atomic_thread_fence(std::memory_order_seq_cst);
-  if (worker_asleep_.load(std::memory_order_seq_cst)) {
-    { std::lock_guard<std::mutex> lk(q_mu_); }
-    q_cv_.notify_one();
-  }
-}
-
-// The producer is a whole queue ahead: publish what it has and wait for room.
-void Gpu3D::q_wait_room() {
-  q_rd_seen_ = q_rd_.load(std::memory_order_acquire);
-  if (q_wr_local_ - q_rd_seen_ < QN) return;
-  q_publish();
-  prof::add(prof::C_GX_WORKER_FULL, 1);
-  while (q_wr_local_ - (q_rd_seen_ = q_rd_.load(std::memory_order_acquire)) >= QN) std::this_thread::yield();
-}
-
-// Spin for about `us` microseconds waiting for `done`, before either side
-// pays a futex sleep and the wake-up latency that follows it (tens of us on
-// the handhelds' kernels, against DMA bursts a few us apart).
-template <class F> static bool spin_for(u32 us, F done) {
-  const auto t0 = std::chrono::steady_clock::now();
-  for (;;) {
-    for (int i = 0; i < 64; ++i) if (done()) return true;
-    if (std::chrono::steady_clock::now() - t0 > std::chrono::microseconds(us)) return done();
-  }
-}
-
-void Gpu3D::worker_join() {
-  if (q_pending_) q_publish();
-  const u32 target = q_wr_local_;
-  if (q_rd_.load(std::memory_order_acquire) == target) return;
-  prof::Scope sc(prof::GX_JOIN);
-  const auto t0 = std::chrono::steady_clock::now();
-  // A spin first: the common join (VBlank) finds the worker on its last few
-  // commands, and a sleep here costs the wake-up latency on top of the wait.
-  if (!spin_for(200, [&] { return q_rd_.load(std::memory_order_acquire) == target; })) {
-    std::unique_lock<std::mutex> lk(q_mu_);
-    joiner_waiting_.store(true, std::memory_order_seq_cst);
-    std::atomic_thread_fence(std::memory_order_seq_cst);
-    q_done_cv_.wait(lk, [&] { return q_rd_.load(std::memory_order_seq_cst) == target; });
-    joiner_waiting_.store(false, std::memory_order_relaxed);
-  }
-  join_wait_ns_.fetch_add(static_cast<u64>((std::chrono::steady_clock::now() - t0).count()), std::memory_order_relaxed);
-}
-
-void Gpu3D::worker_loop() {
-  name_current_thread("gx-worker");
-  u32 rd = q_rd_local_;
-  for (;;) {
-    u32 wr = q_wr_.load(std::memory_order_acquire);
-    if (rd == wr) {
-      // Feeds arrive per CPU slice and per DMA burst, a few microseconds
-      // apart while a list is being built: spin through those gaps and
-      // sleep only through a real idle (the rest of the frame).
-      if (spin_for(50, [&] { return q_wr_.load(std::memory_order_acquire) != rd; })) continue;
-      std::unique_lock<std::mutex> lk(q_mu_);
-      worker_asleep_.store(true, std::memory_order_seq_cst);
-      std::atomic_thread_fence(std::memory_order_seq_cst);
-      q_cv_.wait(lk, [&] { return q_stop_ || q_wr_.load(std::memory_order_seq_cst) != rd; });
-      worker_asleep_.store(false, std::memory_order_relaxed);
-      if (q_stop_) return;
-      continue;
-    }
-    // Execute the batch; the cursor is published once at its end -- a
-    // joiner only needs to know when everything is done, and per-command
-    // publication would put a release store in the hottest loop.
-    const auto t0 = std::chrono::steady_clock::now();
-    while (rd != wr) {
-      const Entry e = q_[rd & (QN - 1)];
-      ++rd;
-      exec_single(e.cmd, e.param);
-    }
-    worker_busy_ns_.fetch_add(static_cast<u64>((std::chrono::steady_clock::now() - t0).count()), std::memory_order_relaxed);
-    q_rd_.store(rd, std::memory_order_seq_cst);
-    q_rd_local_ = rd;
-    std::atomic_thread_fence(std::memory_order_seq_cst);
-    if (joiner_waiting_.load(std::memory_order_seq_cst)) {
-      { std::lock_guard<std::mutex> lk(q_mu_); }
-      q_done_cv_.notify_all();
-    }
-  }
-}
-
-// ---- registers ----------------------------------------------------------------
-
 u32 Gpu3D::read(u32 addr, u32 width) {
   const u32 r = addr - 0x04000000;
-  if (worker_on_) {
-    // Sync on observation, but only where the value depends on execution:
-    // GXSTAT comes from the parser's shadow, DISP3DCNT and RDLINES_COUNT
-    // never touch the engine. The rest (RAM_COUNT, the test results, the
-    // clip and vector matrices) waits for the worker.
-    if ((r & ~3u) != 0x600 && r != 0x60 && r != 0x320) worker_join();
-  } else if (no_fifo_) drain_all();   // sync on observation: whatever is read reflects everything queued
+  // Sync on observation: whatever is read reflects everything logged.
+  //
+  // An append-time GXSTAT shadow was tried here (2026-09-20) so a poll would
+  // not replay, as the geometry worker's did. It does not work without the
+  // worker: the worker executed concurrently, so a poll answered from the
+  // shadow still saw the wait end, while single-threaded nothing advances
+  // between polls and the guest spins to VBlank. Dragon Ball Origins' GXSTAT
+  // reads went 1.55 M -> 37 M and SM64DS's picture did not move at all.
+  drain_all();
   if ((r & ~3u) == 0x600) {
     // GXSTAT first, ahead of the width split and the switch: a game waiting
     // for a swap polls it tens of thousands of times a frame (Dragon Ball
@@ -1928,19 +1333,19 @@ u32 Gpu3D::read(u32 addr, u32 width) {
     // itself is what the idle-loop skip (DS_IDLE_SKIP) removes.
     if (prof::enabled) {
       prof::add(prof::C_GX_READ, 1); prof::add(prof::C_GX_READ_GXSTAT, 1);
-      if (gxstat_ & (1u << 27)) prof::add(prof::C_GX_READ_GXSTAT_BUSY, 1);
-      if (pipe_n_) prof::add(prof::C_GX_READ_GXSTAT_PIPE, 1);
-      if (fifo_n_) prof::add(prof::C_GX_READ_GXSTAT_FIFO, 1);
+      if (swap_wait_) prof::add(prof::C_GX_READ_GXSTAT_BUSY, 1);
     }
-    run_to(nds_.sched.now());
-    const u32 level = no_fifo_ ? 0 : fifo_n_;
-    // The stack level and the overflow flag are command-derived, so with the
-    // worker on the shadow's copy is the executed state's future exactly. The
-    // box test result is not: a read after a queued test waits for it.
-    if (worker_on_ && sh_.box_pending) { worker_join(); sh_.box_pending = false; }
-    const u32 sp = worker_on_ ? sh_.err | ((sh_.pos_sp & 0x1F) << 8) | ((sh_.proj_sp & 1) << 13)
-                              : stack_err_ | ((pos_sp_ & 0x1F) << 8) | ((proj_sp_ & 1) << 13);
-    const u32 v = gxstat_ | (swap_wait_ || nds_.sched.now() < swap_busy_until_ ? (1u << 27) : 0) | box_result_ | sp | (level << 16) | (level < 128 ? (1u << 25) : 0) | (level == 0 ? (1u << 26) : 0);
+    // The synthesised answer, and the reason --timing-oc was always safer than
+    // replaying the log up to now (§3.4, checklist 4.19): the FIFO reads empty
+    // and under half full, so the guest never sees a full FIFO, never stalls
+    // on one and cannot be locked out of step by one; and the busy bit is held
+    // from SWAP_BUFFERS until 650 cycles past the swap, so a game polling "has
+    // my swap landed?" still sees a busy -> idle edge at a plausible time
+    // instead of an immediate idle. Bits 14 and 0 are clear because the drain
+    // above ran everything queued.
+    const u32 sp = stack_err_ | ((pos_sp_ & 0x1F) << 8) | ((proj_sp_ & 1) << 13);
+    const u32 v = gxstat_ | (swap_wait_ || nds_.sched.now() < swap_busy_until_ ? (1u << 27) : 0)
+                | box_result_ | sp | (1u << 25) | (1u << 26);
     return width == 32 ? v : width == 16 ? (v >> ((addr & 2) * 8)) & 0xFFFF : (v >> ((addr & 3) * 8)) & 0xFF;
   }
   if (width == 8) { const u32 v = read(addr & ~3u, 32); return (v >> ((addr & 3) * 8)) & 0xFF; }
@@ -2027,7 +1432,7 @@ void Gpu3D::write(u32 addr, u32 width, u32 value) {
     case 0x35C: fog_offset_ = value & 0x7FFF; return;
     case 0x600: if (value & 0x8000) stack_reset(); return;
     case 0x602: gxstat_ = (gxstat_ & 0x3FFFFFFF) | ((value & 0xC000) << 16); check_fifo_irq(); return;
-    case 0x610: if (worker_on_) worker_join(); zero_dot_w_limit_ = ((value & 0x7FFF) * 0x200) + 0x1FF; return;
+    case 0x610: zero_dot_w_limit_ = ((value & 0x7FFF) * 0x200) + 0x1FF; return;
     default: break;
     }
     if (r >= 0x330 && r < 0x340) { edge_[(r - 0x330) >> 1] = static_cast<u16>(value); return; }
@@ -2053,7 +1458,7 @@ void Gpu3D::write(u32 addr, u32 width, u32 value) {
     gxstat_ = (gxstat_ & 0x3FFFFFFF) | (value & 0xC0000000);
     check_fifo_irq();
     return;
-  case 0x610: if (worker_on_) worker_join(); zero_dot_w_limit_ = ((value & 0x7FFF) * 0x200) + 0x1FF; return;
+  case 0x610: zero_dot_w_limit_ = ((value & 0x7FFF) * 0x200) + 0x1FF; return;
   default: break;
   }
   if (r >= 0x400 && r < 0x440) { gxfifo_write(value); return; }
@@ -2073,13 +1478,12 @@ template <class S> void sync_polygon(S& s, Polygon& p) {
 } // namespace
 
 template <class S> void Gpu3D::sync_state(S& s) {
-  if (worker_on_) { worker_join(); if (no_fifo_) num_pushpop_ = num_tests_ = 0; }
+  if constexpr (!S::reading) drain_all();   // the log does not travel; it is replayed out first
   // On disk the overflow flag is GXSTAT bit 15 and the box result bit 1, as they always were.
   if constexpr (!S::reading) gxstat_ |= stack_err_ | box_result_;
   s.begin("GX3D");
   for (Entry& e : ring_) s.fields(e.param, e.cmd);
-  s.fields(ring_rd_, ring_wr_, pipe_n_, fifo_n_, stall_n_, stalled_, parse_.num_cmds, parse_.cur_cmd, parse_.param_count, parse_.total_params, exec_params_, exec_count_,
-           timestamp_, cycle_count_, vertex_pipeline_, normal_pipeline_, polygon_pipeline_, vertex_slot_counter_, vertex_slots_free_, num_pushpop_, num_tests_,
+  s.fields(ring_rd_, ring_wr_, n_, parse_.num_cmds, parse_.cur_cmd, parse_.param_count, parse_.total_params, exec_params_, exec_count_,
            gxstat_, geometry_on_, rendering_on_, dispcnt_, alpha_ref_val_, alpha_ref_, toon_, edge_, fog_color_, fog_offset_, fog_density_,
            clear_attr1_, clear_attr2_, zero_dot_w_limit_,
            rstate_.dispcnt, rstate_.alpha_ref, rstate_.toon, rstate_.edge, rstate_.fog_color, rstate_.fog_offset, rstate_.fog_shift, rstate_.fog_density,
@@ -2149,7 +1553,6 @@ template <class S> void Gpu3D::sync_state(S& s) {
   s.end();
   renderer_.sync_output(s);
   stack_err_ = gxstat_ & 0x8000u; box_result_ = gxstat_ & 2u; gxstat_ &= ~0x8002u;
-  if (worker_on_) pricer_resync();
 }
 template void Gpu3D::sync_state<state::Writer>(state::Writer&);
 template void Gpu3D::sync_state<state::Reader>(state::Reader&);

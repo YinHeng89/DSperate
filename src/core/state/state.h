@@ -24,8 +24,21 @@ namespace ds::state {
 // A chunk may grow: a reader that reaches the end of a chunk early stops
 // taking fields (`more()` is false), and a writer that appends fields keeps
 // old files loadable as long as the new fields default sensibly.
-constexpr u32 FORMAT_VERSION = 3;   // 2: HEAD carries bios_id + firmware_id (the last released format); 3: the DSi (HEAD says DSi or DS, NAND and SDCD chunks, 16 MB main RAM, the DSi scheduler events, the DSI and DSIH chunks)
-constexpr u32 OLDEST_READABLE_VERSION = 2;   // a DS state from a version-2 file still loads (Reader::version)
+// 2: HEAD carries bios_id + firmware_id (the last format in a shipped
+// release). 3: the DSi (HEAD says DSi or DS, NAND and SDCD chunks, 16 MB main
+// RAM, the DSi scheduler events, the DSI and DSIH chunks). 4: the speed-first
+// rework's geometry engine (GX3D loses the FIFO stages, the cycle model and
+// the worker's mirrors -- docs/speed-first-rework-scoping.md §3.4).
+//
+// 4 exists because 3 does not distinguish the two GX3D layouts. Version 3 was
+// committed on 2026-09-11 (4dde102), nine days before the `exact-reference`
+// tag, so version-3 files -- including this repo's own scene states -- are
+// already written with the old layout. Reusing 3 would have made an old file
+// and a new one indistinguishable by version, which is a silent mis-parse
+// rather than a clean refusal. The rework breaks the layout once more at
+// most: further phases stay inside 4 until a release ships.
+constexpr u32 FORMAT_VERSION = 4;
+constexpr u32 OLDEST_READABLE_VERSION = 4;   // the rework drops the older formats rather than carrying migration through seven phases
 
 class Writer {
 public:

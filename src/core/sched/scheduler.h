@@ -152,11 +152,9 @@ public:
   // slice ends here (as the bus stall would), and it sits out until the
   // FIFO drains, re-checking every LOCKSTEP_QUANTUM cycles. In lockstep the
   // stall queue absorbs the rest of the 128-cycle slice, as before.
-  void gx_fifo_full();
   bool in_dma() const { return in_dma_; }
   void dma_progress(u32 used) { if (dsi_) dma_used_ = used; }   // DSi only
   // Event-bound mode: a GX-stalled ARM9 sits out (lockstep keeps queueing, as melonDS's timing assumes).
-  bool a9_gx_stalled(const CpuContext& cpu) const;
 
   // Nominal time of the event whose handler is running. Events fire at slice
   // ends, up to a CPU overshoot after their deadline; a periodic handler must
@@ -211,7 +209,6 @@ private:
     s64 slice = 0, ran9 = 0;
     s32 budget7 = 0;
     s32 budget9 = 0;          // the ARM9's core-cycle budget for the slice (slice << shift9_, less the carry)
-    bool gx_stalled = false;
     bool skip9 = false, skip7 = false;   // proven idle loop: do not execute this slice
     CpuContext* cpu = nullptr;
     std::chrono::steady_clock::time_point t0;

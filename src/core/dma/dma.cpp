@@ -102,7 +102,10 @@ void Dma::start(Channel& c) {
     prof::add(c.cpu == Cpu::ARM9 && c.start_mode <= MODE9_GXFIFO
                 ? static_cast<prof::Counter>(prof::C_DMA_M_IMM + c.start_mode) : prof::C_DMA_M_ARM7, 1);
   }
-  c.iter_count = (c.start_mode == MODE9_GXFIFO && c.rem_count > 112 && !nds_.gpu3d.no_fifo()) ? 112 : c.rem_count;
+  // A GXFIFO DMA once ran in 112-word chunks so the FIFO level could be
+  // re-observed between them. There is no level any more, so the whole
+  // transfer goes at once.
+  c.iter_count = c.rem_count;
   if ((c.cnt & 0x01800000) == 0x01800000) c.cur_src = c.src;
   if ((c.cnt & 0x00600000) == 0x00600000) c.cur_dst = c.dst;
   set_running(c, 2);
@@ -273,7 +276,6 @@ u32 Dma::run_channel_impl(Channel& c, u32 budget) {
   u32 no_run_below = 0;
   u32 loops = 0;                                // C_DMA_LOOP, added once after the loop
   while (c.iter_count > 0 && used < budget) {
-    if (a9 && nds_.gpu3d.stalled()) break;      // a full GX FIFO stalls the ARM9's DMA too
     ++loops;
     u32 cost = unit_cycles(c, burst_start, word);
     if (a9) cost <<= shift9_;
@@ -332,7 +334,7 @@ u32 Dma::run_channel_impl(Channel& c, u32 budget) {
             nds_.gpu3d.gxfifo_dma_write(v);
             prof::add(prof::C_DMA_GXF_WORDS, 1); prof::add(prof::C_DMA_D_IO, 1);
             c.cur_src += 4; c.iter_count--; c.rem_count--;
-            if (--room == 0 || c.iter_count == 0 || used >= budget || nds_.gpu3d.stalled()) break;
+            if (--room == 0 || c.iter_count == 0 || used >= budget) break;
             used += rc.next(c) << 1;
             p += 4;
           }
@@ -372,11 +374,8 @@ u32 Dma::run_channel_impl(Channel& c, u32 budget) {
           // whose cost reaches the budget, so this is the same transfer only
           // while the budget cannot cut the run short; the unit costs are a
           // cyclic pattern, so both the total and that test are closed-form.
-          // gpu3d.stalled() is loop-invariant here: the CPU is stopped for the
-          // duration of a DMA and only a FIFO feed can set it, which is the
-          // branch above and not this one.
           if (const u32 n = room < c.iter_count ? room : c.iter_count;
-              n >= kBulkMin && rc.closed_form() && !(a9 && nds_.gpu3d.stalled())) {
+              n >= kBulkMin && rc.closed_form()) {
             // The most units the budget can take: the loop breaks on the one
             // that reaches it, so every unit up to the last with used < budget
             // is copied for certain. Costs rise monotonically, so binary search
@@ -413,7 +412,7 @@ u32 Dma::run_channel_impl(Channel& c, u32 budget) {
             std::memcpy(pd, ps, 4);
             prof::add(prof::C_DMA_RUN_W, 1);
             c.cur_src += 4; c.cur_dst += 4; c.iter_count--; c.rem_count--;
-            if (--room == 0 || c.iter_count == 0 || used >= budget || (a9 && nds_.gpu3d.stalled())) break;
+            if (--room == 0 || c.iter_count == 0 || used >= budget) break;
             cost = rc.next(c); if (a9) cost <<= shift9_; used += cost;
             ps += 4; pd += 4;
           }
@@ -451,11 +450,8 @@ u32 Dma::run_channel_impl(Channel& c, u32 budget) {
           // whose cost reaches the budget, so this is the same transfer only
           // while the budget cannot cut the run short; the unit costs are a
           // cyclic pattern, so both the total and that test are closed-form.
-          // gpu3d.stalled() is loop-invariant here: the CPU is stopped for the
-          // duration of a DMA and only a FIFO feed can set it, which is the
-          // branch above and not this one.
           if (const u32 n = room < c.iter_count ? room : c.iter_count;
-              n >= kBulkMin && rc.closed_form() && !(a9 && nds_.gpu3d.stalled())) {
+              n >= kBulkMin && rc.closed_form()) {
             // The most units the budget can take: the loop breaks on the one
             // that reaches it, so every unit up to the last with used < budget
             // is copied for certain. Costs rise monotonically, so binary search
@@ -492,7 +488,7 @@ u32 Dma::run_channel_impl(Channel& c, u32 budget) {
             std::memcpy(pd, ps, 2);
             prof::add(prof::C_DMA_RUN_H, 1);
             c.cur_src += 2; c.cur_dst += 2; c.iter_count--; c.rem_count--;
-            if (--room == 0 || c.iter_count == 0 || used >= budget || (a9 && nds_.gpu3d.stalled())) break;
+            if (--room == 0 || c.iter_count == 0 || used >= budget) break;
             cost = rc.next(c); if (a9) cost <<= shift9_; used += cost;
             ps += 2; pd += 2;
           }

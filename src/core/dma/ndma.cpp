@@ -140,7 +140,6 @@ u32 Ndma::run_channel(Channel& c, u32 budget) {
   const bool dst_aes = direct && c.dst_inc == 0 && c.cur_dst == 0x04004408 && nds_.io.dsi_io_access(Cpu::ARM7, c.cur_dst);
   u32 used = 0;
   while (c.iter_count > 0) {
-    if (a9 && nds_.gpu3d.stalled()) break;
     used += unit;
     nds_.sched.dma_progress(run_base_ + used);
     const u32 v = fill ? c.fill : src_fifo ? nds_.io.ndma_read7(c.cur_src) : bus.dma_read32(c.cpu, c.cur_src);

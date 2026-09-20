@@ -125,6 +125,11 @@ def main():
     ap.add_argument('--region-limit', type=float, default=0.02,
                     help='largest wrong connected region, as a fraction of a screen, before it is a structural fault (default 0.02)')
     ap.add_argument('--verbose', action='store_true', help='one line per frame')
+    ap.add_argument('--dump-worst', type=int, metavar='N',
+                    help='write the N lowest-SSIM frames as reference|candidate|difference PNGs '
+                         'into --dump-dir. A number cannot tell a blinking arrow from a missing '
+                         'wall; the picture can. Use this before arguing about a floor.')
+    ap.add_argument('--dump-dir', default='.', help='where --dump-worst writes (default: .)')
     args = ap.parse_args()
 
     ref, nref = load(args.ref)
@@ -236,6 +241,31 @@ def main():
     if transient:
         print('  (transient, under --fault-persist: '
               + ', '.join(f'{k} {n} frame(s)' for k, n in transient.items()) + ')')
+
+    if args.dump_worst:
+        try:
+            from PIL import Image
+        except ImportError:
+            print('  (--dump-worst needs Pillow; skipped)')
+        else:
+            os.makedirs(args.dump_dir, exist_ok=True)
+            order = sorted(range(len(ssims)), key=lambda i: ssims[i])[:args.dump_worst]
+            for i in order:
+                f = lo + i
+                best = f + args.offset + shifts[i]
+                def stack(m, k):            # both screens, BGRA -> RGB
+                    a = np.asarray(m[k])[..., :3][..., ::-1]
+                    return np.concatenate([a[0], a[1]], axis=0)
+                r, c = stack(ref, best), stack(cand, f)
+                d = np.abs(r.astype(np.int16) - c.astype(np.int16)).sum(2).clip(0, 255).astype(np.uint8)
+                d = np.stack([d, d, d], axis=2)
+                gap = np.full((r.shape[0], 8, 3), 32, np.uint8)
+                img = np.concatenate([r, gap, c, gap, d], axis=1)
+                px = int(np.count_nonzero(d[:, :, 0]))
+                out = os.path.join(args.dump_dir, f'{args.scene}.f{f}.png')
+                Image.fromarray(img).resize((img.shape[1] * 2, img.shape[0] * 2), Image.NEAREST).save(out)
+                print(f'  worst: frame {f} ssim {ssims[i]:.4f} shift {shifts[i]:+d} '
+                      f'{px} px ({100 * px / (r.shape[0] * r.shape[1]):.2f}%) -> {out}')
 
     if args.json:
         with open(args.json, 'w') as fh:

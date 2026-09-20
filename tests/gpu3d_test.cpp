@@ -24,28 +24,39 @@ static void power_on(NDS& nds) { w16(nds, 0x04000304, 0x820F); }
 // Run the geometry engine for `cycles` system cycles.
 static void advance(NDS& nds, u32 cycles) { nds.sched.run_until(nds.sched.now() + cycles * 2); }
 
-static void test_fifo_status() {
+// The synthesised GXSTAT (Phase 1a). There is no FIFO level, no stall and no
+// execution clock: a read replays whatever is queued and then answers from a
+// fixed, deliberately safe shape. This is the contract §3.4 says must not be
+// weakened, so it is asserted directly rather than inferred from a drain.
+static void test_gxstat_synthesis() {
   NDS nds; power_on(nds);
-  CHECK_EQ(r32(nds, 0x04000600) & 0x07FF0000, 0x06000000u);   // empty, below half
-  // 40 single-parameter commands: 4 go into the pipe, the rest queue in the FIFO.
-  for (int i = 0; i < 40; ++i) w32(nds, CMD(0x10), 0);
-  const u32 st = r32(nds, 0x04000600);
-  CHECK_EQ((st >> 16) & 0x1FF, 36u);
-  CHECK(st & (1u << 27));                                      // busy
-  CHECK(!(st & (1u << 26)));
-  advance(nds, 2000);
-  CHECK_EQ(r32(nds, 0x04000600) & 0x0FFF0000, 0x06000000u);   // drained, idle
-  CHECK(!nds.gpu3d.stalled());
+  auto st = [&] { return r32(nds, 0x04000600); };
+  // Empty, below half full, not busy -- before anything is queued.
+  CHECK_EQ(st() & 0x07FF0000, 0x06000000u);
+  CHECK(!(st() & (1u << 27)));
+  // 300 commands: more than the old 4-deep pipe plus 256-entry FIFO plus
+  // 64-entry stall queue could hold. The level still reads zero, the
+  // half-full and empty bits still read set, and nothing stalls.
+  for (int i = 0; i < 300; ++i) w32(nds, CMD(0x10), 0);
+  CHECK_EQ(st() & 0x07FF0000, 0x06000000u);
+  advance(nds, 5000);
+  CHECK_EQ(st() & 0x07FF0000, 0x06000000u);
 }
 
-static void test_fifo_stall() {
+// The busy bit (27) is the one piece of GXSTAT that is not constant: it is
+// held from SWAP_BUFFERS until 650 cycles past the swap, so a game polling
+// "has my swap landed?" sees a busy -> idle edge at a plausible time rather
+// than an immediate idle.
+static void test_gxstat_swap_busy() {
   NDS nds; power_on(nds);
-  for (int i = 0; i < 300; ++i) w32(nds, CMD(0x10), 0);        // 4 pipe + 256 FIFO + 40 stalled
-  CHECK(nds.gpu3d.stalled());
-  CHECK_EQ((r32(nds, 0x04000600) >> 16) & 0x1FF, 256u);
-  advance(nds, 5000);
-  CHECK(!nds.gpu3d.stalled());
-  CHECK_EQ((r32(nds, 0x04000600) >> 16) & 0x1FF, 0u);
+  CHECK(!(r32(nds, 0x04000600) & (1u << 27)));
+  w32(nds, CMD(0x50), 0);                                      // swap buffers
+  CHECK(r32(nds, 0x04000600) & (1u << 27));                    // busy from the command
+  // VBlank is where swap_wait_ becomes a deadline and the 650-cycle tail
+  // starts; measured, the bit drops between 0.8 M and 1.0 M ARM9 cycles from
+  // a cold boot, so run well past that rather than up against it.
+  advance(nds, 600000);                                        // past VBlank and the 650-cycle tail
+  CHECK(!(r32(nds, 0x04000600) & (1u << 27)));
 }
 
 static void test_matrix_stack() {
@@ -122,8 +133,8 @@ static void test_final_pass() {
 }
 
 int main() {
-  test_fifo_status();
-  test_fifo_stall();
+  test_gxstat_synthesis();
+  test_gxstat_swap_busy();
   test_matrix_stack();
   test_flat_quad();
   test_final_pass();

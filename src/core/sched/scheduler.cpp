@@ -72,16 +72,6 @@ void Scheduler::set_clock9_shift(u32 timing_shift) {
   arm9_carry_ = 0;
 }
 
-void Scheduler::gx_fifo_full() {
-  if (quantum_ <= LOCKSTEP_QUANTUM || in_dma_) return;
-  CpuContext& a9 = nds_.cpu(Cpu::ARM9);
-  if (running_ == &a9) preempt(a9);
-}
-
-bool Scheduler::a9_gx_stalled(const CpuContext& cpu) const {
-  return quantum_ > LOCKSTEP_QUANTUM && cpu.which == Cpu::ARM9 && nds_.gpu3d.stalled();
-}
-
 void Scheduler::set_quantum(s64 q) {
   if (quantum_forced_) return;
   quantum_ = q <= 0 ? EVENT_BOUND_QUANTUM : q;
@@ -247,7 +237,6 @@ void Scheduler::count_slice(bool skipped, s64 slice) const {
   if (a9.halted && a7.halted) prof::add(prof::C_SLICES_BOTH_HALTED, 1);
   if (nds_.dma.any_running(Cpu::ARM9) || nds_.dma.any_running(Cpu::ARM7)) prof::add(prof::C_SLICES_DMA, 1);
   if (skipped) prof::add(prof::C_SLICES_SKIPPED, 1);
-  if (nds_.gpu3d.stalled()) prof::add(prof::C_SLICES_GX_STALLED, 1);
 
   // Cycle-weighted halt state: slice counts hide it, because the slices where
   // a CPU is awake are the ones the quantum keeps short.
@@ -419,7 +408,7 @@ void Scheduler::run_cpu(CpuContext& cpu, RunFn run) {
       // NDMA in/out ping-pong); returning here banks the rest as ARM7 debt
       // and the ARM7 falls behind the ARM9 for the whole transfer.
       if (dsi_ && cpu.hot.cycle_budget > 0 && cpu.hot.cycle_budget != b0 && nds_.dma.any_running(which)) continue;
-      if (cpu.hot.cycle_budget <= 0 || nds_.dma.any_running(which) || a9_gx_stalled(cpu)) return;
+      if (cpu.hot.cycle_budget <= 0 || nds_.dma.any_running(which)) return;
       // The DMA ended mid-phase and the CPU resumes now: an IRQ its DMA raised
       // is off-slice (Io::update_irq), taken after this CPU's next instruction
       // (melonDS resumes from Halt(2) straight into Execute, which checks IRQs
@@ -445,7 +434,6 @@ void Scheduler::run_cpu(CpuContext& cpu, RunFn run) {
     if (cpu.yielded) { cpu.yielded = false; return; }   // yield(): the rest of the slice goes to the other CPU
     if (dsi_ && which == Cpu::ARM9) { a9_dma_iter_ = true; return; }   // DSi: the DMA runs in the next iteration (see a9_dma_iter_)
     if (cpu.hot.cycle_budget <= 0 || cpu.halted) return;
-    if (a9_gx_stalled(cpu)) return;   // gx_fifo_full: sits out until the FIFO drains
   }
 }
 
@@ -483,7 +471,6 @@ begin:
     const bool all_idle = machine_idle(sl_.skip9, sl_.skip7);
     const bool idle = slice > quantum_ && all_idle && !dsi_;   // DSi: melonDS steps 64 cycles even with both CPUs asleep (its timers are checked per step)
     if (slice >= quantum_ + slice_margin_ && !idle) slice = quantum_;   // melonDS: minEvent < max + margin extends, equal does not
-    if (slice > LOCKSTEP_QUANTUM && nds_.gpu3d.stalled()) slice = LOCKSTEP_QUANTUM;   // event-bound: poll the FIFO drain
     u64 wake = 0;
     if (!all_idle && !sl_.skip7 && arm7_spi_poll(wake)) {
       sl_.skip7 = true;
@@ -498,9 +485,8 @@ begin:
     if (a9.boot_stall) take_stall(a9);
     if (a9.irq_offline) { a9.irq_skip_once = !a9.halted; a9.irq_offline = false; }
     running_ = &a9; running_start_budget_ = budget9_; running_shift_ = 0; running_rshift_ = dsi_ ? shift9_ + 1 : 0; running_base_ = now_; running_carry_ = static_cast<u64>(arm9_carry_);
-    sl_.gx_stalled = nds_.gpu3d.stalled();
     sl_.phase = SL_A9; cpu = &a9; run = nds_.run_arm9;
-    if (sl_.gx_stalled || sl_.skip9) goto a9_done;
+    if (sl_.skip9) goto a9_done;
   }
 cpu_begin:   // run_cpu loop head
   {
@@ -509,7 +495,7 @@ cpu_begin:   // run_cpu loop head
       { DS_PROF(DMA); in_dma_ = true; dma_used_ = 0; cpu->hot.cycle_budget -= static_cast<s32>(nds_.dma.run(cpu->which, static_cast<u32>(cpu->hot.cycle_budget))); in_dma_ = false; dma_used_ = 0; }
       if (dsi_ && cpu == &a9 && cpu->hot.cycle_budget != b0) { a9_dma_iter_ = true; goto cpu_done; }   // see a9_dma_iter_
       if (dsi_ && cpu->hot.cycle_budget > 0 && cpu->hot.cycle_budget != b0 && nds_.dma.any_running(cpu->which)) goto cpu_begin;   // see run_cpu
-      if (cpu->hot.cycle_budget <= 0 || nds_.dma.any_running(cpu->which) || a9_gx_stalled(*cpu)) goto cpu_done;
+      if (cpu->hot.cycle_budget <= 0 || nds_.dma.any_running(cpu->which)) goto cpu_done;
       if (cpu->irq_offline) { cpu->irq_skip_once = !cpu->halted; cpu->irq_offline = false; }   // see run_cpu
     }
     if (prof::enabled) sl_.t0 = std::chrono::steady_clock::now();
@@ -542,21 +528,20 @@ run_returned:
       cpu->preempt_residual = 0;
       if (cpu->yielded) cpu->yielded = false;   // yield(): the rest of the slice goes to the other CPU
       else if (dsi_ && cpu == &a9) a9_dma_iter_ = true;   // DSi: the DMA runs in the next iteration (see a9_dma_iter_)
-      else if (cpu->hot.cycle_budget > 0 && !cpu->halted && !a9_gx_stalled(*cpu)) goto cpu_begin;
+      else if (cpu->hot.cycle_budget > 0 && !cpu->halted) goto cpu_begin;
     }
   }
 cpu_done:
   if (cpu == &a7) goto a7_done;
 a9_done:
   {
-    const bool full9 = (a9.halted || sl_.gx_stalled || sl_.skip9) && !a9_dma_iter_;
+    const bool full9 = (a9.halted || sl_.skip9) && !a9_dma_iter_;
     const bool dma_iter = a9_dma_iter_; a9_dma_iter_ = false;
     s64 ran9 = full9 ? sl_.slice : ticks9(budget9_ - a9.hot.cycle_budget);
     if (full9) arm9_carry_ = 0;
     if (ran9 <= 0) ran9 = dma_iter ? 0 : 1;   // a DMA hand-off phase may be empty (melonDS's zero-length iteration); the DMA runs next
     sl_.ran9 = ran9;
     running_ = nullptr; running_rshift_ = 0;
-    { DS_PROF(GX_RUN); nds_.gpu3d.run_to(now_ + static_cast<u64>(ran9)); }
     arm7_debt_ += ran9;
     sl_.budget7 = static_cast<s32>(arm7_debt_ / 2);
     if (sl_.budget7 <= 0) goto slice_end;
@@ -628,7 +613,6 @@ u64 Scheduler::run_until_impl(u64 until, bool until_frame) {
     const bool all_idle = machine_idle(skip9, skip7);
     const bool idle = slice > quantum_ && all_idle && !dsi_;   // DSi: melonDS steps 64 cycles even with both CPUs asleep (its timers are checked per step)
     if (slice >= quantum_ + slice_margin_ && !idle) slice = quantum_;   // melonDS: minEvent < max + margin extends, equal does not
-    if (slice > LOCKSTEP_QUANTUM && nds_.gpu3d.stalled()) slice = LOCKSTEP_QUANTUM;   // event-bound: poll the FIFO drain
     u64 wake = 0;
     if (!all_idle && !skip7 && arm7_spi_poll(wake)) {
       skip7 = true;
@@ -646,19 +630,15 @@ u64 Scheduler::run_until_impl(u64 until, bool until_frame) {
     if (a9.boot_stall) take_stall(a9);
     if (a9.irq_offline) { a9.irq_skip_once = !a9.halted; a9.irq_offline = false; }
     running_ = &a9; running_start_budget_ = budget9_; running_shift_ = 0; running_rshift_ = dsi_ ? shift9_ + 1 : 0; running_base_ = now_; running_carry_ = static_cast<u64>(arm9_carry_);
-    // While the GX FIFO is full the ARM9 (and its DMA) sit out the slice;
-    // the geometry engine keeps draining behind it.
-    const bool gx_stalled = nds_.gpu3d.stalled();
-    if (!gx_stalled && !skip9) run_cpu(a9, nds_.run_arm9);
+    if (!skip9) run_cpu(a9, nds_.run_arm9);
     // A halted CPU consumes exactly the slice; a running one may overshoot,
     // and the overshoot is real time (it carries into the next slice).
-    const bool full9 = (a9.halted || gx_stalled || skip9) && !a9_dma_iter_;
+    const bool full9 = (a9.halted || skip9) && !a9_dma_iter_;
     const bool dma_iter = a9_dma_iter_; a9_dma_iter_ = false;
     s64 ran9 = full9 ? slice : ticks9(budget9_ - a9.hot.cycle_budget);
     if (full9) arm9_carry_ = 0;   // melonDS: a halted ARM9 is set to the target exactly
     if (ran9 <= 0) ran9 = dma_iter ? 0 : 1;   // see above
     running_ = nullptr; running_rshift_ = 0;
-    { DS_PROF(GX_RUN); nds_.gpu3d.run_to(now_ + static_cast<u64>(ran9)); }
 
     // The ARM7 runs at half clock and must cover the same span of time. Its
     // overshoot and the odd ARM9 cycle are carried in arm7_debt_, the way
@@ -694,34 +674,21 @@ template <class S> void Scheduler::sync_state(S& s) {
   s.begin("SCHD");
   // The event arrays grew with the DSi's events (FORMAT_VERSION 3: the two
   // grid events, the SD/MMC and SDIO transfers, the Wi-Fi module's timer, the
-  // camera's two and the card slots' power-off timers); a version-2 file
-  // carries the DS's 21.
+  // camera's two and the card slots' power-off timers).
+  //
+  // The version-2 reader that used to stand here is gone with
+  // OLDEST_READABLE_VERSION 4. It is worth recording why it was delicate: a
+  // version-2 file carried 20 events until Wifi was added (2026-09-07) and 21
+  // after, both written as version 2, so the count had to be recovered from
+  // the chunk's remaining size. Reading 21 from a 20-event file shifted every
+  // param_ by two entries -- the ARM7's Timer1 fired as Timer3 once and never
+  // rescheduled, the sound driver lost its tick, and the state ran silent and
+  // 1.5 ms a frame lighter than it should (found 2026-09-16 on the st-intro
+  // and gsdd-phase2 scenes). A format version that does not move when the
+  // layout does costs more than the bump it saves.
   static_assert(EVENT_COUNT == 29, "EVENT_COUNT changed: add a save-state version");
   s.fields(now_, arm7_debt_, armed_);
-  if (s.version >= 3) s.fields(at_, param_);
-  else {
-    // A version-2 file carries the DS's events -- but that was 20 of them
-    // until Wifi was added (2026-09-07) and 21 after, both written as
-    // version 2. Reading 21 from a 20-event file shifts every param_ by two
-    // entries: the ARM7's Timer1 event then fires as Timer3 once and never
-    // reschedules itself, the sound driver loses its tick, and the state
-    // runs silent and 1.5 ms a frame lighter than it should (the st-intro
-    // and gsdd-phase2 scenes, found 2026-09-16). The chunk's size says which
-    // it was: what follows the two arrays is the idle ring, its position, and
-    // an arm9_carry_ that was itself appended, so the size is one of four
-    // values and each names its count.
-    u32 n = 21;
-    if constexpr (S::reading) {
-      const size_t tail = sizeof(idle_pc_ring_) + sizeof(idle_pc_pos_);
-      const size_t rem = s.remaining();
-      for (u32 cand : {21u, 20u}) {
-        const size_t arrays = cand * (sizeof(at_[0]) + sizeof(param_[0]));
-        if (rem == arrays + tail || rem == arrays + tail + sizeof(arm9_carry_)) { n = cand; break; }
-      }
-    }
-    for (u32 i = 0; i < n; ++i) s.fields(at_[i]);
-    for (u32 i = 0; i < n; ++i) s.fields(param_[i]);
-  }
+  s.fields(at_, param_);
   // The idle-skip pre-filter: whether a slice is skipped depends on the
   // recent slice-start PCs, so the ring is part of the timing.
   s.fields(idle_pc_ring_, idle_pc_pos_);

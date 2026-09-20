@@ -23,11 +23,13 @@ namespace ds::gpu {
 // documented by the melonDS project (GPLv3), whose software implementation
 // this engine is verified against frame for frame.
 //
-// Timing: the engine has its own clock (system cycles, half the ARM9 clock).
-// The scheduler calls run_to() after every ARM9 slice and register reads
-// catch up first, so command execution is interleaved with the CPU at slice
-// granularity. When the 256-entry FIFO is full the ARM9 (and its DMA) stall
-// until it drains.
+// Timing: there is none. Commands are appended to a log as they arrive and
+// replayed in one pass -- at VBlank, when a read observes the engine, or when
+// the log fills. Nothing is priced in cycles, the FIFO has no level and never
+// stalls the ARM9, and GXSTAT is synthesised (see read()) rather than derived
+// from an execution clock. Phase 1 of the speed-first rework; the exact
+// per-command cycle model and the geometry worker it coexisted with were
+// deleted in 1a, measured in docs/speed-first-rework-scoping.md §3.4.
 
 struct Vertex {
   s32 pos[4];          // clip space, 20.12
@@ -101,81 +103,16 @@ public:
   void gxfifo_dma_burst(const u8* src, u32 n);
   // Words a burst may feed without any chance of filling the FIFO: a word
   // carries at most four commands, so this many can never reach FIFO_DEPTH.
-  u32 fifo_burst_room() const {
-    if (no_fifo_) { const u32 q = pipe_n_ + fifo_n_; return q < RING - 8 ? (RING - 8 - q) >> 2 : 0; }
-    return (FIFO_DEPTH - fifo_n_) >> 2;
-  }
-  // "Timing OC" (emu.timing_oc / --timing-oc): the performance-accuracy trade
-  // the user opts into, DraStic's geometry model. Two things at once, which
-  // only pay together: (1) no FIFO -- the command FIFO has no level and never
-  // stalls anything; commands queue in the ring and execute in batches (when
-  // the ring fills, when the game observes the engine through any 3D
-  // register read, and at VBlank) instead of against emulated time at every
-  // slice; SWAP_BUFFERS takes effect at once (the finished list is finalised
-  // and the bank flips there, the render still happens at VBlank); GXSTAT
-  // reports the FIFO empty and less-than-half-full, a GXFIFO-mode DMA starts
-  // whenever armed, the FIFO IRQ conditions read as met. (2) untimed
-  // geometry -- commands cost no cycles and the per-command pipeline model
-  // is skipped, since with no FIFO nothing can observe it. DMA unit costs
-  // stay exact (an untimed DMA measured worse everywhere: it overclocks the
-  // guest). Games that pace themselves on the FIFO level, the stall or the
-  // swap wait see different timing; Dragon Ball Origins' intro desyncs.
-  void set_timing_oc(bool on) { no_fifo_ = on; untimed_ = on; exec_timed_ = !untimed_ && !worker_on_; }
-  bool no_fifo() const { return no_fifo_; }
-  // Geometry worker (no-FIFO only): the command stream is parsed on the
-  // emulation thread and executed -- matrices, transform, clip, polygon
-  // writes -- on a thread of its own, a frame at most behind. Only possible
-  // in the no-FIFO model: with the FIFO, the cycle cost of a polygon (8, then
-  // 26/35 if it survives the cull) needs the transformed vertices, and the
-  // FIFO level, the busy bits and the DMA trigger times the CPU observes all
-  // depend on it. Without the FIFO nothing observes execution except through
-  // the joins: VBlank (before the raster is dispatched), RAM_COUNT, the
-  // test results, the clip/vector matrix ports, save states, and the rare
-  // writes that touch engine state (stack reset, zero-dot limit, POWCNT).
-  // GXSTAT is answered from a shadow of its command-derived bits (matrix
-  // mode, stack pointers, overflow) kept by the parser, so a poll never
-  // waits. See set_geometry_worker.
-  //
-  // With the FIFO kept (--cpu-oc, the "race-preserving" tier) the worker
-  // still runs; the emulation thread keeps the ring, the FIFO level, the
-  // stall and the whole cycle model, and prices each command as it pops it
-  // (price_single) before handing it over. The one price it cannot know --
-  // whether a polygon survives the cull (8 cycles) or not (26/35 more) -- is
-  // taken from the previous frame's kept ratio (see pr_kept_num_): the
-  // mechanism a game paces itself on (level, stall, busy bits) is intact, at
-  // a throughput that follows the scene a frame late.
-  // Start the worker thread and the shape controller (DS_GX_THREAD: 0 never,
-  // 1 controller (default), 2 always on). Which frames actually use it is the
-  // controller's call -- see shape_step.
-  void set_geometry_worker(bool on);
-  bool geometry_worker() const { return worker_on_; }
+  u32 fifo_burst_room() const { return n_ < RING - 8 ? (RING - 8 - n_) >> 2 : 0; }
 
   // POWCNT1 bit 3 (geometry) and bit 2 (rendering).
   void set_powcnt(u16 value);
 
-  // Advance the engine to `arm9_time` (scheduler time, ARM9 cycles). The
-  // idle check is inline: the scheduler calls this after every ARM9 slice.
-  void run_to(u64 arm9_time) {
-    if (no_fifo_ || !geometry_on_ || flush_request_ || (pipe_n_ == 0 && !(gxstat_ & (1u << 27)))) {
-      timestamp_ = arm9_time >> 1;
-      // The worker's feed point: what the slice parsed becomes visible to it
-      // here, once per slice rather than per word.
-      if (worker_on_ && q_pending_) q_publish();
-      return;
-    }
-    run_to_slow(arm9_time);
-  }
-  bool stalled() const { return stalled_; }
-  // The bundled --timing-oc of ef61339 also drained the FIFO at half full so
-  // the ARM9 never stalled on it. That is not one of DraStic's multipliers but
-  // a behavioural change, it went in unattributed alongside the two cycle
-  // models, and it no longer ports: it called execute(), which 670ad22
-  // dissolved into run_to_slow's inlined drain (pipe refill, stall promotion,
-  // deferred settle). Left out rather than reimplemented blind.
-  // Nothing to execute and nothing to raise: run_to would only stamp the time.
-  bool idle() const { return !geometry_on_ || flush_request_ || (pipe_n_ == 0 && !(gxstat_ & (1u << 27))); }
-  // A swap has been issued and waits for VBlank: the engine accepts nothing
-  // and changes nothing until then, so a loop polling GXSTAT can be skipped.
+  // Nothing to replay and no swap parked: the scheduler's idle-skip may
+  // advance time without asking the engine anything.
+  bool idle() const { return !geometry_on_ || flush_request_ || n_ == 0; }
+  // A swap has been issued and waits for VBlank: the engine changes nothing
+  // until then, so a loop polling GXSTAT can be skipped.
   bool swap_pending() const { return flush_request_ != 0 || swap_wait_; }
 
   // Display timing hooks.
@@ -189,15 +126,6 @@ public:
   // emulation thread at the start of a display frame, used by whichever
   // thread composites its lines.
   Renderer3D::FrameRef frame_ref() const { return renderer_.frame_ref(); }
-  // Instrumentation: the worker's execution time (ns) accumulated since the
-  // last take_worker_busy_ns, and the raster's serial cost of the last frame.
-  u64 take_worker_busy_ns() { return worker_busy_ns_.exchange(0, std::memory_order_relaxed); }
-  // A frontend that paces, presents or waits for a scanout buffer between
-  // emulation slices reports that time here: the shape controller measures
-  // frames VBlank to VBlank on the wall clock, and a pacer's sleep is longest
-  // exactly when the frame was fastest -- it inverted the choice in the SDL
-  // frontend until this was subtracted.
-  void note_external_ns(u64 ns) { external_ns_ += ns; }
   u64 last_raster_ns() const { return renderer_.last_band_sum_ns(); }
   const u32* line(const Renderer3D::FrameRef& f, u32 y);
   const u32* split_line(const Renderer3D::FrameRef& f, u32 y);   // the line's split map, scrolled the same way (after line(); null = none)   // 3D output for display line y, X-scrolled (RGB666 + 5-bit alpha at 24-28)
@@ -237,38 +165,24 @@ public:
 private:
 
   struct Entry { u32 param; u8 cmd; };
-  // The command pipe (4), the FIFO (256) and the CPU's stalled writes (64)
-  // are one ring in arrival order: the pipe is its head, the FIFO the middle,
-  // the stall queue the tail. Only the three counts move on a push or pop;
-  // no entry is ever copied between stages. Visible state is unchanged:
-  // GXSTAT reports fifo_n_, the pipe refills to 3+ from the FIFO on a pop.
-  static constexpr u32 PIPE_DEPTH = 4, FIFO_DEPTH = 256, STALL_DEPTH = 64, RING = 512;
+  // Arrival-order log of queued commands. There are no stages any more: no
+  // pipe, no FIFO level, no stall queue -- one count, and a replay when it
+  // nears full. 1b replaces this with a frame-sized command log and parameter
+  // log; 1a only removes what the stages cost.
+  static constexpr u32 RING = 512;
   std::array<Entry, RING> ring_{};
-  u32 ring_rd_ = 0, ring_wr_ = 0;
-  u32 pipe_n_ = 0, fifo_n_ = 0, stall_n_ = 0;
-  bool drain_settle_ = false;    // a pop deferred its DMA re-arm and IRQ check to run_to_slow
-  bool stalled_ = false;
-  bool no_fifo_ = false;         // see set_timing_oc
-  bool swapped_ = false;         // no-FIFO: a SWAP_BUFFERS finalised a list since the last VBlank
-  // no-FIFO: a SWAP_BUFFERS was issued since the last VBlank. On hardware the
-  // engine parks until VBlank, and GXSTAT bit 27 reads busy all that time; the
-  // untimed model has already executed the swap, so the bit is reported from
-  // this. Set where the command is issued on the emulation thread. The
-  // exact engine is still busy for the swap's 325 cycles after the flip, so
-  // VBlank turns the flag into a time (ARM9 cycles) the bit reads busy until.
+  u32 ring_rd_ = 0, ring_wr_ = 0, n_ = 0;
+  bool swapped_ = false;         // a SWAP_BUFFERS finalised a list since the last VBlank
+  // A SWAP_BUFFERS was issued since the last VBlank. On hardware the engine
+  // parks until VBlank and GXSTAT bit 27 reads busy all that time; we have
+  // already executed the swap, so the bit is reported from this instead. The
+  // hardware engine is still busy for the swap's 325 cycles after the flip,
+  // so VBlank turns the flag into a time (ARM9 cycles) the bit reads busy
+  // until. This synthesis is the contract Phase 1 must not weaken.
   bool swap_wait_ = false;
   u64 swap_busy_until_ = 0;
   bool list_same_ = false;       // finalise_list: the finished list equals the previous one
-  bool untimed_ = false;
-  bool pipe_empty() const { return pipe_n_ == 0; }
-  u32  fifo_level() const { return fifo_n_; }
   void ring_push(const Entry& e) { ring_[ring_wr_] = e; ring_wr_ = (ring_wr_ + 1) & (RING - 1); }
-  // Status side effects of an entry entering the pipe or FIFO (not the stall queue).
-  void note_enqueued(u8 cmd) {
-    gxstat_ |= (1u << 27);
-    if (static_cast<u8>(cmd - 0x11) <= 1) { gxstat_ |= (1u << 14); ++num_pushpop_; }      // 0x11, 0x12
-    else if (static_cast<u8>(cmd - 0x70) <= 2) { gxstat_ |= (1u << 0); ++num_tests_; }    // 0x70-0x72
-  }
 
   // Command assembly for packed GXFIFO writes.
   // Packed-command parser state. A struct so a DMA burst can walk a whole run
@@ -279,132 +193,17 @@ private:
   std::array<u32, 32> exec_params_{};
   u32 exec_count_ = 0;
 
-  // Timing.
-  u64 timestamp_ = 0;          // system cycles
-  s32 cycle_count_ = 0;
-  s32 vertex_pipeline_ = 0, normal_pipeline_ = 0, polygon_pipeline_ = 0;
-  s32 vertex_slot_counter_ = 0;
-  u32 vertex_slots_free_ = 1;
-  u32 num_pushpop_ = 0, num_tests_ = 0;
-
-  // Status.
+  // Status. gxstat_ now carries only the two IRQ-mode bits (30-31): the busy
+  // bit is synthesised from the swap, the FIFO level is always reported empty,
+  // and the matrix-stack and test busy bits are always clear because any read
+  // that could observe them replays the log first (see read()).
   u32 gxstat_ = 0;
-  // Timing helpers act only when this thread owns the cycle model: false in
-  // the no-FIFO model (nothing observes it) and whenever the worker executes
-  // (the emulation thread prices instead). Bodies are the tm_ functions.
-  bool exec_timed_ = true;
-  // GXSTAT bit 1 (box test result), written by the execute path -- see stack_err_.
+  // GXSTAT bit 1 (box test result), written by the execute path.
   u32 box_result_ = 0;
   // GXSTAT bit 15 (matrix stack over/underflow), kept apart from gxstat_
-  // because the execute path sets it -- on the worker, with the worker on --
-  // while gxstat_ belongs to the emulation thread. read() ORs it in.
+  // because the execute path sets it. read() ORs it in.
   u32 stack_err_ = 0;
 
-  // ---- geometry worker ----------------------------------------------------
-  bool worker_on_ = false;
-  // The parser's shadow of the command-derived GXSTAT fields: matrix mode,
-  // the three stack pointers and the overflow flag, advanced per command as
-  // it is queued, exactly as exec_single will advance the real ones later.
-  struct Shadow { u32 mode = 0; s32 proj_sp = 0, pos_sp = 0, tex_sp = 0; u32 err = 0; bool box_pending = false; };
-  Shadow sh_;
-  // Pricer state (FIFO kept + worker): the command-derived pieces the cycle
-  // model reads, mirrored from the execute path's own copies.
-  u32 pr_poly_mode_ = 0, pr_vertex_in_poly_ = 0, pr_consecutive_polys_ = 0;
-  u32 pr_polygon_attr_ = 0, pr_cur_polygon_attr_ = 0, pr_count_ = 0;
-  // The cull price. The worker counts the polygons it was given and the ones
-  // that survived; the emulation thread reads both at the VBlank join -- a
-  // fixed point in the command stream, so the ratio is a function of the
-  // inputs alone -- and prices the next frame's polygons kept or culled in
-  // that proportion, dithered by an integer accumulator. Always-kept measured
-  // as a 3x over-price on Golden Sun (91 % culled): the FIFO drained so slowly
-  // that its half-empty DMA trigger fired in four times as many pieces.
-  u32 w_polys_submitted_ = 0, w_polys_kept_ = 0;   // worker's, reset by the emulation thread at the join
-  u32 pr_kept_num_ = 1, pr_kept_den_ = 1, pr_kept_acc_ = 0;
-  void price_single(u8 cmd, u32 param);
-  void price_accum(u8 cmd);
-  void price_vertex();
-  void pricer_resync();                 // mirror the executed state (queue empty)
-  inline __attribute__((always_inline)) void shadow_exec(u8 cmd, u32 param);   // body below the class
-  // Single-producer single-consumer queue of entries. The producer (parser)
-  // writes at q_wr_local_ and publishes to q_wr_ at feed points (run_to per
-  // slice, the end of a DMA burst, every join); the worker publishes q_rd_
-  // after each batch it executes. Power-of-two ring, cursors free-running.
-  static constexpr u32 QN = 1u << 16;
-  std::unique_ptr<Entry[]> q_ = std::unique_ptr<Entry[]>(new Entry[QN]);
-  u32 q_wr_local_ = 0;
-  u32 q_rd_seen_ = 0;                  // the worker's cursor as last read: the room check reloads it only when this says full
-  bool q_pending_ = false;             // entries written since the last publish
-  alignas(64) std::atomic<u32> q_wr_{0};
-  alignas(64) std::atomic<u32> q_rd_{0};
-  alignas(64) std::mutex q_mu_;
-  std::condition_variable q_cv_;        // worker sleeps here when the queue is empty
-  std::condition_variable q_done_cv_;   // a joiner sleeps here
-  bool q_stop_ = false;
-  // Sleep flags, each raised under q_mu_ by its sleeper and read lock-free by
-  // the other side after it publishes its cursor (seq_cst both ways, so one
-  // of the pair always sees the other); the notifier then takes the lock, so
-  // a wake cannot fall between the sleeper's predicate check and its wait.
-  std::atomic<bool> worker_asleep_{false};
-  std::atomic<bool> joiner_waiting_{false};
-  std::thread worker_thread_;
-  u32 q_rd_local_ = 0;                  // worker's cursor
-  std::atomic<u64> worker_busy_ns_{0};   // time spent executing batches
-  void q_push(const Entry& e) {
-    // No cross-core load per entry: q_rd_ is a line the worker keeps dirty,
-    // so the producer reads it only when its last reading says the queue is
-    // full (q_wait_room refreshes q_rd_seen_).
-    if (q_wr_local_ - q_rd_seen_ >= QN) q_wait_room();
-    q_[q_wr_local_ & (QN - 1)] = e; ++q_wr_local_; q_pending_ = true;
-    shadow_exec(e.cmd, e.param);
-  }
-  void q_publish();
-  void q_wait_room();
-  void worker_join();                   // everything queued has executed
-  void worker_activate(bool on);        // route commands to the worker (true) or execute inline (false); queue must be empty
-  std::atomic<u64> join_wait_ns_{0};     // time spent in worker_join since the last take
-  // ---- shape controller -----------------------------------------------------
-  // Two shapes, chosen per frame at VBlank: A = three band workers, geometry
-  // inline on the emulation thread; B = two band workers plus the geometry
-  // worker. Both titles measured so far alternate a heavy list and a light one
-  // frame by frame, and the heavy list is built in one frame and rasterised
-  // during the next -- so the best shape flips every frame: B while a heavy
-  // list is being built, A while one is being rasterised. Predictions come
-  // from the frame two back (same phase): the serial raster cost of the list
-  // about to be dispatched (Renderer3D's band sum), and the emulation thread's
-  // own cost in each shape, remembered per phase and refreshed by an
-  // occasional probe of the shape not in use. Cost of a shape = the longer of
-  // its two paths: emulation thread, and raster (serial cost / bands, with an
-  // imbalance factor) -- the compositor tail is common to both. That was the
-  // plan; what runs is empirical, see shape_step.
-  int shape_mode_ = 1;
-  bool worker_started_ = false;
-  // The shapes of a frame pair are one decision. Measured per phase alone the
-  // choice went wrong in the SDL frontend: a three-band raster dispatched at
-  // line 215 spills into the next interval, so a worker frame after a
-  // three-band frame cost 1.7 ms more than after a worker frame, and the
-  // per-phase memory charged that to the wrong shape. Four arms -- the shape
-  // of the even interval and of the odd one -- and the pair's summed wall
-  // time is what is remembered and compared.
-  struct Arm { u64 wall_ns = 0; u32 age = ~0u; };   // age in pairs (~0 = never measured)
-  Arm arms_[4];                        // bit 0: even interval uses the worker; bit 1: odd interval does
-  u32 arm_now_ = 3;  // the arm the current pair runs under / the one decided for the next
-  u64 pair_even_ns_ = 0;               // the even interval's wall, waiting for the odd one
-  bool pair_clean_ = true;             // both intervals of the pair ran their planned shapes
-  std::chrono::steady_clock::time_point frame_t0_{};
-  bool frame_t0_valid_ = false;
-  u32 frame_idx_ = 0;
-  // Inline execution time this interval (shape A). DIAGNOSTIC ONLY: the arm
-  // choice in shape_step is made on `wall`, and this number reaches nothing
-  // but the DS_GX_SHAPE_LOG line -- so it is accumulated only when that log is
-  // on. It cost two steady_clock reads per run_to_slow call otherwise, which
-  // is ~1,300 a frame on a 3D-heavy title (run_to_slow drains in ~667 chunks),
-  // and the A30's kernel has no vDSO, so each one of those is a syscall.
-  bool shape_log_ = false;             // DS_GX_SHAPE_LOG: read once, see the constructor
-  u64 gx_inline_ns_ = 0;
-  u64 external_ns_ = 0;                // frontend time outside emulation this interval (note_external_ns)
-  void shape_step();
-  void worker_loop();
-  void worker_stop();
   void stack_reset();                   // GXSTAT bit 15 written: clear the flag, reset proj/tex stacks
   bool geometry_on_ = false, rendering_on_ = false;
   u32 dispcnt_ = 0;
@@ -513,55 +312,26 @@ private:
   Polygon* cur_pram() { return &pram_[bank_ * PRAM_BANK]; }
   u32 vram_base() const { return bank_ * VRAM_BANK; }
 
-  // FIFO.
+  // Log append.
   [[gnu::always_inline]] inline void fifo_write(const Entry& e);   // LTO outlined it out of gxfifo_write: 30 insn + a call per word; body below the class
-  void fifo_write_full(const Entry& e);   // the cold leg: FIFO full, stall the CPU (needs the scheduler)
   // The packed-command walk, shared by the single-word port and the burst.
   // The two differ only in their sink, so the assembly state machine has one
   // copy: a divergence between them would be a silent accuracy bug.
   template <class Push> [[gnu::always_inline]] static inline void gxfifo_word(u32 value, GxParse& p, Push push);
-  // The stall queue drains into the FIFO after a pop made room. Out of line:
-  // it only runs when the CPU has been stalled by a full FIFO.
-  void promote_stalled();
-  // no-FIFO: execute everything queued, now.
+  // Replay everything queued, now.
   void drain_all();
   // The finished polygon list: sort it for the renderer, decide whether it
-  // repeats the previous one. At VBlank in the exact model, at the SWAP
-  // command in the no-FIFO model.
+  // repeats the previous one. At the SWAP command.
   void finalise_list();
   // Put temp_vtx_ back in position order and reset vslot_ to the identity.
   void normalise_temp_vtx();
   void gxfifo_write(u32 value);
-  void run_to_slow(u64 arm9_time);
-  // One call site: the run_to_slow drain loop. Every command goes through this
+  // One call site: the drain_all replay loop. Every command goes through this
   // one switch; the multi-parameter ones tail into exec_accum.
   inline __attribute__((always_inline)) void exec_single(u8 cmd, u32 param);
   void exec_accum(u8 cmd, u32 param);
   void exec_multi(u8 cmd);
 
-  // Per-command timing helpers: called once per command from the execute
-  // loop, so they are forced inline (LTO left them as calls: ~15 insn of
-  // call overhead each at 15 k+ calls a frame).
-  __attribute__((always_inline)) void add_cycles(s32 n) { if (exec_timed_) tm_add_cycles(n); }
-  void next_vertex_slot();
-  void stall_polygon_pipeline(s32 delay, s32 nonstall_delay) { if (exec_timed_) tm_stall_polygon_pipeline(delay, nonstall_delay); }
-  __attribute__((always_inline)) void vtx_cmd_submit() { if (exec_timed_) tm_vtx_cmd_submit(); }
-  __attribute__((always_inline)) void vtx_cmd_delayed6() { if (exec_timed_) tm_vtx_cmd_delayed6(); }
-  __attribute__((always_inline)) void vtx_cmd_delayed8() { if (exec_timed_) tm_vtx_cmd_delayed8(); }
-  __attribute__((always_inline)) void vtx_cmd_delayed4() { if (exec_timed_) tm_vtx_cmd_delayed4(); }
-  inline __attribute__((always_inline)) void tm_add_cycles(s32 n);
-  void tm_stall_polygon_pipeline(s32 delay, s32 nonstall_delay);
-  inline __attribute__((always_inline)) void tm_vtx_cmd_submit();
-  inline __attribute__((always_inline)) void tm_vtx_cmd_delayed6();
-  inline __attribute__((always_inline)) void tm_vtx_cmd_delayed8();
-  inline __attribute__((always_inline)) void tm_vtx_cmd_delayed4();
-  // Polygon pipeline start / survival prices, shared by submit_polygon and the pricer.
-  void tm_polygon_start() { polygon_pipeline_ = 8; vertex_slot_counter_ = 1; vertex_slots_free_ = 0b11110; }
-  void tm_polygon_kept(int nverts, u32 mode) {
-    if (nverts == 4) { polygon_pipeline_ = 35; vertex_slot_counter_ = 1; vertex_slots_free_ = (mode & 2) ? 0b11100 : 0b11110; }
-    else { polygon_pipeline_ = 26; vertex_slot_counter_ = 1; vertex_slots_free_ = (mode & 2) ? 0b1000 : 0b1110; }
-  }
-  void finish_work(s32 cycles);
 
   // Geometry.
   void update_clip_matrix();
@@ -585,70 +355,8 @@ private:
 // Forced-inline members called from the inline code above (q_push, write):
 // their bodies must be visible in every translation unit that uses them.
 inline void Gpu3D::fifo_write(const Entry& e) {
-  if (worker_on_ && no_fifo_) { q_push(e); return; }
-  // Order of tests follows frequency: a frame is tens of thousands of words
-  // into a FIFO that is neither empty nor full.
-  if (no_fifo_ && pipe_n_ + fifo_n_ >= RING - 8) drain_all();   // no level: the ring is the only bound
-  if (fifo_n_ - 1 < FIFO_DEPTH - 1) { ring_push(e); ++fifo_n_; }              // 1 <= fifo_n_ < 256
-  else if (fifo_n_ == 0 && pipe_n_ < PIPE_DEPTH) { ring_push(e); ++pipe_n_; }
-  else if (fifo_n_ == FIFO_DEPTH && !no_fifo_) { fifo_write_full(e); return; }
-  else { ring_push(e); ++fifo_n_; }                                          // FIFO empty, pipe full
-  note_enqueued(e.cmd);
-}
-
-inline void Gpu3D::shadow_exec(u8 cmd, u32 param) {
-  if (cmd == 0x70) { sh_.box_pending = true; return; }
-  if (cmd == 0x50) { swap_wait_ = no_fifo_; return; }
-  if (static_cast<u8>(cmd - 0x10) > 4) return;
-  switch (cmd) {
-  case 0x10: sh_.mode = param & 3; break;
-  case 0x11:
-    if (sh_.mode == 0) { if (sh_.proj_sp > 0) sh_.err = 1u << 15; sh_.proj_sp = (sh_.proj_sp + 1) & 1; }
-    else if (sh_.mode == 3) { if (sh_.tex_sp > 0) sh_.err = 1u << 15; sh_.tex_sp = (sh_.tex_sp + 1) & 1; }
-    else { if (sh_.pos_sp > 30) sh_.err = 1u << 15; sh_.pos_sp = (sh_.pos_sp + 1) & 0x3F; }
-    break;
-  case 0x12:
-    if (sh_.mode == 0) { if (sh_.proj_sp == 0) sh_.err = 1u << 15; sh_.proj_sp = (sh_.proj_sp - 1) & 1; }
-    else if (sh_.mode == 3) { if (sh_.tex_sp == 0) sh_.err = 1u << 15; sh_.tex_sp = (sh_.tex_sp - 1) & 1; }
-    else { const s32 off = static_cast<s32>(param << 26) >> 26; sh_.pos_sp = (sh_.pos_sp - off) & 0x3F; if (sh_.pos_sp > 30) sh_.err = 1u << 15; }
-    break;
-  case 0x13: case 0x14:
-    if (sh_.mode != 0 && sh_.mode != 3 && (param & 0x1F) > 30) sh_.err = 1u << 15;
-    break;
-  default: break;
-  }
-}
-
-// The timing helpers, forced inline through the add_cycles / vtx_cmd_* wrappers above.
-inline void Gpu3D::tm_add_cycles(s32 n) {
-  cycle_count_ += n;
-  if (vertex_pipeline_ > 0) vertex_pipeline_ = vertex_pipeline_ > n ? vertex_pipeline_ - n : 0;
-  if (polygon_pipeline_ > 0) {
-    if (polygon_pipeline_ > n) {
-      polygon_pipeline_ -= n;
-      vertex_slot_counter_ += n;
-      while (vertex_slot_counter_ > 9) { vertex_slot_counter_ -= 9; vertex_slots_free_ >>= 1; }
-    } else {
-      polygon_pipeline_ = 0; vertex_slot_counter_ = 0; vertex_slots_free_ = 1;
-    }
-  }
-}
-
-inline void Gpu3D::tm_vtx_cmd_submit() {          // vertex commands
-  if (!(vertex_slots_free_ & 1)) next_vertex_slot(); else tm_add_cycles(1);
-  normal_pipeline_ = 0;
-}
-inline void Gpu3D::tm_vtx_cmd_delayed6() {        // may run 6 cycles after a vertex
-  if (vertex_pipeline_ > 2) tm_add_cycles((vertex_pipeline_ - 2) + 1); else tm_add_cycles(normal_pipeline_ + 1);
-  normal_pipeline_ = 0;
-}
-inline void Gpu3D::tm_vtx_cmd_delayed8() {        // may run 8 cycles after a vertex
-  if (vertex_pipeline_ > 0) tm_add_cycles(vertex_pipeline_ + 1); else tm_add_cycles(normal_pipeline_ + 1);
-  normal_pipeline_ = 0;
-}
-inline void Gpu3D::tm_vtx_cmd_delayed4() {        // everything else: 4 cycles after a vertex
-  tm_add_cycles(normal_pipeline_ + 1);
-  normal_pipeline_ = 0;
+  if (n_ >= RING - 8) drain_all();   // no level: the log's size is the only bound
+  ring_push(e); ++n_;
 }
 
 } // namespace ds::gpu
