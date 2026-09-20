@@ -24,8 +24,9 @@ const Choice kCpuOc[] = {{"false", "OFF"}, {"underclock", "UNDERCLOCK"}, {"overc
 const Choice kLimiter[] = {{"auto", "CONSOLE (59.8)"}, {"30", "30"}, {"60", "60"}, {"120", "120"},
                            {"144", "144"}, {"240", "240"}, {"off", "UNLIMITED"}};
 const Choice kIntScale[] = {{"off", "OFF"}, {"under", "UNDER"}, {"over", "OVER"}};
-// 3D edges. "true"/"false" are the old boolean and read as accurate/off (aa_mode in main.cpp).
-const Choice kAa[]       = {{"off", "OFF"}, {"smooth", "SMOOTH"}, {"accurate", "ACCURATE"}, {"shaped", "SHAPED"}};
+// 3D edges. "true"/"false" are the old boolean and read as accurate/off, and "smooth" is the older sub-pixel
+// mode, still read from a file but no longer offered here -- enhanced supersedes it (aa_mode in main.cpp).
+const Choice kAa[]       = {{"off", "OFF"}, {"accurate", "ACCURATE"}, {"enhanced", "ENHANCED"}};
 const Choice kSeam[]     = {{"dark", "DARK"}, {"blend", "BLEND"}, {"blend_linear", "BLEND LINEAR"}};
 // The file's own words on the left. "mean" is the ordinary cell and reads as
 // DEFAULT; the rest are named for what they do rather than how they do it.
@@ -167,8 +168,8 @@ const Setting kVideoSettings[] = {
          "PANEL PIXELS PER CELL", "auto", "AUTO"),
   number("video.screen_gap", "SCREEN GAP", 0, 128, 4, "0", FlagDeferred, Dep::OneWindow,
          "PANEL PIXELS BETWEEN THE TWO SCREENS WHEN THEY ARE STACKED OR SIDE BY SIDE"),
-  pick("video.aa", "ANTI-ALIASING", kAa, 4, "off", FlagLive, Dep::None,
-       "SMOOTH DRAWS 3D EDGES AT PANEL RESOLUTION. ACCURATE BLENDS THEM AS THE HARDWARE DID. SHAPED ADDS STRAIGHT SILHOUETTES ON TOP OF ACCURATE"),
+  pick("video.aa", "ANTI-ALIASING", kAa, 3, "off", FlagLive, Dep::None,
+       "ACCURATE BLENDS 3D EDGES AS THE HARDWARE DID. ENHANCED REDRAWS THE STEPPED EDGE BETWEEN OBJECTS AS STRAIGHT LINES ON TOP OF THAT"),
   boolean("video.fps", "FPS COUNTER", "false", FlagLive, Dep::None,
           "FRAMES PER SECOND IN THE CORNER OF THE SCREEN"),
   boolean("video.fullscreen", "FULLSCREEN", "false", FlagDeferred, Dep::Windowed, nullptr),

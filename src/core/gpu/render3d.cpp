@@ -2719,6 +2719,29 @@ void Renderer3D::shape_frame(u32 idx) {
         if (r > L) continue;                                          // the riser is the long direction: its own run does this corner
         s32 span = L;
         if (!horiz && L >= 3) span = std::min(L, L == 3 ? 2 * r : r); // an upright front stays upright
+        // The chamfer is for a lone upright front, not for a shallow edge that is drawn as a regular staircase.
+        // Walk the chain of treads both ways from this run, counting the consecutive ones of about its own
+        // length; a pair is enough, and because the walk carries on past the first the treads at the ENDS of a
+        // staircase are exempt too. One match on its own would not do: that is the back of Mario's cap, whose
+        // front stands over the rim below it and must keep its chamfer.
+        if (span < L) {
+          constexpr s32 kStairPair = 2;
+          const s32 tol = 1 + L / 3, dl = (s > 0 ? r : -r);
+          auto walk = [&](s32 step_line, s32 k0, s32 step) {
+            s32 n = 0, l = line, k = k0;
+            for (s32 i = 0; i < kMaxRun; ++i) {
+              l += step_line;
+              if (l < 0 || l + 1 >= nl) break;
+              s32 len = 0;
+              for (s32 q = k; q >= 0 && q < np && B(l, q) == s && len < kMaxRun; q += step) ++len;
+              if (!len || std::abs(len - L) > tol) break;
+              ++n; k += step * len;
+            }
+            return n;
+          };
+          const s32 like = rb ? walk(dl, b, 1) + walk(-dl, a - 1, -1) : walk(dl, a - 1, -1) + walk(-dl, b, 1);
+          if (like >= kStairPair) span = L;
+        }
         const u32 side = horiz ? (s > 0 ? SPLIT_UP : SPLIT_DOWN) : (s > 0 ? SPLIT_LEFT : SPLIT_RIGHT);
         for (s32 i = a; i < b; ++i) {
           const s32 fc = cell(frontl, i), bc = cell(back, i);

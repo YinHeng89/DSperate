@@ -347,7 +347,7 @@ int main(int argc, char** argv) {
     else if (arg("--trace")) trace = argv[++i];
     else if (arg("--max")) ts.max = std::strtoull(argv[++i], nullptr, 0);
     else if (arg("--dump-frames")) dump = argv[++i];
-    else if (flag("--shape")) shape = true;                                  // edge shaping on top of the hardware picture (Gpu::set_shape); only a scaled dump shows it
+    else if (flag("--enhanced") || flag("--shape")) shape = true;            // video.aa = enhanced: edge shaping on top of the hardware picture (Gpu::set_shape); only a scaled dump shows it
     else if (flag("--subpixel")) subpixel = true;                            // sub-pixel polygon edges (Gpu::set_subpixel), hardware AA off as video.aa = smooth has it; only a scaled dump shows them
     else if (arg("--dump-scaled")) { scaled_n = std::atoi(argv[++i]); scaled_path = argv[++i]; }   // N FILE: both screens through the scanline scaler at Nx, raw BGRA, the --dump-from/--dump-count window
     else if (arg("--dump-from")) dump_from = std::atoi(argv[++i]);    // first frame to dump

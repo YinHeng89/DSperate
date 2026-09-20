@@ -177,7 +177,7 @@ const char* kUsage =
     "  --cpu-oc        CPU tuning, overclock: recompiled data accesses priced as main RAM, geometry on its\n                  own thread with every polygon priced as drawn (less accurate); emu.cpu_tuning = overclock\n"
     "  --cpu-uc        CPU tuning, underclock: for the harder to run games and/or the lowest end devices.\n                  The game's CPUs run slower than a console's, so there is less to emulate a frame\n                  (less accurate; a game can miss VBlanks); emu.cpu_tuning = underclock\n"
     "  --fast-load     cart DMA reads the card without its clock (may affect accuracy); emu.fast_load\n"
-    "  --aa [off|smooth|accurate|shaped] / --no-aa  3D edges; video.aa, off by default. smooth: polygon edges at panel\n"
+    "  --aa [off|accurate|enhanced] / --no-aa  3D edges; video.aa, off by default. accurate: the hardware's blend.\n"
     "                  resolution (scanline tiers, nearest/grid/seam; 2D untouched). accurate (bare --aa): the hardware's blend\n"
     "  --lockstep      128-cycle CPU interleave (melonDS lockstep) instead of event-bound; --quantum N for any value\n"
     "  --frameskip N   skip drawing up to N frames in N+1 (0 = off); emu.frameskip. Skipping runs\n"
@@ -298,14 +298,15 @@ std::string save_path(const std::string& rom, const std::string& dir) {
 // video.aa: 0 off, 1 smooth, 2 accurate, 3 shaped. Smooth is the sub-pixel edge
 // mode (Gpu::set_subpixel) with the hardware blend off -- it looks best
 // unblended, and the two are never on together (user decision). Accurate is the
-// hardware's anti-aliasing; shaped is the hardware's anti-aliasing and the edge
-// shaping over it (Renderer3D::shape_frame), which is why it is a mode of its
-// own rather than a switch: the blend on its own stays available. The old
-// boolean reads as accurate / off.
-constexpr const char* kAaNames[4] = {"off", "smooth", "accurate", "shaped"};
+// hardware's anti-aliasing; enhanced is the hardware's anti-aliasing and the
+// edge shaping over it (Renderer3D::shape_frame), which is why it is a mode of
+// its own rather than a switch: the blend on its own stays available. Smooth is
+// no longer offered in the menu -- enhanced supersedes it -- but a file that
+// asks for it still gets it. The old boolean reads as accurate / off.
+constexpr const char* kAaNames[4] = {"off", "smooth", "accurate", "enhanced"};
 int aa_mode(const std::string& v) {
   if (v == "smooth") return 1;
-  if (v == "shaped") return 3;
+  if (v == "enhanced") return 3;
   if (v == "accurate" || v == "true" || v == "1" || v == "yes" || v == "on") return 2;
   return 0;
 }
@@ -1271,7 +1272,7 @@ static int run(int argc, char** argv) {
     else if (flag("--aa")) {
       // Bare --aa is what it always was (the hardware blend); a mode word may follow.
       const char* m = i + 1 < argc ? argv[i + 1] : "";
-      if (!std::strcmp(m, "off") || !std::strcmp(m, "smooth") || !std::strcmp(m, "accurate") || !std::strcmp(m, "shaped")) { cli.set("video.aa", m); ++i; }
+      if (!std::strcmp(m, "off") || !std::strcmp(m, "smooth") || !std::strcmp(m, "accurate") || !std::strcmp(m, "enhanced")) { cli.set("video.aa", m); ++i; }
       else cli.set("video.aa", "accurate");
     }
     else if (flag("--no-aa")) cli.set("video.aa", "off");
