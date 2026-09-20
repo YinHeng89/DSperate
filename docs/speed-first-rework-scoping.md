@@ -304,6 +304,41 @@ suggests. It is not going to be ten times higher.
    real floor is `const_nd >= 0`, which emits no cost code at the site at all,
    and the probe above already bounds what reaching it is worth.
 
+### 3.3 Phase 2's census, on the device — the lever is not where the plan put it
+
+RG DS Plus, `perf -F 499`, 900 frames, filtered to the emulation thread. Full
+tables and the device stage baseline are in `fixtures/device/`.
+
+**Translated guest code is ~35 % of the emulation thread** (36 % on dbori,
+34 % on mlbis). That is Phase 2's floor and nothing in the plan's queued rows
+touches it — the four open JIT rows (1.5, 1.12, 1.23, 1.26) are all about the
+machinery *around* translated code.
+
+**The `Io::` read path is the largest identified non-JIT cost on the
+emulation thread**: ~24 % on dbori, ~11 % on mlbis, with
+`Io::cart_catch_up_slow` the hottest C++ symbol on *both* scenes (10.3 % and
+3.0 % of the process). This was not on the plan's list at all, and it is not
+a DraStic checklist row. It is now Phase 2's first candidate.
+
+**`ds_slice_next` (2.5 % / 1.4 %) and `interp::ldm_stm` (1.7 % / 0.5 %)** are
+the next two: the slice loop, and the JIT falling back to the interpreter for
+block transfers that cross a 2 KB page (row 1.28). Both were on the list; both
+are small.
+
+So Phase 2's revised shape is: the cost model is worth 0.2-0.4 ms (§3.2), the
+I/O read path is worth more than that and was unplanned, and roughly a third
+of the row is translated code that only better block quality would move.
+**The 3.5 ms target is not reachable from the rows the plan had.**
+
+*One hypothesis tested and rejected already* — hoisting
+`cart_catch_up_slow`'s `event_armed || late` guard into its inline caller.
+Provably identical semantics, byte-identical on five scenes, and on the device
+it measured **flat to 1.3 % worse** with swap counts unchanged. The samples
+are in the function's real work, not its early return. The lesson is
+methodological and applies to every later patch: **a `perf` share says where
+the time is, not why**, and `perf annotate` is what separates them. ROCKNIX
+ships no `objdump`, so annotate off-device against the cross binary.
+
 ### Phase 1 — Geometry as a replayed log (weeks 1-2) — target **-3.0 ms**
 
 The largest single win, and the one already measured: `--timing-oc` alone is
@@ -368,7 +403,7 @@ frontend**, because no headless gate can settle cadence (§3.1). The picture
 and swap counts under `--timing-oc` are already clean, so a regression here
 means the synthesised `GXSTAT` was weakened.
 
-### Phase 2 — The ARM9 at 6.7 ms (weeks 2-4) — target **revised, see §3.2**
+### Phase 2 — The ARM9 row (weeks 2-4) — target **revised, see §3.2 and §3.3**
 
 The biggest row, and the one with the least prior work, because the JIT was
 already audited as close to DraStic (`06` rows 1.1-1.29 are mostly `same`).

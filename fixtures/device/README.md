@@ -1,0 +1,77 @@
+# Device baseline — RG DS Plus, `exact-reference`, 2026-09-20
+
+`baseline.jsonl` is one `DS_PROFILE_LINE` row per scene from the RG DS Plus
+(ROCKNIX 7.0.2, RK3566, four Cortex-A55 at 1.992 GHz), headless,
+`--quantum 0`, 1800 frames with the first 200 dropped. Diff a later phase
+against it with `tools/profile_diff.py`.
+
+Host numbers do not substitute for these: `gx_geom` is ~0.04 ms on an x86
+host and 1.0-1.5 ms here.
+
+## The emulation thread, typical frame (ms)
+
+| | sm64 | dbori | etody | mlbis |
+|---|---|---|---|---|
+| frame median | 11.23 | 12.80 | 5.33 | 13.65 |
+| cpu9 | 3.02 | **7.54** | 0.83 | **6.28** |
+| cpu7 | 1.37 | 0.73 | 0.70 | 1.16 |
+| gx_geom | 1.05 | 1.29 | 0.16 | 1.50 |
+| dma | 0.46 | 0.66 | 0.98 | 0.55 |
+| spu | 0.62 | 0.16 | 0.14 | 0.37 |
+| sched | 0.65 | 0.53 | 0.32 | 0.52 |
+| band workers (overlapped) | 10.16 | 10.17 | 4.25 | 11.23 |
+
+The band workers do as much work as the emulation thread and `r3d_wait` is
+0.0002-0.18 ms, so they remain entirely off the critical path — as the
+2026-09-16 profile found, and the reason Phase 4 is scoped for p99 and
+thermals rather than the median.
+
+## Phase 2's census: where the ARM9 row actually goes
+
+`perf -F 499`, 900 frames, filtered to the emulation thread (the threads are
+named, so `--comms dsperate-headle` isolates it from `r3d-band*` and
+`line-worker`). Shares are of the whole process.
+
+| | dbori | mlbis |
+|---|---|---|
+| emulation thread, total | 90.4 % | 56.1 % |
+| ‣ `[JIT]` translated guest code | 32.7 % | 19.2 % |
+| ‣ ... as a share of the emulation thread | **36 %** | **34 %** |
+| ‣ `Io::cart_catch_up_slow` | **10.3 %** | 3.0 % |
+| ‣ `Io::read32_special` | 5.5 % | 1.6 % |
+| ‣ `Io::read` | 4.8 % | 1.5 % |
+| ‣ `ds_slice_next` | 2.5 % | 1.4 % |
+| ‣ `jit_h_ld32` | 1.8 % | 1.0 % |
+| ‣ `interp::ldm_stm` (JIT fallback) | 1.7 % | 0.5 % |
+
+**Translated guest code is about a third of the emulation thread on both
+scenes.** That is the floor Phase 2 cannot go under without better block
+quality, and it is not addressed by any row the plan had queued.
+
+**The `Io::` read path is the largest identified non-JIT cost**: on dbori
+`cart_catch_up_slow` + `read32_special` + `read` + `cart_schedule_receive` is
+21.5 % of the process, i.e. ~24 % of the emulation thread; on mlbis ~11 %.
+dbori reads `GXSTAT` ~950 times a frame and starts ~413 DMAs a frame, so it
+is the extreme, but mlbis reads `GXSTAT` only 12 k times in 1800 frames and
+`cart_catch_up_slow` is still its hottest non-rendering symbol.
+
+### One hypothesis tested and rejected
+
+`cart_catch_up()` inlines only `transfer_pos < transfer_len`, while
+`cart_catch_up_slow()` opens with `if (event_armed || late) return`. The
+obvious reading is that a title reading ROMCTRL during an armed transfer pays
+an out-of-line call that does nothing, so the guard was hoisted into the
+caller — provably identical semantics, and byte-identical frames on all five
+scenes for 900 frames each.
+
+**It does not pay.** Device, paired, both orders, 2 reps, 1800 frames, swap
+counts unchanged: dbori median +0.69 % and cpu9 +1.06 %, mlbis +0.42 % /
++1.30 %, sm64 −0.10 % / −0.31 %. So the samples are in the function's real
+work — the receive loop and the DMA-armed scan — not in the early return, and
+the extra pair of loads at every call site costs more than it saves. Reverted.
+
+The lesson for the rest of Phase 2: a `perf` share says *where* the time is,
+not *why*. `perf annotate` is what distinguishes them, and it needs
+`objdump` on the device (ROCKNIX has none) or the `perf.data` copied back and
+annotated against the cross binary with `aarch64-linux-gnu-objdump`. Do that
+before writing the next patch.
