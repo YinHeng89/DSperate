@@ -12,6 +12,7 @@
 #include <SDL2/SDL_syswm.h>
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <sys/ioctl.h>
@@ -23,6 +24,14 @@ namespace ds::sdl {
 namespace {
 
 constexpr u32 FMT_XRGB8888 = 0x34325258;   // 'XR24'; the core writes 0xAARRGGBB and we are opaque
+
+// The two layouts we can actually hand over. LINEAR says the buffer is a
+// plain row-major image, which is what the CMA heap gives us; INVALID says
+// "no explicit layout, derive it from the dmabuf", which is the same memory
+// described the other way round. A compositor may accept one and not the
+// other -- see pick_modifier().
+constexpr u64 MOD_LINEAR  = 0;
+constexpr u64 MOD_INVALID = 0x00ffffffffffffffULL;
 
 // The globals are bound once per process and never destroyed: proxies we
 // create can be referenced by events queued for OTHER dispatchers -- the
@@ -40,6 +49,17 @@ struct Globals {
   wl_output* outputs[4] = {};
   int n_outputs = 0;
   bool tried = false;
+
+  // What the compositor said it can import, gathered during the bind
+  // roundtrip. A v3 bind gets modifier events; older ones only get format
+  // events and tell us nothing about layout.
+  bool any_format = false;        // at least one format event arrived
+  bool any_modifier = false;      // at least one modifier event arrived
+  bool xr24 = false;              // XR24 in a format event
+  bool xr24_linear = false;       // XR24 + LINEAR in a modifier event
+  bool xr24_implicit = false;     // XR24 + INVALID in a modifier event
+  u64 mod = MOD_LINEAR;           // what alloc_buf() declares
+  bool usable = false;            // the tier may run at all
 };
 Globals g_;
 
@@ -64,9 +84,67 @@ void on_global(void* data, wl_registry* reg, u32 name, const char* iface, u32 ve
 void on_global_remove(void*, wl_registry*, u32) {}
 const wl_registry_listener reg_listener = { on_global, on_global_remove };
 
+void on_dmabuf_format(void* data, zwp_linux_dmabuf_v1*, u32 format) {
+  Globals* g = static_cast<Globals*>(data);
+  g->any_format = true;
+  if (format == FMT_XRGB8888) g->xr24 = true;
+}
+
+void on_dmabuf_modifier(void* data, zwp_linux_dmabuf_v1*, u32 format, u32 hi, u32 lo) {
+  Globals* g = static_cast<Globals*>(data);
+  g->any_modifier = true;
+  if (format != FMT_XRGB8888) return;
+  g->xr24 = true;
+  const u64 m = (static_cast<u64>(hi) << 32) | lo;
+  if (m == MOD_LINEAR) g->xr24_linear = true;
+  else if (m == MOD_INVALID) g->xr24_implicit = true;
+}
+
+const zwp_linux_dmabuf_v1_listener dmabuf_listener = { on_dmabuf_format, on_dmabuf_modifier };
+
+// Decide what to declare in the add request, or refuse the tier.
+//
+// The compositor's `created` event is NOT proof that it can display the
+// buffer: wlroots validates the params (plane count, stride, size) and
+// answers `created` there and then, but the import into its renderer happens
+// later, at composite time. When that import fails the surface simply
+// contributes nothing and we are never told -- every frame still looks like
+// a clean attach/damage/commit from here. That is a black screen with the
+// emulator running behind it, and it is why this checks the advertised table
+// up front instead of trusting `created`.
+bool pick_modifier(Globals* g) {
+  // The same DS_VERBOSE gate as display.cpp and main.cpp.
+  static const bool verbose = std::getenv("DS_VERBOSE") != nullptr;
+  if (g->any_modifier) {
+    // A v3 table is authoritative: what is not in it will not import.
+    if (g->xr24_linear) {
+      g->mod = MOD_LINEAR;
+      if (verbose) std::fprintf(stderr, "dmabuf: XR24 linear\n");
+      return true;
+    }
+    if (g->xr24_implicit) {
+      g->mod = MOD_INVALID;
+      if (verbose) std::fprintf(stderr, "dmabuf: XR24 implicit layout (compositor offers no linear)\n");
+      return true;
+    }
+    std::fprintf(stderr, "dmabuf: compositor imports no XR24 layout we can produce%s\n",
+                 g->xr24 ? " (XR24 offered, but neither LINEAR nor implicit)" : " (no XR24 at all)");
+    return false;
+  }
+  if (g->any_format && !g->xr24) {
+    std::fprintf(stderr, "dmabuf: compositor does not import XR24\n");
+    return false;
+  }
+  // Pre-v3, or a compositor that advertised nothing: no table to consult, so
+  // declare LINEAR and let create answer, as before.
+  g->mod = MOD_LINEAR;
+  if (verbose) std::fprintf(stderr, "dmabuf: no modifier table; assuming XR24 linear\n");
+  return true;
+}
+
 // Bind the globals on first use; idempotent, failure sticky for the session.
 bool globals_init(wl_display* dpy) {
-  if (g_.tried) return g_.dpy == dpy && g_.dmabuf;
+  if (g_.tried) return g_.dpy == dpy && g_.dmabuf && g_.usable;
   g_.tried = true;
   g_.dpy = dpy;
   g_.q = wl_display_create_queue(dpy);
@@ -77,8 +155,16 @@ bool globals_init(wl_display* dpy) {
   wl_proxy_set_queue(reinterpret_cast<wl_proxy*>(g_.reg), g_.q);
   wl_registry_add_listener(g_.reg, &reg_listener, &g_);
   wl_display_roundtrip_queue(dpy, g_.q);
-  if (!g_.dmabuf) std::fprintf(stderr, "dmabuf: compositor lacks zwp_linux_dmabuf_v1\n");
-  return g_.dmabuf != nullptr;
+  if (!g_.dmabuf) {
+    std::fprintf(stderr, "dmabuf: compositor lacks zwp_linux_dmabuf_v1\n");
+    return false;
+  }
+  // The format/modifier events are sent once on bind, so a second roundtrip
+  // after adding the listener is what collects them.
+  zwp_linux_dmabuf_v1_add_listener(g_.dmabuf, &dmabuf_listener, &g_);
+  wl_display_roundtrip_queue(dpy, g_.q);
+  g_.usable = pick_modifier(&g_);
+  return g_.usable;
 }
 
 } // namespace
@@ -102,7 +188,9 @@ bool DmabufOut::alloc_buf(Buf& b) {
     zwp_linux_buffer_params_v1* p = zwp_linux_dmabuf_v1_create_params(g_.dmabuf);
     Created c;
     zwp_linux_buffer_params_v1_add_listener(p, &params_listener, &c);
-    zwp_linux_buffer_params_v1_add(p, fd, 0, 0, w_ * 4, 0, 0);   // plane 0, LINEAR
+    // plane 0, with the layout pick_modifier() settled at bind time
+    zwp_linux_buffer_params_v1_add(p, fd, 0, 0, w_ * 4,
+                                   static_cast<u32>(g_.mod >> 32), static_cast<u32>(g_.mod));
     zwp_linux_buffer_params_v1_create(p, w_, h_, FMT_XRGB8888, 0);
     while (!c.done && wl_display_roundtrip_queue(dpy_, g_.q) >= 0) {}
     zwp_linux_buffer_params_v1_destroy(p);
