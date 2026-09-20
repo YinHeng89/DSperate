@@ -380,6 +380,7 @@ void Gpu3D::reset() {
   vertex_num_ = vertex_in_poly_ = consecutive_polys_ = 0;
   last_strip_poly_ = nullptr; num_opaque_ = 0;
   bank_ = 0; render_bank_ = 1; raster_bank_ = 1; pending_bank_ = 1; num_vertices_ = num_polygons_ = 0;
+  swaps_ = 0;
   flush_request_ = flush_attr_ = 0; render_identical_ = false; swapped_ = false; swap_wait_ = false; swap_busy_until_ = 0; list_same_ = false;
   renderer_.reset();
 }
@@ -1145,6 +1146,7 @@ void Gpu3D::finalise_list() {
                        [](const Polygon* a, const Polygon* b) { return a->sort_key < b->sort_key; });
     }
     render_count_[bank_] = num_polygons_;
+    ++swaps_;
     // A swap that resubmits the same geometry with the same render state
     // produces the same picture: keep the previous output (the rasteriser
     // still checks its textures itself).

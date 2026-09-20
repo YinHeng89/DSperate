@@ -153,6 +153,10 @@ public:
   // unchanged: the rasteriser may keep its previous output if the textures
   // it used are unchanged too (it checks those itself).
   bool render_identical() const { return render_identical_; }
+  // SWAP_BUFFERS that finalised a list, since reset. Always counted, not
+  // behind prof::enabled: the SDL cadence recorder (DS_CADENCE_LOG) needs it
+  // on an ordinary build, and it is one increment per swap.
+  u64 swap_count() const { return swaps_; }
 
 private:
   NDS& nds_;
@@ -298,6 +302,7 @@ private:
   // starting its bands (the etody --timing-oc segfault, 2026-09-07).
   std::array<std::array<const Polygon*, PRAM_BANK>, BANKS> render_polys_{};
   std::array<u32, BANKS> render_count_{};
+  u64 swaps_ = 0;                  // see swap_count()
   bool render_identical_ = false;
   bool render_stale_ = false;      // note_raster_skipped: the last render is older than rstate_ says
   u32 flush_request_ = 0, flush_attr_ = 0;

@@ -4637,6 +4637,40 @@ sdl_ready:
     pace_ticks += SDL_GetPerformanceCounter() - t3;
     fps_pace_ticks += SDL_GetPerformanceCounter() - t3;
 
+    // DS_CADENCE_LOG=<path>: one line per emulated frame, for the cadence
+    // check Phase 1's exit gate needs.
+    //
+    // This cannot be done headless. The headless harness boots differently
+    // from this frontend and the two disagree about what a game does with its
+    // frames: Dragon Ball Origins runs its intro at 30 Hz headless and 60 Hz
+    // here under the same model (docs/speed-first-rework-scoping.md §3.1). So
+    // a cadence claim about a game as it is played has to be recorded here.
+    //
+    // What a line carries, and why each part: the emulated frame index; the
+    // number of SWAP_BUFFERS that finalised a list during it, which is the
+    // signal itself (a 30 Hz game alternates 1,0,1,0 and a 60 Hz one reads
+    // 1,1,1,1); the polygon count of the list, so a cadence change can be
+    // told from the game simply drawing less; and whether this frontend
+    // presented the frame, so frameskip and fast-forward cannot be mistaken
+    // for the game changing its mind. Wall time is deliberately NOT here --
+    // it varies with the host and would make two recordings incomparable.
+    if (static const char* cad_path = std::getenv("DS_CADENCE_LOG"); cad_path) {
+      static std::FILE* cad = [&] {
+        std::FILE* f = std::fopen(cad_path, "w");
+        if (f) std::fprintf(f, "# frame swaps polygons presented\n");
+        else std::fprintf(stderr, "DS_CADENCE_LOG: cannot write %s\n", cad_path);
+        return f;
+      }();
+      static u64 cad_prev = 0;
+      if (cad) {
+        const u64 now = nds.gpu3d.swap_count();
+        std::fprintf(cad, "%llu %llu %u %d\n", static_cast<unsigned long long>(frames),
+                     static_cast<unsigned long long>(now - cad_prev),
+                     nds.gpu3d.render_polygon_count(), present ? 1 : 0);
+        cad_prev = now;
+        if (frames % 256 == 0) std::fflush(cad);
+      }
+    }
     ++frames;
     // DS_SHOT_AT=N: a screenshot (the hotkey's, into paths.screenshots) after
     // frame N -- for offscreen/replay runs, where no hotkey can fire.
