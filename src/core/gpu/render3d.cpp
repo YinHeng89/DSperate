@@ -1122,6 +1122,21 @@ bool Renderer3D::texture_fields(Shade& sh, const Polygon& p) const {
 void Renderer3D::setup_shade(Shade& sh, const Polygon& p) {
   sh.polyattr = p.attr & 0x3F008000;
   if (!p.facing) sh.polyattr |= (1 << 4);
+  // Edge shaping leaves pixel art alone. A flat, screen-parallel polygon -- every vertex at one w and one depth -- is
+  // a sprite, a logo or a menu plate on a quad; bit 13 (free in the opaque attr) says so to shape_frame. (w alone
+  // would be every polygon of an orthographic scene: NSMB, M&L.)
+  if (shape_) {
+    bool flat = true; for (u32 i = 1; i < p.nverts; ++i) flat &= p.w[i] == p.w[0] && p.z[i] == p.z[0];
+    // Or pixel art on a quad whatever its depth does (M&L slopes a sprite's z with y to sort it by its feet): an
+    // axis-aligned textured rectangle whose texels land one to a pixel. tex is 12.4.
+    bool pix = ((p.texparam >> 26) & 7) != 0 && p.nverts == 4;
+    for (u32 i = 0; pix && i < 4; ++i) {
+      const Vertex& v0 = gx_->vertex(p.vtx[i]); const Vertex& v1 = gx_->vertex(p.vtx[(i + 1) & 3]);
+      const s32 dx = std::abs(v1.sx - v0.sx), dy = std::abs(v1.sy - v0.sy), ds = std::abs(v1.tex[0] - v0.tex[0]), dt = std::abs(v1.tex[1] - v0.tex[1]);
+      pix = (dy == 0 && dt == 0 && ds == 16 * dx) || (dx == 0 && ds == 0 && dt == 16 * dy);
+    }
+    if (flat || pix) sh.polyattr |= (1u << 13);
+  }
   sh.polyattr_z = (p.attr & (1 << 11)) != 0;
   sh.polyalpha = (p.attr >> 16) & 0x1F;
   sh.wireframe = sh.polyalpha == 0;
@@ -2579,6 +2594,171 @@ void Renderer3D::extract_splits(s32 y) {
   any = made != 0;
 }
 
+// ---- edge shaping ----------------------------------------------------------------
+//
+// The picture is the hardware's, anti-aliasing included. On top of it the stair-stepped boundary
+// between two objects is redrawn as a straight line through the stairs' outer corners:
+//
+//   * the boundary between two neighbouring pixels is TAGGED when one is 3D and the other is not,
+//     their polygon ids differ, or the depth jumps (the step dwarfs both surfaces' own gradients);
+//     the nearer side is the FRONT. Judged on the blended picture: where the hardware has already
+//     mixed an edge the contrast is gone and a flickering depth tag draws no teeth.
+//   * tagged boundaries fall into straight runs. A run is a stair tread when the front reaches
+//     further out at exactly one end (and that riser is no longer than the tread); the front then
+//     GROWS into the back cells by the triangle under the line to that outer corner. Grow-only:
+//     notches and flat ends stay. A tall vertical run (3 and up) only takes a 45-degree chamfer,
+//     so an upright front stays upright over whatever sticks out beneath it.
+//   * pixel art stays pixel art: nothing grows from a screen-parallel polygon (setup_shade's
+//     bit 13), nor from a front one pixel thick.
+//   * painted with the colours from before the blend: the front's cell along a shaped run goes back
+//     to its pure colour (our line defines that edge now), so do its blended neighbours of the same
+//     object, and the triangle takes that colour through the scaler (a SPLIT_GROW record borrows the
+//     composed colour of the front's cell).
+//   * an edge-marked outline belongs to its object: no depth tag between it and the interior, it
+//     keeps the hardware's half-blended colour, and where it grows outwards the interior follows it
+//     in by the same triangle -- the band is moved, not fattened.
+//
+// Runs once per frame on whichever thread first reads the frame (shape_sync); the look was settled
+// on offline mocks, edge-mock/outside-in/boundary_outline_mock.py is the specification.
+void Renderer3D::save_shape_line(s32 y) {
+  const u32 row = row_of(y) + 1, o = static_cast<u32>(y) * 256;
+  std::memcpy(shape_dst_.pure + o, &color_[row], 256 * sizeof(u32));
+  std::memcpy(shape_dst_.depth + o, &depth_[row], 256 * sizeof(u32));
+  std::memcpy(shape_dst_.attr + o, &attr_[row], 256 * sizeof(u32));
+}
+
+void Renderer3D::shape_sync(const FrameRef& f) {
+  if (!f.shape || sh_built_[f.shape_idx].load(std::memory_order_acquire) == f.shape_seq) return;
+  std::lock_guard<std::mutex> lk(sh_mx_);
+  if (sh_built_[f.shape_idx].load(std::memory_order_relaxed) == f.shape_seq) return;
+  for (u32 b = 0; b < f.nbins; ++b) if (f.bin_y[b] < f.bin_y[b + 1]) sync_line(f, f.bin_y[b]);   // every band: the pass reads across them
+  { DS_PROF(R3D_FINAL); shape_frame(f.shape_idx); }
+  sh_built_[f.shape_idx].store(f.shape_seq, std::memory_order_release);
+}
+
+void Renderer3D::shape_frame(u32 idx) {
+  constexpr s32 W = 256, H = 192, kMaxRun = 24;
+  const u32* const pure = sh_pure_[idx].data();
+  const u32* const depth = sh_depth_[idx].data();
+  const u32* const attr = sh_attr_[idx].data();
+  u32* const out = out_[idx].data();
+  u32* const sp = split_[idx].data();
+  u8* const any = split_any_[idx].data();
+  s8* const hb = sh_hb_.data(); s8* const vb = sh_vb_.data(); u8* const rep = sh_rep_.data();
+  for (s32 y = 0; y < H; ++y) if (any[y]) { std::memset(sp + y * 512, 0, 512 * sizeof(u32)); any[y] = 0; }
+  std::memset(hb, 0, W * H); std::memset(vb, 0, W * H); std::memset(rep, 0, W * H);
+
+  auto is3d = [&](s32 i) { return ((pure[i] >> 24) & 0x1F) == 31 && depth[i] < 0xFFFFFFu; };
+  auto ident = [&](s32 i) -> s32 { return is3d(i) ? static_cast<s32>((attr[i] >> 24) & 0x3F) : -1; };
+  auto marked = [&](s32 i) { return (attr[i] & 0x80u) != 0; };
+  auto cdist = [](u32 a, u32 b) { auto d = [](u32 x, u32 y) { return x > y ? x - y : y - x; };
+    return d(a & 0x3F, b & 0x3F) + d((a >> 8) & 0x3F, (b >> 8) & 0x3F) + d((a >> 16) & 0x3F, (b >> 16) & 0x3F); };
+  auto zdist = [&](s32 a, s32 b) { const s64 d = static_cast<s64>(depth[a]) - static_cast<s64>(depth[b]); return d < 0 ? -d : d; };
+  // The surface's own depth step at `o`, away from the boundary (step = -1 / +1 / -W / +W as an index offset).
+  auto grad = [&](s32 o, s32 x, s32 y, s32 sx, s32 sy) -> s64 {
+    const s32 nx = x + sx, ny = y + sy;
+    if (nx < 0 || nx >= W || ny < 0 || ny >= H) return 0;
+    const s32 n = ny * W + nx;
+    return ident(n) == ident(o) ? zdist(n, o) : 0;
+  };
+  // +1: p is the front of a tagged boundary, -1: q = p + (dx, dy) is, 0: no boundary.
+  auto front_of = [&](s32 x, s32 y, s32 dx, s32 dy) -> s8 {
+    const s32 p = y * W + x, q = (y + dy) * W + x + dx;
+    const s32 ip = ident(p), iq = ident(q);
+    if (ip < 0 && iq < 0) return 0;
+    s8 r = 0;
+    if (ip < 0 || iq < 0) r = iq < 0 ? 1 : -1;
+    else {
+      if (cdist(out[p], out[q]) < 6) return 0;                       // nothing to see (the 2D side is the scaler's to judge)
+      if (ip != iq) r = depth[p] <= depth[q] ? 1 : -1;
+      else if (marked(p) || marked(q)) return 0;                     // the outline belongs to its object
+      else {
+        const s64 dz = zdist(p, q), floor_ = std::min(depth[p], depth[q]) >> 9;
+        if (dz <= floor_) return 0;
+        if (dz > 3 * std::max(grad(p, x, y, -dx, -dy), grad(q, x + dx, y + dy, dx, dy)) + floor_) r = depth[p] < depth[q] ? 1 : -1;
+      }
+    }
+    if (r && (attr[r > 0 ? p : q] & (1u << 13))) return 0;           // pixel art on a quad keeps its pixels
+    return r;
+  };
+  for (s32 y = 0; y < H; ++y)
+    for (s32 x = 0; x < W; ++x) {
+      if (y + 1 < H) hb[y * W + x] = front_of(x, y, 0, 1);
+      if (x + 1 < W) vb[y * W + x] = front_of(x, y, 1, 0);
+    }
+
+  u32 made = 0;
+  auto put = [&](s32 cell, u32 side, s32 unc, s32 slope, s32 src) {
+    u32* const slot = sp + cell * 2;
+    const u32 v = side | (static_cast<u32>(unc) << 3) | (static_cast<u32>(slope & 0x7F) << 9) | (static_cast<u32>(src & 7) << 16) | SPLIT_GROW;
+    if (!slot[0]) slot[0] = v; else if (!slot[1]) slot[1] = v; else return;
+    any[cell / W] = 1; ++made;
+  };
+  // horizontal = true: runs along x of the boundaries below a row (hb); false: runs along y of those right of a column.
+  auto process = [&](bool horiz) {
+    const s32 nl = horiz ? H : W, np = horiz ? W : H;
+    auto B = [&](s32 l, s32 p) -> s8 { return horiz ? hb[l * W + p] : vb[p * W + l]; };
+    auto O = [&](s32 l, s32 p) -> s8 { return horiz ? vb[l * W + p] : hb[p * W + l]; };
+    auto cell = [&](s32 l, s32 p) -> s32 { return horiz ? l * W + p : p * W + l; };
+    for (s32 line = 0; line + 1 < nl; ++line) {
+      s32 p = 0;
+      while (p < np) {
+        const s8 s = B(line, p);
+        if (!s) { ++p; continue; }
+        const s32 a = p;
+        while (p < np && B(line, p) == s) ++p;
+        const s32 b = p, L = b - a;
+        if (L > kMaxRun) continue;
+        const s32 dir = s > 0 ? 1 : -1;
+        const s32 back = s > 0 ? line + 1 : line, frontl = s > 0 ? line : line + 1, f2 = frontl - dir;
+        auto riser = [&](s32 pos, s8 sign) { s32 n = 1; for (s32 k = back + dir; k >= 0 && k < nl && O(k, pos) == sign && n < kMaxRun; k += dir) ++n; return n; };
+        const s32 ra = (a > 0 && O(back, a - 1) == 1) ? riser(a - 1, 1) : 0;
+        const s32 rb = (b < np && O(back, b - 1) == -1) ? riser(b - 1, -1) : 0;
+        if ((ra != 0) == (rb != 0)) continue;                         // flat at both ends, or a notch
+        const s32 r = ra ? ra : rb;
+        if (r > L) continue;                                          // the riser is the long direction: its own run does this corner
+        s32 span = L;
+        if (!horiz && L >= 3) span = std::min(L, L == 3 ? 2 * r : r); // an upright front stays upright
+        const u32 side = horiz ? (s > 0 ? SPLIT_UP : SPLIT_DOWN) : (s > 0 ? SPLIT_LEFT : SPLIT_RIGHT);
+        for (s32 i = a; i < b; ++i) {
+          const s32 fc = cell(frontl, i), bc = cell(back, i);
+          const bool f3d = is3d(fc), fmark = marked(fc);
+          if (f3d && !fmark) { out[fc] = pure[fc]; rep[fc] = 1; }     // the front's own cell: our line is its edge now
+          if (f2 >= 0 && f2 < nl && B(std::min(frontl, f2), i) != 0) continue;   // a front one pixel thick is not fattened
+          const float t0 = static_cast<float>(i - a), t1 = t0 + 1.0f;
+          float o0 = rb ? (t0 - static_cast<float>(L - span)) / static_cast<float>(span) : 1.0f - t0 / static_cast<float>(span);
+          float o1 = rb ? (t1 - static_cast<float>(L - span)) / static_cast<float>(span) : 1.0f - t1 / static_cast<float>(span);
+          o0 = std::max(0.0f, std::min(1.0f, o0)); o1 = std::max(0.0f, std::min(1.0f, o1));
+          if (o0 <= 0.0f && o1 <= 0.0f) continue;
+          const s32 unc = std::max(1, std::min(32, static_cast<s32>(16.0f * (o0 + o1) + 0.5f)));
+          s32 slope = static_cast<s32>(32.0f * (o1 - o0)); if (s < 0) slope = -slope;
+          put(bc, side, unc, slope, -dir);
+          // An outline is moved, not fattened: the interior follows it into the outline's cell.
+          if (fmark && f2 >= 0 && f2 < nl) { const s32 ic = cell(f2, i); if (ident(ic) == ident(fc) && !marked(ic)) put(fc, side, unc, slope, -dir); }
+        }
+      }
+    }
+  };
+  process(true); process(false);
+
+  // The pure repaint reaches the front's blended neighbours of the same object (the mixed pixels at corners and run ends).
+  for (s32 y = 0; y < H; ++y)
+    for (s32 x = 0; x < W; ++x) {
+      const s32 c = y * W + x;
+      if (rep[c] != 1) continue;
+      for (s32 dy = -1; dy <= 1; ++dy)
+        for (s32 dx = -1; dx <= 1; ++dx) {
+          const s32 nx = x + dx, ny = y + dy;
+          if (nx < 0 || nx >= W || ny < 0 || ny >= H) continue;
+          const s32 n = ny * W + nx;
+          if (rep[n] || ident(n) != ident(c) || marked(n) || !same_surface(static_cast<s32>(depth[n]), static_cast<s32>(depth[c]))) continue;
+          if (cdist(pure[n], out[n]) < 2 || sp[n * 2] || sp[n * 2 + 1]) continue;
+          out[n] = pure[n]; rep[n] = 2;
+        }
+    }
+  (void)made;
+}
+
 // The scalar passes: the specification the NEON final_pass is checked against
 // (selftest_final_pass), and the whole of final_pass on non-NEON builds.
 void Renderer3D::final_pass_ref(s32 y) {
@@ -2591,7 +2771,7 @@ void Renderer3D::final_pass_ref(s32 y) {
     const bool clear_fog = (rs_->dispcnt & (1 << 14)) || (rs_->clear_attr1 & 0x8000);
     work = (dispcnt & (1 << 7)) && clear_fog;
   }
-  if (!work) { std::memcpy(&out_dst_[y * 256], &color_[row_of(y) + 1], 256 * sizeof(u32)); if (subpix_ && split_any_dst_[y]) { std::memset(&split_dst_[y * 512], 0, 512 * sizeof(u32)); split_any_dst_[y] = 0; } return; }
+  if (!work) { if (shape_) save_shape_line(y); std::memcpy(&out_dst_[y * 256], &color_[row_of(y) + 1], 256 * sizeof(u32)); if (subpix_ && split_any_dst_[y]) { std::memset(&split_dst_[y * 512], 0, 512 * sizeof(u32)); split_any_dst_[y] = 0; } return; }
   if (dispcnt & (1 << 5)) {
     // Edge marking on the topmost pixels, against the four neighbours.
     const u32 up = row_of(y - 1) + 1, dn = row_of(y + 1) + 1;
@@ -2605,7 +2785,7 @@ void Renderer3D::final_pass_ref(s32 y) {
           (id != (attr_[up + x] >> 24) && z < depth_[up + x]) || (id != (attr_[dn + x] >> 24) && z < depth_[dn + x])) {
         u32 r, g, b; rgb15_to_666(rs_->edge[id >> 3], r, g, b);
         color_[addr] = r | (g << 8) | (b << 16) | (color_[addr] & 0xFF000000);
-        attr_[addr] = subpix_ ? attr | 0x80u : (attr & 0xFFFFE0FF) | 0x00001000;    // coverage broken for the AA pass; sub-pixel mode, which runs without that pass, tags the pixel instead (bit 7: extract_splits)
+        attr_[addr] = subpix_ ? attr | 0x80u : (attr & 0xFFFFE0FF) | 0x00001000 | (shape_ ? 0x80u : 0u);    // coverage broken for the AA pass; sub-pixel mode, which runs without that pass, tags the pixel instead (bit 7: extract_splits)
       }
     }
   }
@@ -2636,6 +2816,7 @@ void Renderer3D::final_pass_ref(s32 y) {
       if (attr_[addr] & (1 << 15)) apply(addr);
     }
   }
+  if (shape_) save_shape_line(y);   // the top layer as marking and fog leave it, before the blend
   if (game_aa_) {
     // Anti-aliasing: blend edge pixels with the pixel underneath by coverage.
     for (int x = 0; x < 256; ++x) {
@@ -2673,7 +2854,7 @@ void Renderer3D::final_pass(s32 y) {
     const bool clear_fog = (rs_->dispcnt & (1 << 14)) || (rs_->clear_attr1 & 0x8000);
     work = (dispcnt & (1 << 7)) && clear_fog;
   }
-  if (!work) { std::memcpy(&out_dst_[y * 256], &color_[row_of(y) + 1], 256 * sizeof(u32)); if (subpix_ && split_any_dst_[y]) { std::memset(&split_dst_[y * 512], 0, 512 * sizeof(u32)); split_any_dst_[y] = 0; } return; }
+  if (!work) { if (shape_) save_shape_line(y); std::memcpy(&out_dst_[y * 256], &color_[row_of(y) + 1], 256 * sizeof(u32)); if (subpix_ && split_any_dst_[y]) { std::memset(&split_dst_[y * 512], 0, 512 * sizeof(u32)); split_any_dst_[y] = 0; } return; }
   // The three passes as 16-pixel byte-plane kernels: a record's four bytes
   // (r g b a, and edge-flags / coverage+fog / translucent id / opaque id for
   // an attribute) are deinterleaved by one ld4 into planes, the maths is done
@@ -2723,7 +2904,10 @@ void Renderer3D::final_pass(s32 y) {
       vst4q_u8(cb + addr * 4, c);
       // attr = (attr & 0xFFFFE0FF) | 0x1000: byte 1 keeps bits 5-7, coverage 0x10.
       if (subpix_) at.val[0] = vorrq_u8(at.val[0], vandq_u8(mark, vdupq_n_u8(0x80)));   // sub-pixel mode tags the pixel instead: see final_pass_ref
-      else at.val[1] = vbslq_u8(mark, vorrq_u8(vandq_u8(at.val[1], vdupq_n_u8(0xE0)), vdupq_n_u8(0x10)), at.val[1]);
+      else {
+        at.val[1] = vbslq_u8(mark, vorrq_u8(vandq_u8(at.val[1], vdupq_n_u8(0xE0)), vdupq_n_u8(0x10)), at.val[1]);
+        if (shape_) at.val[0] = vorrq_u8(at.val[0], vandq_u8(mark, vdupq_n_u8(0x80)));   // edge shaping wants to know the outline too
+      }
       vst4q_u8(ab + addr * 4, at);
     }
   }
@@ -2803,6 +2987,7 @@ void Renderer3D::final_pass(s32 y) {
       if (compat::maxv_u8(ufog)) apply16(under, ufog);
     }
   }
+  if (shape_) save_shape_line(y);   // the top layer as marking and fog leave it, before the blend
   if (game_aa_) {
     // Anti-aliasing: blend edge pixels with the pixel underneath by coverage.
     // Coverage 31 keeps the top pixel, 0 takes the one underneath whole;
@@ -3004,7 +3189,7 @@ void Renderer3D::render(const Gpu3D& gx) {
   // (a memcmp per texture, once) settles that, and when nothing had to be
   // re-decoded the previous colour buffer is kept; games that run their 3D
   // at 30 fps then cost half.
-  if (gx.render_identical() && texcache_.enabled() && rendered_once_ && aa_ == aa_rendered_ && subpix_ == subpix_rendered_) {
+  if (gx.render_identical() && texcache_.enabled() && rendered_once_ && aa_ == aa_rendered_ && subpix_ == subpix_rendered_ && shape_ == shape_rendered_) {
     for (u32 i = 0; i < gx.render_polygon_count(); ++i) {
       const Polygon& p = *polys[i];
       const u32 fmt = (p.texparam >> 26) & 7;
@@ -3015,7 +3200,7 @@ void Renderer3D::render(const Gpu3D& gx) {
     if (texcache_.decodes_this_frame() == 0) { prof::add(prof::C_R3D_FRAMES_KEPT, 1); return; }
   }
   rendered_once_ = true;
-  aa_rendered_ = aa_; subpix_rendered_ = subpix_;
+  aa_rendered_ = aa_; subpix_rendered_ = subpix_; shape_rendered_ = shape_;
   // What the emulation thread does itself is only what it must: resolve the
   // (non-thread-safe) texture cache to plain pointers, in list order, and
   // count the polygons that draw. Edge setup -- the per-polygon slopes,
@@ -3058,7 +3243,8 @@ void Renderer3D::render(const Gpu3D& gx) {
   u32* const dst = out_[display_ ^ 1].data();
   u32* const sdst = split_[display_ ^ 1].data();
   u8* const adst = split_any_[display_ ^ 1].data();
-  if (maxb == 0) { pending_bands_ = 0; wait_ns_.store(0, std::memory_order_relaxed); build_edges(); split_dst_ = sdst; split_any_dst_ = adst; render_band(0, 192, dst); display_ ^= 1; return; }
+  ShapeDst shd; if (shape_) { const u32 i = display_ ^ 1; shd = {sh_pure_[i].data(), sh_depth_[i].data(), sh_attr_[i].data()}; ++sh_seq_[i]; }
+  if (maxb == 0) { pending_bands_ = 0; wait_ns_.store(0, std::memory_order_relaxed); build_edges(); split_dst_ = sdst; split_any_dst_ = adst; shape_dst_ = shd; render_band(0, 192, dst); display_ ^= 1; return; }
 
   // The pool is always the maximum size and only `nb` of it is given work, so
   // ramping the thread count costs a dispatch flag rather than creating and
@@ -3066,7 +3252,7 @@ void Renderer3D::render(const Gpu3D& gx) {
   if (bands_.size() < maxb - 1) {
     while (bands_.size() < maxb - 1) bands_.push_back(std::make_unique<Renderer3D>(nds_));
   }
-  for (auto& b : bands_) { b->aa_ = aa_; b->subpix_ = subpix_; }   // the setting can change between frames
+  for (auto& b : bands_) { b->aa_ = aa_; b->subpix_ = subpix_; b->shape_ = shape_; }   // the setting can change between frames
   // Never replaced once it is big enough: the compositor thread may be
   // waiting on it for the previous frame's bands (sync_line). So it is made
   // once, for the most workers any frame gets by default -- three, whatever
@@ -3092,7 +3278,7 @@ void Renderer3D::render(const Gpu3D& gx) {
   // Each worker takes bins until they run out, rather than owning one band,
   // so an uneven split costs the frame nothing: whoever is free next picks up
   // the next strip of the frame.
-  job_fn_ = [this, &gxr, dst, sdst, adst](u32 w) {
+  job_fn_ = [this, &gxr, dst, sdst, adst, shd](u32 w) {
     const auto t0 = std::chrono::steady_clock::now();
     Renderer3D* r = this;
     if (w != 0) { r = bands_[w - 1].get(); r->prepare_worker(gxr, list_polys_, list_count_, &poly_texels_, &rs_frame_); }
@@ -3101,7 +3287,7 @@ void Renderer3D::render(const Gpu3D& gx) {
       const u32 b = pool_->claim();
       if (b >= nbins_) break;
       const s32 y0 = bin_y_[b], y1 = bin_y_[b + 1];
-      if (y0 < y1) { r->split_dst_ = sdst; r->split_any_dst_ = adst; r->render_band(y0, y1, dst); }
+      if (y0 < y1) { r->split_dst_ = sdst; r->split_any_dst_ = adst; r->shape_dst_ = shd; r->render_band(y0, y1, dst); }
       pool_->mark_done(b);
     }
     // Per worker now, not per bin: what a thread spent on the frame. Each
@@ -3117,7 +3303,7 @@ void Renderer3D::render(const Gpu3D& gx) {
     // generation two back is still reading it.
     DispatchCtx& c = ctx_[(gen_ + 1) & 1];
     c.gx = &gx; c.polys = list_polys_; c.npoly = list_count_; c.texels = poly_texels_; c.rs = rs_frame_;
-    c.bin_y = bin_y_; c.nbins = nbins_; c.dst = dst; c.split = sdst; c.split_any = adst; c.aa = aa_; c.subpix = subpix_;
+    c.bin_y = bin_y_; c.nbins = nbins_; c.dst = dst; c.split = sdst; c.split_any = adst; c.shape_dst = shd; c.aa = aa_; c.subpix = subpix_; c.shape = shape_;
   }
   gen_ = pool_->dispatch(job_fn_, nb, nbins_);
   display_ ^= 1;
@@ -3290,7 +3476,8 @@ void Renderer3D::debug_dump(FILE* f) {
 Renderer3D::FrameRef Renderer3D::frame_ref() const {
   FrameRef f;
   f.out = out_[display_].data();
-  f.split = subpix_rendered_ ? split_[display_].data() : nullptr;
+  f.split = (subpix_rendered_ || shape_rendered_) ? split_[display_].data() : nullptr;
+  f.shape = shape_rendered_; f.shape_idx = display_; f.shape_seq = sh_seq_[display_];
   f.split_any = split_any_[display_].data();
   f.gen = gen_;
   f.nbins = pending_bands_;
@@ -3370,12 +3557,12 @@ bool Renderer3D::steal_bins(u64 gen, u32 upto) {
     if (c >= cx.nbins) { result = pool_->done(gen, mask); break; }
     if (sb->gen != gen) {
       if (!sb->band) sb->band = std::make_unique<Renderer3D>(nds_);
-      sb->band->aa_ = cx.aa; sb->band->subpix_ = cx.subpix;
+      sb->band->aa_ = cx.aa; sb->band->subpix_ = cx.subpix; sb->band->shape_ = cx.shape;
       sb->band->prepare_worker(*cx.gx, cx.polys, cx.npoly, &cx.texels, &cx.rs);
       sb->gen = gen;
     }
     const s32 y0 = cx.bin_y[c], y1 = cx.bin_y[c + 1];
-    if (y0 < y1) { sb->band->split_dst_ = cx.split; sb->band->split_any_dst_ = cx.split_any; sb->band->render_band(y0, y1, cx.dst); }
+    if (y0 < y1) { sb->band->split_dst_ = cx.split; sb->band->split_any_dst_ = cx.split_any; sb->band->shape_dst_ = cx.shape_dst; sb->band->render_band(y0, y1, cx.dst); }
     pool_->thief_done(c);
     prof::add(prof::C_R3D_STOLEN, 1);
   }

@@ -614,7 +614,7 @@ void Gpu::worker_job(void* self) {
   for (u32 i = 0; i < g.bscale_n_; ++i) {
     const StashedLine& st = g.bscale_[i];
     g.emit_scaled(st.screen, st.line, st.px);
-    if (g.subpixel_) g.emit_splits_b(st.screen, st.line, st.px, st.key);
+    if (g.splits_on()) g.emit_splits_b(st.screen, st.line, st.px, st.key);
   }
 }
 
@@ -751,7 +751,7 @@ void Gpu::step_engine(int e, u32 line) {
   // Reading the 3D line joins the raster bands, so a skipped frame (whose
   // raster never ran) must not ask for it; capture, which also reads it, is
   // never on for a skipped frame.
-  if (e == 0 && (draw || capture_render_)) { prof::Scope l3(prof::R3D_LINE); line3d_ = nds_.gpu3d.line(ref3d_, line); en.set_3d_line(line3d_); split3d_ = subpixel_ ? nds_.gpu3d.split_line(ref3d_, line) : nullptr; }
+  if (e == 0 && (draw || capture_render_)) { prof::Scope l3(prof::R3D_LINE); line3d_ = nds_.gpu3d.line(ref3d_, line); en.set_3d_line(line3d_); split3d_ = splits_on() ? nds_.gpu3d.split_line(ref3d_, line) : nullptr; }
   if (draw) { en.render_line(line); output_engine(e, line); }
   // A skipped frame has nothing to capture: its destination bank keeps the
   // picture it last captured, and display_phase_period() is what stops an
@@ -814,11 +814,11 @@ void Gpu::output_engine(int e, u32 line) {
     if (e == 1 && bscale_defer_ && bscale_n_ < SCREEN_H) {
       StashedLine& st = bscale_[bscale_n_++];
       st.line = line; st.screen = screen;
-      st.key = subpixel_ && screens_on_ && ((en.dispcnt() >> 16) & 1) && sp_last_store_ + kSplitGens > nds_.frame_count ? line_key(en.output()) : 0;
+      st.key = splits_on() && screens_on_ && ((en.dispcnt() >> 16) & 1) && sp_last_store_ + kSplitGens > nds_.frame_count ? line_key(en.output()) : 0;
       std::memcpy(st.px, dst, sizeof st.px);
     } else {
       emit_scaled(screen, line, dst);
-      if (subpixel_) {
+      if (splits_on()) {
         // Engine A's composed line carries the 3D splits when it is shown (normal display) or
         // captured; any other shown line may be a remembered one (see carry_store).
         const u32 mode = e == 0 ? (en.dispcnt() >> 16) & 3 : ((en.dispcnt() >> 16) & 1);
@@ -847,6 +847,20 @@ static inline u32* row_at(const Gpu::ScaleTarget& t, u32 y) { return t.px + (sta
 // colour of the neighbour on that side (what is really there -- another
 // polygon, the 2D layer behind a transparent clear). Write-only: colours come
 // from the source lines, never from the target.
+void Gpu::set_shape(bool on) {
+  if (on && sp_gen_.empty()) sp_gen_.resize(kSplitGens);
+  shape_ = on;
+  update_shape();
+  for (int s = 0; s < 2; ++s) { sp_pend_n_[s] = 0; sp_pend_line_[s] = sp_prev_line_[s] = ~0u; }
+}
+
+void Gpu::update_shape() {
+  const bool live = shape_ && shape_usable();
+  if (live == shape_live_) return;
+  shape_live_ = live;
+  nds_.gpu3d.renderer().set_shape(live);
+}
+
 void Gpu::set_subpixel(bool on) {
   if (on && sp_gen_.empty()) sp_gen_.resize(kSplitGens);
   subpixel_ = on;
@@ -943,6 +957,9 @@ void Gpu::emit_splits_b(int screen, u32 line, const u32* dst, u64 key) {
 void Gpu::emit_splits(int screen, u32 line, const u32* dst, const Pixel* composed, bool shown, u64 key) {
   const ScaleTarget& t = scale_[screen];
   const bool usable = !t.bilinear && !t.chunky && t.h >= SCREEN_H && t.xrun[SCREEN_W] >= SCREEN_W;
+  const u32* const l3_now = composed ? line3d_ : nullptr;
+  // The 3D layer is what shows at x, unblended (a record's colour source must be).
+  auto own3d = [&](u32 x) { return !composed || !l3_now || (x < SCREEN_W && !((composed[x] ^ l3_now[x]) & 0x3F3F3F) && ((l3_now[x] >> 24) & 0x1F) == 31); };
   // Cuts of the line above that were waiting for this one.
   if (sp_pend_n_[screen]) {
     if (usable && sp_pend_line_[screen] + 1 == line)
@@ -951,6 +968,7 @@ void Gpu::emit_splits(int screen, u32 line, const u32* dst, const Pixel* compose
         // An outline's band reaching down into this line (see the marked case below): this
         // line's cell, its upper part, the outline's colour from the line above.
         if (r.side & 0x10) { patch_cell(t, line, r, sp_prev_[screen][r.x]); continue; }
+        if ((r.side & 0x08) && !own3d(r.x)) continue;   // a grown triangle takes this line's pixel: it must be the front's own
         // The cell's own line is sp_prev_ by now, the line it takes from is this one.
         if (split_admit(r, sp_prev_[screen], dst, r.x, true)) patch_cell(t, line - 1, r, dst[r.x]);
       }
@@ -968,10 +986,18 @@ void Gpu::emit_splits(int screen, u32 line, const u32* dst, const Pixel* compose
       // The 3D layer must be what shows, unblended, at the polygon's pixel: the cell itself,
       // or for a spill the pixel the colour comes from.
       const s32 src = static_cast<s32>(static_cast<s8>(((v >> 16) & 7) << 5) >> 5);
+      const bool grow = v & Renderer3D::SPLIT_GROW;
+      if (grow) {
+        // Edge shaping: the cell is the BACK's (it may be 2D); what must be the 3D layer's is the front's cell the
+        // colour comes from -- beside it, on the line above (remembered), or on the next line (asked when it comes).
+        const u32 s3 = v & 7;
+        if (s3 <= 2 ? !own3d(x + static_cast<u32>(src)) : (s3 == 3 && !(sp_prev_line_[screen] + 1 == line && sp_prev_own_[screen][x]))) continue;
+      } else {
       const u32 px = (v & Renderer3D::SPLIT_SPILL) ? x + static_cast<u32>(src) : x;
       if (px >= SCREEN_W || ((composed[px] ^ l3[px]) & 0x3F3F3F) || ((l3[px] >> 24) & 0x1F) != 31) continue;
+      }
       const bool marked = v & Renderer3D::SPLIT_MARKED;
-      const u8 side = static_cast<u8>((v & 7) | ((v & Renderer3D::SPLIT_WEAK) ? 0x80 : 0) | ((v & Renderer3D::SPLIT_SPILL) ? 0x40 : 0) | (marked ? 0x20 : 0));
+      const u8 side = static_cast<u8>((v & 7) | ((v & Renderer3D::SPLIT_WEAK) ? 0x80 : 0) | ((v & Renderer3D::SPLIT_SPILL) ? 0x40 : 0) | (marked ? 0x20 : 0) | (grow ? 0x08 : 0));
       own[n++] = SplitRec{static_cast<u8>(x), side, static_cast<u8>(marked ? (v >> 19) & 0x7F : (v >> 3) & 0x3F), static_cast<s8>(static_cast<s8>(((v >> 9) & 0x7F) << 1) >> 1), static_cast<s8>(src)};
     }
     // A plain capture of this picture: remember the line as the bank will hold it.
@@ -1042,6 +1068,7 @@ void Gpu::emit_splits(int screen, u32 line, const u32* dst, const Pixel* compose
     sp_pend_line_[screen] = line;
   }
   std::memcpy(sp_prev_[screen], dst, sizeof sp_prev_[screen]);
+  if (shape_) for (u32 x = 0; x < SCREEN_W; ++x) sp_prev_own_[screen][x] = own3d(x);
   sp_prev_line_[screen] = line;
 }
 

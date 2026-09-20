@@ -8,6 +8,7 @@
 
 #include <array>
 #include <atomic>
+#include <mutex>
 #include <thread>
 #include <memory>
 #include <vector>
@@ -84,7 +85,13 @@ public:
   // edge marking on, so with both off the 3D picture is NOT the hardware's while this is on.
   void set_subpixel(bool on) { if (on) for (auto& v : split_) if (v.empty()) v.assign(512 * 192, 0); subpix_ = on; }
   bool subpixel() const { return subpix_; }
-  enum : u32 { SPLIT_NONE = 0, SPLIT_LEFT = 1, SPLIT_RIGHT = 2, SPLIT_UP = 3, SPLIT_DOWN = 4, SPLIT_MARKED = 1u << 29, SPLIT_SPILL = 1u << 30, SPLIT_WEAK = 1u << 31 };   // see extract_splits
+  // Edge shaping: on top of the hardware picture (anti-aliasing as the game has it), the stair-stepped boundary
+  // between objects is redrawn as straight lines through the stairs' outer corners (shape_frame). The raster keeps
+  // three full-frame planes for it -- attributes, depth and the colour before the AA blend -- and the pass writes its
+  // triangles into the split map as SPLIT_GROW records, which the scaler patches as it does the sub-pixel mode's.
+  void set_shape(bool on) { if (on) { for (auto& v : split_) if (v.empty()) v.assign(512 * 192, 0); for (int i = 0; i < 2; ++i) { sh_pure_[i].resize(256 * 192); sh_depth_[i].resize(256 * 192); sh_attr_[i].resize(256 * 192); } sh_hb_.resize(256 * 192); sh_vb_.resize(256 * 192); sh_rep_.resize(256 * 192); } shape_ = on; }
+  bool shape() const { return shape_; }
+  enum : u32 { SPLIT_NONE = 0, SPLIT_LEFT = 1, SPLIT_RIGHT = 2, SPLIT_UP = 3, SPLIT_DOWN = 4, SPLIT_GROW = 1u << 28, SPLIT_MARKED = 1u << 29, SPLIT_SPILL = 1u << 30, SPLIT_WEAK = 1u << 31 };   // see extract_splits
   bool aa() const { return aa_; }
 
 private:
@@ -129,6 +136,11 @@ private:
   // what lets the compositor of frame N run on past line 215 of frame N.
   std::array<u32, 256 * 192> out_[2]{};
   std::array<u8, 192> split_any_[2]{};      // per line: it has records (extract_splits), so the scaler can skip the rest
+  std::vector<u32> sh_pure_[2], sh_depth_[2], sh_attr_[2];   // edge shaping: the frame's top layer before the AA blend (set_shape)
+  std::vector<s8> sh_hb_, sh_vb_; std::vector<u8> sh_rep_;   // shape_frame's scratch: tagged boundaries below / right of a pixel, repainted cells
+  u32 sh_seq_[2]{};                                          // bumped when a frame is dispatched into out_[i]
+  std::atomic<u32> sh_built_[2]{};                           // the sh_seq_ whose shape pass has run
+  std::mutex sh_mx_;
   std::vector<u32> split_[2];               // split map of out_[i], two slots a pixel (extract_splits); allocated by set_subpixel   // split map of out_[i]; only written in sub-pixel mode
   u32 display_ = 0;
   std::array<u8, 256 * RING> stencil_{};   // one row per ring line: see render_chunk
@@ -279,6 +291,7 @@ private:
   const Gpu3D* gx_ = nullptr;
   const RenderState* rs_ = nullptr;
   bool subpix_ = false, subpix_rendered_ = false;
+  bool shape_ = false, shape_rendered_ = false;
   bool game_aa_ = false;                  // the AA blend runs (the game asked and aa_ allows): dispcnt_ bit 4 alone no longer says so
   bool aa_ = true, aa_rendered_ = true;   // aa_rendered_: the setting the kept frame was drawn with
   // DISP3DCNT as the raster sees it this frame: rs_->dispcnt with bit 4
@@ -532,6 +545,7 @@ public:
     const u32* split_line(u32 y) const { return split && split_any[y] ? split + y * 512 : nullptr; }   // null: no records on this line
     u64 gen = 0;
     u32 nbins = 0;
+    bool shape = false; u32 shape_idx = 0, shape_seq = 0;   // edge shaping: which buffer, and which dispatch into it (shape_sync)
     std::array<s32, MAX_BINS + 1> bin_y{};
     const u32* line(u32 y) const { return out + y * 256; }
   };
@@ -556,6 +570,12 @@ private:
   u32  edge_count_ = 0;
   u32* out_dst_ = nullptr;                              // where final_pass writes
   u32* split_dst_ = nullptr;
+  struct ShapeDst { u32* pure = nullptr; u32* depth = nullptr; u32* attr = nullptr; } shape_dst_;   // this frame's planes (edge shaping)
+  void save_shape_line(s32 y);
+  void shape_frame(u32 idx);
+public:
+  void shape_sync(const FrameRef& f);   // before the first line of a shaped frame is read: wait for its bands, run the pass once
+private:
   u8* split_any_dst_ = nullptr;
   std::array<u8, RING> erow_{};                           // ring rows that had an edge noted since their clear                            // and extract_splits
   void extract_splits(s32 y);
@@ -609,7 +629,8 @@ private:
     u32* dst = nullptr;
     u32* split = nullptr;
     u8* split_any = nullptr;
-    bool aa = false, subpix = false;
+    ShapeDst shape_dst;
+    bool aa = false, subpix = false, shape = false;
   };
   DispatchCtx ctx_[2];
   struct StealBand { std::unique_ptr<Renderer3D> band; std::atomic<bool> busy{false}; u64 gen = ~u64{0}; };

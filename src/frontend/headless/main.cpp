@@ -251,7 +251,7 @@ void entry_snap_cb(ds::CpuContext& cpu, ds::u32, void* user) {
 
 int main(int argc, char** argv) {
   ds::mem::fmc::init();   // before any Bus exists: the census counts page-table churn from reset on
-  bool subpixel = false; int scaled_n = 0; const char* scaled_path = nullptr;
+  bool subpixel = false, shape = false; int scaled_n = 0; const char* scaled_path = nullptr;
   const char *rom = nullptr, *bios9 = nullptr, *bios7 = nullptr, *fw = nullptr, *trace = nullptr, *dump = nullptr, *dump_audio = nullptr, *replay = nullptr, *save = nullptr;
   const char* load_state = nullptr; const char* save_state_path = nullptr; int save_state_at = -1;
   const char* hide_screen = nullptr;
@@ -347,6 +347,7 @@ int main(int argc, char** argv) {
     else if (arg("--trace")) trace = argv[++i];
     else if (arg("--max")) ts.max = std::strtoull(argv[++i], nullptr, 0);
     else if (arg("--dump-frames")) dump = argv[++i];
+    else if (flag("--shape")) shape = true;                                  // edge shaping on top of the hardware picture (Gpu::set_shape); only a scaled dump shows it
     else if (flag("--subpixel")) subpixel = true;                            // sub-pixel polygon edges (Gpu::set_subpixel), hardware AA off as video.aa = smooth has it; only a scaled dump shows them
     else if (arg("--dump-scaled")) { scaled_n = std::atoi(argv[++i]); scaled_path = argv[++i]; }   // N FILE: both screens through the scanline scaler at Nx, raw BGRA, the --dump-from/--dump-count window
     else if (arg("--dump-from")) dump_from = std::atoi(argv[++i]);    // first frame to dump
@@ -557,6 +558,7 @@ int main(int argc, char** argv) {
   nds.gpu3d.set_geometry_worker(timing_oc || gx_worker || cpu_oc != 0);   // DS_GX_THREAD: 0 never, 1 per-frame shape controller, 2 always
   nds.gpu3d.renderer().set_aa(!no_aa && !subpixel);   // the SDL frontend's video.aa = smooth: never with the hardware blend
   nds.gpu.set_subpixel(subpixel);
+  nds.gpu.set_shape(shape && !subpixel);
   // --dump-scaled: a panel-sized target per screen, as the SDL frontend's scanline tiers set one.
   std::vector<ds::u32> scaled_px[2]; std::vector<ds::u16> scaled_xrun; FILE* scaled_out = nullptr;
   if (scaled_n > 0 && scaled_path) {

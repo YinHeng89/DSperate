@@ -1552,6 +1552,7 @@ const u32* Gpu3D::split_line(const Renderer3D::FrameRef& f, u32 y) {
 }
 
 const u32* Gpu3D::line(const Renderer3D::FrameRef& f, u32 y) {
+  if (f.shape) renderer_.shape_sync(f);   // edge shaping reads across the bands and repaints: once, before the frame's first line is read
   renderer_.sync_line(f, static_cast<s32>(y));
   const u32* raw = f.line(y);
   const u32 xpos = render_xpos_;

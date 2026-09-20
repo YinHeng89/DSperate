@@ -220,7 +220,16 @@ public:
     u32 y_lo = 0, y_hi = 0;
   };
   // Both screens or neither: pass a null `px` to go back to fb_.
-  void set_scale_target(int screen, const ScaleTarget& t) { scale_[screen] = t; if (scale_[screen].y_hi == 0) scale_[screen].y_hi = t.h; }
+  void set_scale_target(int screen, const ScaleTarget& t) { scale_[screen] = t; if (scale_[screen].y_hi == 0) scale_[screen].y_hi = t.h; update_shape(); }
+  // Edge shaping only shows through the scanline scaler's runs: it repaints the 3D frame with the colours from
+  // before the anti-aliasing blend and leaves the shape itself to the split records, so on a tier that cannot
+  // patch cells (bilinear, chunky, the display engine's own scaler, a downscaled view) the mode is held off --
+  // there it would take the blend away and put nothing in its place, which is worse than the hardware picture.
+  bool shape_usable() const {
+    for (int s = 0; s < 2; ++s) { const ScaleTarget& t = scale_[s];
+      if (t.px && !t.bilinear && !t.chunky && t.h >= SCREEN_H && t.xrun[SCREEN_W] >= SCREEN_W) return true; }
+    return false;
+  }
   // Run a whole DS-resolution image through the scanline scaler, for a
   // picture the emulator did not produce: the frontend's pause menu, which is
   // composited while nothing is running and so has no display lines of its
@@ -238,6 +247,8 @@ public:
   // anti-aliasing and edge marking off.
   void set_subpixel(bool on);
   bool subpixel() const { return subpixel_; }
+  void set_shape(bool on);                 // edge shaping on top of the hardware picture (Renderer3D::shape_frame); not with set_subpixel
+  bool shape() const { return shape_; }
   u16 line() const { return line_; }
 
   Engine2D engine[2];
@@ -318,6 +329,11 @@ private:
   // below waits in sp_pend_ until that line is composed.
   struct SplitRec { u8 x, side, unc; s8 slope, src; };   // side: SPLIT_* | 0x80 weak | 0x40 spill | 0x20 edge-marked (unc = position + 32) | 0x10 a band's reach from the line above; unc 0..32; src: see Renderer3D::extract_splits
   bool subpixel_ = false;
+  bool shape_ = false;
+  bool shape_live_ = false;                // shape_ and a screen that can show it: what the renderer was told
+  void update_shape();                     // the renderer runs the pass only while a screen can show it (shape_usable)
+  bool splits_on() const { return subpixel_ || shape_live_; }   // a split map comes with the 3D lines
+  u8 sp_prev_own_[2][256]{};               // per screen: which pixels of the line before were the 3D layer's, unblended (SPLIT_GROW records)
   const u32* split3d_ = nullptr;          // split map of line3d_ (null: none this frame)
   SplitRec sp_pend_[2][4 * SCREEN_W];
   u32 sp_pend_n_[2] = {0, 0}, sp_pend_line_[2] = {~0u, ~0u};

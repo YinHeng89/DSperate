@@ -268,14 +268,15 @@ R"(# DSperate settings. Command-line flags override this file. Two files next
 # chunky_threshold = 180        # extreme only: luma distance (0..255) an outlier needs to win over the mean
 # chunky_cell = auto            # panel pixels per cell: auto (4..16, whatever divides the screen) | pair
                                 # (2x2 DS pixels) | N (or the nearest size below N that divides the screen)
-# aa = off                      # 3D edges: off | smooth | accurate. accurate is the hardware's anti-aliasing
-                                # (edge pixels blended by coverage). smooth draws a polygon's edge where it
-                                # really falls inside a DS pixel, at panel resolution, unblended: 3D
-                                # silhouettes only -- 2D, sprites and text are untouched. smooth works with
-                                # nearest, lcd_grid and seam (not linear or chunky, and not on the A30's
-                                # display-engine tier, where it shows as off), and fills 3D edges the way
-                                # accurate does, which is not pixel-exact. true / false still read as
-                                # accurate / off
+# aa = off                      # 3D edges: off | smooth | accurate | shaped. accurate is the hardware's
+                                # anti-aliasing (edge pixels blended by coverage). smooth draws a polygon's
+                                # edge where it really falls inside a DS pixel, at panel resolution,
+                                # unblended. shaped keeps the hardware's anti-aliasing and redraws the
+                                # stair-stepped boundary between objects as straight lines at panel
+                                # resolution. Both are 3D only -- 2D, sprites, pixel art on a quad and text
+                                # are untouched -- work with nearest, lcd_grid and seam (not linear or
+                                # chunky, and not on the A30's display-engine tier, where they show as off),
+                                # and are not pixel-exact. true / false still read as accurate / off
 # disp = auto                   # present through the display engine's hardware scaler (Miyoo A30 and
                                 # other Allwinner boards): auto (wherever /dev/disp answers) | true | false
 # fbdev = auto                  # present straight through /dev/fb0 (the H700 handhelds' mali-only SDL2):
