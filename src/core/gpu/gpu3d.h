@@ -31,6 +31,21 @@ namespace ds::gpu {
 // per-command cycle model and the geometry worker it coexisted with were
 // deleted in 1a, measured in docs/speed-first-rework-scoping.md §3.4.
 
+// Parameter count per command. A command with zero parameters is one byte in
+// the command log and nothing in the parameter log; the replay advances
+// through par_log_ by this table, so it is the contract between the two.
+inline constexpr u8 CMD_PARAMS[256] = {
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  1, 0, 1, 1, 1, 0, 16, 12, 16, 12, 9, 3, 3, 0, 0, 0,
+  1, 1, 1, 2, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0,
+  1, 1, 1, 1, 32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  3, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  // 0x80-0xFF: none
+};
+
 struct Vertex {
   s32 pos[4];          // clip space, 20.12
   s32 col[3];          // 5-bit colour with 12 fractional bits (kept through clipping)
@@ -96,21 +111,27 @@ public:
     const u32 r = addr - 0x04000400;
     if (!geometry_on_) return;
     if (r < 0x40) gxfifo_write(value);
-    else fifo_write(Entry{value, static_cast<u8>((r & 0x1FC) >> 2)});
+    else log_port(static_cast<u8>((r & 0x1FC) >> 2), value);
   }
   // A run of `n` DMA words fed straight from a direct-mapped source page.
   // See the definition for why the burst is unobservable and what that buys.
   void gxfifo_dma_burst(const u8* src, u32 n);
   // Words a burst may feed without any chance of filling the FIFO: a word
   // carries at most four commands, so this many can never reach FIFO_DEPTH.
-  u32 fifo_burst_room() const { return n_ < RING - 8 ? (RING - 8 - n_) >> 2 : 0; }
+  u32 fifo_burst_room() const {
+    // A word carries at most four commands, or one parameter. Both logs keep
+    // a margin so the caller never has to think about either bound.
+    const u32 c = cmd_n_ + 8 < CMD_CAP ? (CMD_CAP - 8 - cmd_n_) >> 2 : 0;
+    const u32 q = par_n_ + 8 < PAR_CAP ? PAR_CAP - 8 - par_n_ : 0;
+    return c < q ? c : q;
+  }
 
   // POWCNT1 bit 3 (geometry) and bit 2 (rendering).
   void set_powcnt(u16 value);
 
   // Nothing to replay and no swap parked: the scheduler's idle-skip may
   // advance time without asking the engine anything.
-  bool idle() const { return !geometry_on_ || flush_request_ || n_ == 0; }
+  bool idle() const { return !geometry_on_ || flush_request_ || cmd_n_ == 0; }
   // A swap has been issued and waits for VBlank: the engine changes nothing
   // until then, so a loop polling GXSTAT can be skipped.
   bool swap_pending() const { return flush_request_ != 0 || swap_wait_; }
@@ -168,14 +189,24 @@ public:
   void force_full_raster() { render_identical_ = false; }
 private:
 
-  struct Entry { u32 param; u8 cmd; };
-  // Arrival-order log of queued commands. There are no stages any more: no
-  // pipe, no FIFO level, no stall queue -- one count, and a replay when it
-  // nears full. 1b replaces this with a frame-sized command log and parameter
-  // log; 1a only removes what the stages cost.
-  static constexpr u32 RING = 512;
-  std::array<Entry, RING> ring_{};
-  u32 ring_rd_ = 0, ring_wr_ = 0, n_ = 0;
+  // The two logs. A command is one byte in cmd_log_; its parameters are u32
+  // words in par_log_, contiguous and in arrival order, so the replay reads a
+  // command's parameters straight out of the log instead of accumulating them
+  // one dispatch at a time. That is the whole point of 1b: a 16-parameter
+  // MTX_LOAD_4x4 used to cost sixteen trips through the drain loop and
+  // sixteen calls into an accumulator with its own switch; it now costs one.
+  //
+  // Sized for a frame rather than for a FIFO: Golden Sun's title pushes ~40 k
+  // words a frame. A replay happens at VBlank, on any observing read, and
+  // here if either log approaches full, so filling these is the rare path.
+  //
+  // par_log_ is over-allocated by PAR_SLACK words so that exec_single may
+  // read p[0] for a zero-parameter command whose slot is at the very end of
+  // the log without running off it.
+  static constexpr u32 CMD_CAP = 1u << 16, PAR_CAP = 1u << 18, PAR_SLACK = 64;
+  std::unique_ptr<u8[]> cmd_log_ = std::unique_ptr<u8[]>(new u8[CMD_CAP]());
+  std::unique_ptr<u32[]> par_log_ = std::unique_ptr<u32[]>(new u32[PAR_CAP + PAR_SLACK]());
+  u32 cmd_n_ = 0, par_n_ = 0;
   bool swapped_ = false;         // a SWAP_BUFFERS finalised a list since the last VBlank
   // A SWAP_BUFFERS was issued since the last VBlank. On hardware the engine
   // parks until VBlank and GXSTAT bit 27 reads busy all that time; we have
@@ -186,7 +217,33 @@ private:
   bool swap_wait_ = false;
   u64 swap_busy_until_ = 0;
   bool list_same_ = false;       // finalise_list: the finished list equals the previous one
-  void ring_push(const Entry& e) { ring_[ring_wr_] = e; ring_wr_ = (ring_wr_ + 1) & (RING - 1); }
+
+  // A command under assembly writes its parameters at par_log_[par_n_ ...]
+  // and commits by appending its byte and advancing par_n_. So the two logs
+  // are consistent at every point a replay can happen: cmd_log_ describes
+  // exactly par_log_[0, par_n_), and an unfinished command is scratch beyond
+  // par_n_ that no replay reads and the next command overwrites.
+  //
+  // Both sources -- the packed GXFIFO and the direct command ports -- assemble
+  // here, so they cannot interleave into a corrupt log. A port write arriving
+  // mid-FIFO-command abandons that command rather than splicing its
+  // parameters, which is the same class of outcome the per-entry accumulator
+  // gave and is a guest error either way.
+  u32 inflight_n_ = 0;
+  u8  inflight_cmd_ = 0xFF;
+  struct Sink;                    // the GXFIFO sink; defined in the .cpp beside the walk
+  friend struct Sink;
+  void log_commit(u8 cmd) { cmd_log_[cmd_n_++] = cmd; par_n_ += inflight_n_; inflight_n_ = 0; inflight_cmd_ = 0xFF; }
+  void log_room() { if (cmd_n_ + 8 >= CMD_CAP || par_n_ + 40 >= PAR_CAP) drain_all(); }
+  // A direct command port: one parameter of `cmd` per write.
+  void log_port(u8 cmd, u32 value) {
+    log_room();
+    const u32 np = CMD_PARAMS[cmd];
+    if (np == 0) { cmd_log_[cmd_n_++] = cmd; return; }
+    if (cmd != inflight_cmd_) { inflight_cmd_ = cmd; inflight_n_ = 0; }
+    par_log_[par_n_ + inflight_n_] = value;
+    if (++inflight_n_ >= np) log_commit(cmd);
+  }
 
   // Command assembly for packed GXFIFO writes.
   // Packed-command parser state. A struct so a DMA burst can walk a whole run
@@ -194,8 +251,6 @@ private:
   // port passes the member itself.
   struct GxParse { u32 num_cmds = 0, cur_cmd = 0, param_count = 0, total_params = 0; };
   GxParse parse_;
-  std::array<u32, 32> exec_params_{};
-  u32 exec_count_ = 0;
 
   // Status. gxstat_ now carries only the two IRQ-mode bits (30-31): the busy
   // bit is synthesised from the swap, the FIFO level is always reported empty,
@@ -317,12 +372,10 @@ private:
   Polygon* cur_pram() { return &pram_[bank_ * PRAM_BANK]; }
   u32 vram_base() const { return bank_ * VRAM_BANK; }
 
-  // Log append.
-  [[gnu::always_inline]] inline void fifo_write(const Entry& e);   // LTO outlined it out of gxfifo_write: 30 insn + a call per word; body below the class
   // The packed-command walk, shared by the single-word port and the burst.
   // The two differ only in their sink, so the assembly state machine has one
   // copy: a divergence between them would be a silent accuracy bug.
-  template <class Push> [[gnu::always_inline]] static inline void gxfifo_word(u32 value, GxParse& p, Push push);
+  template <class S> [[gnu::always_inline]] static inline void gxfifo_word(u32 value, GxParse& p, S& sink);
   // Replay everything queued, now.
   void drain_all();
   // The finished polygon list: sort it for the renderer, decide whether it
@@ -332,10 +385,9 @@ private:
   void normalise_temp_vtx();
   void gxfifo_write(u32 value);
   // One call site: the drain_all replay loop. Every command goes through this
-  // one switch; the multi-parameter ones tail into exec_accum.
-  inline __attribute__((always_inline)) void exec_single(u8 cmd, u32 param);
-  void exec_accum(u8 cmd, u32 param);
-  void exec_multi(u8 cmd);
+  // one switch, reading its parameters from the log in place; there is no
+  // accumulator and no second dispatch.
+  void exec_single(u8 cmd, const u32* p);
 
 
   // Geometry.
@@ -359,9 +411,4 @@ private:
 
 // Forced-inline members called from the inline code above (q_push, write):
 // their bodies must be visible in every translation unit that uses them.
-inline void Gpu3D::fifo_write(const Entry& e) {
-  if (n_ >= RING - 8) drain_all();   // no level: the log's size is the only bound
-  ring_push(e); ++n_;
-}
-
 } // namespace ds::gpu

@@ -26,19 +26,6 @@ namespace compat = kern::compat;
 
 namespace {
 
-// Parameter count per command. Commands with zero parameters still occupy
-// one FIFO entry when written through the packed GXFIFO port.
-constexpr u8 CMD_PARAMS[256] = {
-  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-  1, 0, 1, 1, 1, 0, 16, 12, 16, 12, 9, 3, 3, 0, 0, 0,
-  1, 1, 1, 2, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0,
-  1, 1, 1, 1, 32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-  1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-  1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-  1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-  3, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-  // 0x80-0xFF: none
-};
 
 // ---- census (DS_CENSUS_GX=1) -----------------------------------------------
 // Is the polygon list a game submits on a SWAP_BUFFERS actually different from
@@ -345,9 +332,8 @@ void Gpu3D::reset_render_state() {
 
 void Gpu3D::reset() {
   stack_err_ = 0; box_result_ = 0;
-  ring_rd_ = ring_wr_ = n_ = 0;
+  cmd_n_ = par_n_ = inflight_n_ = 0; inflight_cmd_ = 0xFF;
   parse_ = GxParse{};
-  exec_params_.fill(0); exec_count_ = 0;
   gxstat_ = 0; geometry_on_ = rendering_on_ = false; render_on_.store(false, std::memory_order_relaxed);
   dispcnt_ = 0; alpha_ref_val_ = alpha_ref_ = 0;
   toon_.fill(0); edge_.fill(0);
@@ -403,13 +389,23 @@ void Gpu3D::drain_all() {
   // build the next list, so the loop simply carries on; flush_request_ is
   // cleared by the swap itself in the no-FIFO model, and only a VBlank-parked
   // swap (the exact model's) ever left it set -- nothing sets it now.
-  if (!n_) return;   // the common case by far: dbori reads GXSTAT ~1.5 M times a run
-  do {
-    const Entry e = ring_[ring_rd_];
-    ring_rd_ = (ring_rd_ + 1) & (RING - 1);
-    --n_;
-    exec_single(e.cmd, e.param);
-  } while (n_);
+  if (!cmd_n_) return;   // the common case by far: dbori reads GXSTAT ~1.5 M times a run
+  // One pass. A command's parameters are already contiguous, so there is no
+  // accumulator, no second dispatch and no per-parameter trip round the loop:
+  // a 16-parameter MTX_LOAD_4x4 is one iteration.
+  const u8* const c = cmd_log_.get();
+  const u32* const q = par_log_.get();
+  u32 pi = 0;
+  for (u32 i = 0; i < cmd_n_; ++i) {
+    const u8 k = c[i];
+    exec_single(k, q + pi);
+    pi += CMD_PARAMS[k];
+  }
+  // Whatever a half-written command has put beyond par_n_ stays where it is:
+  // par_n_ is what the replay consumed, and the next parameter still lands at
+  // par_n_ + inflight_n_.
+  if (inflight_n_) std::memmove(par_log_.get(), par_log_.get() + par_n_, inflight_n_ * 4);
+  cmd_n_ = 0; par_n_ = 0;
   // Only after something actually ran. The old drain settled the DMA re-arm
   // and the IRQ line once per drain that popped an entry, not once per call:
   // firing them on every observation of an empty log re-arms a GXFIFO DMA at
@@ -432,17 +428,17 @@ void Gpu3D::check_fifo_dma() {
 // Packed command port: up to four command bytes followed by their parameters.
 // The walk is a template on its sink so the single-word port and the DMA
 // burst below cannot drift apart; `push` receives every entry the word makes.
-template <class Push>
-inline void Gpu3D::gxfifo_word(u32 value, GxParse& p, Push push) {
+template <class S>
+inline void Gpu3D::gxfifo_word(u32 value, GxParse& p, S& sink) {
   if (p.num_cmds != 0) {
     // A parameter that does not complete its command: the common word (a
     // 16-parameter matrix load, a vertex pair). Everything else takes the
     // packed-command walk below.
-    if (++p.param_count < p.total_params) { push(Entry{value, static_cast<u8>(p.cur_cmd)}); return; }
+    if (++p.param_count < p.total_params) { sink.param(value); return; }
     // The parameter completes its command. When no packed command follows
     // (the usual case: one command per word, 40 k a frame on Golden Sun),
     // the walk below would only shift zero bytes out; finish here.
-    push(Entry{value, static_cast<u8>(p.cur_cmd)});
+    sink.param(value); sink.commit(static_cast<u8>(p.cur_cmd));
     p.cur_cmd >>= 8; --p.num_cmds;
     if (p.cur_cmd == 0) { p.num_cmds = 0; return; }
     p.param_count = 0;
@@ -455,8 +451,10 @@ inline void Gpu3D::gxfifo_word(u32 value, GxParse& p, Push push) {
     if (p.total_params > 0) return;
   }
   for (;;) {
-    if ((p.cur_cmd & 0xFF) || (p.num_cmds == 4 && p.cur_cmd == 0))
-      push(Entry{value, static_cast<u8>(p.cur_cmd & 0xFF)});
+    // A zero-parameter command: its byte, and nothing in the parameter log.
+    // NOPs (command 0) are not logged at all -- they occupied a FIFO entry on
+    // hardware, and there is no FIFO to occupy.
+    if (p.cur_cmd & 0xFF) sink.commit(static_cast<u8>(p.cur_cmd & 0xFF));
     if (p.param_count >= p.total_params) {
       p.cur_cmd >>= 8;
       if (--p.num_cmds == 0) break;
@@ -467,8 +465,19 @@ inline void Gpu3D::gxfifo_word(u32 value, GxParse& p, Push push) {
   }
 }
 
+// The sink both GXFIFO paths share: parameters land beyond par_n_ and a
+// commit is what makes them real. See the class for why assembly is shared.
+struct Gpu3D::Sink {
+  Gpu3D& g;
+  void param(u32 v) { g.par_log_[g.par_n_ + g.inflight_n_++] = v; }
+  void commit(u8 c) { g.log_commit(c); }
+};
+
 void Gpu3D::gxfifo_write(u32 value) {
-  gxfifo_word(value, parse_, [this](const Entry& e) { fifo_write(e); });
+  log_room();
+  if (parse_.num_cmds == 0) inflight_cmd_ = 0xFF;   // a fresh word: no port command is half-written
+  Sink s{*this};
+  gxfifo_word(value, parse_, s);
 }
 
 // A GXFIFO DMA burst: `n` words from one direct-mapped source page.
@@ -481,9 +490,12 @@ void Gpu3D::gxfifo_write(u32 value) {
 // across the whole run instead of reloaded per word.
 void Gpu3D::gxfifo_dma_burst(const u8* src, u32 n) {
   if (!geometry_on_) return;
-  u32 wr = ring_wr_, pushed = 0;
-  Entry* const ring = ring_.data();
-  const auto sink = [&](const Entry& e) { ring[wr] = e; wr = (wr + 1) & (RING - 1); ++pushed; };
+  // The cursors ride in registers for the whole run and are written back once.
+  struct BurstSink {
+    u8* c; u32* p; u32 cn, pn, inf;
+    void param(u32 v) { p[pn + inf++] = v; }
+    void commit(u8 k) { c[cn++] = k; pn += inf; inf = 0; }
+  } sink{cmd_log_.get(), par_log_.get(), cmd_n_, par_n_, inflight_n_};
   // The parser state rides in registers for the whole run: the walk is a
   // static function of a local copy, written back once. Per word that is
   // the difference between ~10 loads and stores and none (the burst was
@@ -495,31 +507,16 @@ void Gpu3D::gxfifo_dma_burst(const u8* src, u32 n) {
     gxfifo_word(v, p, sink);
   }
   parse_ = p;
-  ring_wr_ = wr;
-  n_ += pushed;
+  cmd_n_ = sink.cn; par_n_ = sink.pn; inflight_n_ = sink.inf;
 }
 
 // ---- command execution --------------------------------------------------------
 
-// The eleven multi-parameter commands: their entries only accumulate into
-// exec_params_ until the last one, which runs the command. Out of line -- 7 %
-// of the entries on a geometry-heavy frame -- so the dispatch below stays one
-// jump table over the command byte with no parameter-count lookup in front.
-void Gpu3D::exec_accum(u8 cmd, u32 param) {
-  exec_params_[exec_count_++] = param;
-  if (exec_count_ == 1) {
-    switch (cmd) {
-    case 0x23: break;
-    case 0x34: case 0x71: break;
-    case 0x70: break;
-    default: break;
-    }
-  } else {
-    if (exec_count_ >= CMD_PARAMS[cmd]) { exec_count_ = 0; exec_multi(cmd); }
-  }
-}
-
-void Gpu3D::exec_single(u8 cmd, u32 param) {
+// Every command, reading its parameters straight out of the log. `p` points
+// at this command's first parameter; a zero-parameter command may still read
+// p[0], which is why par_log_ carries PAR_SLACK words of tail.
+void Gpu3D::exec_single(u8 cmd, const u32* p) {
+  const u32 param = p[0];
   switch (cmd) {
   case 0x10: matrix_mode_ = param & 3; break;
   case 0x11:   // push
@@ -661,58 +658,57 @@ void Gpu3D::exec_single(u8 cmd, u32 param) {
     viewport_[5] = (viewport_[1] - viewport_[3] + 1) & 0xFF;
     break;
   case 0x72: vec_test(param); break;
-  // The commands that take more than one parameter. They sit in the same
-  // switch so that a popped entry needs no CMD_PARAMS lookup to be dispatched.
-  case 0x16: case 0x17: case 0x18: case 0x19: case 0x1A: case 0x1B: case 0x1C:
-  case 0x23: case 0x34: case 0x70: case 0x71:
-    exec_accum(cmd, param); break;
-  default: break;
-  }
-}
-
-void Gpu3D::exec_multi(u8 cmd) {
-  const s32* p = reinterpret_cast<const s32*>(exec_params_.data());
-  auto on_matrix = [&](auto&& op, s32 proj_cycles, s32 tex_cycles, s32 pos_cycles, s32 posvec_cycles) {
-    if (matrix_mode_ == 0) { op(proj_.data()); clip_dirty_ = true; }
-    else if (matrix_mode_ == 3) { op(tex_.data()); }
-    else {
-      op(pos_.data());
-      if (matrix_mode_ == 2) { op(vec_.data()); } else      clip_dirty_ = true;
+  // The commands that take more than one parameter, in the same switch. They
+  // used to accumulate one parameter at a time into exec_params_ and dispatch
+  // a second time; the log hands them a contiguous run instead.
+  case 0x16: case 0x17: case 0x18: case 0x19: case 0x1A: case 0x1B: case 0x1C: {
+    const s32* m = reinterpret_cast<const s32*>(p);
+    auto on_matrix = [&](auto&& op) {
+      if (matrix_mode_ == 0) { op(proj_.data()); clip_dirty_ = true; }
+      else if (matrix_mode_ == 3) { op(tex_.data()); }
+      else {
+        op(pos_.data());
+        if (matrix_mode_ == 2) op(vec_.data()); else clip_dirty_ = true;
+      }
+    };
+    switch (cmd) {
+    case 0x16: on_matrix([&](s32* d) { std::memcpy(d, m, 64); }); break;
+    case 0x17: on_matrix([&](s32* d) { mtx_load_4x3(d, m); }); break;
+    case 0x18: on_matrix([&](s32* d) { mtx_mult_4x4(d, m); }); break;
+    case 0x19: on_matrix([&](s32* d) { mtx_mult_4x3(d, m); }); break;
+    case 0x1A: on_matrix([&](s32* d) { mtx_mult_3x3(d, m); }); break;
+    // Scale never touches the vector matrix, in any mode.
+    case 0x1B:
+      if (matrix_mode_ == 0) { mtx_scale(proj_.data(), m); clip_dirty_ = true; }
+      else if (matrix_mode_ == 3) { mtx_scale(tex_.data(), m); }
+      else { mtx_scale(pos_.data(), m); clip_dirty_ = true; }
+      break;
+    case 0x1C: on_matrix([&](s32* d) { mtx_translate(d, m); }); break;
+    default: break;
     }
-  };
-  switch (cmd) {
-  case 0x16: on_matrix([&](s32* m) { std::memcpy(m, p, 64); }, 18, 10, 18, 18); break;
-  case 0x17: on_matrix([&](s32* m) { mtx_load_4x3(m, p); }, 18, 7, 18, 18); break;
-  case 0x18: on_matrix([&](s32* m) { mtx_mult_4x4(m, p); }, 35 - 16, 33 - 16, 35 - 16, 35 + 30 - 16); break;
-  case 0x19: on_matrix([&](s32* m) { mtx_mult_4x3(m, p); }, 35 - 12, 33 - 12, 35 - 12, 35 + 30 - 12); break;
-  case 0x1A: on_matrix([&](s32* m) { mtx_mult_3x3(m, p); }, 35 - 9, 33 - 9, 35 - 9, 35 + 30 - 9); break;
-  case 0x1B:   // scale: never applied to the vector matrix
-    if (matrix_mode_ == 0) { mtx_scale(proj_.data(), p); clip_dirty_ = true; }
-    else if (matrix_mode_ == 3) { mtx_scale(tex_.data(), p); }
-    else { mtx_scale(pos_.data(), p); clip_dirty_ = true; }
     break;
-  case 0x1C: on_matrix([&](s32* m) { mtx_translate(m, p); }, 35 - 3, 33 - 3, 35 - 3, 35 + 30 - 3); break;
+  }
   case 0x23:   // full vertex
-    cur_vertex_[0] = static_cast<s16>(exec_params_[0] & 0xFFFF); cur_vertex_[1] = static_cast<s16>(exec_params_[0] >> 16);
-    cur_vertex_[2] = static_cast<s16>(exec_params_[1] & 0xFFFF);
+    cur_vertex_[0] = static_cast<s16>(p[0] & 0xFFFF); cur_vertex_[1] = static_cast<s16>(p[0] >> 16);
+    cur_vertex_[2] = static_cast<s16>(p[1] & 0xFFFF);
     submit_vertex();
     break;
   case 0x34:   // shininess table
     for (int i = 0; i < 128; i += 4) {
-      const u32 v = exec_params_[i >> 2];
+      const u32 v = p[i >> 2];
       shininess_[i] = v & 0xFF; shininess_[i + 1] = (v >> 8) & 0xFF; shininess_[i + 2] = (v >> 16) & 0xFF; shininess_[i + 3] = v >> 24;
     }
     break;
   case 0x71:   // position test
-    
-    cur_vertex_[0] = static_cast<s16>(exec_params_[0] & 0xFFFF); cur_vertex_[1] = static_cast<s16>(exec_params_[0] >> 16);
-    cur_vertex_[2] = static_cast<s16>(exec_params_[1] & 0xFFFF);
+    cur_vertex_[0] = static_cast<s16>(p[0] & 0xFFFF); cur_vertex_[1] = static_cast<s16>(p[0] >> 16);
+    cur_vertex_[2] = static_cast<s16>(p[1] & 0xFFFF);
     pos_test();
     break;
-  case 0x70: box_test(exec_params_.data()); break;
+  case 0x70: box_test(p); break;
   default: break;
   }
 }
+
 
 // ---- geometry -----------------------------------------------------------------
 
@@ -1198,7 +1194,7 @@ void Gpu3D::vblank() {
   if (debug_gx)
     std::fprintf(stderr, "[gx] frame %llu geom %d rend %d flush %u attr %u polys %u verts %u disp3dcnt %04x alpharef %u clear %08x/%08x fifo %u gxstat %08x ie %08x if %08x\n",
                  static_cast<unsigned long long>(nds_.frame_count), geometry_on_, rendering_on_, flush_request_, flush_attr_, num_polygons_, num_vertices_,
-                 dispcnt_, alpha_ref_, clear_attr1_, clear_attr2_, n_, gxstat_, nds_.io.cpu_io[0].ie, nds_.io.cpu_io[0].if_);
+                 dispcnt_, alpha_ref_, clear_attr1_, clear_attr2_, cmd_n_, gxstat_, nds_.io.cpu_io[0].ie, nds_.io.cpu_io[0].if_);
   if (!geometry_on_) return;
   drain_all();
   // The raster of the frame being displayed may still be running (nothing
@@ -1381,7 +1377,7 @@ void Gpu3D::write(u32 addr, u32 width, u32 value) {
   if (width == 32 && r - 0x400 < 0x1CC) {
     if (!geometry_on_) return;
     if (r < 0x440) gxfifo_write(value);
-    else fifo_write(Entry{value, static_cast<u8>((r & 0x1FC) >> 2)});
+    else log_port(static_cast<u8>((r & 0x1FC) >> 2), value);
     return;
   }
   if (!rendering_on_ && r >= 0x320 && r < 0x400) return;
@@ -1464,7 +1460,7 @@ void Gpu3D::write(u32 addr, u32 width, u32 value) {
   default: break;
   }
   if (r >= 0x400 && r < 0x440) { gxfifo_write(value); return; }
-  if (r >= 0x440 && r < 0x5CC) { fifo_write(Entry{value, static_cast<u8>((r & 0x1FC) >> 2)}); return; }
+  if (r >= 0x440 && r < 0x5CC) { log_port(static_cast<u8>((r & 0x1FC) >> 2), value); return; }
   if (r >= 0x330 && r < 0x340) { const u32 i = (r - 0x330) >> 1; edge_[i] = value & 0xFFFF; edge_[i + 1] = value >> 16; return; }
   if (r >= 0x360 && r < 0x380) { const u32 i = r - 0x360; for (int k = 0; k < 4; ++k) fog_density_[i + k] = (value >> (8 * k)) & 0x7F; return; }
   if (r >= 0x380 && r < 0x3C0) { const u32 i = (r - 0x380) >> 1; toon_[i] = value & 0xFFFF; toon_[i + 1] = value >> 16; return; }
@@ -1484,8 +1480,14 @@ template <class S> void Gpu3D::sync_state(S& s) {
   // On disk the overflow flag is GXSTAT bit 15 and the box result bit 1, as they always were.
   if constexpr (!S::reading) gxstat_ |= stack_err_ | box_result_;
   s.begin("GX3D");
-  for (Entry& e : ring_) s.fields(e.param, e.cmd);
-  s.fields(ring_rd_, ring_wr_, n_, parse_.num_cmds, parse_.cur_cmd, parse_.param_count, parse_.total_params, exec_params_, exec_count_,
+  // The logs do not travel. A write replays them out first, so only a
+  // half-assembled command is left: its parameters (inflight_n_ of them, at
+  // most 32) and the parser state that will finish it.
+  u32 inflight = inflight_n_;
+  s.put(inflight);
+  if constexpr (S::reading) { if (inflight > 32) { s.fail("gx in-flight parameters"); return; } inflight_n_ = inflight; cmd_n_ = par_n_ = 0; }
+  for (u32 i = 0; i < inflight; ++i) s.put(par_log_[i]);
+  s.fields(inflight_cmd_, parse_.num_cmds, parse_.cur_cmd, parse_.param_count, parse_.total_params,
            gxstat_, geometry_on_, rendering_on_, dispcnt_, alpha_ref_val_, alpha_ref_, toon_, edge_, fog_color_, fog_offset_, fog_density_,
            clear_attr1_, clear_attr2_, zero_dot_w_limit_,
            rstate_.dispcnt, rstate_.alpha_ref, rstate_.toon, rstate_.edge, rstate_.fog_color, rstate_.fog_offset, rstate_.fog_shift, rstate_.fog_density,

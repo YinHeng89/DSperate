@@ -14,6 +14,21 @@
 #
 # The reference binary should be built from the `exact-reference` tag, not
 # from the working tree. See docs/speed-first-rework-scoping.md §3.
+#
+# THE CANDIDATE SIDE IS NOT DETERMINISTIC, and a comparison must be read with
+# that in mind. The golden side runs --interp --quantum 128 with every thread
+# off, so it reproduces exactly; the candidate runs as the game is played --
+# event-bound, threads on (run_candidate.sh) -- which is the point, because a
+# gate against a configuration nobody ships proves little. The cost is
+# run-to-run variation on the long scenes: gsdd measured 2399 / 2400 / 2399
+# exact frames over three runs of the SAME pair of binaries (2026-09-20), with
+# ssim min 0.9996 / 1.0000 / 0.9990.
+#
+# So: a scene one or two frames off byte-exact is noise, not evidence, and
+# "byte-exact" is not a usable invariant for the boot scenes. What IS evidence
+# is the floors, the structural faults, the swap counts, and -- for a change
+# that should be behaviour-preserving -- the deterministic scenes (sm64,
+# dbori, mlbis, meteos) coming back digit for digit.
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 SCRATCH=${GATE_SCRATCH:-${TMPDIR:-/tmp}/dsperate-gate.$$}
