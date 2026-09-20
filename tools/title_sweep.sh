@@ -18,6 +18,10 @@
 #   ok       ran the whole run and the picture moved
 #   blank    >98 % of frames are a flat colour on both screens
 #   stuck    the picture stopped moving (>98 % repeats, <=3 distinct frames)
+#   static   nothing changed at all over the last quarter of the run. Needs a
+#            human: with no input, a title sitting on a still "press start"
+#            screen looks exactly like one that died at the end of its boot
+#            sequence. Listed apart from the failures for that reason.
 #   short    fewer frames than asked for, but exited cleanly
 #   hang     the watchdog fired (no frame progress) -- the log has the dump
 #   crash    non-zero exit for any other reason
@@ -31,7 +35,7 @@ WD=${SWEEP_WATCHDOG:-20}                     # seconds of no frame progress = ha
 TO=${SWEEP_TIMEOUT:-600}                     # per-title backstop, seconds
 mkdir -p "$OUT/logs"
 TSV="$OUT/results.tsv"
-[ -f "$TSV" ] || printf 'title\tstatus\tframes\tblank\tfrozen\tdistinct\tfirst_motion\twall_s\n' > "$TSV"
+[ -f "$TSV" ] || printf 'title\tstatus\tframes\tblank\tfrozen\tdistinct\tfirst_motion\tlate_distinct\tlate_changes\twall_s\n' > "$TSV"
 
 for dir in "$@"; do
   for rom in "$dir"/*.nds; do
@@ -52,14 +56,15 @@ for dir in "$@"; do
     t1=$(date +%s); wall=$((t1 - t0))
     rm -f "$fifo"
 
-    read -r n blank frozen distinct motion < <(python3 - "$health" <<'PY'
+    read -r n blank frozen distinct motion ldist lchg < <(python3 - "$health" <<'PY'
 import json, sys
 try:
     r = json.load(open(sys.argv[1]))
 except Exception:
     r = {}
 print(r.get('frames', 0), r.get('blank', 1.0), r.get('frozen', 1.0),
-      r.get('distinct', 0), r.get('first_motion') if r.get('first_motion') is not None else -1)
+      r.get('distinct', 0), r.get('first_motion') if r.get('first_motion') is not None else -1,
+      r.get('late_distinct', 0), r.get('late_changes', 0))
 PY
 )
     if   [ $rc -eq 124 ] || [ $rc -eq 137 ];        then st=timeout
@@ -67,11 +72,12 @@ PY
     elif [ $rc -ne 0 ];                             then st=crash
     elif awk "BEGIN{exit !($blank > 0.98)}";        then st=blank
     elif awk "BEGIN{exit !($frozen > 0.98)}" && [ "$distinct" -le 3 ]; then st=stuck
+    elif [ "${lchg:-0}" -eq 0 ] && [ "$n" -gt 0 ];  then st=static
     elif [ "$n" -lt "$FRAMES" ];                    then st=short
     else                                                 st=ok
     fi
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$name" "$st" "$n" "$blank" "$frozen" "$distinct" "$motion" "$wall" >> "$TSV"
-    printf '%-62s %-8s %5s frames  blank %-6s frozen %-6s distinct %-5s %ss\n' "$name" "$st" "$n" "$blank" "$frozen" "$distinct" "$wall"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$name" "$st" "$n" "$blank" "$frozen" "$distinct" "$motion" "$ldist" "$lchg" "$wall" >> "$TSV"
+    printf '%-56s %-7s %5s fr blank %-6s frozen %-6s dist %-5s late %s/%s %ss\n' "$name" "$st" "$n" "$blank" "$frozen" "$distinct" "$ldist" "$lchg" "$wall"
   done
 done
 
@@ -80,4 +86,6 @@ echo "== summary =="
 awk -F'\t' 'NR>1{c[$2]++} END{for(k in c) printf "  %-8s %d\n", k, c[k]}' "$TSV" | sort
 echo "  total    $(($(wc -l < "$TSV") - 1))"
 echo "not ok:"
-awk -F'\t' 'NR>1 && $2!="ok"{printf "  %-8s %s\n", $2, $1}' "$TSV" | sort || true
+awk -F'\t' 'NR>1 && $2!="ok" && $2!="static"{printf "  %-8s %s\n", $2, $1}' "$TSV" | sort || true
+echo "needs a human (no motion at all late in the run; may be a still title screen):"
+awk -F'\t' 'NR>1 && $2=="static"{printf "  %-56s distinct %-5s late %s/%s\n", $1, $6, $8, $9}' "$TSV" || true

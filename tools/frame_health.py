@@ -7,11 +7,21 @@
 
 Reads frames as they arrive and reports, as JSON:
 
-  frames        how many whole frames arrived
-  blank         fraction whose two screens are both a single flat colour
-  frozen        fraction byte-identical to the frame before
-  distinct      distinct frame hashes
-  first_motion  index of the first frame that differs from frame 0, or null
+  frames         how many whole frames arrived
+  blank          fraction whose two screens are both a single flat colour
+  frozen         fraction byte-identical to the frame before
+  distinct       distinct frame hashes
+  first_motion   index of the first frame that differs from frame 0, or null
+  late_distinct  distinct hashes over the last quarter of the run
+  late_changes   frame-to-frame changes over that same window
+
+The late window is what decides liveness; counting over the whole run does
+not. A title that draws a boot sequence and then stops still has plenty of
+whole-run distinct frames -- ZhuZhu Babies scored 19 and Spore Creatures 21 --
+while showing one frozen picture from frame ~600 to the end. Conversely a
+blinking "press start" screen has only two distinct frames late but changes
+between them constantly (DK Jungle Climber), and is alive. late_changes
+separates those two; distinct alone does not.
 
 A title that boots to a picture and animates scores low blank, low frozen and
 high distinct. The three failures the compatibility sweep is looking for each
@@ -37,6 +47,7 @@ def main():
     first = None
     first_motion = None
     hashes = set()
+    seq = []            # hashes in order, for the late-window test
     with open(args.path, 'rb') as f:
         while True:
             d = f.read(FRAME)
@@ -51,6 +62,7 @@ def main():
                 blank += 1
             h = hashlib.blake2b(d, digest_size=8).digest()
             hashes.add(h)
+            seq.append(h)
             if prev is not None and h == prev:
                 frozen += 1
             if first is None:
@@ -60,12 +72,15 @@ def main():
             prev = h
             n += 1
 
+    late = seq[max(0, n - max(1, n // 4)):]
     rep = {
         'frames': n,
         'blank': round(blank / n, 4) if n else 1.0,
         'frozen': round(frozen / n, 4) if n else 1.0,
         'distinct': len(hashes),
         'first_motion': first_motion,
+        'late_distinct': len(set(late)),
+        'late_changes': sum(1 for i in range(1, len(late)) if late[i] != late[i - 1]),
     }
     out = json.dumps(rep)
     if args.json:
