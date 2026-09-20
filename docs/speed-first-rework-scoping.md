@@ -512,6 +512,60 @@ frontend**, because no headless gate can settle cadence (§3.1). The picture
 and swap counts under `--timing-oc` are already clean, so a regression here
 means the synthesised `GXSTAT` was weakened.
 
+
+#### Phase 1's shape, and the decisions taken (2026-09-20)
+
+Three stages, separately measurable and separately abortable.
+
+**1a — Demolition.** The no-FIFO, untimed model becomes the only model, and
+the alternatives are deleted rather than predicated off: `exec_timed_`,
+`untimed_`, `no_fifo_`, the geometry worker and its SPSC queue, `shape_step`
+and its four arms, the pricer (`price_single`, `price_accum`, `pr_kept_*`),
+`DS_GX_THREAD`, `--gx-worker`, `--timing-oc`. With them goes the FIFO
+machinery they served: the stall queue, `fifo_write_full`, `promote_stalled`,
+`note_enqueued`'s counters, `drain_settle_`, the whole `tm_*` family,
+`finish_work`, and the `cycle_count_` / `vertex_pipeline_` /
+`polygon_pipeline_` / `vertex_slots_free_` state. The expected landing point
+is `tinl` plus whatever the branch removal itself buys -- which is known in
+advance (§3.4), so this stage also checks the harness before anything
+structural moves.
+
+**1b — The logs.** The 512-entry ring of `Entry{u32 param, u8 cmd}` becomes a
+frame-sized `u8` command log and `u32` parameter log. `gxfifo_write`'s sink
+becomes two appends and a pointer bump, bounds-checked per burst rather than
+per entry. The replay becomes a straight-line pass, not `drain_all` looping
+`run_to_slow` with a fake cycle deficit. This is where the structural win has
+to appear; if it does not, say so before 1c rather than after.
+
+**1c — The transform split.** Two-pass replay: walk the log applying state and
+matrix commands while capturing raw vertices and a snapshot of the state each
+depends on, then one batched NEON transform over the array, then polygon
+assembly. Gated on an instruction census under qemu before the real version is
+written -- the per-vertex NEON attempt went 110 -> 118, and the per-vertex
+state snapshot is exactly the cost that could repeat it. Last, so a negative
+result costs nothing already banked.
+
+Unchanged throughout: the synthesised `GXSTAT` contract in full, the
+drain-on-observation path for `POLYGON_COUNT` / `VERTEX_COUNT` / matrix
+read-backs, and the renderer -- dual-window and the multi-buffer path are not
+in this phase's blast radius.
+
+Decisions taken:
+
+1. **Save-state format goes to 3, once, for the whole rework.** A version is
+   only owed a bump when a release ships, so breakage between published
+   releases stays inside version 3 and no migration is carried through seven
+   phases.
+2. **`--cpu-oc` keeps its plumbing.** 1a strips only its geometry-worker half
+   (the call to `set_geometry_worker`); its JIT half -- translate-time
+   data-access pricing -- is untouched and its fate is folded into Phase 2,
+   where the rest of the JIT work happens and where the flag actually lives.
+3. **`--timing-oc` is removed outright**, name and all. An unread key in an
+   existing SDL config costs a line of bloat until the user deletes it;
+   nothing fails to parse.
+4. **The SDL cadence check is built after 1a is soundly in place**, so it is
+   measuring a settled engine rather than a moving one.
+
 ### Phase 2 — The ARM9 row (weeks 2-4) — target **revised, see §3.2 and §3.3**
 
 The biggest row, and the one with the least prior work, because the JIT was
