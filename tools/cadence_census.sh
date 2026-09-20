@@ -43,11 +43,12 @@ if [ -n "${!OVERRIDE_VAR:-}" ]; then ROM="${!OVERRIDE_VAR}"; else
   [ -n "$ROM" ] || { echo "no ROM \"$NAME\" under $DS_ROMS" >&2; exit 3; }
 fi
 
+# Must match golden_dump.sh: gsdd and st-intro are boot scenes with no file
+# of their own (scenes/README.md).
 ENTRY=()
-if   [ "$SCENE" = gsdd ];                    then ENTRY=(--load-state "$HERE/scenes/gsdd-phase2.dss")
-elif [ -f "$HERE/scenes/$SCENE.dsin" ];      then ENTRY=(--replay "$HERE/scenes/$SCENE.dsin")
-elif [ -f "$HERE/scenes/$SCENE.dss" ];       then ENTRY=(--load-state "$HERE/scenes/$SCENE.dss")
-else echo "no scene file for $SCENE" >&2; exit 4; fi
+if   [ -f "$HERE/scenes/$SCENE.dsin" ];      then ENTRY=(--replay "$HERE/scenes/$SCENE.dsin")
+elif [ "$SCENE" = gsdd ] || [ "$SCENE" = st-intro ]; then ENTRY=()
+else echo "no scene file for $SCENE, and it is not a boot scene" >&2; exit 4; fi
 SAVE=(); [ -f "$HERE/scenes/$SCENE.sav" ] && SAVE=(--save "$HERE/scenes/$SCENE.sav")
 
 DS_PROFILE=1 "$BIN" --direct --quantum 0 \

@@ -78,3 +78,36 @@ What distinguishes them is which secondary cost they expose:
 Timing still belongs on the device (`bench3.sh`); these files make the
 *counter* census reproducible on any host, since the counters measure the
 workload rather than the machine.
+
+## The two boot scenes
+
+`gsdd` (Golden Sun: Dark Dawn) and `st-intro` (Spirit Tracks) have no file in
+here. Both games reach their title and attract mode from a `--direct` boot
+with no input at all, so the scene *is* the boot — 2400 frames of it, which
+`tools/gate.sh` knows by name:
+
+    dsperate --direct --quantum 128 --bios9 … --frames 2400 \
+             --dump-frames out.bin "Golden Sun - Dark Dawn.nds"
+
+They were save states (`gsdd-phase2.dss`, `st-intro.dss`) until 2026-09-20.
+Phase 1a of the speed-first rework changed the `GX3D` chunk, and the states
+could not simply be re-recorded at the same point, because **a state's
+`frame_count` is not a position in a boot**: it counts frames since the
+session that wrote it started, which was not a `--direct` boot and used a
+firmware we no longer have. `gsdd-phase2.dss` reads frame 222; a direct boot
+is still on a black screen there and does not reach the title until about
+frame 700. Booting to the recorded number and comparing measured ssim 0.3182,
+with blank, frozen and region faults — a different situation, not a slightly
+shifted one.
+
+Running from boot is what the states were standing in for anyway. They existed
+to reach a heavy spot quickly for repeated measurement; for a perceptual gate
+the whole run is better, because it also covers the lighter 2D stretches a
+state skips straight past, and because no fixture is left that a future chunk
+layout can invalidate.
+
+The cost, stated plainly: the boot scenes are **not** the old situations. The
+recorded `gsdd` state ran ~652 polygons per swap and the boot title ~438, so
+the workload is in the same family at a different point of the animation.
+Their baselines were recorded fresh; do not compare them to numbers taken
+before 2026-09-20.

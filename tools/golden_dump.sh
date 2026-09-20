@@ -71,13 +71,23 @@ else
 fi
 [ -f "$ROM" ] || { echo "no ROM for $SCENE at $ROM (set $OVERRIDE_VAR to point at it)" >&2; exit 3; }
 
-# gsdd's state file is not named after the scene, so it is tested first -- the
-# generic branches below exit when neither scenes/<name>.dsin nor .dss exists.
+# gsdd and st-intro have no entry of their own: both games reach their title
+# and attract mode from a direct boot with no input, so the scene IS the boot
+# (2400 frames -- see gate.sh's frames_for).
+#
+# They were save states until 2026-09-20. Phase 1a broke the state format, and
+# the states could not be regenerated: a state's frame_count counts frames
+# since ITS session's boot, not since a --direct boot, so booting to the
+# recorded number lands somewhere else entirely (gsdd's state reads frame 222;
+# a direct boot is still black there and does not reach the title until ~700 --
+# measured ssim 0.3182 with blank, frozen and region faults). Both states also
+# carried a firmware id we no longer have. Running from boot is equivalent for
+# a perceptual check, needs no fixture that a chunk layout can invalidate, and
+# covers the lighter 2D stretches the states skipped past.
 ENTRY=()
-if   [ "$SCENE" = gsdd ];               then ENTRY=(--load-state "$HERE/scenes/gsdd-phase2.dss")
-elif [ -f "$HERE/scenes/$SCENE.dsin" ]; then ENTRY=(--replay "$HERE/scenes/$SCENE.dsin")
-elif [ -f "$HERE/scenes/$SCENE.dss" ];  then ENTRY=(--load-state "$HERE/scenes/$SCENE.dss")
-else echo "no scenes/$SCENE.dsin or .dss" >&2; exit 4; fi
+if   [ -f "$HERE/scenes/$SCENE.dsin" ]; then ENTRY=(--replay "$HERE/scenes/$SCENE.dsin")
+elif [ "$SCENE" = gsdd ] || [ "$SCENE" = st-intro ]; then ENTRY=()
+else echo "no scenes/$SCENE.dsin, and $SCENE is not a boot scene" >&2; exit 4; fi
 SAVE=(); [ -f "$HERE/scenes/$SCENE.sav" ] && SAVE=(--save "$HERE/scenes/$SCENE.sav")
 
 exec env DS_R3D_THREADS=0 DS_2D_THREAD=0 DS_2D_LAZY=0 DS_SPU_BATCH=1 \

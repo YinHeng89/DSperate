@@ -20,11 +20,14 @@ SCRATCH=${GATE_SCRATCH:-${TMPDIR:-/tmp}/dsperate-gate.$$}
 mkdir -p "$SCRATCH"; trap 'rm -rf "$SCRATCH"' EXIT
 
 # scene -> frames. The replays are 1800 frames and measuring fewer measures
-# boot and title screens (scenes/README.md); the two state scenes are shorter
-# because that is what they were recorded for.
+# boot and title screens (scenes/README.md); the two boot scenes are longer
+# because they include that boot.
 frames_for() {
   case $1 in
-    gsdd) echo 300;; st-intro) echo 600;; *) echo 1800;;
+    # The two boot scenes run longer than the replays: they start at power-on
+    # rather than at a recorded moment, so they have a title sequence to get
+    # through before the part worth judging, and 2400 leaves room for it.
+    gsdd|st-intro) echo 2400;; *) echo 1800;;
   esac
 }
 ALL_SCENES="mlbis meteos sm64 etody dbori artacd gsdd st-intro"
@@ -47,7 +50,9 @@ MODE=${1:?usage: tools/gate.sh baseline|check ...}; shift
 if [ "$MODE" = baseline ]; then
   REF=${1:?ref headless binary}; OUT=${2:?fixtures dir}; shift 2
   mkdir -p "$OUT"
-  for s in $ALL_SCENES; do
+  # Named scenes re-baseline only those, leaving the rest of the fixtures
+  # alone; with none named, every scene is recorded.
+  for s in ${*:-$ALL_SCENES}; do
     n=$(frames_for "$s"); d="$SCRATCH/$s.bin"
     if ! "$HERE/golden_dump.sh" "$REF" "$s" "$n" "$d" >"$SCRATCH/$s.log" 2>&1; then
       echo "skip $s (see $SCRATCH/$s.log)"; sed -n '$p' "$SCRATCH/$s.log"; continue
@@ -57,8 +62,14 @@ if [ "$MODE" = baseline ]; then
     echo "$s: $(wc -l < "$OUT/$s.hashes") frames hashed"
     rm -f "$d"
   done
-  printf '%s\n' "$(git -C "$HERE/.." describe --tags --always 2>/dev/null)" > "$OUT/REFERENCE"
-  echo "baseline in $OUT (reference $(cat "$OUT/REFERENCE"))"
+  # Only a full baseline may claim what the whole directory was recorded
+  # against. `git describe` reads the WORKING TREE, not the reference build,
+  # so a partial re-baseline run from a later commit would otherwise stamp
+  # that commit over a directory recorded from the tag (it did, once).
+  if [ $# -eq 0 ]; then
+    printf '%s\n' "$(git -C "$HERE/.." describe --tags --always 2>/dev/null)" > "$OUT/REFERENCE"
+  fi
+  echo "baseline in $OUT (reference $(cat "$OUT/REFERENCE" 2>/dev/null || echo unknown))"
   exit 0
 fi
 
