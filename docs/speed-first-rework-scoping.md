@@ -339,11 +339,120 @@ methodological and applies to every later patch: **a `perf` share says where
 the time is, not why**, and `perf annotate` is what separates them. ROCKNIX
 ships no `objdump`, so annotate off-device against the cross binary.
 
-### Phase 1 — Geometry as a replayed log (weeks 1-2) — target **-3.0 ms**
+### 3.4 Phase 1's premise, measured on the device — the model is the cheap half
 
-The largest single win, and the one already measured: `--timing-oc` alone is
-worth 3-4 ms a frame on every 3D scene, and DraStic's full model
-(04 §6, checklist 4.17/4.18) goes further than `--timing-oc` does.
+Phase 1 was budgeted at -3.0 ms on the strength of a claim that `--timing-oc`
+"is worth 3-4 ms a frame on every 3D scene". Measured on the RG DS Plus on
+2026-09-20, that claim is wrong twice over: the flag is worth far less than
+3 ms, and most of what it *is* worth does not come from the geometry model at
+all.
+
+Two things made the original number untrustworthy. First, **`gx_geom` does not
+measure geometry.** The `GX_RUN` scope wraps only the two `run_to()` calls in
+the scheduler slice loop (`scheduler.cpp:559`, `:661`); `gxfifo_write` from a
+CPU store is charged to `cpu9`, `gxfifo_dma_burst` to `dma`, a `drain_all()`
+from a `GXSTAT` read to whatever scope the read sits under, and the sort and
+swap to `gx_vblank`. The device baseline's 1.05-1.50 ms `gx_geom` row is
+therefore not Phase 1's before-number and never was. Second, **`--timing-oc`
+is three changes, not one**: both frontends wire it to `set_geometry_worker`
+as well (`headless/main.cpp:558`, `sdl/main.cpp:2012`), and `worker_activate`
+drops the band workers from three to two on a four-core host.
+
+Five arms, three reps, rotating arm order, 1800 frames from 200, `--quantum 0`:
+
+| arm | flags | isolates |
+|---|---|---|
+| `base` | — | control: inline, FIFO kept, timed |
+| `wctl` | `--gx-worker`, `DS_GX_THREAD=1` | the worker as shipped, shape controller deciding |
+| `walw` | `--gx-worker`, `DS_GX_THREAD=2` | worker always on; the controller cannot opt out |
+| `tinl` | `--timing-oc`, `DS_GX_THREAD=0` | no-FIFO + untimed, inline, bands stay at three |
+| `tall` | `--timing-oc`, `DS_GX_THREAD=1` | the shipped combination |
+
+Deltas against `base`, one session:
+
+**median (ms)**
+
+| scene | `wctl` | `walw` | `tinl` | `tall` |
+|---|---|---|---|---|
+| sm64 | -0.09 | **-1.24** | **-1.21** | -2.11 |
+| mlbis | -0.66 | -0.90 | -0.35 | -1.58 |
+| dbori | +0.06 | +0.08 | -0.11 | -0.24 |
+| etody | -0.05 | -0.07 | -0.05 | -0.12 |
+
+**p99 (ms)**
+
+| scene | `wctl` | `walw` | `tinl` | `tall` |
+|---|---|---|---|---|
+| sm64 | +1.61 | +2.28 | **+0.27** | +1.07 |
+| mlbis | +0.49 | +0.63 | **-0.11** | +0.85 |
+| dbori | +1.62 | **+4.03** | **-0.21** | +2.77 |
+| etody | +1.49 | +2.59 | +0.57 | +2.36 |
+
+**total wall (s), 1800 frames**
+
+| scene | `wctl` | `walw` | `tinl` | `tall` |
+|---|---|---|---|---|
+| sm64 | +0.5 | +0.4 | -0.7 | -0.8 |
+| mlbis | -0.2 | -0.5 | -0.2 | -0.8 |
+| dbori | 0.0 | 0.0 | -0.4 | -1.1 |
+| etody | **+0.9** | **+1.5** | 0.0 | +0.4 |
+
+Three conclusions, and they reshape the phase.
+
+**The geometry model is worth about a millisecond, not three.** `tinl` is
+no-FIFO plus untimed geometry with nothing else changed — exactly what the
+phase's first bullet describes — and it buys -1.21 / -0.35 / -0.11 / -0.07 ms
+of median. It is also the only arm that regresses nothing: mean and p90
+improve in all four scenes, total improves or is flat in all four, p99
+improves in two and moves +0.27 / +0.57 in the others. It is safe, and it is
+small.
+
+**The worker does not make the machine faster; it moves work off the critical
+thread, and charges p99 for it.** Every arm containing the worker degrades p99
+in all four scenes without exception. On sm64 `walw` takes median down 1.24
+while mean rises 0.26 and total rises 0.4 s — frames finish sooner on average
+while *more work is done to finish them* — and on etody the trade goes fully
+negative (total +1.5 s, p90 +4.0). That is the queue, the joins, and the
+three-to-two band drop. Given the rework's stability scope puts frame pacing
+on the bar, this settles the plan's instruction to delete the worker: it is
+not a win being given up, it is a liability.
+
+**The shape controller picks wrong wherever the worker helps at all.** `wctl`
+gets -0.09 on sm64 where `walw` gets -1.24, and -0.66 on mlbis against -0.90,
+while still paying most of the p99 cost. Nothing here argues for keeping it.
+
+The arithmetic this leaves Phase 1 is therefore harder than the plan assumed,
+and should be stated plainly. Deleting the worker gives back the ~0.9 ms
+(sm64) and ~1.2 ms (mlbis) of median that `tall` was buying with it. So the
+rewritten log, replay loop and batched transform must find roughly **4 ms on
+the 3D-heavy titles, not 3** — starting from a measured floor of `tinl`, which
+the current structure already reaches.
+
+That floor is the argument for a rewrite rather than a promotion of
+`--timing-oc` to the default. The flag changes the model's *semantics* while
+leaving its *structure* untouched: each parameter word still becomes an 8-byte
+`Entry{u32 param, u8 cmd}`; entries still land in a **512-entry ring** that
+must be drained whenever it fills, so there is no frame log, only a small
+buffer replayed dozens of times a frame; `drain_all` still replays through
+`run_to_slow` with a fake cycle deficit, carrying pipe refill, stall
+promotion, busy-bit bookkeeping and the settle; `exec_single` is still the
+per-command switch with `add_cycles` and `vtx_cmd_*` wrappers at every arm,
+predicated off but still branched; and `submit_vertex` still transforms,
+advances strip assembly and calls `submit_polygon` inline. The measured -1.21
+is what removing the arithmetic buys while all of that remains. The rest of
+the target has to come from removing it.
+
+### Phase 1 — Geometry as a replayed log (weeks 1-2) — target **-4.0 ms on the 3D-heavy titles; see §3.4**
+
+The largest single win, and the one whose premise §3.4 has now measured
+rather than assumed. The earlier claim that `--timing-oc` "alone is worth
+3-4 ms a frame on every 3D scene" does not survive the device: the flag is
+worth -2.11 / -1.58 / -0.24 / -0.12 ms of median on sm64 / mlbis / dbori /
+etody, and only -1.21 / -0.35 / -0.11 / -0.07 of that is the geometry model
+rather than the geometry worker it silently also enables. DraStic's full model
+(04 §6, checklist 4.17/4.18) goes further than `--timing-oc` does, and the
+gap between them is not the semantics — it is the structure underneath, which
+`--timing-oc` leaves in place.
 
 Today `Gpu3D::run_to` executes queued commands after every ARM9 slice and
 prices each command to keep the FIFO level exact; the checklist closed this

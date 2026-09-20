@@ -75,3 +75,38 @@ not *why*. `perf annotate` is what distinguishes them, and it needs
 `objdump` on the device (ROCKNIX has none) or the `perf.data` copied back and
 annotated against the cross binary with `aarch64-linux-gnu-objdump`. Do that
 before writing the next patch.
+
+## The five-arm geometry run (`gx-arms.jsonl`, `gx-arms.log`)
+
+`tools/gx_arms.sh`, run on the device 2026-09-20: five arms, three reps,
+rotating arm order so no arm sits at a fixed point in the thermal curve.
+The arms separate the three changes `--timing-oc` bundles — the no-FIFO
+model, the geometry worker, and the band drop from three workers to two that
+`worker_activate` performs when the worker starts.
+
+| arm | flags |
+|---|---|
+| `base` | — (inline, FIFO kept, timed) |
+| `wctl` | `--gx-worker`, `DS_GX_THREAD=1` |
+| `walw` | `--gx-worker`, `DS_GX_THREAD=2` |
+| `tinl` | `--timing-oc`, `DS_GX_THREAD=0` |
+| `tall` | `--timing-oc`, `DS_GX_THREAD=1` |
+
+The result and what it changed are in the plan at §3.4. In short: the no-FIFO
+model alone is worth about a millisecond of median and regresses nothing; the
+worker buys median by moving work off the emulation thread and charges p99 in
+every scene, turning negative on total wall time in two of four.
+
+Two traps this run walked into, both worth remembering:
+
+* A backgrounded watcher of the form `while pgrep -f foo.sh; do sleep 10;
+  done; bar.sh` **waits on itself** — the watching shell's own command line
+  contains `foo.sh`, so `pgrep -f` matches it forever and `bar.sh` never
+  runs. The same self-match makes a `pgrep -f`-based status check report
+  both jobs as running, so the check that should catch it hides it instead.
+* A `dsperate-headless` left over from an earlier session was still alive
+  throughout the first run, blocked in `wait_for_partner` opening a
+  `--dump-frames` FIFO with no reader. It was harmless here (`state=S`,
+  14 ticks of CPU in 92 minutes, loadavg 0.17) but only because it was
+  blocked rather than spinning; check `/proc/<pid>/stat` before trusting or
+  discarding a run, rather than assuming either way.
