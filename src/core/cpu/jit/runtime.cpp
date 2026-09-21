@@ -846,6 +846,15 @@ extern "C" void jit_h_msr_cpsr(CpuContext* cpu, u32 value, u32 mask) {
   cpu->set_cpsr((cpu->hot.cpsr & ~mask) | (value & mask));
 }
 
+// The exception return -- SUBS/ADDS/MOVS pc, rn, #imm. Restores CPSR from
+// SPSR (mode switch and all) and hands back the branch target with the
+// RESTORED T in bit 0, so the caller can take the ordinary interworking
+// branch: the new state comes from SPSR, not from the address.
+extern "C" u32 jit_h_exc_return(CpuContext* cpu, u32 target) {
+  cpu->restore_cpsr();
+  return (target & ~1u) | ((cpu->hot.cpsr >> 5) & 1u);
+}
+
 extern "C" u32 jit_h_ld8(CpuContext* cpu, u32 addr) {
   g_rt.stats.slow_accesses++;
   if (u8* p = cpu->page_table.read_ptr(addr)) return *p;

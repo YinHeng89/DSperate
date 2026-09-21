@@ -83,6 +83,7 @@ bool arm_needs_fallback(u32 instr, bool a9) {
   case AOp::DpImm: case AOp::DpImmShift: case AOp::DpRegShift: {
     const u32 opcode = (instr >> 21) & 0xF;
     const bool test = opcode >= 8 && opcode <= 0xB;
+    if (rd == 15 && !test && shape::dp_exc_return(instr)) return false;
     return rd == 15 && !test;
   }
   case AOp::Mrs: case AOp::B: case AOp::Bl: case AOp::Bx: case AOp::Pld:
@@ -1099,6 +1100,7 @@ private:
   // preserve both, and call_pure spills the caller-saved guest registers, so
   // nothing else has to be saved around the calls. r15 in the list still
   // falls back: its branch and post-jump CDI charge are the inline path's.
+  void emit_exc_return(u32 instr, u32 opcode, u32 rn);
   void emit_block_slow(u32 list, bool load, bool writeback, u32 rn, u32 n) {
     e().and_imm(SCRATCH1, SCRATCH1, ~3u);
     // The cost FIRST, while the scratch registers are still free: the slow
@@ -1265,13 +1267,37 @@ private:
 
 // ---- ARM -----------------------------------------------------------------------------------------------------
 
+// SUBS/ADDS/MOVS pc, rn, #imm: compute the target, restore CPSR from SPSR
+// through the narrow-spill helper (r13/r14 by hand, call_pure carries r8-r12
+// and reloads the host flags from the RESTORED cpsr -- which is exactly what
+// an exception return needs), then branch with the new T in bit 0.
+void Translator::emit_exc_return(u32 instr, u32 opcode, u32 rn) {
+  const u32 imm = rotr(instr & 0xFF, ((instr >> 8) & 0xF) * 2);
+  if (opcode == 0xD) e().mov_imm(SCRATCH1, imm);
+  else if (opcode == 0x2) e().sub_imm_any(SCRATCH1, host_reg(rn), imm, SCRATCH2);
+  else e().add_imm_any(SCRATCH1, host_reg(rn), imm, SCRATCH2);
+  add_pending(numC(pc_));
+  flush_pending();
+  e().str_w(host_reg(13), R_CTX, off_reg(13));
+  e().str_w(host_reg(14), R_CTX, off_reg(14));
+  e().mov(SCRATCH0, R_CTX, true);
+  e().mov_imm64(R_FN, reinterpret_cast<u64>(&jit_h_exc_return));
+  call_stub(rt().call_pure);
+  e().ldr_w(host_reg(13), R_CTX, off_reg(13));
+  e().ldr_w(host_reg(14), R_CTX, off_reg(14));
+  emit_branch_indirect(SCRATCH0, true);   // the helper put the restored T in bit 0
+}
+
 void Translator::arm_data_processing(u32 instr, AOp op) {
   const u32 opcode = (instr >> 21) & 0xF;
   const bool s = instr & (1u << 20);
   const u32 rd = (instr >> 12) & 0xF, rn = (instr >> 16) & 0xF;
   const bool test = opcode >= 8 && opcode <= 0xB;
   const bool logical = opcode <= 1 || opcode == 8 || opcode == 9 || opcode >= 0xC;
-  if (rd == 15 && !test) { emit_fallback(instr, true); return; }
+  if (rd == 15 && !test) {
+    if (shape::dp_exc_return(instr)) { emit_exc_return(instr, opcode, rn); return; }
+    emit_fallback(instr, true); return;
+  }
   if (op == AOp::DpRegShift) add_pending(numC_internal() + 1);
   else add_pending(numC(pc_));
 

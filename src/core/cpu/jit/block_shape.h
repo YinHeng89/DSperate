@@ -20,6 +20,19 @@ inline bool mcr_is_nop(u32 instr, bool a9) {
 }
 // MSR forms translated inline: CPSR writes from a register or immediate. The
 // mode must not change (tested at run time; otherwise the interpreter runs it).
+// SUBS/ADDS/MOVS pc, rn, #imm with S set: the exception return. Inlined --
+// it is one mode switch (restore_cpsr) and an interworking branch, which is
+// 120 k fallbacks a run in Golden Sun's IRQ exit. The register-operand forms
+// and the other opcodes keep the interpreter.
+inline bool dp_exc_return(u32 instr) {
+  if ((instr >> 28) != 0xE) return false;                       // unconditional only
+  if (arm::decode_arm(instr) != arm::AOp::DpImm) return false;
+  if (!(instr & (1u << 20))) return false;                      // S
+  if (((instr >> 12) & 0xF) != 15) return false;                // rd == pc
+  const u32 opc = (instr >> 21) & 0xF;
+  return opc == 0x2 || opc == 0x4 || opc == 0xD;                // SUB / ADD / MOV
+}
+
 inline bool msr_inline(u32 instr) {
   // SPSR writes inline too: they bank nothing and change no mode -- the
   // current mode's SPSR is one word -- and user/system mode, which have no

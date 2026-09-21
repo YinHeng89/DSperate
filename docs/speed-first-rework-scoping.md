@@ -1101,6 +1101,43 @@ the block, fallback, slow-access and invalidation counters are IDENTICAL with
 and without it, so on that stretch it essentially never fires, while
 `const_step` runs at translate time for every instruction translated.
 
+
+### 3.13 `LDM ^` -- ruled out twice, wrongly, and what it actually needs
+
+`LDM r0, {r0-r14}^` (120 k fallbacks a run, Golden Sun's IRQ exit) was first
+ruled out by inheriting SS3.10's withdrawn rule, then a second time on the
+grounds that it "writes r0-r14, so everything spills and only the decode is
+saved". Both were wrong, and wrong the same way: reasoning from how the
+INTERPRETER implements it rather than from what the hardware requires.
+
+The interpreter switches to user mode, transfers, and switches back
+(`interp_arm.cpp`, `user_bank`). That is convenient in C and irrelevant to the
+JIT. What the banking actually says (`cpu.h`): `bank_r8_r12[2][5]` covers USR
+and FIQ **only**, while `bank_r13[6]` / `bank_r14[6]` are per bank. So in IRQ,
+SVC, ABT or UND mode:
+
+* r0-r7 are never banked -- straight into the pinned host registers;
+* r8-r12 are banked only for FIQ, so in those modes the live registers ARE the
+  user's -- also straight into the pinned host registers;
+* only **r13 and r14** belong elsewhere, at `bank_r13[0]` / `bank_r14[0]`.
+
+That is an ordinary inline block transfer with two destinations redirected to
+fixed memory slots -- the same narrow-spill shape that paid for the mode
+switch and the exception return -- guarded by a runtime check that the mode is
+not USR/SYS (where bank 0 is current) or FIQ (where r8-r12 are banked too),
+which keep the interpreter.
+
+Not attempted yet, deliberately: its correctness is MODE-DEPENDENT, and the
+failure mode is writing the wrong bank, which corrupts an interrupted context
+and surfaces as a rare crash rather than a clean gate failure. It wants a
+fresh session and its own compatibility sweep.
+
+**The general lesson, since it has now cost two wrong rejections in one
+session: when deciding whether a fallback can be inlined, derive the
+requirement from the architecture, not from the interpreter's implementation.
+The interpreter is written for clarity in C and routinely does more than the
+hardware demands.**
+
 ### Phase 3 — DMA, SPU and scheduler granularity (week 4-5) — target **-2.5 ms**
 
 Three small rows that together are as big as Phase 1.
