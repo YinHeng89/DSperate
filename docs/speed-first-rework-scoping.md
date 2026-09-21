@@ -1431,33 +1431,180 @@ from the 2026-09-16 NSMB profile -- SDL, `--dual-window`, two phases old, and
 NSMB has never been a device scene in this rework. Phase 3 needs rescoping per
 scene before it is committed to, the way SS3.3 rescoped Phase 2.
 
-### Phase 3 — DMA, SPU and scheduler granularity (week 4-5) — target **-2.5 ms**
+### Phase 3 — DMA, SPU and scheduler granularity (week 4-5) — target **per scene, see below**
 
-Three small rows that together are as big as Phase 1.
+**Rescoped 2026-09-21 against SS3.17's before-line, the way SS3.3 rescoped
+Phase 2.** The original shape — three rows, one -2.5 ms number, DMA 1.5 → 0.2
+and SPU 0.9 → 0.1 — was arithmetic from the 2026-09-16 NSMB profile, taken in
+the SDL frontend with `--dual-window` on a tree two phases old, on a scene that
+has never been device-measured in this rework. Measured on the device, the
+rows do not contain that much time on four of the five scenes.
 
-* **DMA 1.5 → ~0.2 ms** (checklist 4.8/4.9 in full). Today every word is
-  charged, stall-checked and budget-bounded against a per-unit burst model,
-  even inside a direct-mapped run. DraStic does a whole-transfer copy over a
-  16-entry 8 MB region table with static seq/non-seq cost tables and schedules
-  completion as an event — 7.7 k instructions a frame against our ~30 per
-  word. The code-page invalidation over the destination becomes the coarse
-  (64 KB) / fine (2 KB) bitmap OR (4.10).
-* **SPU 0.9 → ~0.1 ms** (5.1 in full, plus 5.4, 5.6, 5.9, 5.11). Mix once per
-  frame at VBlank with a catch-up on the ARM7 audio timer; resolve each
-  channel's source to a host pointer at key-on; fold resampling into playback
-  with a 32.32 cursor; decode ADPCM a word (8 samples) at a time into a ring;
-  PSG as duty tables and noise as a precomputed 32 K LFSR table. The note that
-  these "would change what Rhythm Heaven's just-in-time stream writer sees" is
-  now a compatibility-sweep question, not a veto.
-* **Scheduler 1.4 → ~0.5 ms.** ~1,090 slices a frame and the scanline hooks.
-  With the SPU no longer an event per 16 samples and the geometry no longer
-  needing per-slice `run_to`, the event count falls on its own; then remove
-  `LOCKSTEP_QUANTUM` and the dual-mode interleave, keep `EVENT_BOUND_QUANTUM`
-  at 2048 (the SDK's IPCSYNC boot handshake needs it — SM64DS boots at 2048
-  and does not at 2560), and let both-halted slices run to the deadline.
+**Phase 3 is the Golden Sun phase.** That is the whole shape of it:
 
-*Exit gate:* audio is judged by ear and by a spectral comparison against
-`dsperate-ref`, not by sample equality — which will not survive any of this.
+| | gsdd | mlbis | dbori | sm64 | etody |
+|---|---|---|---|---|---|
+| frame median | **20.67** | 12.30 | 11.33 | 9.26 | 5.05 |
+| over/under 16.74 | **+3.93** | -4.44 | -5.41 | -7.48 | -11.69 |
+| Phase 3 surface | **4.64** | 1.23 | 1.00 | 1.36 | 1.36 |
+
+Four scenes are already inside the budget and hold 1.0-1.4 ms each across DMA,
+SPU and the scheduler *combined*; there is no -2.5 ms in them to find. Golden
+Sun misses by 3.93 ms and holds 4.64 ms of surface. **So the target is: gsdd
+inside 16.74 ms, and no regression anywhere else.** Hitting it means taking
+about 85 % of gsdd's DMA, SPU and scheduler time, which is a harder ask than
+the -2.5 ms it replaces, and it is the honest one.
+
+The ordering below is by evidence per unit of risk, and it deliberately does
+not follow the subsystem order in the phase's title.
+
+#### 3b — Census before commit, on Golden Sun
+
+Every premise in the original bullets is now old enough to re-check, and one
+is provably stale (3d). The Phase 2 rescope is the precedent: *"a `perf` share
+says where the time is, not why"*, and the plan committed weeks to a row it
+had not profiled once.
+
+* **`perf` gsdd on the device.** The only device census in
+  `fixtures/device/README.md` covers dbori and mlbis. Golden Sun — the scene
+  carrying 48 % of Phase 3's surface and the only one missing the budget — has
+  never been profiled. Do this first and let it choose between 3d, 3e and 3f.
+* **Split `join_worker()` out of the DMA scope.** `prof::Scope` is plain
+  wall-clock with no nesting subtraction (`profile.h`), and the DMA scope in
+  the slice loop wraps `dma.run()`, which calls `gpu.vram_store_trap()`, which
+  can join the line worker and burst-render 2D lines. The 2D rendering is
+  double-counted into `bg_draw` as well and is therefore bounded (gsdd's 2D
+  rows total 0.64 ms), but **the join's own wait has no scope at all** and
+  lands entirely in `dma`. Golden Sun is the trap's worst scene, ~3.5 k VRAM
+  stores a frame. **Until that is split, "gsdd spends 2.54 ms in DMA" is not
+  known to be true**, and neither is SS3.6's basis for dropping Phase 5.
+* **The counters already exist** for the DMA half: `C_DMA_RUN_W` / `RUN_H` /
+  `SLOW_W` / `SLOW_H` / `RUN_SEGS` / `LOOP` / `VRAM_TRAP` / `GXF_*`. The split
+  between bulk-copied words, per-word bus words and trap hits decides 3d
+  without writing any of it.
+
+*Exit:* a per-stage attribution for gsdd that survives the scope overlap, and
+a named lever for each of 3d-3f. Expected gain: 0 ms.
+
+#### 3c — The cart, first
+
+**The largest identified non-JIT cost on the emulation thread, and Phase 2
+never harvested it.** SS3.3 measured `Io::cart_catch_up_slow` as the hottest
+C++ symbol on both censused scenes — ~24 % of dbori's emulation thread, ~11 %
+of mlbis's — named it "Phase 2's first candidate", and Phase 2 then spent
+itself on JIT emitters instead. It is not a DraStic checklist row, which is
+why the plan never had it; it is in Phase 3 because **the cart is DMA**, and
+because the lever is the same whole-transfer granularity the DMA row is about.
+
+The lever is already written. `DS_CART_BULK` (`io.cpp`, `cart_receive_word`):
+with a DMA taking the words, nothing observes their cadence — DRQ is consumed
+by the channel, ROMCTRL's busy bit holds to the end either way, and words the
+DMA has not read are not in RAM on hardware either. So the words are produced
+as the DMA reads them, and the transfer keeps **one** event at the nominal
+time of the last word. Per 512-byte block that is 1 scheduler event and 1
+slice instead of 128 of each, and a loading screen streams tens of blocks a
+frame. The code comment says it: *"Opt-in until swept on the device."*
+
+Three things to do, in order: measure it as an A/B on the device (it is an
+environment variable, so this costs one run, not a patch); sweep it, because
+cart timing is where loaders live and the title sweep is the real gate here,
+not the five scenes; and if it holds, **make it the default and delete the
+flag** — which also pre-pays Phase 7's `--fast-load` deletion, the frontend
+wiring `set_cart_bulk()` being the only thing that flag does to the core.
+
+*Risk:* this is the change most likely to alter what a title observes, and the
+one whose failure mode is a loader that hangs rather than a picture that
+differs. It is first because the evidence is strongest, not because it is safe.
+
+#### 3d — DMA, with the lever chosen by 3b
+
+**The original bullet's premise is stale.** It says *"every word is charged,
+stall-checked and budget-bounded against a per-unit burst model, even inside a
+direct-mapped run... ~30 instructions per word"*. `dma.cpp` already does
+whole-run `memcpy` between direct-mapped pages, closed-form cyclic burst costs
+(`RunCost::bulk`), a binary-searched budget cut, one page-table walk per end
+per run, a once-per-run VRAM trap instead of once per word, and a bulk GXFIFO
+feed. The per-word path is the fallback now, not the model. Rows 4.8/4.9 in
+the form the checklist describes them are substantially done.
+
+So do not re-derive the lever from the checklist. Take it from 3b's counter
+split: per-word bus words (`SLOW_W`/`SLOW_H`) point at the bus path; many
+`RUN_SEGS` carrying few words each point at per-transfer and per-run overhead
+— `start()`, the page walks, the trap probe, the budget loop — which is where
+the genuine whole-transfer row still lives; and a large `VRAM_TRAP` count
+points at lazy 2D rather than at DMA, which is a different phase.
+
+Still unclaimed and still worth having whichever way that falls: the code-page
+invalidation over the destination becoming the coarse (64 KB) / fine (2 KB)
+bitmap OR (4.10).
+
+#### 3e — The scheduler, and the FF3 freeze together
+
+SS3.6 already relocated the freeze here: *"not a JIT defect. It is interleave
+granularity, and it belongs WITH the Phase 3 scheduler row"*. Two things have
+changed since it was written, and both help.
+
+* **The freeze is reachable sooner.** SS3.17's sweep has FF3 freezing 43 %
+  earlier than the Phase 2 sweep did — 95 distinct frames against 167, the
+  same 95 Phase 6's table reads for both recompilers at quantum 2048. A defect
+  that arrives at frame ~95 of a boot bisects faster than one at ~167.
+* **The `EVENT_BOUND_QUANTUM` justification has already expired once.** The
+  reason given for pinning it at 2048 — "SM64DS boots at 2048 and does not at
+  2560" — is no longer true on this tree, and 1792 fixes FF3 at no measured
+  cost. **That is a mitigation, not the fix**: it moves a cliff without
+  explaining it, and the explanation is a cycle-accounting difference between
+  the two engines that this row should find. Re-verify the SM64DS boot
+  constraint before relying on either number.
+
+The row's own work is unchanged: remove `LOCKSTEP_QUANTUM` and the dual-mode
+interleave, let both-halted slices run to the deadline, and let the event count
+fall out of 3c and 3f rather than being attacked directly.
+
+#### 3f — SPU, last and split
+
+The one bullet whose premise **is** intact: `run_channel` really does step a
+16-bit timer per sample per channel, and `mix()` really does run per sample.
+It is last anyway, and the reasons are worth stating because they are not
+about the design being wrong.
+
+It is the largest piece of new code in the phase; it is worth at most 1.13 ms
+and only on gsdd (0.14-0.59 elsewhere); it carries the highest compatibility
+risk in the rework, since a title that paces itself on the SPU's write timing
+has no gate that can catch it; and **its exit gate is the weakest in this
+document** — "by ear and by a spectral comparison", which is the only gate here
+that cannot be run unattended.
+
+So split it, and let 3b decide whether the second half happens at all:
+
+* **The cheap half**, independent of the model: resolve each channel's source
+  to a host pointer at key-on, decode ADPCM a word (8 samples) at a time into
+  a ring, PSG as duty tables, noise as a precomputed 32 K LFSR table. These
+  shrink the per-sample cost without changing when anything is observed.
+* **The model change** — mix once per frame at VBlank with a catch-up on the
+  ARM7 audio timer, resampling folded into playback with a 32.32 cursor — only
+  if 3b shows the row is per-sample loop cost rather than per-event cost. The
+  note that this "would change what Rhythm Heaven's just-in-time stream writer
+  sees" remains a compatibility-sweep question rather than a veto, but Rhythm
+  Heaven is in `games-bench` and should be checked by ear specifically.
+
+#### The stop rule
+
+**Phase 3 ends when gsdd is inside 16.74 ms, or when 3b's census says every
+remaining row is under ~0.3 ms — whichever comes first.** Not when all the
+rows have been done.
+
+SS4 already says the project lands inside budget even if Phase 2 underdelivers,
+and it did underdeliver; four of the five scenes now clear the budget with
+4.4-11.7 ms of margin. Spending weeks on the SPU for 0.14 ms on dbori would be
+risk 4 — "the most code for the least median gain" — in a new costume, and the
+phase that is genuinely short of evidence for its remaining time is not this
+one.
+
+*Exit gate:* the title sweep (3c makes this mandatory, not optional), diffed on
+`distinct` and `frozen` as well as `status` (SS3.17); the picture and cadence
+gates; and audio by ear and by spectral comparison for 3f only. Every step
+reports missed frames and dry audio queues beside the median, as Phase 6
+requires.
 
 ### Phase 4 — The rasteriser, rebuilt for plausibility (weeks 5-7) — target: **p99, thermals, and the other devices**
 
@@ -1651,12 +1798,28 @@ NSMB, emulation thread, if every phase returns its target:
 That is DraStic's neighbourhood on a 3D-heavy scene, with headroom for the
 p99 tail, and it is the number that makes upscaling a conversation worth
 having later. It is also, deliberately, arithmetic from targets rather than
-from measurements — **the only rows with prior measured evidence are geometry
-(`--timing-oc`, 3-4 ms) and DMA/SPU (the checklist's own censuses).** Phase 2
-is the largest single line and the least evidenced; if it returns 1.5 ms
-instead of 3.5 ms the project still lands near 10 ms, inside the budget with
-margin, and that should be treated as success rather than as a reason to
-extend the phase.
+from measurements.
+
+**Superseded, 2026-09-21 — keep this table as the plan's opening bet and do
+not quote it as a forecast.** Every row in it has since been measured on the
+device, and the three the table leaned on hardest did not hold:
+
+* The geometry claim it cites as evidence (`--timing-oc` worth 3-4 ms) is
+  wrong on the device (SS3.4); the phase delivered -0.30 to -1.49 ms (SS3.5)
+  and the row is now **0.00 ms on every scene** (SS3.17) — the only row that
+  beat its target, by being deleted rather than shrunk.
+* Phase 2 returned -0.02 to -1.13 ms against 3.5 (SS3.16), which SS4 itself
+  said to treat as success rather than as a reason to extend the phase. It was.
+* The DMA and SPU rows cited as measured come from the checklist's censuses and
+  the 2026-09-16 NSMB profile, not from this device. Measured here they are
+  1.0-1.4 ms of *combined* Phase 3 surface on four of the five scenes (SS3.17),
+  so the -2.5 ms this table assumes is not in them.
+
+**The conclusion survives the arithmetic that produced it.** Four of the five
+device scenes are inside 16.74 ms today with 4.4-11.7 ms of margin, which is
+what the table was predicting for the end of Phase 5. NSMB, the scene the
+column is about, has never been a device scene in this rework; if the number
+matters, record it as one rather than carrying this table forward.
 
 ## 5. Risks, in order
 
