@@ -67,6 +67,8 @@ const char* const count_names[] = {"3d polygon lines", "3d span pixels", "3d res
   "3d span pixels in len 1-4", "3d span pixels in len 5-8", "3d span pixels in len 9-16", "3d span pixels in len 17-32", "3d span pixels in len 33-64", "3d span pixels in len 65-128", "3d span pixels in len 129-256",
   "stores into palette space", "stores into oam space",
   "2d lazy frames", "2d lazy frames skipped (futile)", "2d vram trap hits", "2d lag frames", "2d lag: trapped stores", "2d lag: stores that joined a line", "2d lag: frames that hit the trap limit", "2d lag: lines left in flight", "2d engine A batch: stores that joined it", "2d engine A batch: capture-bank reads that joined it",
+  "2d join calls",
+  "2d join ns: catch_up", "2d join ns: vram trap", "2d join ns: journal full", "2d join ns: line 0", "2d join ns: vram remap", "2d join ns: render_ranges pre", "2d join ns: render_ranges post", "2d join ns: other",
   "3d resolve kernel calls", "3d resolve parts entered",
   "3d polygon-chunk entries",
   "3d spans empty (no pixels)", "3d spans fully occluded by depth", "3d spans that draw",

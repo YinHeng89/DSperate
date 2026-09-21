@@ -204,7 +204,7 @@ void Gpu::vram_store_trap(Cpu cpu, u32 addr) {
   // windows, or LCDC when A displays or captures from it -- joins it first,
   // which finishes the frame and lifts the trap. B's windows cannot.
   if (a_deferred_) {
-    if (reach_engines(addr) & 1) { prof::add(prof::C_2D_A_JOIN_STORES, 1); join_worker(); }
+    if (reach_engines(addr) & 1) { prof::add(prof::C_2D_A_JOIN_STORES, 1); join_worker(JoinSite::Trap); }
     return;
   }
   const u32 mask = store_engines(addr);
@@ -215,7 +215,7 @@ void Gpu::vram_store_trap(Cpu cpu, u32 addr) {
     prof::add(prof::C_2D_LAG_STORES, 1);
     const u32 reach = reach_engines(addr);
     const bool b_joined = ((reach & 1) && inflight_[0]) || ((reach & 2) && inflight_[1]);
-    if (b_joined) { prof::add(prof::C_2D_LAG_STORE_JOINS, 1); join_worker(); }
+    if (b_joined) { prof::add(prof::C_2D_LAG_STORE_JOINS, 1); join_worker(JoinSite::Trap); }
     // Past the limit the lag is dropped and the trap lifted -- but the trap is
     // still the other engine's guard if it is batching, and lifting it there
     // would let a store into ITS vram land unseen before its batch renders.
@@ -261,7 +261,7 @@ bool Gpu::vram_remap_begin() {
   lazy_probe_period_ = LAZY_PROBE_PERIOD;   // a remap is how scenes change: probe soon
   if (lazy_probe_in_ > LAZY_PROBE_PERIOD) lazy_probe_in_ = LAZY_PROBE_PERIOD;
   catch_up(3);
-  join_worker();
+  join_worker(JoinSite::Remap);
   engine[0].vram_remapped(); engine[1].vram_remapped();
   const bool was = trap_armed_;
   if (was) disarm_trap();
@@ -318,7 +318,7 @@ void Gpu::catch_up(u32 mask) {
                 b ? render_next_[1] : 1, b ? last : 0);
   // A catch-up exists to render lines before the bytes they read change: a
   // run left in flight by lag mode must land before the caller's store does.
-  join_worker();
+  join_worker(JoinSite::CatchUp);
 }
 void Gpu::fall_back_per_line(u32 mask) {
   catch_up(mask);
@@ -352,9 +352,18 @@ void Gpu::on_hblank() {
     // The draws account for themselves; take them out of this hook's time.
     // (Adding the negated interval to the unsigned accumulator subtracts it
     // modulo 2^64; the enclosing scope keeps the per-frame sum positive.)
+    //
+    // The WORKER JOIN inside render_ranges does not account for itself, so it
+    // must not be subtracted with the draws: it has no scope of its own to add
+    // it back, and taking it out here charged it to nothing at all. That is
+    // where Golden Sun's `untimed` row came from -- 2.8 ms a typical frame and
+    // 16 ms at p99, invisible in every stage (SS3.19). Only the draw time is
+    // removed now, by adding the join interval back.
     const auto t_draw0 = prof::enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const u64 join0 = prof::enabled ? join_wait_ns_ : 0;
     render_ranges(f[0], l[0], f[1], l[1]);
-    if (prof::enabled) prof::add_ns(prof::GPU_LINE, static_cast<u64>(-(std::chrono::steady_clock::now() - t_draw0).count()));
+    if (prof::enabled)
+      prof::add_ns(prof::GPU_LINE, static_cast<u64>(-(std::chrono::steady_clock::now() - t_draw0).count()) + (join_wait_ns_ - join0));
     // End of a burst window: the lines after this one batch again, trapped.
     for (int e = 0; e < 2; ++e)
       if (burst_[e] && --burst_left_[e] == 0 && line_ < SCREEN_H - 1) {
@@ -461,7 +470,7 @@ void Gpu::on_scanline_start() {
     // The frame's display lines must all be drawn before the frontend reads
     // them (run_frame returns here) and before begin_frame reads the
     // engines' render side.
-    { prof::Scope j(prof::JOIN0); join_worker(); }
+    { prof::Scope j(prof::JOIN0); join_worker(JoinSite::Line0); }
     if (probe_enabled_) async_probe_check(true);
     { prof::Scope b(prof::BEGIN_FRAME); begin_frame(); }
     nds_.frame_ready = true;
@@ -618,7 +627,7 @@ void Gpu::worker_job(void* self) {
   }
 }
 
-void Gpu::join_worker() {
+void Gpu::join_worker(JoinSite site) {
   if (!inflight_[0] && !inflight_[1] && !scale_inflight_) return;
   const bool dbg = g_dbg_join;
   if (dbg) std::fprintf(stderr, "[join] frame %llu line %u hblank %d a %u..%u b %u..%u deferred %d\n", (unsigned long long)nds_.frame_count, line_, hblank_done_ ? 1 : 0, job_first_[0], job_last_[0], job_first_[1], job_last_[1], a_deferred_ ? 1 : 0);
@@ -627,9 +636,21 @@ void Gpu::join_worker() {
   // Eight of the nine join_worker() call sites had no scope, and the two in
   // the VRAM write trap run inside the DMA scope. "Of which" -- see W2D_JOIN
   // in profile.h.
+  //
+  // Split by call site as well (SS3.19). 99.8 % of the wait turns out to be
+  // render_ranges' PRE-join -- waiting for the previous run before handing off
+  // the next -- and not catch_up, which SS3.18 guessed.
   { const auto t0 = std::chrono::steady_clock::now(); worker_.wait();
     const u64 dt = static_cast<u64>((std::chrono::steady_clock::now() - t0).count());
-    join_wait_ns_ += dt; prof::add_ns(prof::W2D_JOIN, dt); }
+    join_wait_ns_ += dt; prof::add_ns(prof::W2D_JOIN, dt);
+    if (prof::enabled) {
+      prof::add(prof::C_W2D_JOIN_CALLS, 1);
+      static constexpr prof::Counter kBySite[] = {
+        prof::C_W2D_JOIN_NS_CATCHUP, prof::C_W2D_JOIN_NS_TRAP, prof::C_W2D_JOIN_NS_JOURNAL,
+        prof::C_W2D_JOIN_NS_LINE0, prof::C_W2D_JOIN_NS_REMAP,
+        prof::C_W2D_JOIN_NS_RPRE, prof::C_W2D_JOIN_NS_RPOST, prof::C_W2D_JOIN_NS_OTHER };
+      prof::add(kBySite[static_cast<int>(site)], dt);
+    } }
   inflight_[0] = inflight_[1] = false; scale_inflight_ = false; bscale_n_ = 0;
   if (a_deferred_) { a_deferred_ = false; finish_a(); }
 }
@@ -664,7 +685,7 @@ void Gpu::render_ranges(u32 af, u32 al, u32 bf, u32 bl) {
   if (!a_has && !b_has) return;
   // Whatever the worker still holds -- a lagged line, a previous run --
   // before anything below reads or re-latches what it uses.
-  join_worker();
+  join_worker(JoinSite::RangesPre);
   // What the lines read of the frame-level capture state, as of now -- the
   // same for lines drawn here and for lines handed over.
   capcnt_render_ = capcnt_; capture_render_ = capture_on_;
@@ -721,16 +742,16 @@ void Gpu::render_ranges(u32 af, u32 al, u32 bf, u32 bl) {
   // Engine A's deferred batch stays in flight until line 0. A lagged run
   // stays in flight until the next line; the last display line always
   // joins, since writes after it apply directly.
-  if (a_deferred_) { if (!defer_join_) join_worker(); }
+  if (a_deferred_) { if (!defer_join_) join_worker(JoinSite::RangesPost); }
   else if ((a_handed || b_handed || scale_inflight_) && lag_frame_ && last < SCREEN_H - 1) prof::add(prof::C_2D_LAG_LINES, 1);
-  else join_worker();
+  else join_worker(JoinSite::RangesPost);
   if (a_has) render_next_[0] = al + 1;
   if (b_has) render_next_[1] = bl + 1;
   if (!frame_finished_ && render_next_[0] >= SCREEN_H && render_next_[1] >= SCREEN_H) {
     frame_finished_ = true;
     if (a_deferred_) engine[1].frame_done();   // engine A's end, and the traps, at the join (finish_a)
     else {
-      join_worker();
+      join_worker(JoinSite::RangesPost);
       if (read_trap_bank_ >= 0) { nds_.bus.set_lcdc_read_trap(read_trap_bank_, false); read_trap_bank_ = -1; }
       engine[0].frame_done(); engine[1].frame_done(); disarm_trap();
     }

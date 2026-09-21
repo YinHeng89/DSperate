@@ -160,7 +160,7 @@ public:
   // lines in flight if the read is of the bank the capture is writing.
   bool lcdc_read_trapped() const { return read_trap_bank_ >= 0; }
   void lcdc_read_hit(u32 addr) {
-    if (static_cast<int>((addr >> 17) & 7) == read_trap_bank_) { prof::add(prof::C_2D_A_JOIN_READS, 1); join_worker(); }
+    if (static_cast<int>((addr >> 17) & 7) == read_trap_bank_) { prof::add(prof::C_2D_A_JOIN_READS, 1); join_worker(JoinSite::Trap); }
   }
   // begin_frame() for the frame about to run has already happened when
   // run_frame() returns, so this is settled before the frontend asks.
@@ -508,11 +508,15 @@ private:
   // its frame here (finish_a): the journal drained -- the VBlank writes and
   // latches so far, in order -- then frame_done and the traps lifted, as
   // render_ranges does for a frame that finished on this thread.
-  void join_worker();
+  // Where a join was taken from, so its wait can be attributed. SS3.18 found
+  // the emulation thread blocking 2.78 ms a typical frame here with eight of
+  // the nine sites unscoped; this says which of them.
+  enum class JoinSite { CatchUp, Trap, Journal, Line0, Remap, RangesPre, RangesPost, Other };
+  void join_worker(JoinSite site = JoinSite::Other);
   u64 join_wait_ns_ = 0;
   void finish_a();
 public:
-  void journal_full() { join_worker(); }   // Engine2D::queue on a full journal
+  void journal_full() { join_worker(JoinSite::Journal); }   // Engine2D::queue on a full journal
 private:
   static void worker_job(void* self);
 
