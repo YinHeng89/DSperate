@@ -716,7 +716,7 @@ worker -- and Phase 1a deleted that worker. The 1x decision on `gpu-path` is
 software raster through the GPU present stage; the GPU raster stays the opt-in
 route to 2x.
 
-### Phase 2 — The ARM9 row (weeks 2-4) — target **revised, see §3.2 and §3.3**
+### Phase 2 — The ARM9 row (weeks 2-4) — target **revised, see §3.2 and §3.3**; delivered **-0.02 to -1.13 ms**, closed (§3.16)
 
 The biggest row, and the one with the least prior work, because the JIT was
 already audited as close to DraStic (`06` rows 1.1-1.29 are mostly `same`).
@@ -1210,6 +1210,138 @@ different, and self-modifying trials are declined and counted rather than
 judged (25 / 32 / 10 / 28 per set at 6000 trials). `DS_FUZZ_TRACE=<prefix>`
 dumps a per-instruction trace of both engines, which is what localised this;
 the end-state comparison names the symptom, not the instruction.
+
+### 3.15 The exception return: the largest single win in Phase 2 (2026-09-21)
+
+`SUBS`/`ADDS`/`MOVS pc, rn, #imm` with S set -- the IRQ exit -- inlined
+(`f72421e`). Compute the target, restore CPSR from SPSR through the same
+narrow-spill helper the mode switch uses (r13/r14 by hand; `call_pure` already
+carries r8-r12 and reloads the host flags from the *restored* cpsr, which is
+exactly what an exception return needs), then branch.
+
+One subtlety that is not in the mode-switch version: the helper returns the
+target with the restored T already in bit 0, because the new state comes from
+SPSR and not from the address. `emit_branch_indirect`'s non-interworking path
+would have taken T from the translate-time `thumb_`, which is wrong here.
+
+Scoped narrowly on purpose: unconditional, immediate operand, SUB/ADD/MOV.
+The register-operand forms and the other opcodes keep the interpreter, each
+having its own operand-shift cycle behaviour.
+
+| scene | base median | with the emitter | median | mean |
+|---|---|---|---|---|
+| gsdd | 21.494 | **20.880** | **-0.614** | -0.725 |
+| sm64 | 9.370 | 9.269 | -0.101 | |
+| mlbis | 12.239 | 12.214 | -0.025 | |
+| dbori | 11.446 | 11.451 | +0.005 | |
+
+Three reps, alternating order. Golden Sun's total wall fell 24.1 -> 23.3 s.
+Serial census (the only valid kind, SS3.12): 3,517,232,540 -> 3,500,366,331.
+Fuzzer: 1600 trials and 55 directed cases pass. Picture byte-identical to HEAD
+over 800 frames of Golden Sun.
+
+**Why it is worth seven times what `LDM ^` was, per occurrence.** The
+encoding appears 120,458 times a run, but total fallback executions fell
+1,070,861 -> 509,730 -- 561 k, more than four times the encoding's own count.
+This was a **block-ending** fallback: every IRQ exit forced a dispatcher round
+trip, 134 times a frame, and the block now continues through it. Against
+SS3.13's `LDM ^`, which is mid-block:
+
+| | occurrences removed | median won (gsdd) | per thousand |
+|---|---|---|---|
+| exception return (block-ending) | 120,458 | 0.614 ms | **5.1 us** |
+| `LDM ^` (mid-block) | 137,231 | 0.094 ms | 0.69 us |
+
+**So the rule SS3.10 was reaching for, correctly stated, is about block
+shape rather than about work:** a fallback that ends a block costs the
+dispatcher round trip and the truncated block as well as its own execution,
+so the census *understates* it; a mid-block fallback costs roughly its own
+execution, so the census *overstates* what removing it buys. Both of Phase 2's
+two largest wins are block-ending fallbacks. That is the axis to sort any
+future fallback census on, and it is not the axis either SS3.10 or SS3.13
+used.
+
+### 3.16 Phase 2, closed -- the tally, and the gate that is not yet met
+
+**Delivered.** Device medians, RG DS Plus, three reps per step, alternating
+order. The before-column is SS3.9's base (the tree as Phase 1 closed it); the
+after-column is SS3.13's candidate.
+
+| scene | before | after | | |
+|---|---|---|---|---|
+| gsdd | 21.769 | **20.643** | **-1.126** | **-5.2 %** |
+| dbori | 11.879 | **11.345** | -0.534 | -4.5 % |
+| sm64 | 9.509 | **9.230** | -0.279 | -2.9 % |
+| mlbis | 12.276 | 12.260 | -0.016 | -0.1 % |
+
+Step by step, each measured against its own base in its own session:
+
+| step | commit | gsdd | sm64 | mlbis | dbori |
+|---|---|---|---|---|---|
+| two emitters (SS3.9) | `855e266` | -0.177 | -0.088 | +0.068 | -0.247 |
+| wider idle skipping (SS3.11) | `017c4e5`, `ffb29f0` | -0.109 | -0.141 | -0.004 | -0.143 |
+| mode switch (SS3.10) | `58fca58` | -0.180 | -0.084 | -0.061 | -0.040 |
+| exception return (SS3.15) | `f72421e` | **-0.614** | -0.101 | -0.025 | +0.005 |
+| `LDM ^` (SS3.13) | `83898bf` | -0.094 | -0.036 | +0.063 | +0.030 |
+| **sum of steps** | | -1.174 | -0.450 | +0.041 | -0.395 |
+| **end to end** | | **-1.126** | **-0.279** | **-0.016** | **-0.534** |
+
+**The two columns disagree, and the disagreement is the honest error bar.**
+They agree on gsdd (-1.174 against -1.126, 4 %) and diverge on the three
+scenes where every step was inside the noise -- sm64 -0.450 against -0.279,
+dbori -0.395 against -0.534, mlbis +0.041 against -0.016. Each step's A/B was
+paired against a base built in its own session, and those bases drift by more
+than the steps themselves move. **Only gsdd separates from the noise at
+step granularity, and only the end-to-end column should be quoted.** Phase 2
+is a Golden Sun result with three scenes that did not regress.
+
+Against the phase's original **-3.5 ms** that is a third on the best scene --
+but SS3.2 and SS3.3 had already retired that number before any of this was
+written, and what remained had no target. Read against what the census
+actually offered, the phase took the two block-ending fallbacks, the two
+emitter clusters and the idle-skip relaxation, and left translated guest code
+-- a third of the emulation thread, and the floor SS3.3 named -- untouched.
+
+**What Phase 2 rejected, with the evidence.**
+
+* **The per-access cost model** (SS3.2): 2.3-5.5 % of emulated instructions by
+  costprobe, worth 0.2-0.4 ms, not the 3.5 ms the phase was scoped for.
+* **`DS_JIT_FASTCOST`** (SS3.2): +3.16 % *slower* than the exact model.
+* **Hoisting `cart_catch_up_slow`'s guard** (SS3.3): flat to 1.3 % worse.
+* **Row 1.26, known-constant tracking** (`e51c6fd`).
+* **`const_nd` as a flat cost model** (SS3.2 named it "the real floor" and
+  "cheap to try because the code is written"). Tried, and worse on all four
+  scenes: gsdd +0.28, dbori +0.10, sm64 +0.10, mlbis +0.055 ms of median, with
+  every candidate rep above every base rep on dbori and mlbis. *Provenance
+  caveat:* `fixtures/device/phase2-constnd-ab.jsonl` carries the run, but no
+  commit, branch or script survives it, so the arm's exact content is inferred
+  from the filename. Re-derive before quoting it as the last word on SS3.2's
+  recommendation. **With this, every lever SS3.2 and SS3.3 nominated has been
+  measured, and the cost model is closed as a dead end.**
+
+**The exit gate is not yet met.** Phase 2's exit criteria are self-consistency,
+the perceptual gate, and -- "the real gate, not the four scenes" -- the
+compatibility sweep. `fixtures/sweep/a64-jit-phase2.tsv` was produced at
+`1f82522` and **three changes landed after it**: the mode-switch restore, the
+exception return, and the `LDM ^` and `STM`/r15 work (`83898bf`). All three
+touch banked registers or mode switching, which is precisely the class SS3.13
+warns about -- "the failure mode is writing the wrong bank, which corrupts an
+interrupted context and surfaces as a rare crash rather than a clean gate
+failure". A 46-title sweep is ~25 s a title under qemu.
+
+**So Phase 2 closes on paper.** The `LDM ^` emitter and the `STM`/r15
+slow-path fix are committed (`83898bf`); `test_jit`'s 96 directed cases and
+1600 fuzz trials pass against it. Three things carry into Phase 3a:
+
+1. Re-run `tools/title_sweep.sh` over the 46 titles and diff the status column
+   against `a64-jit-phase2.tsv`. Until it passes, Phase 2 has no exit gate.
+2. Re-baseline the golden cadence fixtures. SS3.13 records them as stale --
+   sm64's swap counts, and GXSTAT poll counts on several scenes, differ from
+   the fixtures on the *base* binary as well as the candidate, and have done
+   since the timing work earlier in Phase 2.
+3. Re-baseline `fixtures/device/baseline.jsonl`. It is still `exact-reference`
+   from before Phase 1, so no per-stage row in it is the current tree's, and
+   Phase 3 needs a before-line.
 
 ### Phase 3 — DMA, SPU and scheduler granularity (week 4-5) — target **-2.5 ms**
 
