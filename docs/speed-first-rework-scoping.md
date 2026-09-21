@@ -908,6 +908,55 @@ needs banked-register handling, so each needs a helper with a full register
 spill rather than an emitter -- and the helper has to honour the same
 flag-materialisation contract (`reads = F_ALL`) the interpreter fallback does.
 
+
+### 3.10 The mode-switch core: built, measured, reverted (2026-09-20)
+
+The census's second cluster is the IRQ entry and exit -- `MSR CPSR` with a
+mode change (~361 k), `LDM ^`, `SUBS pc, lr, #4` -- and DraStic has an emitter
+for each (`cpu_translate_msr_op`, `cpu_translate_raise_exception`). The
+`MSR CPSR` one was built as a targeted helper and it does not pay.
+
+**What was built.** `jit_h_msr_cpsr` runs the interpreter's `msr()` CPSR arm
+without the decode, reached from `arm_msr`'s cold path. The spill is narrowed
+to the banked registers only: r0-r7 live in callee-saved host registers and
+`switch_mode` does not touch them, `call_pure` already spills and reloads
+r8-r12 and writes the host flags into `hot.cpsr` (the contract `set_cpsr`
+needs), so only r13 and r14 travel by hand -- 4 memory operations against
+`call_full`'s ~32.
+
+**What it measured.** Golden Sun, 900 frames:
+
+| | committed tree | with the mode switch |
+|---|---|---|
+| fallback executions | 1,601,937 | **1,070,861** (-33 %) |
+| total instructions | 28,920,336,717 | **29,364,147,319 (+1.53 %)** |
+| picture | -- | byte-identical over 800 frames |
+
+A third of the remaining fallbacks removed, and 444 million MORE instructions
+executed. Reverted.
+
+**Why, and why it generalises.** The LDM/STM win came from the fallback doing
+work the replacement could do more cheaply -- n page-table walks in C against
+n slow-stub accesses. A mode switch has no such slack: `set_cpsr` ->
+`switch_mode` is the same call either way, so a helper can only save the
+decode and part of the spill, and here that saving is smaller than what the
+emitted call sequence costs. `LDM ^` and `SUBS pc, lr, #4` need the same
+banked-register handling and do the same work, so they inherit the same
+ceiling and should not be attempted on this evidence.
+
+The rule this suggests, stated for the next phase: **replacing a fallback pays
+when the fallback's own work can be done more cheaply, not when only its
+decode can be avoided.** Every fallback looks like waste in a census; only
+some of it is.
+
+**The fuzzer is what makes this cheap to learn.** It caught a real defect in
+each of the three emitters tried today -- the per-word cost on a cross-page
+transfer (162 cycles against 161), the SPSR liveness claim on the `f` field,
+and the missing `numC` charge here (92 consumed against 128). None would have
+shown in the picture gate. That matters the more because the JIT's other
+correctness route, `--interp` against the recompiler with `--dump-frames`, is
+broken for Golden Sun on the unmodified tree (SS3.9).
+
 ### Phase 3 — DMA, SPU and scheduler granularity (week 4-5) — target **-2.5 ms**
 
 Three small rows that together are as big as Phase 1.
