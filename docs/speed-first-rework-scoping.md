@@ -2121,7 +2121,79 @@ and is therefore no longer write-trapped. The trap's coverage does not follow
 the job. Nothing above tests for it, and the clean gates should not be read as
 covering it.
 
-### Phase 3 — DMA, SPU and scheduler granularity (week 4-5) — target **per scene, see below**
+### 3.29 Phase 3 stowed: the time is in the 2D/worker architecture, and it does not take point fixes
+
+**What Phase 3 set out to do and what it actually did.** The phase owns DMA,
+SPU and the scheduler. Of its rows, **3c (the cart), 3d (DMA), 3e (scheduler
+and FF3) and 3f (SPU) are all untouched.** What the census found instead
+(SS3.18-SS3.28) is that on the two scenes outside the budget the emulation
+thread's largest costs are not in those rows at all:
+
+| | gsdd | st-intro |
+|---|---|---|
+| frame | 20.96 | 19.05 |
+| the Phase 3 rows (dma+spu+sched) | 4.64 | ~1.8 |
+| **worker interaction** | **2.95** (pre-join) | **0.94** (remap join) |
+| geometry replay, hidden in cpu9 | 3.56 | — |
+
+**Three findings say this is architecture, not tuning.**
+
+1. **Removing a wait moves it rather than removing it.** st-intro's remap join
+   went 0.935 -> 0.003 and `r3d_wait` rose 0.001 -> 0.931 in the same run. The
+   frame improved 0.44 of the 0.93 removed; the rest reappeared as a different
+   wait. The thread is gated on rendering finishing, and which wait it shows up
+   as is incidental — the point made while reading SS3.28, and the reason
+   headless (unbound, no frame limiter) turns every render dependency into a
+   visible wait where a paced frontend would absorb some of it.
+2. **A join removed in one path changed hand-off policy in another.** mlbis's
+   remap join was 0.016 ms, and removing it cost +0.33 ms — because
+   `render_ranges`' hand-off predicates read `worker_.parked()`, which is a
+   side effect of joins taken elsewhere for unrelated reasons. perf settles the
+   character: instructions +1.39 % against cycles +0.68 %, so it is **more
+   work**, not slower work, and the symbols put it in 2D rendering on the
+   emulation thread.
+3. **Five hypotheses, all wrong.** The extpal race (real, fixed, not the
+   cause), core starvation (band sweep: gap survives at 2 bands), 2D drawn
+   inline (ablate 8 made it worse), the 3D bin steal (12-15 bins a whole run),
+   and memory interference (refills rose slower than instructions). Each was
+   plausible from reading the code and each was wrong. **A subsystem where five
+   successive local explanations all fail is not one that yields to local
+   fixes.**
+
+**And the shape of the thing is now measured.** `render_ranges` decides, per
+call, both *when to block* and *who draws* — and gsdd calls it **175 times a
+frame** against the other scenes' once, at ~16.6 us a call. It is one function
+carrying the pre-join, the lag policy, the deferred-batch decision, the
+short-run rule and the capture read trap, with the branches coupled through a
+worker state that unrelated code mutates.
+
+**So Phase 3 is stowed here, in favour of a raster / line-worker refactor.**
+That is a scope decision and it should be recorded as one. It is not that the
+Phase 3 rows are worthless — 3c in particular is still the largest identified
+non-JIT cost in the project (SS3.3, ~24 % of dbori's emulation thread) and has
+never been touched. It is that the two scenes that miss the budget miss it for
+reasons Phase 3 does not name, and the next honest step is the architecture
+rather than another row.
+
+**Carried forward, and worth not losing:**
+
+* **The instruments.** `gx_geom` restored (it had no site and read 0.00 through
+  two phases), `w2d_join`, `R3D_STEAL`, the `untimed` accounting fixed, the
+  remap and `render_ranges` censuses, the device before-line with gsdd in it.
+  Four gates were found reporting rather than judging; three now judge.
+* **The gate can see a swapped screen**, in both its shapes — the alternating
+  one reference-free in `frame_health.py`, the persistent one against a
+  reference in `sweep_swapcheck.py`. Zero false positives across 46 titles.
+* **The `VramMap` snapshot is a correctness fix independent of the speed
+  question**: the worker no longer reads an object the emulation thread
+  rebuilds.
+* **Open and unaddressed:** the SS3.25 write-side hazard (a guest write into a
+  bank the snapshot still references, once it has left the engines' view and is
+  no longer trapped). No gate here tests it.
+* **The mlbis regression is unexplained.** Not "probably contention" — five
+  candidates are dead and the sixth has not been formed.
+
+### Phase 3 — DMA, SPU and scheduler granularity (week 4-5) — target **per scene, see below**; **STOWED at 3b, see SS3.29** — 3c/3d/3e/3f untouched
 
 **Rescoped 2026-09-21 against SS3.17's before-line, the way SS3.3 rescoped
 Phase 2.** The original shape — three rows, one -2.5 ms number, DMA 1.5 → 0.2
