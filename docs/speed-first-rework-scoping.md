@@ -1621,8 +1621,19 @@ candidates that the runs above cannot separate:
 
 If it is (1), the fix is a band/line worker budget and costs nothing else. If
 it is (2), the fix is a deeper queue, which is a real change to the hand-off
-and to `render_ranges`' contract. **Measure (1) first: it is one run and it
-decides whether (2) needs writing at all.**
+and to `render_ranges`' contract.
+
+**(1) is answered and it is not the cause.** gsdd was in the post-1b band
+sweep after all (`fixtures/device/band-sweep-post1b.jsonl`): two band workers
+against three reads median 22.059 against 22.096 — noise — while p99 goes
+**35.707 against 33.438** and max **50.090 against 44.424**. Freeing a core by
+dropping a band worker makes the tail *worse*, because the raster then becomes
+the constraint. So the line worker is not starved of a core, and (2) stands as
+the explanation: one line of lag slack is not enough on this scene.
+
+`DS_2D_SPLIT`, which would have sidestepped the question by keeping engine A
+batched, is measured in SS3.22 and does nothing — it has been inert since the
+day after it was written.
 
 **What this does not support** is deleting the 2D worker, which mlbis settles,
 or reinstating Phase 5's representation work on this evidence. A cheaper line
@@ -1669,6 +1680,99 @@ trap as *"a deliberate departure from DraStic... the output stays
 hardware-exact"*, and the speed-first bar has retired that exactness. So the
 justification is the accuracy bar, not anything about GXSTAT -- and the
 plan's own census expects it to be worth little outside Golden Sun.
+
+### 3.22 `DS_2D_SPLIT` measured on the current tree: null, and inert by construction
+
+The per-engine lazy-2D split (`508b7bc`) was measured at **mean -5.1 %, median
+-4.9 %, p99 -11.5 %** on Golden Sun and left opt-in *"until the other scenes
+are measured"*. SS3.20 made it the obvious candidate for the pre-join stall:
+it takes engine A from 192 per-line renders a frame to one batch, and a
+batched engine A uses the deferred join rather than the per-line pre-join.
+
+**Measured, five scenes, three reps, alternating:**
+
+| scene | Δ median | Δ mean | Δ p99 | join base -> split |
+|---|---|---|---|---|
+| gsdd | +0.076 | +0.039 | -0.396 | **2.898 -> 2.880** |
+| mlbis | -0.011 | +0.007 | -0.723 | 0.023 -> 0.035 |
+| dbori | +0.040 | +0.020 | -0.619 | 0.324 -> 0.353 |
+| sm64 | +0.008 | +0.011 | +1.124 | 0.010 -> 0.023 |
+| etody | -0.027 | -0.016 | +0.728 | 0.036 -> 0.020 |
+
+**Nothing, on any scene.** And the join column says why: on Golden Sun it does
+not move. The split never acts at all.
+
+**It was made inert the day after it was written.** `8bdcd13` ("stop arming the
+lazy trap on frames that never batch") landed on 2026-09-01, on by default,
+against the same Golden Sun behaviour, and took the title from 23.5 to 22.2 ms
+median with the dma stage 6.87 -> 2.96 and trap hits 4800 -> 128 a frame. Its
+rule sets `lazy_frame_ = false` once a scene is futile — so **the frame does
+not batch at all**, and the split only decides *which engine leaves a batch
+that never starts*. Re-probe frames come one per `lazy_probe_period_`, which
+doubles to 1024. The counters confirm the state on the current tree: 232 lazy
+frames against 1569 skipped, 129 trap hits.
+
+So the split's headline number was not merely measured against a superseded
+baseline — the commit that superseded it removed the conditions the split needs
+to do anything.
+
+**Recommendation: delete it rather than ship it.** It returns nothing on five
+scenes; it carries a real hazard that its own follow-up recorded (`31a7ab6`:
+lifting the trap while the other engine still batches *"would let a store into
+that engine's vram land unseen before its batch renders. Golden Sun hit it 13
+times a frame and produced correct frames only because it writes nothing to
+engine A — a title that streams to both would have dropped a frame"*); and it
+is another per-subsystem knob, which SS2 counts as a cost in itself. The five
+scenes pass only because none of them streams to both engines, so the gate we
+have cannot retire that risk.
+
+*Picture, both arms, host, against the golden reference:* all eight scenes pass
+with the split on and off, and the differences are identical in both arms
+(etody 1772/1800 exact with 223 realigned, artacd 1799, st-intro ~1948) — they
+are pre-existing, verified by running the control rather than assumed. gsdd is
+2400/2400 exact with the split and 2399/2400 without. **Zero cadence movement
+on any counter on any scene, in either arm.**
+
+*Also recorded in `31a7ab6`, so it is not re-tried:* arming the trap per engine
+measured **+0.9 %** against the split's -5.1 % and was rejected — a page is
+2 KB, so each toggle rewrites 8192 page-table entries and the 8-line bursts
+toggle it ~31 times a frame.
+
+### 3.23 The gate could not name the failure the bar is set on
+
+The user's acceptance bar, stated plainly: **blatantly incorrect rendering
+(missing geometry, poor textures), and DraStic's threaded-3D failure on
+capture-heavy titles — screens flipping rapidly, or a mistaken latch or delay
+rendering onto the opposite one.** Everything else is negotiable.
+
+Checked rather than assumed, and the `swapped` detector could not see half of
+it. `--fault-persist` requires **4 consecutive frames**, and runs are collapsed
+per kind per screen, so a fault that *alternates* — one frame wrong, one right
+— has every run at length 1 and never reaches the threshold however long it
+continues. Eight of twenty-four frames with the screens exchanged reports as
+`(transient, under --fault-persist: swapped 8 frame(s))` and nothing more.
+
+**It was not passing such a build, and the first reading of this said it was.**
+With floors applied it fails `ssim_min`: a swapped frame scores ~0.49 against
+floors of 0.90-0.94. But it fails *unnamed* — three ssim rows and no statement
+of what is wrong — and *incidentally*, because the floors exist to catch
+gradual degradation and `floors.json` says outright that they are to be tuned
+per scene as phases land. sm64's `ssim_min` is already 0.900 against a measured
+0.9146. A structural fault should not rest on a number under that kind of
+pressure.
+
+`--fault-total` (`53c5e48`) counts frames of a kind anywhere in the run
+regardless of adjacency: swapped 3, others 8. The tight swapped budget is
+affordable because **all eight golden scenes produce zero swapped marks**, so
+it only has to cover a genuine POWCNT screen swap landing a frame early. The
+self-test gains the flapping case and its converse — two scattered swaps must
+still be forgiven — and the existing transient cases still pass, so the
+persistence rule is intact. gsdd, etody, artacd and st-intro pass unchanged.
+
+**This is the fourth gate in two days found to be reporting rather than
+judging**, after the cadence counters (SS3.17), the sweep's status column
+(SS3.17) and `GX_RUN`/`W2D_JOIN` (SS3.18). The remaining unaudited one is the
+self-consistency runner, and it should be audited before Phase 3 leans on it.
 
 ### Phase 3 — DMA, SPU and scheduler granularity (week 4-5) — target **per scene, see below**
 
