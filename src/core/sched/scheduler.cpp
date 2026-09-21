@@ -44,6 +44,7 @@ Scheduler::Scheduler(NDS& nds) : nds_(nds), now_(0) {
   // Read once: a function-local static costs an acquire load per use.
   if (const char* q = std::getenv("DS_QUANTUM")) { set_quantum(std::atoll(q)); quantum_forced_ = true; }
   debug_slices_ = std::getenv("DS_DEBUG_SLICES") != nullptr;
+  idle_survey_ = std::getenv("DS_IDLE_SURVEY") != nullptr;
   if (const char* e = std::getenv("DS_IDLE_SKIP"))
     idle_skip_ = (e[0] == '0') ? 0 : (std::strcmp(e, "all") == 0 || e[0] == '2') ? 2 : 1;
   reset();
@@ -170,9 +171,35 @@ bool Scheduler::machine_idle(bool& skip9, bool& skip7) const {
   if (gx_only && !nds_.gpu3d.swap_pending()) return both_idle();
   CpuContext& a9 = const_cast<CpuContext&>(nds_.cpu(Cpu::ARM9));
   CpuContext& a7 = const_cast<CpuContext&>(nds_.cpu(Cpu::ARM7));
-  if (nds_.dma.any_running(Cpu::ARM9) || nds_.dma.any_running(Cpu::ARM7)) { prof::add(prof::C_IDLE_NO_DMA, 1); return false; }
-  if (!nds_.gpu3d.idle()) { prof::add(prof::C_IDLE_NO_GX, 1); return false; }
+  bool vetoed = false;
+  if (nds_.dma.any_running(Cpu::ARM9) || nds_.dma.any_running(Cpu::ARM7)) { prof::add(prof::C_IDLE_NO_DMA, 1); vetoed = true; }
+  else if (!nds_.gpu3d.idle()) { prof::add(prof::C_IDLE_NO_GX, 1); vetoed = true; }
+  if (vetoed) {
+    // DS_IDLE_SURVEY: run the analysis anyway, purely to count what these two
+    // vetoes are turning away, and undo the one piece of state it touches.
+    // in_idle_loop writes only its own verdict cache, which a later call would
+    // have filled identically; the PC ring steers future decisions, so it is
+    // restored. The answer is still `false` either way.
+    if (!idle_survey_) return false;
+    prof::add(prof::C_IDLE_SURVEY_SEEN, 1);
+    u32 ring[2][8]; std::memcpy(ring, idle_pc_ring_, sizeof ring);
+    const u32 p0 = idle_pc_pos_[0], p1 = idle_pc_pos_[1];
+    bool s9 = false, s7 = false;
+    if (idle_analyse(s9, s7, true)) prof::add(prof::C_IDLE_SURVEY_WOULD_SKIP, 1);
+    std::memcpy(idle_pc_ring_, ring, sizeof ring);
+    idle_pc_pos_[0] = p0; idle_pc_pos_[1] = p1;
+    return false;
+  }
+  return idle_analyse(skip9, skip7, false);
+}
 
+// Everything after the DMA and GX vetoes: the PC pre-filter and the loop
+// analysis. `survey` sends the rejections to the shadow counters so a survey
+// pass cannot pollute the real ones.
+bool Scheduler::idle_analyse(bool& skip9, bool& skip7, bool survey) const {
+  const bool gx_only = idle_skip_ == 1;
+  CpuContext& a9 = const_cast<CpuContext&>(nds_.cpu(Cpu::ARM9));
+  CpuContext& a7 = const_cast<CpuContext&>(nds_.cpu(Cpu::ARM7));
   CpuContext* cpus[2] = {&a9, &a7};
   // Pre-filter: analysing costs a body walk, so only look at a CPU that came
   // back to the same instruction it left on -- what a spinning CPU does.
@@ -189,16 +216,16 @@ bool Scheduler::machine_idle(bool& skip9, bool& skip7) const {
   for (int i = 0; i < 2; ++i) {
     CpuContext& c = *cpus[i];
     // An unmasked pending IRQ means the CPU is about to leave, halted or not.
-    if (c.hot.irq_pending && !(c.hot.cpsr & 0x80)) { prof::add(prof::C_IDLE_NO_IRQ, 1); return false; }
+    if (c.hot.irq_pending && !(c.hot.cpsr & 0x80)) { prof::add(survey ? prof::C_IDLE_SURVEY_NO_IRQ : prof::C_IDLE_NO_IRQ, 1); return false; }
     if (c.halted) continue;
-    if (!repeated[i]) { prof::add(prof::C_IDLE_NO_FILTER, 1); return false; }
+    if (!repeated[i]) { prof::add(survey ? prof::C_IDLE_SURVEY_NO_FILTER : prof::C_IDLE_NO_FILTER, 1); return false; }
     // Swap-wait mode: the ARM9 loop must read GXSTAT and no other device; the
     // ARM7 (which cannot see GXSTAT) may only spin on RAM.
     const cpu::IdlePorts ports = !gx_only ? cpu::IdlePorts::All : i == 0 ? cpu::IdlePorts::GxstatOnly : cpu::IdlePorts::RamOnly;
-    if (!cpu::in_idle_loop(c, ports)) { prof::add(i ? prof::C_IDLE_NO_LOOP7 : prof::C_IDLE_NO_LOOP9, 1); return false; }
+    if (!cpu::in_idle_loop(c, ports)) { prof::add(survey ? prof::C_IDLE_SURVEY_NO_LOOP : (i ? prof::C_IDLE_NO_LOOP7 : prof::C_IDLE_NO_LOOP9), 1); return false; }
     skip[i] = true;
   }
-  prof::add(prof::C_IDLE_OK, 1);
+  if (!survey) prof::add(prof::C_IDLE_OK, 1);
   skip9 = skip[0];
   skip7 = skip[1];
   return true;

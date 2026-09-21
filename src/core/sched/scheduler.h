@@ -235,6 +235,8 @@ private:
   // to pay (Dragon Ball Origins); 2 = "all": any proven poll loop, which costs
   // 7-10 % on scenes that never spin and moved Etrian Odyssey's frames.
   u8 idle_skip_ = 1;
+  bool idle_survey_ = false;      // DS_IDLE_SURVEY: count what the dma/gx vetoes cost, change nothing
+  bool idle_analyse(bool& skip9, bool& skip7, bool survey) const;
   // The event table is split by field and gated by a bitmask: firing scans
   // only the armed events (typically six to eight of the twenty) and touches
   // three cache lines of deadlines instead of eight of interleaved records.

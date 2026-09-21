@@ -855,6 +855,12 @@ it is where DraStic's remaining quarter of a frame lives.
 
 ### Phase 6 — Stability as a workstream (throughout, converging weeks 8-9)
 
+**The FF3 both-recompiler freeze is scheduled after Phase 3**, not before: it
+is a JIT-interaction defect (alive under `--interp`, `--jit9` and `--jit7`
+separately, frozen with both, confirmed on hardware and reproducible under
+qemu), so it is chased once the JIT work of Phases 2-3 has settled rather than
+against a moving target. It is bisectable off-device whenever it is picked up.
+
 Not a phase that follows the others — a track that runs alongside, with its
 own gates. The user named three things; each maps to concrete work already
 visible in the tree.
