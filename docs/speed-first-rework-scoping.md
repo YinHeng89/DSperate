@@ -1482,10 +1482,9 @@ is a third of the thread.
 **1. The emulation thread's largest single cost on this scene is waiting for
 the 2D line worker.** 2.78 ms a typical frame, 16.3 ms at p99, and it accounts
 for essentially the entire tail: nothing else contributes more than 1.5 ms to
-p99. The site is `Gpu::catch_up()` — `render_ranges()` hands one engine's lines
-to the worker and the next statement blocks on it, because a catch-up exists
-precisely to land those lines before the store that triggered it. Golden Sun
-is the lazy trap's worst scene.
+p99. The site was read from the code as `Gpu::catch_up()` — **wrong, and corrected
+in SS3.19: it is `render_ranges`' pre-join, 99.8 % against `catch_up`'s
+0.21 %.** The two want different fixes, so the distinction matters.
 
 **2. SS3.6's grounds for dropping Phase 5 do not hold.** That section dropped
 the 2D engines on "0.64 ms on Golden Sun, 0.0 % join wait". The 0.64 ms is the
@@ -1510,13 +1509,69 @@ and the -1.3 ms the phase wanted from it is not there. 3f (SPU, 1.12 ms) and 3e
 the only scene that misses the budget is now the 2D hand-off**, which is in no
 phase's scope: Phase 3 does not cover it and Phase 5 was dropped.
 
-*Still unmeasured, and needed before committing to that lever:* how much of the
-join is reachable at all. A catch-up that must land before a store cannot
-simply be deleted; the questions are whether the lag limit can absorb more of
-them (`LAG_TRAP_LIMIT`), whether the hand-off is worth making at all for runs
-this short, and whether the 4.86 ms of `untimed` — which tracks the join's tail
-almost exactly — is more of the same thing at sites that are still in no scope.
-**Measure that before writing anything.**
+*Measured in SS3.19, which answers both open questions:* the `untimed` row is
+the same join, subtracted out of `GPU_LINE` and charged to nothing; and the
+site is the pre-join in `render_ranges`, not `catch_up`. The lever is
+pipelining, not correctness.
+
+### 3.19 The untimed row *is* the join -- and the site is not the one SS3.18 named
+
+Two corrections to SS3.18, both found by instrumenting rather than reasoning.
+
+**The `untimed` row was the 2D worker join, subtracted and charged to
+nothing.** `Gpu::on_hblank` opens a `GPU_LINE` scope and then subtracts the
+whole `render_ranges` interval back out -- *"the draws account for
+themselves"*, and they do, through `BG_DRAW`, `SELECT` and the rest. But the
+**worker join inside `render_ranges` has no scope of its own to add itself
+back**, so subtracting it charged it to nothing at all. Removing only the draw
+time:
+
+| Golden Sun, device, 1100 frames | fast | typ | p99 |
+|---|---|---|---|
+| untimed, before | 1.812 | **5.013** | **21.519** |
+| untimed, after | 1.609 | **2.138** | **4.546** |
+| gpu line hooks, before | 0.829 | 0.790 | — |
+| gpu line hooks, after | 0.829 | **3.424** | **13.922** |
+| 2d worker join *(of which)* | 0.178 | 2.837 | 13.509 |
+
+`untimed` falls by 2.88 ms typical and **17.0 ms at p99**, and `gpu_line` rises
+to hold it. What remains unaccounted is 2.14 ms, which is no longer the largest
+thing on the scene.
+
+**The site is `render_ranges`' pre-join, not `catch_up`.** SS3.18 named
+`catch_up` from reading the code. Measured per call site, over the run:
+
+| site | join time | share |
+|---|---|---|
+| **`render_ranges` pre** | **4.81 s** | **99.8 %** |
+| `catch_up` | 10.3 ms | 0.21 % |
+| vram trap | 1.2 ms | 0.03 % |
+| vram remap | 0.4 ms | |
+| `render_ranges` post | 0.6 ms | |
+| line 0 (`JOIN0`) | 0.1 ms | |
+
+That is a different shape of problem. `catch_up` waits because a store must
+not overtake a line -- a correctness join, hard to remove. The **pre-join
+waits for the previous run to land before handing off the next**, which is a
+pipelining problem. Lag mode already skips the *post*-join and leaves a run in
+flight, giving one line of slack; the pre-join at the next HBlank is where that
+slack is spent. **On this scene one line is not enough: the emulation thread
+reaches line N+1 before the worker has finished line N.**
+
+**An instrument that answered the wrong question, recorded because it nearly
+stuck.** A leaf-scope depth counter was built first, and it reported the join
+**99.99 % "inside a leaf scope"** -- which is true, and irrelevant. `GPU_LINE`'s
+`Scope` object *is* open across the join; it is the *time* that is subtracted
+out from under it. "Is a scope open" and "is the time attributed" are different
+questions, and only the second one mattered. On the strength of the first the
+join would have been written off as already accounted for. The depth machinery
+is reverted; the per-call-site counters, which were decisive, stay.
+
+That is the third instrument in two days to give a confident wrong answer --
+after the threaded instruction census (SS3.12) and the slice-counting idle
+survey (SS3.11). The pattern in all three is the same: **the instrument
+measured something adjacent to the question and the adjacency was not
+checked.**
 
 ### Phase 3 — DMA, SPU and scheduler granularity (week 4-5) — target **per scene, see below**
 
