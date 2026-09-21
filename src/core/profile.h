@@ -110,6 +110,13 @@ enum Counter : u32 { C_POLY_LINES, C_SPAN_PIXELS, C_RESOLVED_PIXELS, C_TEX_FAST,
   C_2D_LAG_FRAMES, C_2D_LAG_STORES, C_2D_LAG_STORE_JOINS, C_2D_LAG_DROPPED, C_2D_LAG_LINES, C_2D_A_JOIN_STORES, C_2D_A_JOIN_READS,
   // The 2D worker join by call site, so a lever can be aimed. See Gpu::JoinSite.
   C_W2D_JOIN_CALLS,
+  // VRAMCNT remaps, split by whether they move a view a 2D ENGINE reads.
+  // vram_remap_begin catches both engines up and joins the worker for ANY
+  // remap; the 3D side next to it already syncs only when its own two views
+  // move ("most VRAMCNT traffic ... leaves them alone"). These count whether
+  // the same is true for 2D. STILL means no engine-read view moved, so the
+  // catch-up and the join cannot have been needed.
+  C_VRAM_REMAP, C_VRAM_REMAP_2D_MOVED, C_VRAM_REMAP_2D_STILL, C_VRAM_REMAP_PENDING,
   C_W2D_JOIN_NS_CATCHUP, C_W2D_JOIN_NS_TRAP, C_W2D_JOIN_NS_JOURNAL,
   C_W2D_JOIN_NS_LINE0, C_W2D_JOIN_NS_REMAP, C_W2D_JOIN_NS_RPRE, C_W2D_JOIN_NS_RPOST, C_W2D_JOIN_NS_OTHER,
   C_RESOLVE_CALLS, C_RESOLVE_PARTS,

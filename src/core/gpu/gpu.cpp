@@ -257,7 +257,20 @@ void Gpu::vram_store_trap(Cpu cpu, u32 addr) {
   fall_back_per_line(3);   // both engines: a store is charged to both (see gpu.h)
 }
 
-bool Gpu::vram_remap_begin() {
+// `moved_2d` is the engines whose read views this remap actually moves (bit 0
+// engine A, bit 1 engine B), computed by the caller from the old and new maps.
+// CENSUS ONLY for now -- the catch-up below is still unconditional. The 3D
+// path beside it in Bus::update_vram already syncs only when ITS views move;
+// SS3.25 measures whether 2D can do the same.
+bool Gpu::vram_remap_begin(u32 moved_2d) {
+  if (prof::enabled) {
+    prof::add(prof::C_VRAM_REMAP, 1);
+    prof::add(moved_2d ? prof::C_VRAM_REMAP_2D_MOVED : prof::C_VRAM_REMAP_2D_STILL, 1);
+    const u32 f = frontier();
+    if (f && ((render_next_[0] < f && render_next_[0] < SCREEN_H) ||
+              (render_next_[1] < f && render_next_[1] < SCREEN_H)))
+      prof::add(prof::C_VRAM_REMAP_PENDING, 1);
+  }
   lazy_probe_period_ = LAZY_PROBE_PERIOD;   // a remap is how scenes change: probe soon
   if (lazy_probe_in_ > LAZY_PROBE_PERIOD) lazy_probe_in_ = LAZY_PROBE_PERIOD;
   catch_up(3);

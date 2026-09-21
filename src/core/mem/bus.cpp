@@ -435,7 +435,19 @@ void Bus::update_vram() {
   // whose HBlank has passed are rendered now, against the old views, before
   // anything is rebuilt; the write trap (which the remap below would drop)
   // is re-armed after it.
-  const bool trapped = nds_.gpu.vram_remap_begin();
+  // Which 2D engine's read views this remap actually moves -- the same test
+  // the 3D sync above makes for its own two views, asked for the four (plus
+  // extended palettes) each engine fetches through. LCDC counts for engine A,
+  // which can display and capture from it. Census only for now: gpu's
+  // catch-up is still unconditional (SS3.25).
+  const auto view_moved = [&](const gpu::VramView& a, const gpu::VramView& b) { return differs(a, b); };
+  const u32 moved_2d =
+      ((view_moved(next.abg, vram_map_.abg) || view_moved(next.aobj, vram_map_.aobj) ||
+        view_moved(next.abg_extpal, vram_map_.abg_extpal) || view_moved(next.aobj_extpal, vram_map_.aobj_extpal) ||
+        next.lcdc_mask != vram_map_.lcdc_mask) ? 1u : 0u) |
+      ((view_moved(next.bbg, vram_map_.bbg) || view_moved(next.bobj, vram_map_.bobj) ||
+        view_moved(next.bbg_extpal, vram_map_.bbg_extpal) || view_moved(next.bobj_extpal, vram_map_.bobj_extpal)) ? 2u : 0u);
+  const bool trapped = nds_.gpu.vram_remap_begin(moved_2d);
   vram_map_ = next;
   // The whole 16 MB region is described as one host pointer per page and
   // applied as a diff: games that rewrite VRAMCNT every few frames (bank

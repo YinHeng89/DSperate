@@ -101,7 +101,7 @@ public:
   void palette_store(Cpu cpu, u32 addr, u32 width, u32 value);
   void oam_store(Cpu cpu, u32 addr, u32 width, u32 value);
   void vram_store_trap(Cpu cpu, u32 addr);
-  bool vram_remap_begin();            // before a VRAMCNT remap: catch up, lift the trap; returns whether it was set
+  bool vram_remap_begin(u32 moved_2d);  // before a VRAMCNT remap: catch up, lift the trap; returns whether it was set
   void vram_remap_end(bool trapped);  // after: re-arm it
   void set_lazy(bool on) { lazy_enabled_ = on; }   // tests: DS_2D_LAZY
 

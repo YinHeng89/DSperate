@@ -1819,20 +1819,79 @@ deeper-queue change SS3.20 proposed. A deeper queue helps Golden Sun's
 per-line hand-off and is irrelevant to a remap that must flush by definition.
 
 **3. What to look at for Spirit Tracks.** `vram_remap_begin` catches up *both*
-engines and joins for *any* mapping change. A remap knows which bank moved,
-and `reach_engines`-style reasoning already exists for stores: a bank that
-neither batching engine is reading needs no catch-up at all, and a bank only
-one engine reads needs only that engine's. `e12cee7` already narrowed the
-remap's *trap toggling* to mapped pages; the catch-up and the join were left
-whole. **Census first** -- how many of the ~1 remap a frame actually move a
-bank an engine is fetching from -- because if the answer is "most of them"
-this lever does not exist and the batch genuinely has to flush.
+engines and joins for *any* mapping change. The proposal here was to narrow
+that to the engines whose views actually move. **Censused in SS3.25 and it is
+the wrong lever** -- 99.9 % of remaps do move one. The right one is that the
+catch-up was never the cost (0.4 % of remaps have lines pending); the
+unconditional `join_worker()` after it is, and a job in flight should render
+against the mapping it was handed rather than the live one.
 
 *Coverage gap found while doing this:* Art Academy is in `games-bugtest` on
 the host but **is not on the device at all**, so `artacd` has never been part
 of any device measurement in this rework. It is the most 2D-heavy title in the
 set and the likeliest third scene to have a join problem. Copy the ROM over
 before the next census.
+
+### 3.25 The remap census: the obvious lever is not there, and the right one is a snapshot
+
+SS3.24 proposed narrowing `vram_remap_begin`'s catch-up to the engines whose
+views a remap actually moves -- the test the 3D path beside it already makes
+(*"whether the band workers must be joined depends on whether the two views
+they index actually move, and most VRAMCNT traffic ... leaves them alone"*).
+Censused, 2400 frames:
+
+| | remaps | a 2D view moved | none moved | **lines pending** |
+|---|---|---|---|---|
+| st-intro | 5951 | **5945 (99.9 %)** | 6 | **24 (0.4 %)** |
+| mlbis | 6194 | 6163 (99.5 %) | 31 | 44 (0.7 %) |
+| gsdd | 411 | 405 | 6 | 1 |
+
+**The lever is not there.** Where the 3D views mostly stay put, the 2D views
+almost always move -- 99.9 % on Spirit Tracks -- so a test on "did an engine's
+view move" would skip essentially nothing. That idea is dead.
+
+**But the last column is the finding.** Only **24 of 5951** remaps had any
+lines pending, so `catch_up(3)` returns immediately 99.6 % of the time. The
+catch-up was never the cost. **`join_worker()` is called unconditionally
+afterwards**, and *that* is what waits: ~2488 joins that actually blocked, 1.75 s
+between them, about **700 us each and one per frame** -- the whole of a batched
+frame's 2D render.
+
+So the sequence on Spirit Tracks is:
+
+1. Line 191: engine A's frame batches and is handed to the worker as a
+   *deferred* job -- the one hand-off designed **not** to block, so the render
+   overlaps the next frame's emulation.
+2. VBlank: the game rewrites VRAMCNT, as games do.
+3. `vram_remap_begin` joins the worker immediately, and the deferral buys
+   nothing at all.
+
+**The lever is to give the worker its own view, not to skip the join.** A
+remap moves the *mapping*; it does not move the banks, whose storage is fixed
+(A..I) and shared either way. A job in flight should render against the
+`VramMap` as it stood when it was handed off, which is exactly what those
+lines are supposed to read -- and then a remap has nothing to wait for. The
+copy is affordable and already exists: `Bus::update_vram` builds a whole
+`VramMap` copy on *every* remap and the comment calls it *"a few KB of plain
+arrays"*.
+
+This is the same insight lazy 2D started from, applied one level up. That
+design says *"VRAM cannot be journaled, so it is trapped"* -- true of VRAM's
+**contents**, and false of its **mapping**, which is nine VRAMCNT bytes.
+Registers, palette and OAM are journaled; the mapping can be too.
+
+**The hazard, stated before anything is written.** A snapshot keeps pointing at
+banks the guest may now write through a *new* mapping, and the write trap
+covers the pages the engines read *now*, not the ones a job in flight still
+needs. So the trap's coverage has to follow the job, not the live map. That is
+the real work in this change, it is the same class of bug `31a7ab6` had to fix
+for the per-engine split, and it is the reason this is a Phase 3 item with a
+compatibility sweep rather than an afternoon's patch.
+
+*Bounding it first:* count the remaps that both move a view a job in flight is
+reading **and** are followed by a write into the moved bank before that job
+lands. If that is zero on the scene set, the snapshot is nearly free and the
+trap work is insurance; if it is common, this is a much larger change.
 
 ### Phase 3 — DMA, SPU and scheduler granularity (week 4-5) — target **per scene, see below**
 
