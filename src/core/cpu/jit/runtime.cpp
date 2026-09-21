@@ -836,6 +836,16 @@ extern "C" void jit_h_trace(CpuContext* cpu, u32 instr, u32 key) {
 // re-test the region this path has already established. Otherwise the same
 // paths the interpreter's mem_read*/mem_write* take (cpu_mem.h), minus the
 // cost, which the block charges from the timing table like every other access.
+// MSR CPSR whose mode changes, or that runs in user mode: the interpreter's
+// msr() CPSR arm without the decode. call_pure has already put the host flags
+// into hot.cpsr and carried r8-r12; the caller carries r13/r14. set_cpsr swaps
+// the banks and the caller reloads what it spilled.
+extern "C" void jit_h_msr_cpsr(CpuContext* cpu, u32 value, u32 mask) {
+  if ((cpu->hot.cpsr & 0x1F) == 0x10) mask &= 0xFF000000;   // user mode: flags only
+  mask &= ~0x00000020u;                                     // T is not writable through MSR
+  cpu->set_cpsr((cpu->hot.cpsr & ~mask) | (value & mask));
+}
+
 extern "C" u32 jit_h_ld8(CpuContext* cpu, u32 addr) {
   g_rt.stats.slow_accesses++;
   if (u8* p = cpu->page_table.read_ptr(addr)) return *p;

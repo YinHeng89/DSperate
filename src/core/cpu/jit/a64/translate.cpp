@@ -1561,7 +1561,23 @@ void Translator::arm_msr(u32 instr, AOp op) {
   if (fail.empty()) return;
   const size_t join = hot_.size();
   cold_begin(fail);
-  emit_fallback(instr, false);
+  // The mode change (and user mode) without the interpreter's decode. Only the
+  // BANKED registers travel: r0-r7 are callee-saved and switch_mode does not
+  // touch them, call_pure carries r8-r12 and the flags, so r13/r14 are the two
+  // left by hand. numC is charged here because the hot path charges it only
+  // AFTER the mode tests, so this leg never reached it.
+  e().sub_imm(R_BUDGET, R_BUDGET, numC(pc_), true);
+  e().str_w(host_reg(13), R_CTX, off_reg(13));
+  e().str_w(host_reg(14), R_CTX, off_reg(14));
+  e().mov(SCRATCH1, wv);
+  e().mov_imm(SCRATCH2, ((fields & 1) ? 0x000000FFu : 0) | ((fields & 2) ? 0x0000FF00u : 0)
+                      | ((fields & 4) ? 0x00FF0000u : 0) | ((fields & 8) ? 0xFF000000u : 0));
+  e().mov(SCRATCH0, R_CTX, true);
+  e().mov_imm64(R_FN, reinterpret_cast<u64>(&jit_h_msr_cpsr));
+  call_stub(rt().call_pure);
+  e().ldr_w(host_reg(13), R_CTX, off_reg(13));
+  e().ldr_w(host_reg(14), R_CTX, off_reg(14));
+  if (fields & 1) { call_stub(rt().poll); e().word(make_key(pc_ + 4, thumb_)); }   // I may have changed
   cold_end_jump(join);
 }
 

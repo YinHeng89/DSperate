@@ -53,3 +53,23 @@ the RG DS Plus (ROCKNIX 7.0.2, Cortex-A55, glibc 2.41) reproduce the table
 above *digit for digit*: 645 distinct and 181/180 late for `--interp`,
 `--jit9` and `--jit7`; 167 distinct and 1/0 late with both. This is a real
 defect, and qemu reproduces it faithfully, so it can be bisected off-device.
+
+## After Phases 1 and 2 (`a64-jit-phase2.tsv`, 2026-09-20)
+
+The same command, the same 46 titles, the same 3600 frames, the AArch64
+JIT+NEON build under qemu — re-run after the geometry rework (Phase 1) and
+the JIT and scheduler work (Phase 2).
+
+| | ok | static | fail |
+|---|---|---|---|
+| `a64-jit.tsv` — `exact-reference` | 39 | 7 | 0 |
+| `a64-jit-phase2.tsv` — after Phases 1+2 | 39 | 7 | 0 |
+
+**No title changed status.** Joining the two on the title column produces no
+differing rows, so nothing regressed and nothing was fixed. The seven static
+titles are the same seven, still needing the one-off human look recorded above.
+
+This is the gate Phase 2's exit criteria call the real one — "the sweep, not
+the four scenes" — and it cannot run on the host: the JIT has AArch64 and
+ARM32 backends only, so the x86 build is interpreter-only. Run it under qemu
+(as here, ~25 s a title) or on the device.

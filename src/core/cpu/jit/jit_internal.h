@@ -362,6 +362,7 @@ const void* jit_h_lookup(CpuContext* cpu, u32 key);
 const void* jit_h_link(CpuContext* cpu, u32 key, u8* patch_site);
 void        jit_h_trace(CpuContext* cpu, u32 instr, u32 key);
 void        jit_h_cyclog(CpuContext* cpu, u32 instr, u32 key);
+void        jit_h_msr_cpsr(CpuContext* cpu, u32 value, u32 mask);
 u32         jit_h_ld8(CpuContext* cpu, u32 addr);
 u32         jit_h_ld16(CpuContext* cpu, u32 addr);
 u32         jit_h_ld32(CpuContext* cpu, u32 addr);
