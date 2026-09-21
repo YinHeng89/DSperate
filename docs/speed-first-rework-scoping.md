@@ -846,6 +846,68 @@ sizes measured, and both have a DraStic design to follow), then density via
 known-constant tracking, then the timing charge. Rows 1.5, 1.12 and 1.23 stay
 open but none of them addresses anything the census found.
 
+
+### 3.9 Phase 2's first delivery: two emitters, measured (2026-09-20)
+
+The census's two fallback clusters (SS3.8), answered with DraStic's designs
+where they fit and with ours where they do not.
+
+**Cross-page block transfers.** DraStic gives LDM/STM sixteen helpers per
+direction, one per register count, because its fallback is the loop. Ours is
+not: the inline path already unrolls, and it falls back only when a transfer
+straddles a 2 KB page. `emit_block_slow` applies the same idea -- a call into
+straight-line code rather than a re-decode -- to the case we actually lose.
+
+**MSR SPSR inlined.** Refused by a blanket SPSR test, though it banks nothing
+and changes no mode. A load, a merge and a store, skipped in user and system
+mode. The liveness table needed correcting with it: it claimed the `f` field
+writes the host flags, which is true for CPSR and false for SPSR.
+
+Measured, Golden Sun, 900 frames:
+
+| | before | after |
+|---|---|---|
+| fallback executions | 2,482,000 | **1,601,937** (-35.5 %) |
+| total instructions | 30,940,069,510 | **29,601,064,211** (-4.33 %) |
+| hot code density | 26.6 B/guest instr | 26.6 (unchanged; the new leg is cold) |
+
+On the device, three reps, alternating order:
+
+| scene | base | with emitters | median | mean | p99 |
+|---|---|---|---|---|---|
+| dbori | 11.879 | **11.632** | -0.247 | -0.065 | 20.97 -> 20.43 |
+| gsdd | 21.769 | **21.592** | -0.177 | -0.212 | 34.43 -> 34.47 |
+| sm64 | 9.509 | **9.421** | -0.088 | -0.109 | 21.20 -> 20.37 |
+| mlbis | 12.276 | 12.344 | +0.068 | +0.018 | 18.86 -> 18.50 |
+
+Median better on three of four, mean on three, p99 on four. Small, and real.
+Note again that instruction count over-predicted: -4.33 % of instructions
+became -0.8 % of Golden Sun's frame. Part of that is the window (the census
+ran from boot, where cross-page transfers are denser, the device from the
+title), but it is the fourth time in this rework that instruction count has
+been a poor proxy for time on this core.
+
+**Verification.** `test_jit` 1600 fuzz trials and 55 directed cases pass, and
+the JIT's 800-frame dump of Golden Sun is byte-identical to the same tree
+without the emitters. The fuzzer caught a real defect first: the cold path
+charged `N + (n-1) S` from the base page, copying the inline path, but a
+straddling transfer has its words on two pages with different costs and the
+interpreter prices each from its own -- a Thumb LDM consumed 162 cycles
+against 161. It now sums the true per-word costs before the transfer, while
+the scratch registers are still free (the slow stubs preserve only x1 and x7).
+
+**A gate that does not work, found here.** The JIT's dump differs from the
+INTERPRETER's by 11,347,831 bytes -- 3.6 % -- on Golden Sun, and does so on
+the unmodified tree as well. So "`--interp` vs default with `--dump-frames`",
+one of the three verification routes the JIT README names, is not currently
+usable for this game. Worth resolving before Phase 2 leans on it.
+
+**What is left of the census** is all one problem: MSR CPSR with a mode change
+(~361 k), `SUBS pc, lr, #4`, `LDM ^` and a CP15 read (~117 k each). Every one
+needs banked-register handling, so each needs a helper with a full register
+spill rather than an emitter -- and the helper has to honour the same
+flag-materialisation contract (`reads = F_ALL`) the interpreter fallback does.
+
 ### Phase 3 — DMA, SPU and scheduler granularity (week 4-5) — target **-2.5 ms**
 
 Three small rows that together are as big as Phase 1.
