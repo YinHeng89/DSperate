@@ -2051,6 +2051,76 @@ the sweep. And close the sweep's blind spot first (SS3.26 route 3): it runs
 with no input and no reference dump, so the `swapped` detector cannot run
 against it, and a wrong-screen latch is what all of this risks.
 
+### 3.28 The remap join removed: Spirit Tracks -0.44 ms, and a regression not explained
+
+The per-job snapshot of SS3.27, built and measured. `Engine2D::vram()`,
+`Gpu::capture()`, `output_line()`'s VRAM-display case and the split/scale line
+key all read `Gpu::vram_render_` — a `VramMap` copy taken at dispatch, and only
+when `generation()` has moved — so **nothing on the worker touches
+`Bus::vram_map_` any more** and `vram_remap_begin()`'s join is gone.
+
+The whole 2D side turned on one accessor: all 28 readers in `engine2d.cpp` go
+through `Engine2D::vram()`, so pointing that at the snapshot moved them
+together.
+
+**Device, five scenes, three reps, alternating; both arms carry the snapshot
+and differ only in the join:**
+
+| scene | Δ median | Δ mean | Δ p99 | join base -> none | verdict |
+|---|---|---|---|---|---|
+| **st-intro** | **-0.442** | -0.257 | -0.732 | **0.935 -> 0.003** | **clean win** |
+| dbori | -0.061 | -0.174 | -0.512 | 0.303 -> 0.012 | clean win |
+| gsdd | +0.026 | -0.010 | -1.036 | 2.916 -> 2.966 | noise |
+| etody | -0.085 | -0.076 | +0.089 | 0.030 -> 0.000 | noise |
+| **mlbis** | **+0.328** | +0.349 | -0.082 | 0.016 -> 0.027 | **clean regression** |
+
+"Clean" means every rep of one arm falls outside every rep of the other.
+
+**The join is gone where it existed** — st-intro 0.935 -> 0.003, dbori 0.303 ->
+0.012 — and Spirit Tracks drops 18.99 -> 18.55 ms. gsdd is untouched exactly as
+predicted: its join is `render_ranges`' pre-join, a different problem that this
+does not address.
+
+**A race this found, and a hypothesis it killed.** mlbis regressed in the first
+run too, on a scene with essentially no remap join to remove, which made no
+sense as contention. Chasing it found that `vram_remap_begin` also called
+`Engine2D::vram_remapped()`, clearing `extpal_checked_`/`objext_checked_` —
+**Engine2D members the worker reads.** The join had been protecting those as
+well as the `VramMap`, and mlbis has 6194 remaps, the most of any scene, so it
+fired into a live worker ~3.4 times a frame. That is now deferred to the next
+dispatch, with the snapshot, which is also the right moment: a job rendering
+against the old mapping should keep the validation that belongs to it.
+
+**It was not the cause.** With the deferral in, mlbis reads +0.328 against the
+first run's +0.271 — unchanged within the session-to-session spread. The race
+was real and worth fixing on its own merits; it was not the regression.
+
+**So the regression is unexplained, and is recorded as such.** The leading
+hypothesis is contention: mlbis is the scene where the 2D worker earns most
+(SS3.20 — inline is 1.76 ms worse), so its line worker is busy, and with the
+join gone five threads contend for four A55s where the join used to park one
+3.4 times a frame. That is a guess. It has not been measured and should not be
+repeated as though it had been.
+
+**The trade, stated plainly:** -0.44 ms on a scene 1.8 ms over budget, against
++0.33 ms on a scene 4.4 ms inside it. On Phase 3's own target — gsdd and
+st-intro inside 16.74, no regression elsewhere — this buys the first half and
+breaks the second. It is a good trade for the goal and a real cost, and the
+right call is not obvious without knowing why mlbis moves.
+
+*Gates:* the picture and cadence gates pass on all eight scenes at every stage
+— snapshot alone, join removed, revalidation deferred — and match the control
+where they are not byte-exact. **This means less than it looks:** the golden
+configuration is serial (`DS_R3D_THREADS=0 DS_2D_THREAD=0`), so a gate run
+cannot exercise the worker at all and could not have caught the `vram_remapped`
+race. The race was found by a performance regression, not by a gate.
+
+*Still open, from SS3.25 and unaddressed here:* a guest write into a bank the
+snapshot still references, once that bank has left the engines' current view
+and is therefore no longer write-trapped. The trap's coverage does not follow
+the job. Nothing above tests for it, and the clean gates should not be read as
+covering it.
+
 ### Phase 3 — DMA, SPU and scheduler granularity (week 4-5) — target **per scene, see below**
 
 **Rescoped 2026-09-21 against SS3.17's before-line, the way SS3.3 rescoped

@@ -286,9 +286,20 @@ bool Gpu::vram_remap_begin(u32 moved_2d) {
   }
   lazy_probe_period_ = LAZY_PROBE_PERIOD;   // a remap is how scenes change: probe soon
   if (lazy_probe_in_ > LAZY_PROBE_PERIOD) lazy_probe_in_ = LAZY_PROBE_PERIOD;
+  // Lines whose HBlank has passed are rendered before the mapping changes.
+  // This is nearly always free -- 24 of 5951 remaps on Spirit Tracks have any
+  // lines pending (SS3.25) -- and it returns without touching the worker when
+  // there are none.
   catch_up(3);
-  join_worker(JoinSite::Remap);
-  engine[0].vram_remapped(); engine[1].vram_remapped();
+  // NO JOIN HERE. It used to be unconditional, and it was not protecting the
+  // emulated machine: it was keeping the worker's reads of Bus::vram_map_
+  // apart from the emulation thread's `vram_map_ = next` below. The worker now
+  // renders against vram_render_, the snapshot it was dispatched with, so
+  // there is nothing to keep apart -- and a job rendering lines 0..N should
+  // read the mapping those lines were displayed under, not the one the guest
+  // has just installed. Measured at ~700 us a frame on Spirit Tracks, roughly
+  // one whole batched frame's 2D render thrown away per frame (SS3.25-SS3.27).
+  vram_remap_pending_ = true;   // applied at the next dispatch, see gpu.h
   const bool was = trap_armed_;
   if (was) disarm_trap();
   return was;
@@ -710,7 +721,16 @@ void Gpu::render_ranges(u32 af, u32 al, u32 bf, u32 bl) {
   // ...and the one field of the VramMap the capture reads (see gpu.h). Latched
   // here, with the rest of the frame-level capture state, so the job does not
   // consult the live map while the emulation thread may be rebuilding it.
-  lcdc_mask_render_ = nds_.bus.vram_map().lcdc_mask;
+  // ...and the mapping itself. Only when it has actually moved: a lag-mode
+  // frame hands off per line, and VramMap is a few KB of plain arrays.
+  // Serialised against the job in flight by the pre-join above.
+  {
+    const VramMap& live = nds_.bus.vram_map();
+    if (live.generation() != vram_render_gen_) { vram_render_ = live; vram_render_gen_ = live.generation(); }
+    // The extended-palette revalidation belongs with the mapping it describes.
+    if (vram_remap_pending_) { vram_remap_pending_ = false; engine[0].vram_remapped(); engine[1].vram_remapped(); }
+  }
+  lcdc_mask_render_ = vram_render_.lcdc_mask;
   const bool dbg = g_dbg_join;
   auto hand = [&](bool a, bool b) {
     if (dbg) std::fprintf(stderr, "[hand] frame %llu line %u a %u..%u b %u..%u lag %d stash %u\n", (unsigned long long)nds_.frame_count, line_, a ? af : 1, a ? al : 0, b ? bf : 1, b ? bl : 0, lag_frame_ ? 1 : 0, bscale_n_);
@@ -878,7 +898,7 @@ void Gpu::output_engine(int e, u32 line) {
           if (mode == 1) key = line_key(en.output());
           else if (e == 0 && mode == 2) {
             const u32 bank = (en.dispcnt() >> 18) & 3;
-            const VramMap& vm = nds_.bus.vram_map();   // bank pointers are remap-invariant
+            const VramMap& vm = vram_render_;
             if (lcdc_mask_render_ & (1u << bank)) key = line_key15(reinterpret_cast<const u16*>(vm.bank(bank)) + line * 256);
           }
         }
@@ -1572,7 +1592,7 @@ void Gpu::output_a(u32 line, u32* dst) {
     // One kernel does the 15 -> 18 bit unpack, master brightness and the
     // 6 -> 8 expansion; an unmapped bank reads as zero.
     const u32 bank = (dispcnt >> 18) & 3;
-    const VramMap& vm = nds_.bus.vram_map();   // bank pointers are remap-invariant
+    const VramMap& vm = vram_render_;
     static constexpr u16 kZeroLine[256] = {};
     const u16* src = (lcdc_mask_render_ & (1u << bank)) ? reinterpret_cast<const u16*>(vm.bank(bank)) + line * 256 : kZeroLine;
     kern::active::output_vram_line(src, engine[0].master_bright(), dst);
@@ -1600,7 +1620,7 @@ void Gpu::capture(u32 line) {
   const u32 dst_bank = (cnt >> 16) & 3;
   // The bank POINTERS are remap-invariant, so the live map is safe to take
   // them from; lcdc_mask is not, and is latched at hand-off (see gpu.h).
-  const VramMap& vm = nds_.bus.vram_map();
+  const VramMap& vm = vram_render_;
   const u32 lcdc = lcdc_mask_render_;
   if (!(lcdc & (1u << dst_bank))) return;
   u16* dst = reinterpret_cast<u16*>(vm.bank(dst_bank)) + (((((cnt >> 18) & 3) << 14) + line * width) & 0xFFFF);

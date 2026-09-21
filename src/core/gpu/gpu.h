@@ -137,6 +137,8 @@ public:
   // as before. A game that reads the captured pixels back with the CPU, rather
   // than only displaying them, sees an older frame than the hardware would.
   void set_frameskip_capture(bool on) { skip_capture_ok_ = on; }
+  // What a dispatched job renders against; see vram_render_ below.
+  const VramMap& render_vram() const { return vram_render_; }
 
   // How many frames it takes the display setup to come back round. Games drive
   // the two screens on alternate frames: Golden Sun swaps POWCNT1's screen bit
@@ -471,6 +473,34 @@ private:
   // a batched engine A is still drawing.
   u32  capcnt_render_ = 0;
   bool capture_render_ = false;
+  // THE MAPPING A DISPATCHED JOB RENDERS AGAINST (plan SS3.27).
+  //
+  // Engine2D::vram(), Gpu::capture() and output_line() all used to read
+  // Bus::vram_map() live, on the worker, while the emulation thread assigned
+  // vram_map_ = next in Bus::update_vram. vram_remap_begin()'s join was what
+  // kept those apart, and it cost ~700 us a frame on Spirit Tracks -- one
+  // whole batched frame's 2D render, thrown away once per frame because the
+  // guest rewrote VRAMCNT during VBlank.
+  //
+  // A job renders lines that were DISPLAYED under the mapping in force when it
+  // was handed over, so rendering against that mapping is what it should have
+  // been doing anyway; the join was buying a wrong answer. The copy is written
+  // only at dispatch, which the render_ranges pre-join already serialises
+  // against the job in flight, and only when the generation has moved -- so a
+  // lag-mode frame handing off per line does not copy 192 times.
+  VramMap vram_render_;
+  u32  vram_render_gen_ = ~0u;
+  // A remap also invalidates each engine's extended-palette validation
+  // (Engine2D::vram_remapped clears extpal_checked_/objext_checked_). Those
+  // are Engine2D members the worker reads, so clearing them from the emulation
+  // thread the moment VRAMCNT is written is the same shared-state problem the
+  // snapshot solves -- and with the remap join gone there is nothing left to
+  // keep the two apart. It is also the wrong MOMENT: a job in flight renders
+  // against the old mapping, so it should keep the validation that goes with
+  // it. Deferred to the next dispatch, where the snapshot is taken and the
+  // pre-join has serialised against the worker.
+  bool vram_remap_pending_ = false;
+
   // Gpu::capture() runs on the WORKER and used to read Bus::vram_map() live,
   // while the emulation thread assigns vram_map_ = next in Bus::update_vram --
   // which is the real reason vram_remap_begin() joins the worker at all
