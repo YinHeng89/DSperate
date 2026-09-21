@@ -1573,6 +1573,103 @@ survey (SS3.11). The pattern in all three is the same: **the instrument
 measured something adjacent to the question and the adjacency was not
 checked.**
 
+### 3.20 The 2D worker, on and off: its join time predicts whether it pays
+
+`DS_2D_THREAD=0` renders both engines inline -- no worker, no hand-off, no
+join. Three reps, alternating arm order, `dsperate-p3b`, medians of three.
+
+| scene | arm | median | mean | p90 | p99 | max | join |
+|---|---|---|---|---|---|---|---|
+| **gsdd** | worker | 20.754 | 20.806 | 25.410 | **32.526** | **46.072** | 2.794 |
+| | inline | 20.918 | 21.483 | 25.526 | **28.087** | **31.563** | — |
+| | *delta* | +0.164 | +0.677 | +0.117 | **-4.440** | **-14.509** | |
+| **mlbis** | worker | 12.236 | 12.158 | 14.126 | 18.319 | 30.029 | 0.013 |
+| | inline | 13.992 | 13.832 | 15.704 | 19.483 | 31.934 | — |
+| | *delta* | **+1.756** | +1.674 | +1.577 | +1.165 | +1.905 | |
+| **dbori** | worker | 11.355 | 11.528 | 14.776 | 20.939 | 36.889 | 0.346 |
+| | inline | 12.064 | 12.222 | 15.855 | 20.249 | 33.161 | — |
+| | *delta* | +0.709 | +0.695 | +1.080 | -0.690 | -3.727 | |
+
+**The join time is the diagnostic, and it sorts the three scenes exactly.**
+
+* **mlbis, join 0.013 ms** — the worker overlaps completely and is a pure win:
+  inline is worse on every statistic, by 1.76 ms of median. Nothing to fix.
+* **dbori, join 0.346 ms** — mostly overlapped. The worker wins the median by
+  0.71 and loses the tail slightly.
+* **gsdd, join 2.794 ms** — barely overlaps at all. The worker buys **0.16 ms
+  of median** and costs **4.44 ms of p99 and 14.5 ms of max**.
+
+That is the same trade SS3.4 measured for the geometry worker and the plan
+deleted it on -- *"it is not a win being given up, it is a liability"* -- except
+that here it is scene-dependent, so deletion is not the answer. **What the join
+measures is precisely the part of the worker's work that failed to overlap**,
+and on Golden Sun that is nearly all of it: the thread waits for the run
+anyway, and pays the hand-off and the contention on top.
+
+**Why Golden Sun and not the others is the open question**, and there are two
+candidates that the runs above cannot separate:
+
+1. **Core count.** gsdd runs three band workers *plus* the line worker plus the
+   emulation thread -- five threads on four A55s. The band sweep re-run in
+   SS3.5 settled three band workers as right, but it did not vary the line
+   worker, so the interaction has never been measured. `DS_R3D_THREADS=2` with
+   the line worker on is the arm that separates this, and it is one run.
+2. **One line of slack is not enough.** Lag mode leaves a run in flight and the
+   next HBlank's pre-join collects it (SS3.19). If the worker needs longer than
+   the emulation thread's own per-line work, the thread stalls every line no
+   matter how many cores are free.
+
+If it is (1), the fix is a band/line worker budget and costs nothing else. If
+it is (2), the fix is a deeper queue, which is a real change to the hand-off
+and to `render_ranges`' contract. **Measure (1) first: it is one run and it
+decides whether (2) needs writing at all.**
+
+**What this does not support** is deleting the 2D worker, which mlbis settles,
+or reinstating Phase 5's representation work on this evidence. A cheaper line
+renderer would shrink the join, but so would handing the worker less to do, and
+neither has been priced against the other yet.
+
+### 3.21 What the VRAM write trap is for, and why GXSTAT does not bear on it
+
+Asked while reading SS3.19, and worth writing down because the premise is a
+natural one and both halves of it are wrong.
+
+**The trap is not there for the 3D bands or for threading.** It arrived with
+lazy 2D (`e744436`), which defers the whole frame's 2D render to the last
+display line, and its own commit message says why: *"VRAM cannot be journaled,
+so it is trapped... the first trapped store of a frame renders every line whose
+HBlank has passed **before** the bytes change."* Registers, palette, OAM,
+POWCNT and MASTER_BRIGHT can be journaled and replayed in hardware order; VRAM
+is far too large for that, so a read-after-write guard takes its place. It is
+tied to **deferral**, not to threads -- it arms with `DS_2D_THREAD=0` as well,
+and `8bdcd13` stops arming it on frames that never batch. Remove it while the
+render is still deferred and the engines read bytes the guest has already
+overwritten.
+
+**GXSTAT is not synthesised, and an attempt to synthesise it was rejected.**
+The append-time shadow was built on 2026-09-20 and reverted the same day; the
+comment survives at the `drain_all()` in the register read path. It cannot work
+without the geometry worker: the worker executed concurrently, so a poll
+answered from a shadow still saw the wait end, while single-threaded nothing
+advances between polls and the guest spins to VBlank. **Dragon Ball Origins'
+GXSTAT reads went 1.55 M to 37 M and SM64DS's picture did not move at all.**
+What replaced it is the opposite of synthesis -- *sync on observation*, a full
+replay before any read is answered. There is no new guarantee there to lean on.
+
+**And the trap is not where the time is.** Per call site (SS3.19), trap joins
+are 1.2 ms of 4.82 s across the run -- **0.03 %** -- against `render_ranges`'
+pre-join at 99.8 %. On Golden Sun the trap fires 129 times a run and costs
+about 188 slow stores a frame. Deleting it returns none of the 2.84 ms.
+
+**Where the question does land.** There is a live row for removing the trap,
+and it is already in Phase 5: *"the VRAM write trap (4.11) that makes our lazy
+path hardware-exact can become DraStic's rule — ignore CPU stores into VRAM
+mid-frame — if the perceptual gate allows it."* `e744436` records keeping the
+trap as *"a deliberate departure from DraStic... the output stays
+hardware-exact"*, and the speed-first bar has retired that exactness. So the
+justification is the accuracy bar, not anything about GXSTAT -- and the
+plan's own census expects it to be worth little outside Golden Sun.
+
 ### Phase 3 — DMA, SPU and scheduler granularity (week 4-5) — target **per scene, see below**
 
 **Rescoped 2026-09-21 against SS3.17's before-line, the way SS3.3 rescoped
