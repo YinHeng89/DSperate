@@ -925,7 +925,23 @@ spill rather than an emitter -- and the helper has to honour the same
 flag-materialisation contract (`reads = F_ALL`) the interpreter fallback does.
 
 
-### 3.10 The mode-switch core: built, measured, reverted (2026-09-20)
+### 3.10 The mode-switch core: rejected on noise, then restored (2026-09-20)
+
+**RETRACTED AND REVERSED.** Everything below was written from a single
+threaded instruction census reading +1.53 %. Run serially -- the only valid
+way (SS3.12) -- the same comparison reads **-1.38 %**, and on the device the
+change is faster on all four scenes: gsdd -0.180 ms median, sm64 -0.084,
+mlbis -0.061, dbori -0.040, mean better on three. It is restored.
+
+The rule this section proposed -- "replacing a fallback pays when the
+fallback's own work can be done more cheaply, not when only its decode can be
+avoided" -- is a counterexample to itself and is withdrawn. `LDM ^` and
+`SUBS pc, lr, #4` were ruled out by inheriting it, without measurement, and
+are live candidates again at ~120 k fallbacks each.
+
+The original text follows, as the record of a decision made on an instrument
+that had never been validated.
+
 
 The census's second cluster is the IRQ entry and exit -- `MSR CPSR` with a
 mode change (~361 k), `LDM ^`, `SUBS pc, lr, #4` -- and DraStic has an emitter
