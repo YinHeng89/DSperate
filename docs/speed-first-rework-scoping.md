@@ -442,7 +442,7 @@ advances strip assembly and calls `submit_polygon` inline. The measured -1.21
 is what removing the arithmetic buys while all of that remains. The rest of
 the target has to come from removing it.
 
-### Phase 1 — Geometry as a replayed log (weeks 1-2) — target **-4.0 ms on the 3D-heavy titles; see §3.4**
+### Phase 1 — Geometry as a replayed log (weeks 1-2) — target **-4.0 ms**; delivered **-0.30 to -1.49 ms**, closed (§3.5)
 
 The largest single win, and the one whose premise §3.4 has now measured
 rather than assumed. The earlier claim that `--timing-oc` "alone is worth
@@ -565,6 +565,71 @@ Decisions taken:
    nothing fails to parse.
 4. **The SDL cadence check is built after 1a is soundly in place**, so it is
    measuring a settled engine rather than a moving one.
+
+
+### 3.5 Phase 1, closed — what it delivered, and why 1c was abandoned
+
+**Delivered.** The `def` arm of the band sweep was run before 1a and again
+after 1b, same binaries' build configuration (`a64build`, RelWithDebInfo,
+GCC 13.3.0), same scenes, same `--frames 1800 --stats-from 200`. Replay
+scenes only; gsdd is excluded because it stopped being the same scene when it
+became a boot run.
+
+| scene | median | | mean | total |
+|---|---|---|---|---|
+| sm64 | 11.057 -> **9.564** | **-1.49 (-13.5 %)** | 10.84 -> 10.03 | 17.3 -> 16.1 s |
+| mlbis | 13.643 -> **12.339** | **-1.30 (-9.6 %)** | 11.47 -> 10.72 | 18.3 -> 17.2 s |
+| dbori | 12.430 -> **11.933** | -0.50 (-4.0 %) | 11.60 -> 10.30 | 18.6 -> 16.5 s |
+| etody | 5.394 -> **5.096** | -0.30 (-5.5 %) | 9.13 -> 8.86 | 14.6 -> 14.2 s |
+
+Median, mean and total all improve on all four, and by more than §3.4's
+`tinl` arm predicted (-1.21 / -0.35 / -0.11 / -0.07). Against the phase's
+-4.0 ms target that is under half on the best scene, but it is real, it holds
+at the mean and the total as well as the median, and the picture is unchanged:
+the gate passes all eight scenes and dbori's intro cadence in the SDL frontend
+is 26.44 Hz on both sides with the gap histogram within one frame of 705.
+
+**1c was built, measured and abandoned.** The batched transform was written as
+far as its first half -- vertices recorded rather than transformed, the run
+flushed and transformed as an array, the existing per-vertex kernel kept so
+that the restructuring could be priced on its own. It was bit-exact on every
+deterministic scene, and it cost:
+
+| scene | 1b median | 1c step 1 | |
+|---|---|---|---|
+| gsdd | 21.845 | 22.498 | **+0.65 ms (+3.0 %)** |
+| sm64 | 9.595 | 9.859 | +0.26 (+2.8 %) |
+| mlbis | 12.344 | 12.503 | +0.16 (+1.3 %) |
+
+The wide kernel could not have repaid that. The device perf breakdown puts
+`submit_vertex` at 2.41 % of the process against the emulation thread's
+40.3 %, so ~6 % of that thread, ~1.3 ms of gsdd's frame -- and the position
+transform, the only part a wide kernel touches, is about half of it. The
+restructuring costs 0.65 ms before the kernel saves anything.
+
+The cost is structural, not a tuning detail. A batch has to hold transformed
+results while strip assembly recycles the four `temp_vtx_` slots, so each
+vertex is copied into a slot on the way out -- exactly the 56-byte copy the
+engine avoids today by permuting `vptr_` pointers. Removing it means building
+polygons from an index into the batch instead of from slots, which is a much
+larger change than the remaining upside (<= 0.6 ms on the heaviest scene)
+justifies. Reverted; Phase 1 closes on 1a and 1b.
+
+**The instrument that failed.** Instruction count under qemu was used to size
+this phase and was wrong three times. It called 1b +0.0016 % on sm64 and
+-0.188 % on gsdd -- both from an uncontrolled comparison of a `-O3` build
+against a `-O2` one. Rebuilt at matching flags it reads -0.050 % and
+**+0.473 %**, i.e. 1b executes *more* instructions on the matrix-heavy scene
+while the phase containing it takes 1.5 ms off sm64's frame. On an in-order
+A55 the wins here are locality and branch behaviour, which instruction count
+cannot see. Use frame time on the device; treat instruction counts as a hint
+about a kernel, never as a phase's scorecard. (This supersedes the figures in
+commit `de81889`, which were taken before the flag mismatch was found.)
+
+**Also settled.** The band sweep was re-run after 1a gave a core back: three
+workers remains right, `def` and `DS_R3D_THREADS=3` are within noise (the lag
+rule is inert), two workers still loses badly on etody and dbori, and four
+never wins. No change.
 
 ### Phase 2 — The ARM9 row (weeks 2-4) — target **revised, see §3.2 and §3.3**
 
