@@ -1,0 +1,82 @@
+#version 450
+// A 2D engine's line pipeline as one pixel per invocation, shaped after
+// engine2d.h rather than after a synthetic load. Per pixel:
+//
+//   * up to four BG layers, each a dependent chain of tilemap -> tile pixel
+//     -> extended-palette slot (three gathers, the second addressed by the
+//     first), which is what makes the CPU engine load-latency bound;
+//   * one OBJ gather from a sprite line, which the CPU engine pre-renders a
+//     line ahead and which a GPU port would keep as a separate pass;
+//   * the priority select across the five values, resolve through the
+//     winning layer's table, the colour effect, master brightness and the
+//     6->8 expansion (kernels.h: select16 / resolve16_full / composite_line
+//     / output_line).
+//
+// `bgs` varies per pixel when `diverge` is set: 1 to 4 layers, mean 2.5.
+// That arm is a stand-in for a realistic frame's mix of layer counts, NOT a
+// measurement of divergence cost on its own -- it does less total work than
+// the uniform arm, so the two are not an A/B of one variable. The gathers run over a buffer sized
+// like the DS's VRAM + palettes, not a multi-megabyte scratch: the working
+// set is the point.
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(std430, binding = 0) readonly  buffer Vram { uint vram[]; };
+layout(std430, binding = 1) writeonly buffer Out  { uint dst[]; };
+layout(push_constant) uniform Push {
+  uint w; uint h; uint work; uint y0; uint rows; uint bgs; uint diverge;
+} pc;
+
+// Masked, not modulo: a dynamic `%` is an integer division, which Mali has
+// no fast path for, and ten of them per pixel measured the divider rather
+// than the memory system. The buffer is sized a power of two for this.
+uint gather(uint addr) { return vram[addr & (uint(vram.length()) - 1u)]; }
+
+void main() {
+  uvec2 p = gl_GlobalInvocationID.xy;
+  uint y = pc.y0 + p.y;
+  if (p.x >= pc.w || p.y >= pc.rows || y >= pc.h) return;
+
+  uint seed = p.x * 1664525u + y * 1013904223u;
+
+  // How many layers this pixel actually walks. Divergent by design.
+  uint bgs = pc.bgs;
+  if (pc.diverge != 0u) bgs = 1u + ((seed >> 7) & 3u);
+
+  uint top = 0u, top_tid = 7u, second = 0u, prio_best = 0xFFu;
+
+  for (uint b = 0u; b < bgs; ++b) {
+    // tilemap entry -> tile pixel -> palette slot: each address depends on
+    // the previous load, so the chain cannot be issued in parallel.
+    uint map  = gather(seed + b * 0x4000u);
+    uint texel = gather(map + (y << 5) + p.x);
+    uint pal   = gather((texel & 0xFFFFu) + 0x10000u);
+    seed = seed * 1103515245u + texel + 12345u;
+
+    // Priority select (kernels.h select16): opaque wins by priority.
+    uint prio = (map >> 8) & 3u;
+    if ((texel & 0x8000u) != 0u && prio < prio_best) {
+      second = top; top = pal; top_tid = b; prio_best = prio;
+    }
+  }
+
+  // OBJ: one gather from the pre-rendered sprite line.
+  uint obj = gather(seed + 0x30000u + (y << 8) + p.x);
+  if ((obj & 0x8000u) != 0u) { second = top; top = obj; top_tid = 4u; }
+
+  // Colour effect (composite_line): blend of first and second target, or a
+  // brighten / darken. The branch is on register state, but which pixel is
+  // inside the effect window is not.
+  uint r = top & 0x3Fu, g = (top >> 8) & 0x3Fu, b2 = (top >> 16) & 0x3Fu;
+  if (((seed >> 3) & 7u) < 5u) {           // inside the effect window
+    uint sr = second & 0x3Fu, sg = (second >> 8) & 0x3Fu, sb = (second >> 16) & 0x3Fu;
+    r = min((r * 10u + sr * 6u) >> 4, 63u);
+    g = min((g * 10u + sg * 6u) >> 4, 63u);
+    b2 = min((b2 * 10u + sb * 6u) >> 4, 63u);
+  }
+
+  // Extra shading pressure, when the caller wants to scale the cost.
+  for (uint i = 0u; i < pc.work; ++i) { seed = seed * 1664525u + gather(seed) + 1013904223u; }
+
+  // master_brightness + expand_colours: 6 bits -> 8.
+  uint outc = 0xFF000000u | ((b2 * 259u) >> 6 << 0) | ((g * 259u) >> 6 << 8) | ((r * 259u) >> 6 << 16);
+  dst[y * pc.w + p.x] = outc | (top_tid & 0u);
+}

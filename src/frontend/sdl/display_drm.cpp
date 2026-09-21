@@ -141,8 +141,8 @@ bool DrmOut::open(SDL_Window* win, int w, int h, int display_index) {
   }
   if (!conn_ || !crtc_) { std::fprintf(stderr, "drm: no connector/crtc for display %d\n", display_index); return false; }
 
-  for (Buf& b : bufs_)
-    if (!alloc_buf(b)) { close(); return false; }
+  for (int i = 0; i < nbufs_; ++i)
+    if (!alloc_buf(bufs_[i])) { close(); return false; }
 
   // Take the CRTC over with our first buffer. A modeset rather than a flip
   // because SDL's KMSDRM only modesets on its first GL swap, which in
@@ -232,15 +232,22 @@ bool DrmOut::pump(int fd, bool block) {
   return true;
 }
 
+bool DrmOut::dmabuf_plane(int buf, DmabufPlane& out) const {
+  if (buf < 0 || buf >= nbufs_ || bufs_[buf].fd < 0) return false;
+  out.fd = bufs_[buf].fd; out.offset = 0; out.stride_bytes = static_cast<u32>(w_) * 4;
+  out.width = static_cast<u32>(w_); out.height = static_cast<u32>(h_); out.fourcc = FMT_XRGB8888;
+  return true;
+}
+
 u32* DrmOut::begin_frame() {
   if (dead_ || fd_ < 0) return nullptr;
   pump(fd_, false);
   for (;;) {
-    for (int i = 0; i < BUFS; ++i)
+    for (int i = 0; i < nbufs_; ++i)
       if (!bufs_[i].busy) {
         cur_ = i;
         // CPU writes into a dmabuf are bracketed; see dmaheap::sync_begin_write.
-        dmaheap::sync_begin_write(bufs_[i].fd);
+        if (!gpu_writes_) dmaheap::sync_begin_write(bufs_[i].fd);
         return bufs_[i].px;
       }
     // On screen, pending and queued: the emulation is a frame ahead of the
@@ -256,7 +263,7 @@ void DrmOut::end_frame() {
   cur_ = -1;
   // Everything drawn this frame has to reach memory before the display
   // controller scans the buffer out.
-  dmaheap::sync_end_write(bufs_[i].fd);
+  if (!gpu_writes_) dmaheap::sync_end_write(bufs_[i].fd);
   bufs_[i].busy = true;
   if (pending_ >= 0) { queued_ = i; return; }   // one flip per CRTC at a time; retire() issues this one
   if (!flip(i)) dead_ = true;

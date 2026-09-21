@@ -43,7 +43,8 @@ namespace ds::sdl {
 
 class DmabufOut : public ScanoutOut {
 public:
-  static constexpr int BUFS = 4;   // one on screen, two queued, one being drawn: two frames of run-ahead, so a heavy/light pair (Spirit Tracks, Golden Sun) is served from two vblank slots
+  static constexpr int BUFS = 5;   // the array; nbufs_ is the count in use (default 4; 5 under the GPU present stage, whose frame is committed one present later and would otherwise cost the run-ahead a buffer)
+  static constexpr int DEFAULT_BUFS = 4;   // one on screen, two queued, one being drawn: two frames of run-ahead, so a heavy/light pair (Spirit Tracks, Golden Sun) is served from two vblank slots
 
   // False if any precondition is missing (no libwayland, not the wayland
   // video driver, no dmabuf global, CMA allocation failed); the caller logs
@@ -62,13 +63,17 @@ public:
 
   int width() const override { return w_; }
   int height() const override { return h_; }
-  int bufs() const override { return BUFS; }
+  int bufs() const override { return nbufs_; }
+  // Before open(): how many buffers to rotate, up to BUFS.
+  void set_bufs(int n) { nbufs_ = n < 2 ? 2 : n > BUFS ? BUFS : n; }
   int current() const override { return cur_; }
 
   // Pixels of a free buffer to render the next frame into (blocks on the
   // compositor if all are pending, which is the vsync). Null on protocol
   // error; the caller falls back.
   u32* begin_frame() override;
+  bool dmabuf_plane(int buf, DmabufPlane& out) const override;
+  void set_gpu_writes(bool on) override { gpu_writes_ = on; }
   void end_frame() override;       // attach + damage + commit + flush
 
   // Public for the C listener table; not part of the interface.
@@ -89,6 +94,8 @@ private:
   struct wl_surface* surf_ = nullptr;     // SDL's; not ours to destroy
   struct wl_event_queue* q_ = nullptr;    // the process-wide globals' queue
   Buf bufs_[BUFS];
+  int nbufs_ = DEFAULT_BUFS;
+  bool gpu_writes_ = false;
   int cur_ = -1;
   int w_ = 0, h_ = 0;
   int output_index_ = -1;                 // the open() argument, for reopen()

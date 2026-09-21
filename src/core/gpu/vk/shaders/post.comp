@@ -1,0 +1,98 @@
+#version 450
+// glslc enables this implicitly; glslangValidator needs it spelled out.
+#extension GL_GOOGLE_include_directive : require
+// The final pass: edge marking, then fog.
+//
+// Why it is a pass of its own and not part of the raster: edge marking
+// compares a pixel's polygon id and depth against its four NEIGHBOURS, and in
+// a tiled raster three of those four are in other workgroups. Fog needs no
+// neighbour at all and could have been folded into the raster -- but the
+// hardware applies edge marking first and fog to its result, so they belong
+// together in that order. This is Renderer3D::final_pass_ref transcribed,
+// minus the anti-aliasing arm, which is still host-gated.
+//
+// It runs only when DISP3DCNT asks for one of them. The raster writes its
+// depth and attribute planes only in that case too, so a frame with neither
+// pays nothing for this existing.
+#define DS_GLSL 1
+#include "vk_layout.h"
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 4)          buffer Out   { uint fb[]; };
+layout(std430, binding = 5) readonly buffer Post  { GpuPost ps; };
+layout(std430, binding = 6) readonly buffer Depth { uint zbuf[]; };
+layout(std430, binding = 7) readonly buffer Attr  { uint abuf[]; };
+layout(push_constant) uniform Push { GpuFrame f; } pc;
+
+// 15-bit colour channel -> 6 bits: bits 1-5 of the field, +1 when non-zero.
+uint c15_to_18(uint c, uint shift) {
+  uint v = ((shift == 0u ? (c << 1) : (c >> shift)) & 0x3Eu);
+  return v != 0u ? v + 1u : v;
+}
+
+// Renderer3D::fog_density. The (z - offset) >> 2 << shift can wrap in 32 bits
+// for large shifts, as it does on hardware, so this is unsigned throughout and
+// deliberately unguarded.
+uint fog_density(uint z) {
+  uint id, frac;
+  if (z < ps.fog_offset) { id = 0u; frac = 0u; }
+  else {
+    uint v = z - ps.fog_offset;
+    v = (v >> 2) << ps.fog_shift;
+    id = v >> 17;
+    if (id >= 32u) { id = 32u; frac = 0u; } else frac = v & 0x1FFFFu;
+  }
+  uint d = ((ps.density[id] * (0x20000u - frac)) + (ps.density[id + 1u] * frac)) >> 17;
+  return d >= 127u ? 128u : d;
+}
+
+void main() {
+  int W = 256 * int(pc.f.scale), H = 192 * int(pc.f.scale);
+  uint i = gl_GlobalInvocationID.x;
+  if (i >= uint(W * H)) return;
+  int x = int(i) % W, y = int(i) / W;
+
+  uint color = fb[i];
+  uint attr  = abuf[i];
+  uint z     = zbuf[i];
+
+  if ((pc.f.dispcnt & (1u << 5)) != 0u && (attr & 0xFu) != 0u) {
+    // Edge marking, against the four neighbours. Off the screen the CPU reads
+    // the ring's border rows, which the clear fills with the clear colour's
+    // polygon id and the clear depth -- so that is what a neighbour outside
+    // the frame is here, rather than a special case.
+    uint id = attr >> 24;
+    bool mark = false;
+    for (int k = 0; k < 4; ++k) {
+      int nx = x + (k == 0 ? -1 : (k == 1 ? 1 : 0));
+      int ny = y + (k == 2 ? -1 : (k == 3 ? 1 : 0));
+      uint na, nz;
+      if (nx < 0 || nx >= W || ny < 0 || ny >= H) { na = pc.f.clear_attr; nz = pc.f.clear_depth; }
+      else { uint j = uint(ny * W + nx); na = abuf[j]; nz = zbuf[j]; }
+      if (id != (na >> 24) && z < nz) { mark = true; break; }
+    }
+    if (mark) {
+      uint e = ps.edge[id >> 3];
+      color = c15_to_18(e, 0u) | (c15_to_18(e, 4u) << 8) | (c15_to_18(e, 9u) << 16) |
+              (color & 0xFF000000u);
+    }
+  }
+
+  if ((pc.f.dispcnt & (1u << 7)) != 0u && (attr & (1u << 15)) != 0u) {
+    bool fogcolor = (pc.f.dispcnt & (1u << 6)) == 0u;   // clear: fog the colour too, not the alpha alone
+    uint d = fog_density(z);
+    uint fc = ps.fog_color;
+    uint fa = (fc >> 16) & 0x1Fu;
+    uint r = color & 0x3Fu, g = (color >> 8) & 0x3Fu, b = (color >> 16) & 0x3Fu, a = (color >> 24) & 0x1Fu;
+    if (fogcolor) {
+      r = ((c15_to_18(fc, 0u) * d) + (r * (128u - d))) >> 7;
+      g = ((c15_to_18(fc, 4u) * d) + (g * (128u - d))) >> 7;
+      b = ((c15_to_18(fc, 9u) * d) + (b * (128u - d))) >> 7;
+    }
+    a = ((fa * d) + (a * (128u - d))) >> 7;
+    color = r | (g << 8) | (b << 16) | (a << 24);
+  }
+
+  fb[i] = color;
+}
