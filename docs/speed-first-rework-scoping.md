@@ -2193,6 +2193,69 @@ rather than another row.
 * **The mlbis regression is unexplained.** Not "probably contention" — five
   candidates are dead and the sixth has not been formed.
 
+### 3.30 The refactor's brief: two off-main workers, one per screen
+
+The target shape, taken 2026-09-21: **one worker per screen and nothing else
+off the main thread**, with joins avoided rather than merely made cheap. Three
+threads instead of five is the point — the emulation thread plus two — which
+ends the oversubscription of five threads on four A55s and makes the hand-off
+policy trivial, because there is one destination per screen and no question of
+who draws.
+
+**The remap join removal stays in the tree as a preferred shape rather than a
+hard goal** (st-intro -0.44 ms, mlbis +0.33 unexplained, SS3.28). Not because
+the trade is settled, but because a design that does not need joins is where
+this is going, and keeping the tree pointed that way is worth more than 0.33 ms
+on a scene with 4.4 ms of headroom. If the refactor makes joins unnecessary the
+regression dissolves; if it reinstates one, this becomes a measured data point
+rather than a mistake.
+
+**The constraint the shape has to answer, stated before any code.** The 3D
+raster does not partition by screen. It renders one image, composited into
+whichever engine holds the 3D layer, and on Golden Sun it costs **~16.6 ms a
+frame of its own work** — 15.95 ms of spans plus 0.63 of resolve, measured
+directly from `raster_contention`'s inline arm (`b0`), where nothing is
+overlapped. Worker time across all threads totals 24.1 ms a frame on that
+scene.
+
+So a literal per-screen split puts the whole raster on one worker, against a
+16.74 ms budget with its own 2D on top. **Two ways out, and the brief should
+say which:**
+
+1. **"One per screen" governs the 2D engines only**, and the 3D raster keeps a
+   split of its own across both workers. The shape stays three threads; the
+   hand-off simplicity applies to 2D; the raster is still band-parallel.
+2. **The raster gets cheap enough to sit on one worker** — which is Phase 4's
+   stated goal, `gpu-path` having measured our raster at about eight times
+   DraStic's cost per pixel. At that ratio 16.6 ms becomes 2-4 ms and a
+   per-screen worker carries it comfortably.
+
+Route 2 makes the shape clean and **makes Phase 4 a prerequisite rather than a
+successor.** That reverses SS3.6's ordering decision, which put Phase 4 after
+the ARM9 row on the grounds that the raster is hidden behind the band workers
+and does not shorten the median. That reasoning was about the raster's
+*visibility*, and it holds; what it did not consider is that the raster's
+*volume* is what forbids a smaller thread topology. **If the topology is the
+goal, the raster's cost stops being hidden and starts being the blocker.**
+
+**What the refactor inherits, and should not have to rediscover:**
+
+* **A before-line with the scenes that matter.** `baseline-phase3.jsonl`, three
+  reps, gsdd included; plus the per-stage censuses in SS3.18-SS3.28.
+* **Instruments that now tell the truth.** `gx_geom` has a site again,
+  `w2d_join` and `R3D_STEAL` attribute work that was landing in `cpu9`,
+  `untimed` no longer double-subtracts, and `render_ranges`' decision is
+  censused per branch.
+* **A gate that can see a swapped screen**, in both shapes (SS3.23, SS3.26).
+* **The warning from SS3.28:** the golden gate configuration is serial
+  (`DS_R3D_THREADS=0 DS_2D_THREAD=0`), so **it cannot exercise threading at
+  all**. It passed every stage of the `VramMap` work including the one with a
+  live data race in it. The race surfaced as a performance regression. A
+  refactor of the thread topology needs the self-consistency runner — the one
+  Phase 0 gate never audited — before it needs anything else.
+* **Two open items that travel with the tree:** the SS3.25 write-side hazard,
+  and the mlbis regression, which is unexplained rather than attributed.
+
 ### Phase 3 — DMA, SPU and scheduler granularity (week 4-5) — target **per scene, see below**; **STOWED at 3b, see SS3.29** — 3c/3d/3e/3f untouched
 
 **Rescoped 2026-09-21 against SS3.17's before-line, the way SS3.3 rescoped
