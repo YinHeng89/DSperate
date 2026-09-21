@@ -71,6 +71,12 @@ def ssim(a, b):
     return float(np.mean(num / den))
 
 PSNR_CAP = 100.0   # identical screens; a finite cap keeps means and floors meaningful
+# Total frames of one fault kind, anywhere in the run, before it is a fault --
+# see --fault-total. `swapped` is tightest because a swap is never the timing
+# skew the persistence rule exists to forgive: all eight golden scenes produce
+# ZERO swapped marks, so the budget only has to cover a genuine POWCNT screen
+# swap landing a frame early or late.
+FAULT_TOTALS = {'swapped': 3, 'blank': 8, 'frozen': 8, 'region': 8}
 
 def psnr(a, b):
     mse = float(np.mean((a - b) ** 2))
@@ -122,6 +128,14 @@ def main():
     ap.add_argument('--fault-persist', type=int, default=4,
                     help='consecutive frames a structural fault must hold before it is reported (default 4); '
                          'a shorter run is timing skew at a transition, not a regression')
+    ap.add_argument('--fault-total', type=int, default=None,
+                    help='total frames of one fault kind, ANYWHERE in the run, before it is reported '
+                         'regardless of how they are spread (default: swapped 3, others 8). The '
+                         'persistence rule above only sees CONSECUTIVE runs, so a fault that flaps -- '
+                         'one frame wrong, one right, one wrong -- never reaches it. That is exactly '
+                         "DraStic's threaded-3D failure on capture-heavy titles, where the screens flip "
+                         'rapidly or a mis-latch renders onto the wrong one, so it is the shape this '
+                         'gate most needs to catch and the one persistence alone is blind to.')
     ap.add_argument('--region-limit', type=float, default=0.02,
                     help='largest wrong connected region, as a fraction of a screen, before it is a structural fault (default 0.02)')
     ap.add_argument('--verbose', action='store_true', help='one line per frame')
@@ -213,6 +227,19 @@ def main():
                 i = j + 1
         faults[kind] = sorted(runs)
 
+    # Totals, independent of adjacency. A swapped frame scores ~0.49 SSIM, so a
+    # flapping swap does currently fail the ssim_min floor -- but it fails it
+    # unnamed, and only for as long as that floor stays tight. The floors exist
+    # to catch gradual degradation and are expected to be tuned per scene
+    # (sm64's min is 0.900 against a measured 0.9146); a structural fault is
+    # not supposed to depend on one. Counting the frames says what is wrong.
+    flapping = {}
+    for kind, hits in marks.items():
+        budget = args.fault_total if args.fault_total is not None else FAULT_TOTALS[kind]
+        n = len({f for f, _ in hits})
+        if n > budget and not faults[kind]:
+            flapping[kind] = n
+
     if not ssims:
         sys.exit('no frames compared')
     a_ssim = np.array(ssims); a_psnr = np.array(psnrs)
@@ -227,6 +254,8 @@ def main():
         'exact_frames': int(np.sum(a_ssim >= 0.99999)),
         'shift_nonzero': int(sum(1 for s in shifts if s)),
         'faults': {k: len(v) for k, v in faults.items()},
+        'fault_frames': {k: len({f for f, _ in m}) for k, m in marks.items()},
+        'flapping': dict(flapping),
     }
 
     print(f"{args.scene}: {summary['frames']} frames, "
@@ -237,7 +266,12 @@ def main():
         if v:
             where = ', '.join(f'{fr}/{sc}x{n}' for fr, sc, n in v[:6])
             print(f"  FAULT {k}: {len(v)} run(s) ({where}{', ...' if len(v) > 6 else ''})")
-    transient = {k: len(m) for k, m in marks.items() if m and not faults[k]}
+    for k, n in flapping.items():
+        budget = args.fault_total if args.fault_total is not None else FAULT_TOTALS[k]
+        print(f"  FAULT {k} (scattered): {n} frame(s) over the run, budget {budget} "
+              f"-- no run reached --fault-persist, so this is a flapping fault")
+    transient = {k: len(m) for k, m in marks.items()
+                 if m and not faults[k] and k not in flapping}
     if transient:
         print('  (transient, under --fault-persist: '
               + ', '.join(f'{k} {n} frame(s)' for k, n in transient.items()) + ')')
@@ -286,6 +320,8 @@ def main():
             if got < limit: failed.append(f'{key} {got:.4f} < {limit}')
     if any(faults.values()):
         failed.append('structural faults: ' + ', '.join(f'{k}={len(v)}' for k, v in faults.items() if v))
+    if flapping:
+        failed.append('flapping faults: ' + ', '.join(f'{k}={n} frames' for k, n in flapping.items()))
     if failed:
         for m in failed: print(f'  FAIL {m}')
         return 1

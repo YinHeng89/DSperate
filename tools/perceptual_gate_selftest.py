@@ -111,6 +111,27 @@ def main():
     out = run(ref, c, extra=('--align', '0'))
     results.append(check('two-frame region (transient)', out, want_clean=True))
 
+    # FLAPPING, the shape the persistence rule is blind to by construction:
+    # one frame wrong, one right, one wrong. Every run is length 1, so
+    # --fault-persist never sees it however long it goes on. This is DraStic's
+    # threaded-3D failure on capture-heavy titles -- screens flipping rapidly,
+    # or a mis-latch putting a frame on the wrong one -- and it is the fault
+    # this gate most needs to name. It does fail the ssim_min floor, but
+    # unnamed and only while that floor stays tight, so --fault-total catches
+    # it as what it is.
+    c = ref.copy()
+    for i in range(6, 22, 2): c[i, [0, 1]] = c[i, [1, 0]]
+    out = run(ref, c, extra=('--align', '0'))
+    results.append(check('flapping swap (8 scattered frames)', out, 'swapped'))
+
+    # And the other side of it: a swap at a single transition must still be
+    # forgiven, or every genuine POWCNT screen swap landing a frame early
+    # would fail. Two scattered frames, under the budget of three.
+    c = ref.copy()
+    for i in (7, 17): c[i, [0, 1]] = c[i, [1, 0]]
+    out = run(ref, c, extra=('--align', '0'))
+    results.append(check('two scattered swaps (under budget)', out, want_clean=True))
+
     bad = results.count(False)
     print(f"\n{len(results) - bad}/{len(results)} detector checks passed")
     return 1 if bad else 0
