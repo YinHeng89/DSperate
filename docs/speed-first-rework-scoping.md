@@ -1893,6 +1893,69 @@ reading **and** are followed by a write into the moved bank before that job
 lands. If that is zero on the scene set, the snapshot is nearly free and the
 trap work is insurance; if it is common, this is a much larger change.
 
+### 3.26 The snapshot's value and its danger are the same scenes
+
+Before implementing the per-job `VramMap` snapshot (SS3.25), the question asked
+was whether games that swap their engines every frame would be at risk, and
+whether the capture scenes cover them. Censused, all eight scenes:
+
+| scene | frames | alternating phase | capture on | **remaps in flight** | join calls |
+|---|---|---|---|---|---|
+| mlbis | 1801 | 0 | 0 | 973 | 2993 |
+| meteos | 1801 | 0 | 0 | 26 | 2448 |
+| sm64 | 1801 | 0 | 3 | 148 | 14809 |
+| artacd | 1801 | 0 | 0 | 77 | 11150 |
+| etody | 1801 | 783 (43 %) | 825 | 874 | 2448 |
+| dbori | 1801 | 914 (51 %) | 922 | 943 | 1913 |
+| gsdd | 2401 | 1269 (53 %) | 1276 | 27 | 418981 |
+| **st-intro** | 2401 | **2163 (90 %)** | **2170 (90 %)** | **2179 (91 %)** | 2488 |
+
+**"Remaps in flight" is the population the snapshot changes** — the remaps that
+block today and would not with it.
+
+**The alternation is the capture.** Phase-alternating frames and capture frames
+track each other almost exactly on every scene that has either (783/825,
+914/922, 1269/1276, 2163/2170). `gpu.h` predicted this — *"a capture can
+alternate between two destination banks the same way"* — so the engine swap
+the question was about is, in this scene set, capture double-buffering rather
+than a bare POWCNT1 flip.
+
+**And that is the problem.** Spirit Tracks is **90 % capture, 90 % alternating
+phase, and 91 % of its frames take a remap while a job is in flight**. The
+scene the snapshot exists to fix is the scene most exposed to it. The four
+scenes where the change would be unambiguously safe — mlbis, meteos, sm64,
+artacd, no capture and no alternation between them — have 1224 in-flight
+remaps combined against st-intro's 2179, and none of them has a join problem
+worth fixing.
+
+**So the safe version of this change is worth nothing, and the valuable
+version lands exactly on the failure mode the bar names** — a mis-latch
+putting a frame on the wrong screen, on capture-heavy titles. Gating the
+snapshot on `!capture_on_ && phase_period_ == 1` would be provably safe and
+would return nothing on st-intro or gsdd.
+
+**This is not a refusal, it is a scoping result.** Three ways forward, in the
+order they should be tried:
+
+1. **Narrow the join instead of removing it.** `moved_2d` already says *which*
+   engine's views a remap moves, and it is computed and thrown away. If most
+   remaps move only one engine's views, a per-engine job and a per-engine join
+   would halve the waits with none of the snapshot's exposure. **Census this
+   first: it is one counter split three ways and one run.** (`join_worker()`
+   joins the whole worker today, so this needs the jobs separable — which is
+   a real change, but a local and checkable one.)
+2. **Snapshot, gated on capture being off**, shipped and swept, and only then
+   extended to capture frames with its own sweep. This gets the mechanism
+   proven on the scenes where it is safe before it is pointed at the scenes
+   where it matters.
+3. **Snapshot everywhere**, with the compatibility sweep as the gate and the
+   flapping-swap detector (SS3.23) as the specific instrument. Note what this
+   rests on: the sweep runs 46 titles for 3600 frames *with no input*, and the
+   failure being guarded against is a wrong-screen latch — which SS3.23's
+   `swapped` detector now catches, but only against a reference dump, which
+   the sweep does not produce. **The sweep as it stands could not see this
+   bug.** That gap should be closed before route 3 is taken, not after.
+
 ### Phase 3 — DMA, SPU and scheduler granularity (week 4-5) — target **per scene, see below**
 
 **Rescoped 2026-09-21 against SS3.17's before-line, the way SS3.3 rescoped

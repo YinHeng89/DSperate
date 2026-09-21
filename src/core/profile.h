@@ -117,6 +117,15 @@ enum Counter : u32 { C_POLY_LINES, C_SPAN_PIXELS, C_RESOLVED_PIXELS, C_TEX_FAST,
   // the same is true for 2D. STILL means no engine-read view moved, so the
   // catch-up and the join cannot have been needed.
   C_VRAM_REMAP, C_VRAM_REMAP_2D_MOVED, C_VRAM_REMAP_2D_STILL, C_VRAM_REMAP_PENDING,
+  // Remaps taken while a 2D job is IN FLIGHT, tested before the join. This is
+  // exactly the population a per-job VramMap snapshot would change: today each
+  // one blocks, and with a snapshot each one would not.
+  C_VRAM_REMAP_INFLIGHT,
+  // Frames whose display setup alternates (display_phase_period() > 1) and
+  // frames with display capture on. A game that swaps POWCNT1's screen bit
+  // every frame, or alternates capture banks, is the case a snapshot is most
+  // likely to get wrong, so the census has to say how common it is.
+  C_FRAMES_PHASE_ALT, C_FRAMES_CAPTURE, C_FRAMES_TOTAL,
   C_W2D_JOIN_NS_CATCHUP, C_W2D_JOIN_NS_TRAP, C_W2D_JOIN_NS_JOURNAL,
   C_W2D_JOIN_NS_LINE0, C_W2D_JOIN_NS_REMAP, C_W2D_JOIN_NS_RPRE, C_W2D_JOIN_NS_RPOST, C_W2D_JOIN_NS_OTHER,
   C_RESOLVE_CALLS, C_RESOLVE_PARTS,

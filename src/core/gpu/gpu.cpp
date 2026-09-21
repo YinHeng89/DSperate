@@ -266,6 +266,8 @@ bool Gpu::vram_remap_begin(u32 moved_2d) {
   if (prof::enabled) {
     prof::add(prof::C_VRAM_REMAP, 1);
     prof::add(moved_2d ? prof::C_VRAM_REMAP_2D_MOVED : prof::C_VRAM_REMAP_2D_STILL, 1);
+    // Before the join below, which is what clears it.
+    if (lines_in_flight()) prof::add(prof::C_VRAM_REMAP_INFLIGHT, 1);
     const u32 f = frontier();
     if (f && ((render_next_[0] < f && render_next_[0] < SCREEN_H) ||
               (render_next_[1] < f && render_next_[1] < SCREEN_H)))
@@ -547,6 +549,11 @@ void Gpu::begin_frame() {
   if (capcnt_ & (1u << 31)) capture_on_ = true;
   if (capture_on_) capture_recent_ = CAPTURE_STICKY; else if (capture_recent_) --capture_recent_;
   update_phase();
+  if (prof::enabled) {
+    prof::add(prof::C_FRAMES_TOTAL, 1);
+    if (phase_period_ > 1) prof::add(prof::C_FRAMES_PHASE_ALT, 1);
+    if (capture_on_) prof::add(prof::C_FRAMES_CAPTURE, 1);
+  }
   // Frameskip, for this frame's display lines: what the raster at line 215
   // assumed, re-checked now that this frame's capture bit is known.
   skip_frame_ = skip_next_ && skippable();
