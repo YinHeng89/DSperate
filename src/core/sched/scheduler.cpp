@@ -171,9 +171,27 @@ bool Scheduler::machine_idle(bool& skip9, bool& skip7) const {
   if (gx_only && !nds_.gpu3d.swap_pending()) return both_idle();
   CpuContext& a9 = const_cast<CpuContext&>(nds_.cpu(Cpu::ARM9));
   CpuContext& a7 = const_cast<CpuContext&>(nds_.cpu(Cpu::ARM7));
+  // The GX veto is gone (2026-09-20). It asked whether the geometry engine had
+  // anything queued, which mattered when a queued command had a cycle cost, a
+  // FIFO level the guest could observe and a stall behind it. Phase 1 removed
+  // all three: a logged command consumes no emulated time and is replayed at
+  // VBlank or by the read that observes it, so a non-empty log says nothing
+  // about whether the machine can advance. The loop analyser still decides --
+  // it rejects a poll of any port with a side effect, which is what kept this
+  // safe in the first place.
+  //
+  // Measured on what it was turning away (DS_IDLE_SURVEY): sm64 721,368
+  // slices the analyser accepts, mlbis 414,818, dbori 26,909, Golden Sun 1,688
+  // -- 100 % and 92.6 % of the whole opportunity for the first two.
+  //
+  // The DMA veto STAYS. It is not the same kind of rule: DMA is driven from
+  // inside run_cpu, so a skipped slice does not advance a transfer, and
+  // dropping this one would stall a DMA the idle loop may be waiting on.
+  // Restoring hardware behaviour there needs a helper that advances the
+  // ARM9's DMA without running the CPU -- see the plan.
   bool vetoed = false;
   if (nds_.dma.any_running(Cpu::ARM9) || nds_.dma.any_running(Cpu::ARM7)) { prof::add(prof::C_IDLE_NO_DMA, 1); vetoed = true; }
-  else if (!nds_.gpu3d.idle()) { prof::add(prof::C_IDLE_NO_GX, 1); vetoed = true; }
+  else if (prof::enabled && !nds_.gpu3d.idle()) prof::add(prof::C_IDLE_NO_GX, 1);   // counted, no longer vetoed
   if (vetoed) {
     // DS_IDLE_SURVEY: run the analysis anyway, purely to count what these two
     // vetoes are turning away, and undo the one piece of state it touches.
