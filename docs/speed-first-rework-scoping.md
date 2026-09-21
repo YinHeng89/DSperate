@@ -2321,6 +2321,59 @@ its own split) without needing Phase 4 first.
   eight times.** So the refactor should not expect a topology win from copying
   DraStic; the win there is Phase 4's algorithmic one.
 
+### 3.32 The remap join removal reverted: it was wrong, and the gate said so
+
+**`550efeb` is reverted.** SS3.28 recorded its mlbis +0.33 ms as unexplained
+and guessed contention. The guess was wrong and the premise under it was
+false: that section says *"gates pass on all eight scenes at every stage and
+match the control"*, and they do not.
+
+Measured 2026-09-21, `tools/gate.sh check` against the `exact-reference`
+build, host, the same golden fixtures, three scenes:
+
+| scene | 15db8bb (join present) | 550efeb (join removed) |
+|---|---|---|
+| dbori | **1.0000 / 1.0000, 1800 exact** | 0.9956 / 0.9727, 1375 exact — FAIL |
+| etody | 1.0000 / 0.9998, 1772 exact | 0.9978 / **0.9743**, 1500 exact — FAIL |
+| st-intro | 0.9999 / 0.9989, 1950 exact | 0.9851 / **0.9761**, 310 exact — FAIL |
+
+(ssim mean / p01.) **dbori is one of the gate's own named deterministic
+scenes** — the ones this document says must come back digit for digit — and
+it loses 425 exact frames. The figures reproduced identically across two
+independent runs, so this is not the candidate-side non-determinism the gate
+header warns about.
+
+**And there was a third symptom nobody connected.** `tests/gpu_test.cpp` has
+been red since the same commit: it passes at the merge base and on `main`.
+`550efeb` repointed `Engine2D::vram()` from `Bus::vram_map()` to
+`Gpu::render_vram()`, the snapshot written only at dispatch; the test drives
+`Engine2D::render_line` directly and never dispatches, so it rendered against
+a default-constructed `VramMap`. Every failing value was 0 or `0x3e0000` —
+`rgb18(0x7C00)`, the blue backdrop — i.e. the backgrounds drew nothing.
+
+So the three symptoms are one symptom: **a job was rendering against a
+mapping that was not the one its lines needed.** That explains the picture
+loss on three scenes directly, and it explains the mlbis regression far
+better than contention did — drawing the wrong content is not free. SS3.27's
+argument (a job should render against the mapping its lines were displayed
+under) may still be right in principle; the implementation of it was not, and
+the -0.44 ms on st-intro was buying a wrong picture.
+
+**What this costs and what it buys.** It gives back SS3.28's -0.44 ms on
+st-intro and removes the +0.33 ms on mlbis, so Phase 3's net from that work
+returns to zero. After the revert all eight scenes pass and all 27 unit tests
+pass.
+
+**The lesson is the one SS3.28 and SS3.30 already wrote down, now with a
+price on it.** SS3.28 itself said the gates *"mean less than it looks,
+because the golden configuration is serial and cannot exercise the worker at
+all"* — and then treated the passes as support anyway. The failures above are
+not even threading-dependent; they were reachable by the gate as it stands
+and by a unit test already in the tree. **The audit of the self-consistency
+runner (SS3.30) is now a hard prerequisite, not a preference**, and so is
+running `ctest` on the way past: a red unit test sat on the branch through
+three subsequent commits and a plan section that cited its subject.
+
 ### Phase 3 — DMA, SPU and scheduler granularity (week 4-5) — target **per scene, see below**; **STOWED at 3b, see SS3.29** — 3c/3d/3e/3f untouched
 
 **Rescoped 2026-09-21 against SS3.17's before-line, the way SS3.3 rescoped

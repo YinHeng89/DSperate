@@ -354,11 +354,7 @@ void Engine2D::post_draw(bool frame_reset) {
 
 // ---- memory helpers ---------------------------------------------------------
 
-// The mapping this engine renders against: the dispatched job's snapshot, not
-// the live map the emulation thread rebuilds on a VRAMCNT write. See
-// Gpu::vram_render_ -- this one accessor is what put all 28 readers below on
-// the shared object, and what takes them off it.
-const VramMap& Engine2D::vram() const { return nds_.gpu.render_vram(); }
+const VramMap& Engine2D::vram() const { return nds_.bus.vram_map(); }
 const VramView& Engine2D::bg_vram() const { return num_ ? vram().bbg : vram().abg; }
 const VramView& Engine2D::obj_vram() const { return num_ ? vram().bobj : vram().aobj; }
 u16 Engine2D::bg_extpal(u32 slot, u32 pal, u32 idx) const {
