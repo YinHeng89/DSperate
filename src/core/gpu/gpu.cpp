@@ -707,6 +707,10 @@ void Gpu::render_ranges(u32 af, u32 al, u32 bf, u32 bl) {
   // What the lines read of the frame-level capture state, as of now -- the
   // same for lines drawn here and for lines handed over.
   capcnt_render_ = capcnt_; capture_render_ = capture_on_;
+  // ...and the one field of the VramMap the capture reads (see gpu.h). Latched
+  // here, with the rest of the frame-level capture state, so the job does not
+  // consult the live map while the emulation thread may be rebuilding it.
+  lcdc_mask_render_ = nds_.bus.vram_map().lcdc_mask;
   const bool dbg = g_dbg_join;
   auto hand = [&](bool a, bool b) {
     if (dbg) std::fprintf(stderr, "[hand] frame %llu line %u a %u..%u b %u..%u lag %d stash %u\n", (unsigned long long)nds_.frame_count, line_, a ? af : 1, a ? al : 0, b ? bf : 1, b ? bl : 0, lag_frame_ ? 1 : 0, bscale_n_);
@@ -874,8 +878,8 @@ void Gpu::output_engine(int e, u32 line) {
           if (mode == 1) key = line_key(en.output());
           else if (e == 0 && mode == 2) {
             const u32 bank = (en.dispcnt() >> 18) & 3;
-            const VramMap& vm = nds_.bus.vram_map();
-            if (vm.lcdc_mask & (1u << bank)) key = line_key15(reinterpret_cast<const u16*>(vm.bank(bank)) + line * 256);
+            const VramMap& vm = nds_.bus.vram_map();   // bank pointers are remap-invariant
+            if (lcdc_mask_render_ & (1u << bank)) key = line_key15(reinterpret_cast<const u16*>(vm.bank(bank)) + line * 256);
           }
         }
         emit_splits(screen, line, dst, a_3d ? en.output() : nullptr, mode == 1, key);
@@ -1568,9 +1572,9 @@ void Gpu::output_a(u32 line, u32* dst) {
     // One kernel does the 15 -> 18 bit unpack, master brightness and the
     // 6 -> 8 expansion; an unmapped bank reads as zero.
     const u32 bank = (dispcnt >> 18) & 3;
-    const VramMap& vm = nds_.bus.vram_map();
+    const VramMap& vm = nds_.bus.vram_map();   // bank pointers are remap-invariant
     static constexpr u16 kZeroLine[256] = {};
-    const u16* src = (vm.lcdc_mask & (1u << bank)) ? reinterpret_cast<const u16*>(vm.bank(bank)) + line * 256 : kZeroLine;
+    const u16* src = (lcdc_mask_render_ & (1u << bank)) ? reinterpret_cast<const u16*>(vm.bank(bank)) + line * 256 : kZeroLine;
     kern::active::output_vram_line(src, engine[0].master_bright(), dst);
     return;
   }
@@ -1594,8 +1598,11 @@ void Gpu::capture(u32 line) {
   const u32 width = size == 0 ? 128 : 256, height = size == 0 ? 128 : 64 * size;
   if (line >= height) return;
   const u32 dst_bank = (cnt >> 16) & 3;
+  // The bank POINTERS are remap-invariant, so the live map is safe to take
+  // them from; lcdc_mask is not, and is latched at hand-off (see gpu.h).
   const VramMap& vm = nds_.bus.vram_map();
-  if (!(vm.lcdc_mask & (1u << dst_bank))) return;
+  const u32 lcdc = lcdc_mask_render_;
+  if (!(lcdc & (1u << dst_bank))) return;
   u16* dst = reinterpret_cast<u16*>(vm.bank(dst_bank)) + (((((cnt >> 18) & 3) << 14) + line * width) & 0xFFFF);
 
   const Pixel* src_a = (cnt & (1 << 24)) ? line3d_ : engine[0].output();
@@ -1604,7 +1611,7 @@ void Gpu::capture(u32 line) {
   else {
     const u32 dispcnt = engine[0].dispcnt();
     const u32 src_bank = (dispcnt >> 18) & 3;
-    if (vm.lcdc_mask & (1u << src_bank)) {
+    if (lcdc & (1u << src_bank)) {
       u32 off = line * 256;
       if (((dispcnt >> 16) & 3) != 2) off += ((cnt >> 26) & 3) << 14;
       src_b = reinterpret_cast<const u16*>(vm.bank(src_bank)) + (off & 0xFFFF);

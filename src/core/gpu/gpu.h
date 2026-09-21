@@ -471,6 +471,15 @@ private:
   // a batched engine A is still drawing.
   u32  capcnt_render_ = 0;
   bool capture_render_ = false;
+  // Gpu::capture() runs on the WORKER and used to read Bus::vram_map() live,
+  // while the emulation thread assigns vram_map_ = next in Bus::update_vram --
+  // which is the real reason vram_remap_begin() joins the worker at all
+  // (plan SS3.27). Bank STORAGE never moves (Bus::vram_bank is a fixed offset
+  // into one allocation, and VramMap::rebuild copies the same pointers back
+  // into banks_ every time), so the only thing capture reads that a remap can
+  // change is lcdc_mask. Latching it at hand-off, beside capcnt_render_, takes
+  // capture off the shared object entirely.
+  u32  lcdc_mask_render_ = 0;
   int  read_trap_bank_ = -1;            // LCDC bank under the capture read trap, or -1
   // Engine B's scaling, handed to the worker with engine A's lagged lines:
   // the scaler reads only the finished output line, never the engines or

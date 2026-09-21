@@ -26,6 +26,13 @@
 #   hang     the watchdog fired (no frame progress) -- the log has the dump
 #   crash    non-zero exit for any other reason
 #   timeout  the backstop killed it
+#   swapped  the two screens keep exchanging between consecutive frames --
+#            DraStic's threaded-3D failure on capture-heavy titles, and the
+#            shape the deferred 2D work risks. See tools/frame_health.py; the
+#            other half of it, screens exchanged on EVERY frame, is
+#            self-consistent and needs a reference, so the per-screen hashes go
+#            to <out>/screens/ for tools/sweep_swapcheck.py to diff against
+#            another run.
 set -u
 BIN=${1:?headless binary}; OUT=${2:?output dir}; FRAMES=${3:?frames}; shift 3
 [ $# -gt 0 ] || { echo "give at least one ROM directory" >&2; exit 2; }
@@ -33,9 +40,9 @@ BIN=${1:?headless binary}; OUT=${2:?output dir}; FRAMES=${3:?frames}; shift 3
 HERE=$(cd "$(dirname "$0")" && pwd)
 WD=${SWEEP_WATCHDOG:-20}                     # seconds of no frame progress = hang
 TO=${SWEEP_TIMEOUT:-600}                     # per-title backstop, seconds
-mkdir -p "$OUT/logs"
+mkdir -p "$OUT/logs" "$OUT/screens"
 TSV="$OUT/results.tsv"
-[ -f "$TSV" ] || printf 'title\tstatus\tframes\tblank\tfrozen\tdistinct\tfirst_motion\tlate_distinct\tlate_changes\twall_s\n' > "$TSV"
+[ -f "$TSV" ] || printf 'title\tstatus\tframes\tblank\tfrozen\tdistinct\tfirst_motion\tlate_distinct\tlate_changes\tswaps\twall_s\n' > "$TSV"
 
 for dir in "$@"; do
   for rom in "$dir"/*.nds; do
@@ -45,7 +52,7 @@ for dir in "$@"; do
     log="$OUT/logs/$name.log"
     fifo=$(mktemp -u "$OUT/.fifo.XXXXXX"); mkfifo "$fifo"
     health="$OUT/logs/$name.health.json"
-    python3 "$HERE/frame_health.py" "$fifo" --json "$health" &
+    python3 "$HERE/frame_health.py" "$fifo" --json "$health" --screens-out "$OUT/screens/$name.screens" &
     hp=$!
     t0=$(date +%s)
     DS_WATCHDOG=$WD timeout -k 5 "$TO" "$BIN" --direct --quantum 0 \
@@ -56,7 +63,7 @@ for dir in "$@"; do
     t1=$(date +%s); wall=$((t1 - t0))
     rm -f "$fifo"
 
-    read -r n blank frozen distinct motion ldist lchg < <(python3 - "$health" <<'PY'
+    read -r n blank frozen distinct motion ldist lchg swaps < <(python3 - "$health" <<'PY'
 import json, sys
 try:
     r = json.load(open(sys.argv[1]))
@@ -64,7 +71,8 @@ except Exception:
     r = {}
 print(r.get('frames', 0), r.get('blank', 1.0), r.get('frozen', 1.0),
       r.get('distinct', 0), r.get('first_motion') if r.get('first_motion') is not None else -1,
-      r.get('late_distinct', 0), r.get('late_changes', 0))
+      r.get('late_distinct', 0), r.get('late_changes', 0),
+      r.get('swaps') if r.get('swaps') is not None else -1)
 PY
 )
     if   [ $rc -eq 124 ] || [ $rc -eq 137 ];        then st=timeout
@@ -72,11 +80,12 @@ PY
     elif [ $rc -ne 0 ];                             then st=crash
     elif awk "BEGIN{exit !($blank > 0.98)}";        then st=blank
     elif awk "BEGIN{exit !($frozen > 0.98)}" && [ "$distinct" -le 3 ]; then st=stuck
+    elif [ "${swaps:--1}" -gt 8 ] && [ "$n" -gt 0 ] && awk "BEGIN{exit !($swaps > $n / 100.0)}"; then st=swapped
     elif [ "${lchg:-0}" -eq 0 ] && [ "$n" -gt 0 ];  then st=static
     elif [ "$n" -lt "$FRAMES" ];                    then st=short
     else                                                 st=ok
     fi
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$name" "$st" "$n" "$blank" "$frozen" "$distinct" "$motion" "$ldist" "$lchg" "$wall" >> "$TSV"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$name" "$st" "$n" "$blank" "$frozen" "$distinct" "$motion" "$ldist" "$lchg" "$swaps" "$wall" >> "$TSV"
     printf '%-56s %-7s %5s fr blank %-6s frozen %-6s dist %-5s late %s/%s %ss\n' "$name" "$st" "$n" "$blank" "$frozen" "$distinct" "$ldist" "$lchg" "$wall"
   done
 done
