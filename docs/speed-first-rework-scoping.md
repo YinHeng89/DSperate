@@ -1261,7 +1261,7 @@ two largest wins are block-ending fallbacks. That is the axis to sort any
 future fallback census on, and it is not the axis either SS3.10 or SS3.13
 used.
 
-### 3.16 Phase 2, closed -- the tally, and the gate that is not yet met
+### 3.16 Phase 2, closed -- the tally, and the gate it left open (met in SS3.17)
 
 **Delivered.** Device medians, RG DS Plus, three reps per step, alternating
 order. The before-column is SS3.9's base (the tree as Phase 1 closed it); the
@@ -1353,17 +1353,82 @@ failure". A 46-title sweep is ~25 s a title under qemu.
 
 **So Phase 2 closes on paper.** The `LDM ^` emitter and the `STM`/r15
 slow-path fix are committed (`83898bf`); `test_jit`'s 96 directed cases and
-1600 fuzz trials pass against it. Three things carry into Phase 3a:
+1600 fuzz trials pass against it. Three things carried into Phase 3a -- the
+sweep, the cadence fixtures and the device before-line -- and all three are
+done in SS3.17.
 
-1. Re-run `tools/title_sweep.sh` over the 46 titles and diff the status column
-   against `a64-jit-phase2.tsv`. Until it passes, Phase 2 has no exit gate.
-2. Re-baseline the golden cadence fixtures. SS3.13 records them as stale --
-   sm64's swap counts, and GXSTAT poll counts on several scenes, differ from
-   the fixtures on the *base* binary as well as the candidate, and have done
-   since the timing work earlier in Phase 2.
-3. Re-baseline `fixtures/device/baseline.jsonl`. It is still `exact-reference`
-   from before Phase 1, so no per-stage row in it is the current tree's, and
-   Phase 3 needs a before-line.
+### 3.17 Phase 3a: the gate met, and two gates that were not gating
+
+**The sweep (`fixtures/sweep/a64-jit-phase3a.tsv`).** 46 titles, 3600 frames,
+AArch64 JIT under qemu. 39 ok, 7 static, 0 fail -- no title changed status and
+the seven static titles are the same seven. **Phase 2's exit gate is met.**
+
+But the status column is too coarse. Joining on `distinct` instead, three
+titles moved, and one of them matters: **Final Fantasy III now freezes 43 %
+earlier** (167 -> 95 distinct frames, `frozen` 0.9506 -> 0.9706). It was
+already `static` before, so `status` could not see it. 95 is exactly what
+Phase 6's table reads for "both recompilers, quantum 2048" on the current
+tree, and distinct frames stop accumulating at the freeze, so the same count
+at two different run lengths means the same freeze point. **The known
+interleave defect is now reachable sooner** -- a better bisect target for the
+scheduler work, and a worse thing to hit while playing. (Animal Crossing
++17.5 % and Advance Wars +2.2 % also moved; more distinct frames is not a
+concern, but it is a reminder that the column is not the gate.)
+
+**The cadence counters were never gating at all.** `gate.sh` printed a cadence
+diff and returned success regardless -- the census that SS2 names one of the
+four gates replacing byte-exactness was, in the code, a log line. Three of the
+four fail the gate now, and the fourth deliberately does not:
+
+* `3d frames kept`, `gx swap_buffers` and `gx vblanks with no swap` **gate**.
+  They do not depend on which engine produced them -- the same tree reads
+  850 / 1417 / 386 on sm64 from the x86 interpreter and from the AArch64
+  recompiler.
+* `gx reads of GXSTAT` is **reported, never fatal**. It is a poll count and
+  moves with where the two engines' slices fall: 24,772 host against 24,372
+  AArch64, 1.6 % apart with nothing wrong. SS3.13 spent a whole verification
+  run proving one such diff was not its emitter's doing; that is the cost this
+  avoids.
+
+The fixtures' cadence half is re-baselined on the current tree (the picture
+hashes are untouched and remain `exact-reference`'s -- the two halves have
+different references by design, and `fixtures/golden/README.md`, previously an
+empty file, now says so). **No scene draws fewer frames:** swaps are unchanged
+on six of eight and rise by one on the other two. The GXSTAT falls -- sm64
+-17 %, gsdd -6 %, st-intro -5 % -- are Phase 1's no-FIFO model removing the
+reason to spin.
+
+**Twice in one session, then, a gate that reported instead of judging.** Both
+were found by re-reading what the gate script does rather than by trusting
+what this document says it does. That is worth doing to the perceptual gate
+and the self-consistency runner before Phase 3 leans on them.
+
+**The device before-line (`fixtures/device/baseline-phase3.jsonl`).** Three
+reps a scene on `dsperate-p2g` (byte-identical to `83898bf`), with gsdd added:
+
+| ms | gsdd | mlbis | dbori | sm64 | etody |
+|---|---|---|---|---|---|
+| **frame median** | **20.67** | 12.30 | 11.33 | 9.26 | 5.05 |
+| cpu9 | 8.08 | 5.45 | 8.08 | 3.17 | 0.88 |
+| cpu7 | 1.42 | 1.28 | 0.66 | 1.27 | 0.68 |
+| dma | **2.54** | 0.40 | 0.37 | 0.26 | 0.87 |
+| spu | **1.13** | 0.41 | 0.14 | 0.59 | 0.17 |
+| sched + events | 0.97 | 0.42 | 0.49 | 0.51 | 0.32 |
+| gx_geom | **0.00** | **0.00** | **0.00** | **0.00** | **0.00** |
+| **Phase 3 surface** | **4.64** | 1.23 | 1.00 | 1.36 | 1.37 |
+
+**`gx_geom` is gone** -- 1.05-1.50 ms on the old baseline, 0.00 on every scene
+now. Phase 1 deleted the row rather than shrinking it.
+
+**Golden Sun is the only scene outside the 16.74 ms budget**, by 3.93 ms, and
+it holds 4.64 of the 8.60 ms of Phase 3 surface across all five scenes. The
+other four clear the budget already and offer 1.0-1.4 ms each across DMA, SPU
+and the scheduler *combined*. **Phase 3's -2.5 ms target is therefore not
+reachable on four of the five scenes, because the rows do not contain it**, and
+on gsdd it means removing about 85 % of the whole surface. The -2.5 ms comes
+from the 2026-09-16 NSMB profile -- SDL, `--dual-window`, two phases old, and
+NSMB has never been a device scene in this rework. Phase 3 needs rescoping per
+scene before it is committed to, the way SS3.3 rescoped Phase 2.
 
 ### Phase 3 — DMA, SPU and scheduler granularity (week 4-5) — target **-2.5 ms**
 
