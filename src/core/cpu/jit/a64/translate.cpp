@@ -168,7 +168,10 @@ FlagUse arm_flag_use(u32 instr, bool a9) {
   case AOp::Mcr: break;
   case AOp::MsrReg: case AOp::MsrImm:
     u.reads = F_ALL;                                   // the mode-change path syncs CPSR through the interpreter
-    if (instr & (1u << 19)) u.writes = F_ALL;          // f field
+    // The f field writes the host flags only for a CPSR write; an SPSR write
+    // puts them in SPSR, and claiming them here would let the liveness pass
+    // drop a live flag-setting instruction before it.
+    if ((instr & (1u << 19)) && !(instr & (1u << 22))) u.writes = F_ALL;
     break;
   default: u = {F_ALL, F_ALL}; break;
   }
@@ -1082,6 +1085,68 @@ private:
   // the interpreter. `list` is 16 bits; `wstart` (w1) = lowest address,
   // `wwb` (w7) = writeback value. `rn` = base register for the STM "Rn in
   // list" rule (or 16 for none).
+  // The cold leg of a block transfer: the same word accesses, each through the
+  // slow stub, instead of handing the whole instruction back to the
+  // interpreter. DraStic's shape (01 SS7) -- a call into straight-line code
+  // rather than a re-decode -- applied to the case we actually fall back on,
+  // which is not register count but a transfer straddling a 2 KB page.
+  //
+  // Measured on Golden Sun: LDM/STM is ~630 k of the 2.48 M fallback
+  // executions in 900 frames, and the encodings are ordinary multi-register
+  // moves with no r15, so the page split is what costs, not the shape.
+  //
+  // w1 walks the address and w7 carries the writeback value; the slow stubs
+  // preserve both, and call_pure spills the caller-saved guest registers, so
+  // nothing else has to be saved around the calls. r15 in the list still
+  // falls back: its branch and post-jump CDI charge are the inline path's.
+  void emit_block_slow(u32 list, bool load, bool writeback, u32 rn, u32 n) {
+    e().and_imm(SCRATCH1, SCRATCH1, ~3u);
+    // The cost FIRST, while the scratch registers are still free: the slow
+    // stubs preserve only x1 and x7, so an accumulator cannot survive them.
+    //
+    // And it must be per word. The inline path charges N + (n-1) S from the
+    // base's page because every word is on that page; here they are not, and
+    // the interpreter prices each word from its own page. Charging from the
+    // base cost the fuzzer a cycle on a Thumb LDM that straddled the
+    // boundary (161 consumed against 162).
+    if (rt().cpu_oc == CpuOc::Off) {
+      for (u32 k = 0; k < n; ++k) {
+        if (k == 0) emit_data_cost(SCRATCH1, SCRATCH6, true, false, !load);
+        else {
+          e().add_imm(SCRATCH3, SCRATCH1, k * 4, true);
+          emit_data_cost(SCRATCH3, SCRATCH5, true, true, !load);
+          e().add_reg(SCRATCH6, SCRATCH6, SCRATCH5);
+        }
+      }
+      emit_charge_data(SCRATCH6, SCRATCH1, load);
+    } else {
+      const u32 nd = oc_data_cost(true, false, !load) + (n - 1) * oc_data_cost(true, true, !load);
+      e().mov_imm(SCRATCH6, const_charge(nd, load));
+      e().sub_reg(R_BUDGET, R_BUDGET, SCRATCH6);
+    }
+    bool first = true;
+    for (u32 i = 0; i < 16; ++i) {
+      if (!(list & (1u << i))) continue;
+      if (load) {
+        call_stub(rt().slow_load[2]);
+        e().mov(host_reg(i), SCRATCH0);
+      } else {
+        // STM storing its own base: the value is the OLD base when the base is
+        // the first register in the list and the NEW one otherwise. Same rule
+        // as the inline path above.
+        const u32 src = (i == rn && !first && writeback) ? SCRATCH7 : host_reg(i);
+        e().mov(SCRATCH2, src);
+        call_stub(rt().slow_store[2]);
+      }
+      e().add_imm(SCRATCH1, SCRATCH1, 4, true);
+      first = false;
+    }
+    // The writeback lands after every access, so an LDM that loads its own
+    // base keeps the loaded value.
+    if (load) { if (writeback && !(list & (1u << rn))) e().mov(host_reg(rn), SCRATCH7); }
+    else if (writeback) e().mov(host_reg(rn), SCRATCH7);
+  }
+
   void emit_block_transfer(u32 instr, u32 list, bool load, bool writeback, u32 rn, bool interwork_pc, u32 pc_store_value) {
     const u32 n = static_cast<u32>(__builtin_popcount(list));
     flush_pending();
@@ -1166,7 +1231,7 @@ private:
     const size_t join = hot_.size();
     cold_begin(fail);
     const size_t fb = cold_.size();
-    emit_fallback(instr, false);
+    emit_block_slow(list, load, writeback, rn, n);
     cold_end_jump(join);
     fm_walk(fb);
   }
@@ -1438,6 +1503,34 @@ void Translator::arm_msr(u32 instr, AOp op) {
   u32 wv;
   if (op == AOp::MsrImm) { e().mov_imm(SCRATCH4, rotr(instr & 0xFF, ((instr >> 8) & 0xF) * 2)); wv = SCRATCH4; }
   else wv = host_reg(instr & 0xF);
+  // MSR SPSR: no mode change, no banking, no host flags -- a load, a merge and
+  // a store into the current mode's SPSR word, skipped in user and system mode
+  // which have none (the interpreter's rule, interp_arm.cpp msr()).
+  if (instr & (1u << 22)) {
+    const u32 smask = ((fields & 1) ? 0x000000FFu : 0) | ((fields & 2) ? 0x0000FF00u : 0)
+                    | ((fields & 4) ? 0x00FF0000u : 0) | ((fields & 8) ? 0xFF000000u : 0);
+    add_pending(numC(pc_));
+    flush_pending();
+    if (!smask) return;
+    e().ldr_w(SCRATCH2, R_CTX, OFF_CPSR);
+    e().and_imm(SCRATCH3, SCRATCH2, 0x1F);
+    e().sub_imm(SCRATCH5, SCRATCH3, 0x10, true);
+    const size_t skip_user = e().cbz_fwd(SCRATCH5);
+    e().sub_imm(SCRATCH5, SCRATCH3, 0x1F, true);
+    const size_t skip_sys = e().cbz_fwd(SCRATCH5);
+    e().ldr_w(SCRATCH2, R_CTX, OFF_SPSR);
+    if (smask == 0xFFFFFFFFu) e().mov(SCRATCH2, wv);
+    else {
+      e().mov_imm(SCRATCH5, smask);
+      e().and_reg(SCRATCH3, wv, SCRATCH5);
+      e().bic_reg(SCRATCH2, SCRATCH2, SCRATCH5);
+      e().orr_reg(SCRATCH2, SCRATCH2, SCRATCH3);
+    }
+    e().str_w(SCRATCH2, R_CTX, OFF_SPSR);
+    e().bind(skip_user);
+    e().bind(skip_sys);
+    return;
+  }
   FailList fail;
   const u32 mem_mask = ((fields & 1) ? 0xC0u : 0) | ((fields & 2) ? 0xFF00u : 0) | ((fields & 4) ? 0xFF0000u : 0) | ((fields & 8) ? 0x0F000000u : 0);
   const bool touch_mem = mem_mask != 0 || (fields & 7);

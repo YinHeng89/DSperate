@@ -21,7 +21,10 @@ inline bool mcr_is_nop(u32 instr, bool a9) {
 // MSR forms translated inline: CPSR writes from a register or immediate. The
 // mode must not change (tested at run time; otherwise the interpreter runs it).
 inline bool msr_inline(u32 instr) {
-  if (instr & (1u << 22)) return false;                                   // SPSR
+  // SPSR writes inline too: they bank nothing and change no mode -- the
+  // current mode's SPSR is one word -- and user/system mode, which have no
+  // SPSR, is tested at run time. Golden Sun's IRQ handler runs one per
+  // interrupt, 120 k a run through the interpreter before this.
   return !(arm::decode_arm(instr) == arm::AOp::MsrReg && (instr & 0xF) == 15);
 }
 
