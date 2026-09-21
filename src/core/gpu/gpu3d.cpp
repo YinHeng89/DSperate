@@ -366,7 +366,7 @@ void Gpu3D::reset() {
   vertex_num_ = vertex_in_poly_ = consecutive_polys_ = 0;
   last_strip_poly_ = nullptr; num_opaque_ = 0;
   bank_ = 0; render_bank_ = 1; raster_bank_ = 1; pending_bank_ = 1; num_vertices_ = num_polygons_ = 0;
-  swaps_ = 0;
+  swaps_ = 0; list_unconsumed_ = false;
   flush_request_ = flush_attr_ = 0; render_identical_ = false; swapped_ = false; swap_wait_ = false; swap_busy_until_ = 0; list_same_ = false;
   renderer_.reset();
 }
@@ -495,16 +495,44 @@ void Gpu3D::gxfifo_dma_burst(const u8* src, u32 n) {
     u8* c; u32* p; u32 cn, pn, inf;
     void param(u32 v) { p[pn + inf++] = v; }
     void commit(u8 k) { c[cn++] = k; pn += inf; inf = 0; }
+    // A run of words that are certainly parameters of the command already in
+    // flight: straight into the log, no state machine per word.
+    void params(const u8* from, u32 k) { std::memcpy(p + pn + inf, from, k * 4); inf += k; }
   } sink{cmd_log_.get(), par_log_.get(), cmd_n_, par_n_, inflight_n_};
   // The parser state rides in registers for the whole run: the walk is a
   // static function of a local copy, written back once. Per word that is
   // the difference between ~10 loads and stores and none (the burst was
   // 45 % of run_channel's cycles on the GSDD title).
   GxParse p = parse_;
-  for (u32 i = 0; i < n; ++i) {
+  for (u32 i = 0; i < n; ) {
+    // Bulk parameters. The packed format is commands followed by their
+    // parameters, so while a command is in flight with more than one
+    // parameter outstanding, the next words are unconditionally parameters of
+    // it -- there is nothing for the state machine to decide. Copy them in one
+    // go and advance the count, leaving the LAST parameter to go through the
+    // walk below so the commit and the packed-command advance happen exactly
+    // where they did before.
+    //
+    // This is the geometry feed's own cost: Golden Sun's title moves 45 k
+    // words a frame into GXFIFO by DMA, 57 % of all DMA units on that scene,
+    // and every one of them used to step the machine individually.
+    if (p.num_cmds != 0) {
+      const u32 rem = p.total_params - p.param_count;   // includes the completing word
+      if (rem > 2) {
+        const u32 avail = n - i, want = rem - 1;
+        const u32 take = want < avail ? want : avail;
+        if (take >= 2) {
+          sink.params(src + i * 4, take);
+          p.param_count += take;
+          i += take;
+          continue;
+        }
+      }
+    }
     u32 v;
     std::memcpy(&v, src + i * 4, 4);
     gxfifo_word(v, p, sink);
+    ++i;
   }
   parse_ = p;
   cmd_n_ = sink.cn; par_n_ = sink.pn; inflight_n_ = sink.inf;
@@ -1143,6 +1171,11 @@ void Gpu3D::finalise_list() {
     }
     render_count_[bank_] = num_polygons_;
     ++swaps_;
+    // Sizing the "do not build what is never shown" idea: a list finalised
+    // while the previous one is still waiting for a render has superseded
+    // geometry that was transformed, clipped and sorted for nothing.
+    if (prof::enabled && list_unconsumed_) prof::add(prof::C_GX_LIST_DROPPED, 1);
+    list_unconsumed_ = true;
     // A swap that resubmits the same geometry with the same render state
     // produces the same picture: keep the previous output (the rasteriser
     // still checks its textures itself).
@@ -1151,6 +1184,7 @@ void Gpu3D::finalise_list() {
       && lists_equal(&pram_[bank_ * PRAM_BANK], &pram_[render_bank_ * PRAM_BANK], num_polygons_,
                      bank_ * VRAM_BANK, render_bank_ * VRAM_BANK, vram_.data());
     prev_swap_polys_ = num_polygons_; prev_swap_verts_ = num_vertices_; rendered_before_ = true;
+    if (prof::enabled && list_same_) prof::add(prof::C_GX_LIST_SAME, 1);
     if (prof::enabled) {
       prof::add(prof::C_GX_SWAP, 1);
       // Sums, plus a running max kept by adding the shortfall (vblank is
@@ -1255,6 +1289,7 @@ void Gpu3D::vblank() {
 }
 
 void Gpu3D::render_frame() {
+  if (list_unconsumed_) { if (prof::enabled) prof::add(prof::C_GX_LIST_CONSUMED, 1); list_unconsumed_ = false; }
   // The previous raster must be done before its bank is released: the
   // worker's next SWAP may take any bank that is not raster/pending/render.
   renderer_.sync_all();

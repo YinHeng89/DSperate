@@ -358,6 +358,7 @@ private:
   std::array<std::array<const Polygon*, PRAM_BANK>, BANKS> render_polys_{};
   std::array<u32, BANKS> render_count_{};
   u64 swaps_ = 0;                  // see swap_count()
+  bool list_unconsumed_ = false;   // a finalised list is waiting for a render (see C_GX_LIST_DROPPED)
   bool render_identical_ = false;
   bool render_stale_ = false;      // note_raster_skipped: the last render is older than rstate_ says
   u32 flush_request_ = 0, flush_attr_ = 0;

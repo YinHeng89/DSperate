@@ -148,6 +148,14 @@ enum Counter : u32 { C_POLY_LINES, C_SPAN_PIXELS, C_RESOLVED_PIXELS, C_TEX_FAST,
   // table walk): VRAMCNT remaps, TCM/PU window updates, EXMEMCNT slot
   // retimes, and ARM9 timing-range rebuilds from any of them.
   C_BUS_UPDATE_VRAM, C_BUS_UPDATE_TCM, C_BUS_GBA_TIMING, C_TIMING_UPDATE_CPU9,
+  // How much geometry is built for a picture nobody ever sees -- the size of
+  // the prize for deciding, before building a list, that it will not be
+  // displayed. DROPPED: finalised while the previous finalised list had still
+  // not reached a render, so it superseded a list that was never rasterised.
+  // SAME: finalised and identical to the previous one, so the raster is
+  // skipped and the transform, clip and sort were spent for nothing.
+  // CONSUMED: finalised lists that did reach a render.
+  C_GX_LIST_DROPPED, C_GX_LIST_SAME, C_GX_LIST_CONSUMED,
   C_COUNT };
 // Unbounded on purpose: profile.cpp defines it with a deduced size and
 // static_asserts that size against C_COUNT. Declared as [C_COUNT] instead, a
