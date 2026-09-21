@@ -12,14 +12,32 @@ namespace ds::prof {
 // frontend):
 // wall time accumulated per stage, one branch of overhead when disabled.
 enum Stage : u32 {
-  CPU9, CPU7, DMA, GX_RUN,
+  CPU9, CPU7, DMA,
+  // Geometry command execution: Gpu3D::drain_all, the replay of the command
+  // log. Another "of which" column, and a load-bearing one -- the log is
+  // drained wherever it fills or is observed, which is inside DMA when the
+  // feed is a GXFIFO DMA burst (Golden Sun moves 45 k words a frame that way,
+  // 57 % of all its DMA units), inside CPU9 when the guest stores to GXFIFO
+  // or reads GXSTAT, and inside GX_VBLANK at the swap.
+  //
+  // It had NO SITE from Phase 1 until 2026-09-21, so `gx_geom` read 0.00 on
+  // every scene and the plan recorded that as Phase 1 having deleted the row.
+  // Phase 1 deleted the INSTRUMENT; the work moved into its callers' rows.
+  GX_RUN,
   BG_DRAW, OBJ_DRAW, WINDOW, SELECT, EFFECTS, OUTPUT, CAPTURE,
   R3D_CLEAR, R3D_SPANS, R3D_FINAL, R3D_WAIT, SPU,
   // Nested inside CPU9/CPU7 (translation runs mid-slice), so it is an
   // "of which" column: never add it to the others against wall time.
   JIT_TX,
-  // The emulation thread waiting for the geometry worker (Gpu3D::worker_join).
-  GX_JOIN,
+  // The 2D line worker join (Gpu::join_worker), wherever it is reached from.
+  // Eight of its nine call sites had no scope at all until 2026-09-21, and the
+  // two in the lazy-2D VRAM write trap run INSIDE the DMA scope -- so on a
+  // scene that streams tiles by DMA the wait was being reported as DMA time.
+  // "Of which" like JIT_TX: it nests inside DMA, GPU_LINE and JOURNAL, and it
+  // also contains JOIN0's join. Never add it against wall time.
+  // (It replaces GX_JOIN, which measured the geometry worker Phase 1 deleted
+  // and had had no site since.)
+  W2D_JOIN,
   // The "untimed" bucket, resolved (2026-09-16): leaf scopes placed so that
   // none contains another scope and none sits inside one, so they add
   // against wall time like the stages above.

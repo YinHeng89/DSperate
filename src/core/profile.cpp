@@ -17,12 +17,16 @@ namespace ds::prof {
 bool enabled = false;
 bool async_window = false;
 bool census_same_list = false;
+// Nested scopes: each sits inside another stage's scope, so it is reported as
+// an "of which" column and excluded from the sum. See profile.h.
+inline bool of_which(Stage s) { return s == JIT_TX || s == GX_RUN || s == W2D_JOIN; }
+
 const char* const names[COUNT] = {
-  "cpu arm9", "cpu arm7", "dma", "gx geometry",
+  "cpu arm9", "cpu arm7", "dma", "gx geometry (of which)",
   "2d bg draw", "2d obj draw", "2d window", "2d select", "2d effects", "output", "capture",
   "3d clear", "3d spans", "3d final pass", "3d band wait", "spu",
   "jit translate",
-  "gx worker join",
+  "2d worker join (of which)",
   "sched slice loop", "events (timers, dma, fifo; not spu)", "gpu line hooks", "line-0 worker join", "begin_frame", "gx vblank (sort, join)",
   "2d journal/latches", "3d line wait", "3d prep (texcache)", "gpu upload",
 };
@@ -36,7 +40,7 @@ const char* const stage_keys[COUNT] = {
   "bg_draw", "obj_draw", "window", "select", "effects", "output", "capture",
   "r3d_clear", "r3d_spans", "r3d_final", "r3d_wait", "spu",
   "jit_tx",
-  "gx_join",
+  "w2d_join",
   "sched", "events", "gpu_line", "join0", "begin_frame", "gx_vblank",
   "journal", "r3d_line", "r3d_prep", "gpu_upload",
 };
@@ -162,7 +166,10 @@ void frame_breakdown(const std::vector<double>& frame_ms) {
     Group g;
     for (size_t i : idx) {
       double timed = 0;
-      for (u32 s = 0; s < COUNT; ++s) { const double v = frame_series[i].ns[s] / 1e6; g.stage[s] += v; timed += v; }
+      // The "of which" stages nest inside others, so they are reported as rows
+      // but must not be subtracted again here -- counting them would push
+      // `untimed` negative, which is how this was read before 2026-09-21.
+      for (u32 s = 0; s < COUNT; ++s) { const double v = frame_series[i].ns[s] / 1e6; g.stage[s] += v; if (!of_which(static_cast<Stage>(s))) timed += v; }
       g.workers += frame_series[i].workers / 1e6;
       g.ms += frame_ms[i];
       g.untimed += frame_ms[i] - timed;
@@ -187,7 +194,7 @@ void frame_breakdown(const std::vector<double>& frame_ms) {
   for (u32 s : rows)
     if (m.stage[s] >= 0.0005 || t.stage[s] >= 0.0005)
       std::fprintf(stderr, "[frames] %-16s %9.3f %9.3f %9.3f %+9.3f\n", names[s], l.stage[s], m.stage[s], t.stage[s], t.stage[s] - m.stage[s]);
-  std::fprintf(stderr, "[frames] %-16s %9.3f %9.3f %9.3f %+9.3f   (frame_ms minus timed stages: JIT translate, event/bus work between scopes, sched)\n",
+  std::fprintf(stderr, "[frames] %-16s %9.3f %9.3f %9.3f %+9.3f   (frame_ms minus the timed stages, excluding the \"of which\" rows)\n",
                "untimed", l.untimed, m.untimed, t.untimed, t.untimed - m.untimed);
   std::fprintf(stderr, "[frames] %-16s %9.3f %9.3f %9.3f %+9.3f   (overlaps the band wait; not part of the wall time)\n",
                "band workers", l.workers, m.workers, t.workers, t.workers - m.workers);
@@ -289,8 +296,12 @@ void report() {
   }
   const u64* ns = t.ns;
   const u64* count = t.count;
+  // The "of which" stages nest inside other scopes and must not be added
+  // against wall time -- profile.h says so for each of them. JIT_TX was in
+  // this sum anyway until 2026-09-21, so the row has always been slightly
+  // over; GX_RUN and W2D_JOIN would have made it three.
   u64 total = 0;
-  for (u32 i = 0; i < COUNT; ++i) total += ns[i];
+  for (u32 i = 0; i < COUNT; ++i) if (!of_which(static_cast<Stage>(i))) total += ns[i];
   if (!total) return;
   for (u32 i = 0; i < C_COUNT; ++i)
     if (count[i]) std::fprintf(stderr, "[profile] %-20s %12llu\n", count_names[i], static_cast<unsigned long long>(count[i]));
@@ -325,7 +336,7 @@ void report() {
   std::fprintf(stderr, "[profile] %-14s %9s %6s\n", "stage", "ms", "%");
   for (u32 i = 0; i < COUNT; ++i)
     if (ns[i]) std::fprintf(stderr, "[profile] %-14s %9.1f %5.1f%%\n", names[i], ns[i] / 1e6, 100.0 * ns[i] / total);
-  std::fprintf(stderr, "[profile] %-14s %9.1f\n", "sum", total / 1e6);
+  std::fprintf(stderr, "[profile] %-14s %9.1f  (excludes the \"of which\" rows)\n", "sum", total / 1e6);
 }
 
 } // namespace ds::prof

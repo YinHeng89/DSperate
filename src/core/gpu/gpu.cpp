@@ -622,7 +622,14 @@ void Gpu::join_worker() {
   if (!inflight_[0] && !inflight_[1] && !scale_inflight_) return;
   const bool dbg = g_dbg_join;
   if (dbg) std::fprintf(stderr, "[join] frame %llu line %u hblank %d a %u..%u b %u..%u deferred %d\n", (unsigned long long)nds_.frame_count, line_, hblank_done_ ? 1 : 0, job_first_[0], job_last_[0], job_first_[1], job_last_[1], a_deferred_ ? 1 : 0);
-  { const auto t0 = std::chrono::steady_clock::now(); worker_.wait(); join_wait_ns_ += static_cast<u64>((std::chrono::steady_clock::now() - t0).count()); }
+  // The wait was already being timed into join_wait_ns_; it is now also a
+  // profile stage, so it stops being reported as whoever's scope we are under.
+  // Eight of the nine join_worker() call sites had no scope, and the two in
+  // the VRAM write trap run inside the DMA scope. "Of which" -- see W2D_JOIN
+  // in profile.h.
+  { const auto t0 = std::chrono::steady_clock::now(); worker_.wait();
+    const u64 dt = static_cast<u64>((std::chrono::steady_clock::now() - t0).count());
+    join_wait_ns_ += dt; prof::add_ns(prof::W2D_JOIN, dt); }
   inflight_[0] = inflight_[1] = false; scale_inflight_ = false; bscale_n_ = 0;
   if (a_deferred_) { a_deferred_ = false; finish_a(); }
 }

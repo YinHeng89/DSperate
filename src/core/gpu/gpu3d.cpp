@@ -390,6 +390,15 @@ void Gpu3D::drain_all() {
   // cleared by the swap itself in the no-FIFO model, and only a VBlank-parked
   // swap (the exact model's) ever left it set -- nothing sets it now.
   if (!cmd_n_) return;   // the common case by far: dbori reads GXSTAT ~1.5 M times a run
+  // "Of which" -- this nests inside whatever scope drained the log (DMA on a
+  // GXFIFO burst, CPU9 on a store or a GXSTAT read, GX_VBLANK at the swap).
+  // See the GX_RUN comment in profile.h: the row read 0.00 from Phase 1 until
+  // this site existed, which is not the same as the work being gone.
+  //
+  // AFTER the empty-log early-out on purpose: a scope costs two clock reads,
+  // and dbori reaches here 1.5 M times a run with nothing to drain. Placed
+  // above it, the instrument would have cost more than the thing it measures.
+  DS_PROF(GX_RUN);
   // One pass. A command's parameters are already contiguous, so there is no
   // accumulator, no second dispatch and no per-parameter trip round the loop:
   // a 16-parameter MTX_LOAD_4x4 is one iteration.
