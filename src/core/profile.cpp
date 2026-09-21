@@ -19,7 +19,7 @@ bool async_window = false;
 bool census_same_list = false;
 // Nested scopes: each sits inside another stage's scope, so it is reported as
 // an "of which" column and excluded from the sum. See profile.h.
-inline bool of_which(Stage s) { return s == JIT_TX || s == GX_RUN || s == W2D_JOIN; }
+inline bool of_which(Stage s) { return s == JIT_TX || s == GX_RUN || s == W2D_JOIN || s == R3D_STEAL; }
 
 const char* const names[COUNT] = {
   "cpu arm9", "cpu arm7", "dma", "gx geometry (of which)",
@@ -28,7 +28,7 @@ const char* const names[COUNT] = {
   "jit translate",
   "2d worker join (of which)",
   "sched slice loop", "events (timers, dma, fifo; not spu)", "gpu line hooks", "line-0 worker join", "begin_frame", "gx vblank (sort, join)",
-  "2d journal/latches", "3d line wait", "3d prep (texcache)", "gpu upload",
+  "2d journal/latches", "3d line wait", "3d prep (texcache)", "gpu upload", "3d bins stolen (of which)",
 };
 
 // Stable machine keys for the same stages (DS_PROFILE_LINE). Display names
@@ -67,7 +67,11 @@ const char* const count_names[] = {"3d polygon lines", "3d span pixels", "3d res
   "3d span pixels in len 1-4", "3d span pixels in len 5-8", "3d span pixels in len 9-16", "3d span pixels in len 17-32", "3d span pixels in len 33-64", "3d span pixels in len 65-128", "3d span pixels in len 129-256",
   "stores into palette space", "stores into oam space",
   "2d lazy frames", "2d lazy frames skipped (futile)", "2d vram trap hits", "2d lag frames", "2d lag: trapped stores", "2d lag: stores that joined a line", "2d lag: frames that hit the trap limit", "2d lag: lines left in flight", "2d engine A batch: stores that joined it", "2d engine A batch: capture-bank reads that joined it",
-  "2d join calls", "vramcnt remaps", "vramcnt remaps: a 2d view moved", "vramcnt remaps: no 2d view moved", "vramcnt remaps with lines pending",
+  "2d join calls", "render_ranges calls", "rr: engine A deferred", "rr: lag hand-off", "rr: engine B handed", "rr: nothing handed",
+  "rr: worker parked at the decision", "rr: worker awake at the decision",
+  "rr: short run handed ONLY because awake", "rr: short run inline ONLY because parked",
+  "rr: lines drawn inline", "rr: lines handed over",
+  "vramcnt remaps", "vramcnt remaps: a 2d view moved", "vramcnt remaps: no 2d view moved", "vramcnt remaps with lines pending",
   "vramcnt remaps while a 2d job is in flight",
   "  ...of those, on an alternating-phase frame", "  ...of those, the in-flight job is a capture", "  ...of those, on a clean frame (neither)",
   "frames with an alternating display phase", "frames with capture on", "frames total",

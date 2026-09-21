@@ -3572,6 +3572,10 @@ bool Renderer3D::steal_bins(u64 gen, u32 upto) {
   StealBand* sb = nullptr;
   for (StealBand& c : steal_) if (!c.busy.exchange(true, std::memory_order_acq_rel)) { sb = &c; break; }
   if (!sb) return false;
+  // Below the three early-outs on purpose: the fast path (band already drawn,
+  // stealing off, no free band) must stay free of a clock, and only this loop
+  // draws anything. "Of which" -- see R3D_STEAL in profile.h.
+  DS_PROF(R3D_STEAL);
   const DispatchCtx& cx = ctx_[gen & 1];
   bool result = false;
   for (;;) {

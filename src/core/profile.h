@@ -51,6 +51,17 @@ enum Stage : u32 {
   R3D_LINE,     // asking the 3D raster for a line (a band or fence wait when it is one)
   R3D_PREP,     // Renderer3D::render up to the raster seam: texture cache validation and resolve
   GPU_UPLOAD,   // the GPU raster's upload and submit
+  // 3D bins the calling thread drew INSTEAD of waiting for a worker
+  // (Renderer3D::steal_bins). Another "of which": it nests inside whatever
+  // scope the caller is in, and its two call sites are sync_line -- reached
+  // from the compositor -- and sync_all, reached from Bus::update_vram when
+  // the texture views move, i.e. during a VRAMCNT write and so inside CPU9.
+  //
+  // It had no scope at all until 2026-09-21, which made raster work migrating
+  // onto the emulation thread invisible: it inflated cpu9 and read as ARM9
+  // getting slower. Stealing exists to convert a WAIT into WORK, so the work
+  // has to be visible or the trade cannot be judged.
+  R3D_STEAL,
   COUNT
 };
 extern bool enabled;
@@ -116,6 +127,21 @@ enum Counter : u32 { C_POLY_LINES, C_SPAN_PIXELS, C_RESOLVED_PIXELS, C_TEX_FAST,
   // move ("most VRAMCNT traffic ... leaves them alone"). These count whether
   // the same is true for 2D. STILL means no engine-read view moved, so the
   // catch-up and the join cannot have been needed.
+  // render_ranges' hand-off decision, split by the branch taken and by the
+  // worker_.parked() state that gated it. Two scenes point at this one
+  // function from different directions (plan SS3.29): gsdd pays 2.9 ms a
+  // frame in its pre-join, and mlbis moved ~0.26 ms a frame of 2D work onto
+  // the emulation thread the moment join behaviour changed elsewhere -- because
+  // the hand-off predicates read parked(), which is a side effect of joins
+  // taken for unrelated reasons.
+  C_RR_CALLS, C_RR_DEFER_A, C_RR_LAG, C_RR_HAND_B, C_RR_NONE,
+  C_RR_PARKED, C_RR_AWAKE,
+  // The specific policy: a run short enough that it is only handed over
+  // BECAUSE the worker happened to be awake, or only drawn inline BECAUSE it
+  // happened to be parked. These are the decisions that flip when an
+  // unrelated join changes.
+  C_RR_SHORT_HANDED_AWAKE, C_RR_SHORT_INLINE_PARKED,
+  C_RR_LINES_INLINE, C_RR_LINES_HANDED,
   C_VRAM_REMAP, C_VRAM_REMAP_2D_MOVED, C_VRAM_REMAP_2D_STILL, C_VRAM_REMAP_PENDING,
   // Remaps taken while a 2D job is IN FLIGHT, tested before the join. This is
   // exactly the population a per-job VramMap snapshot would change: today each

@@ -750,9 +750,23 @@ void Gpu::render_ranges(u32 af, u32 al, u32 bf, u32 bl) {
   const u32 a_len = a_has ? al - af + 1 : 0, b_len = b_has ? bl - bf + 1 : 0;
   const u32 last = a_has && b_has ? (al > bl ? al : bl) : a_has ? al : bl;
   bool a_handed = false, b_handed = false;
+  // The decision, censused (SS3.29). parked() is read once here rather than
+  // per branch: the branches below read it separately and it can change under
+  // them, which is itself part of what makes this hard to reason about.
+  const bool parked_at_decision = prof::enabled ? worker_.parked() : false;
+  if (prof::enabled) {
+    prof::add(prof::C_RR_CALLS, 1);
+    prof::add(parked_at_decision ? prof::C_RR_PARKED : prof::C_RR_AWAKE, 1);
+    // Would the short-run rule have gone the other way if the worker's parked
+    // state had been the opposite? Those are the decisions an unrelated join
+    // flips.
+    if (b_has && par_2d_ && b_len < 24 && !parked_at_decision) prof::add(prof::C_RR_SHORT_HANDED_AWAKE, 1);
+    if (b_has && par_2d_ && b_len < 24 && parked_at_decision) prof::add(prof::C_RR_SHORT_INLINE_PARKED, 1);
+  }
   if (a_has && par_2d_ && al == SCREEN_H - 1 && (a_len >= 24 || (!worker_.parked() && a_len >= b_len))) {
     // Engine A's run to the last display line: the deferred join (see
     // worker_), engine B's run drawn here meanwhile.
+    prof::add(prof::C_RR_DEFER_A, 1);
     hand(true, false);
     a_handed = true; a_deferred_ = true;
   } else if (par_2d_ && lag_frame_ && (a_has || (b_has && scaling()))) {
@@ -767,6 +781,7 @@ void Gpu::render_ranges(u32 af, u32 al, u32 bf, u32 bl) {
       bscale_defer_ = false;
       b_handed = true;                        // drawn, its scaling in flight
     }
+    prof::add(prof::C_RR_LAG, 1);
     hand(a_has, false);
     a_handed = a_has;
   } else if (b_has && par_2d_ && (b_len >= 24 || !worker_.parked())) {
@@ -774,11 +789,18 @@ void Gpu::render_ranges(u32 af, u32 al, u32 bf, u32 bl) {
     // more than the lines do, and the trap-hit catch-ups of a batched frame
     // (Golden Sun: ~16 a frame, 8-line bursts between them) would each pay it
     // -- measured as the whole loss of batching on that title.
+    prof::add(prof::C_RR_HAND_B, 1);
     hand(false, true);
     b_handed = true;
+  } else {
+    prof::add(prof::C_RR_NONE, 1);
   }
   if (a_has) prof::add(prof::C_2D_RANGE_A, 1);
   if (b_has) prof::add(prof::C_2D_RANGE_B, 1);
+  if (prof::enabled) {
+    prof::add(prof::C_RR_LINES_HANDED, (a_handed ? a_len : 0) + (b_handed ? b_len : 0));
+    prof::add(prof::C_RR_LINES_INLINE, (a_has && !a_handed ? a_len : 0) + (b_has && !b_handed ? b_len : 0));
+  }
   if (a_has && !a_handed) for (u32 x = af; x <= al; ++x) step_engine(0, x);
   if (b_has && !b_handed) for (u32 x = bf; x <= bl; ++x) step_engine(1, x);
   // Engine A's deferred batch stays in flight until line 0. A lagged run
