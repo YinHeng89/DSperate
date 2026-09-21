@@ -1417,8 +1417,11 @@ reps a scene on `dsperate-p2g` (byte-identical to `83898bf`), with gsdd added:
 | gx_geom | **0.00** | **0.00** | **0.00** | **0.00** | **0.00** |
 | **Phase 3 surface** | **4.64** | 1.23 | 1.00 | 1.36 | 1.37 |
 
-**`gx_geom` is gone** -- 1.05-1.50 ms on the old baseline, 0.00 on every scene
-now. Phase 1 deleted the row rather than shrinking it.
+**`gx_geom` reads 0.00 on every scene** against 1.05-1.50 ms on the old
+baseline. ~~Phase 1 deleted the row rather than shrinking it.~~ **Wrong, and
+corrected in SS3.18: Phase 1 deleted the INSTRUMENT.** `GX_RUN` has had no
+scope site since, so the row could only ever read zero; the geometry work moved
+into its callers' rows and is 3.56 ms of a typical Golden Sun frame.
 
 **Golden Sun is the only scene outside the 16.74 ms budget**, by 3.93 ms, and
 it holds 4.64 of the 9.59 ms of Phase 3 surface across all five scenes -- just
@@ -1430,6 +1433,90 @@ on gsdd it means removing about 85 % of the whole surface. The -2.5 ms comes
 from the 2026-09-16 NSMB profile -- SDL, `--dual-window`, two phases old, and
 NSMB has never been a device scene in this rework. Phase 3 needs rescoping per
 scene before it is committed to, the way SS3.3 rescoped Phase 2.
+
+### 3.18 Phase 3b's census: Golden Sun's critical path is the 2D worker, not DMA
+
+The first `perf` ever run on gsdd, plus the three profile stages it showed to
+be lying. The scene carrying 48 % of Phase 3's surface, and the only one
+outside the budget, is not spending its time where any version of this plan
+said it was.
+
+**The instrument came first, because three rows were wrong.**
+
+* **`GX_RUN` had no scope site** and had had none since Phase 1, so `gx_geom`
+  read 0.00 ms on every scene. SS3.17 recorded that as Phase 1 deleting the
+  row. Phase 1 deleted the *instrument*: `drain_all()` runs wherever the
+  command log fills or is observed — inside `DMA` on a GXFIFO burst, inside
+  `CPU9` on a store or a GXSTAT read, inside `GX_VBLANK` at the swap — so the
+  work simply moved into its callers' rows.
+* **`GX_JOIN` had no site either**; it measured the geometry worker Phase 1
+  deleted. It is now `W2D_JOIN`, the 2D line worker join, scoped inside
+  `Gpu::join_worker()` itself. **Eight of its nine call sites had no scope at
+  all**, including both in the lazy-2D VRAM write trap, which run inside the
+  DMA scope.
+* **The sum and `untimed` double-counted the nested rows.** `JIT_TX` was in
+  both despite `profile.h` saying never to add it. This is why SS3.6 found
+  negative unaccounted time and called it impossible — it *was* impossible,
+  and it was this, not the summing of medians that section blamed.
+
+**Golden Sun, device, 1100 frames from 700, per frame:**
+
+| stage | fast | **typ** | p99 | tail delta |
+|---|---|---|---|---|
+| **2d worker join** *(of which)* | 0.196 | **2.782** | **16.317** | **+13.534** |
+| cpu arm9 | 7.892 | 8.104 | 8.985 | +0.881 |
+| **gx geometry** *(of which)* | 2.938 | **3.560** | 3.452 | -0.108 |
+| dma | 1.894 | 2.595 | 2.720 | +0.125 |
+| spu | 0.924 | 1.124 | 1.237 | +0.113 |
+| sched slice loop | 0.692 | 0.865 | 1.055 | +0.191 |
+| untimed | 1.741 | 4.858 | 17.148 | +12.290 |
+
+and `perf` on the emulation thread agrees: `Dma::run_channel_impl` 9.81 %,
+`__schedule` 9.49 % with `do_sched_yield` and `__sched_yield` another 3.1 %,
+`submit_vertex` 7.69 %, `drain_all` 6.24 %. **No translated guest code appears
+in the top thirty symbols at all** — the opposite of dbori and mlbis, where it
+is a third of the thread.
+
+**Three things follow, and they reorder the phase.**
+
+**1. The emulation thread's largest single cost on this scene is waiting for
+the 2D line worker.** 2.78 ms a typical frame, 16.3 ms at p99, and it accounts
+for essentially the entire tail: nothing else contributes more than 1.5 ms to
+p99. The site is `Gpu::catch_up()` — `render_ranges()` hands one engine's lines
+to the worker and the next statement blocks on it, because a catch-up exists
+precisely to land those lines before the store that triggered it. Golden Sun
+is the lazy trap's worst scene.
+
+**2. SS3.6's grounds for dropping Phase 5 do not hold.** That section dropped
+the 2D engines on "0.64 ms on Golden Sun, 0.0 % join wait". The 0.64 ms is the
+2D work done *on the emulation thread*; the join wait it quotes is `JOIN0`,
+which scopes exactly one of the nine join sites and reads 0.002 ms. The line
+worker is 22.7 % of the process by `perf` — comparable to a band worker — and
+the emulation thread blocks on it. **The 2D engines are on Golden Sun's
+critical path, and the decision to drop them was made with an instrument that
+could not see the path.** This does not by itself reinstate Phase 5's
+representation work (1-bit masks, planar split); it reopens the question, and
+the cheaper answer may be the hand-off rather than the rendering.
+
+**3. `cpu9` is not 8.1 ms of ARM9.** 3.56 ms of it is geometry replay, and an
+unmeasured share of the join sits inside it too. Phase 2 spent itself against a
+row that, on this scene, is under half what it reads.
+
+**What this does to Phase 3's shape.** 3c (the cart) is unaffected and stays
+first — it was argued from dbori and mlbis, where the census still stands. 3d
+shrinks: with geometry lifted out, the genuine DMA row is well under 2.595 ms
+and the -1.3 ms the phase wanted from it is not there. 3f (SPU, 1.12 ms) and 3e
+(the scheduler, 0.87 ms) are unchanged and remain small. **The largest lever on
+the only scene that misses the budget is now the 2D hand-off**, which is in no
+phase's scope: Phase 3 does not cover it and Phase 5 was dropped.
+
+*Still unmeasured, and needed before committing to that lever:* how much of the
+join is reachable at all. A catch-up that must land before a store cannot
+simply be deleted; the questions are whether the lag limit can absorb more of
+them (`LAG_TRAP_LIMIT`), whether the hand-off is worth making at all for runs
+this short, and whether the 4.86 ms of `untimed` — which tracks the join's tail
+almost exactly — is more of the same thing at sites that are still in no scope.
+**Measure that before writing anything.**
 
 ### Phase 3 — DMA, SPU and scheduler granularity (week 4-5) — target **per scene, see below**
 

@@ -139,8 +139,13 @@ absent before.
 | gx_geom | **0.00** | **0.00** | **0.00** | **0.00** | **0.00** |
 | **Phase 3 surface** (dma+spu+sched+events) | **4.64** | 1.23 | 1.00 | 1.36 | 1.37 |
 
-**`gx_geom` is gone.** It was 1.05-1.50 ms on the four old scenes and is 0.00
-on all five now — Phase 1 did not shrink the row, it deleted it.
+**`gx_geom` reads 0.00 on all five**, against 1.05-1.50 ms on the four old
+scenes. This was first read here as Phase 1 having deleted the row. It had not:
+**`GX_RUN` had no scope site from Phase 1 until 2026-09-21**, so the row could
+only ever read zero. The geometry work moved into its callers' rows — `dma` on
+a GXFIFO burst, `cpu9` on a store or a GXSTAT read — and measures 3.56 ms of a
+typical Golden Sun frame once the site exists. **The `dma` and `cpu9` columns
+in the table above are therefore inclusive of it.**
 
 **Golden Sun is the only scene outside the 16.74 ms budget**, by 3.93 ms, and
 it holds 4.64 ms of the 9.59 ms of Phase 3 surface across all five scenes --
