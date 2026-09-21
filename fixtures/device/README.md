@@ -143,7 +143,8 @@ absent before.
 on all five now — Phase 1 did not shrink the row, it deleted it.
 
 **Golden Sun is the only scene outside the 16.74 ms budget**, by 3.93 ms, and
-it holds 4.64 ms of the 8.60 ms of Phase 3 surface across all five scenes. The
+it holds 4.64 ms of the 9.59 ms of Phase 3 surface across all five scenes --
+just under half. The
 other four clear the budget already and offer 1.0-1.4 ms each *in total*
 across DMA, SPU and the scheduler.
 

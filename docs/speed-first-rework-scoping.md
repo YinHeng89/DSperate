@@ -1421,7 +1421,8 @@ reps a scene on `dsperate-p2g` (byte-identical to `83898bf`), with gsdd added:
 now. Phase 1 deleted the row rather than shrinking it.
 
 **Golden Sun is the only scene outside the 16.74 ms budget**, by 3.93 ms, and
-it holds 4.64 of the 8.60 ms of Phase 3 surface across all five scenes. The
+it holds 4.64 of the 9.59 ms of Phase 3 surface across all five scenes -- just
+under half. The
 other four clear the budget already and offer 1.0-1.4 ms each across DMA, SPU
 and the scheduler *combined*. **Phase 3's -2.5 ms target is therefore not
 reachable on four of the five scenes, because the rows do not contain it**, and
