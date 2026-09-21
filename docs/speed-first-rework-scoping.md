@@ -771,6 +771,81 @@ Candidate levers, in the order the evidence currently favours:
 sweep clean — this is the phase most likely to break games, so the sweep is
 the real gate, not the four scenes.
 
+
+### 3.8 Phase 2's survey: what Golden Sun's JIT is actually doing (2026-09-20)
+
+Three explanations were eliminated before looking at the JIT itself: raster
+contention (§3.6, cpu9 flat across band counts), the timing cost model (§3.2,
+0.2-0.4 ms by costprobe), and idle spin (the loop analyser rejects 93 % of
+Golden Sun's candidates -- its ARM9 is executing varied code, not waiting).
+
+The census, 900 frames, `DS_JIT_HIST=1` on the cross build under qemu:
+
+    blocks 11346, inline instrs 60763, fallback executions 2482000,
+    slow accesses 5834043, entries 1290487, invalidated 53248,
+    revived 51193, flushes 0
+    code 3138 KB (hot 1581 KB): 52.9 bytes per guest instruction, 26.6 hot
+
+**Churn is not the problem, and the README's fix holds.** Zero arena flushes;
+53,248 blocks invalidated against 51,193 revived, so 96 % come back through
+park-and-revive; 4 retime invalidations killing 19 blocks in a whole run; and
+ARM9 timing-table rebuilds -- each of which drops every block -- happen 11-16
+times per run on every scene measured. The 1.9k-retranslations-a-frame
+catastrophe the JIT README records for this exact game (ITCM data sharing a
+page with the hot ITCM routines) is genuinely fixed by the same-value and
+overlap-only filters. Retranslate lead time averages 287.9 ms over 859
+samples: pages come back long after the kill, not immediately.
+
+Block linking is likewise already there -- `jit_h_link` rewrites a block's
+exit `bl link` into `b native` on first execution, so a taken link is one
+branch with no dispatcher round trip.
+
+**What is left is density and fallbacks.**
+
+*Density: 52.9 bytes per guest instruction, 26.6 in hot code* -- roughly
+thirteen emitted AArch64 instructions per guest ARM instruction, seven in the
+hot set. This is the only figure large enough to explain 8.78 ms of cpu9
+against DraStic's 8.3 ms for all of its CPU emulation. The per-access timing
+charge is part of it (4-7 instructions on every memory op) but costprobe
+prices that at 0.2-0.4 ms, so most of the density is elsewhere.
+
+*Fallbacks: 2,482,000, i.e. 2,758 a frame*, in two clusters:
+
+| encoding | count | what it is |
+|---|---|---|
+| `e8830007`, `e881000c/101c`, `e891000c/101c` | ~630 k | LDM / STM |
+| `e121f000/1/2`, `e16ff001`, `e25ef004`, `e8d07fff` | ~600 k | MSR cpsr/spsr, `LDM ^`, `SUBS pc, lr, #4` |
+| `ee190f11` at `ffff0278` | 117 k | CP15 read in the BIOS vector |
+
+The second cluster is the **IRQ handler entry and exit** -- the BIOS vectors at
+`ffff0278`-`ffff0294` and the handler at `0205404c` -- at 120,452 executions
+over 900 frames, i.e. **134 interrupts a frame**, every instruction of the mode
+switch stepping through the interpreter.
+
+**DraStic has a specialised emitter for every one of these** (01 §7):
+`cpu_translate_block_memory_op` with sixteen helpers per direction
+(`arm64_load_block1` ... `_16`), one per register count, so a transfer is a
+call into straight-line code rather than a loop; `cpu_translate_msr_op`,
+`cpu_translate_mrs_op`, `cpu_translate_bx_op`, and
+`cpu_translate_raise_exception`; plus constant collapsing for the literal-pool
+and `MOV`/`ORR` pairs ARM code generates constantly.
+
+Against the checklist:
+
+* **1.28 is marked `equiv` and should not be.** "LDM/STM inlined when the
+  transfer sits in one 2 KB page, interpreter fallback otherwise" -- the
+  census says that fallback fires ~630 k times in 900 frames. It is a hot
+  path, not an equivalent.
+* **1.26 `partial`** (constants only for pc-relative operands) is the density
+  lever DraStic names explicitly.
+* **There is no row at all for the MSR / MRS / BX / exception emitters.** The
+  largest single fallback cluster we have was never tracked as a gap. Add it.
+
+Phase 2's order follows: the exception path and LDM/STM first (work *removed*,
+sizes measured, and both have a DraStic design to follow), then density via
+known-constant tracking, then the timing charge. Rows 1.5, 1.12 and 1.23 stay
+open but none of them addresses anything the census found.
+
 ### Phase 3 — DMA, SPU and scheduler granularity (week 4-5) — target **-2.5 ms**
 
 Three small rows that together are as big as Phase 1.
