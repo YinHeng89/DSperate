@@ -10,6 +10,7 @@
 #include "check.h"
 
 #include <cstdio>
+#include <string>
 #include <cstring>
 #include <random>
 #include <vector>
@@ -19,6 +20,7 @@ using namespace ds;
 namespace {
 
 constexpr u32 CODE_BASE = 0x02000000, HALT_STUB = 0x02001000, BUF_BASE = 0x02200000, STACK = 0x02300000;
+constexpr u32 MAIN_RAM = 0x02000000, MAIN_RAM_SIZE = 0x400000;
 
 struct Machine {
   NDS nds;
@@ -125,6 +127,26 @@ u32 gen_arm(Rng& r) {
   }
 }
 
+// A self-contained `LDM ^` / `STM ^` gadget. The generator otherwise never
+// leaves SYS mode, where the user bank IS the live one and the transfer is
+// indistinguishable from a plain LDM/STM -- so nothing would ever reach the
+// inline path's four inlinable modes, nor its FIQ/USR guard.
+//
+// The base is copied into r0 first because r9 (the buffer base the generator
+// relies on) is banked away in FIQ; r0-r7 are not banked in any mode, so the
+// transfer addresses the buffer whichever mode the gadget picked.
+void gen_user_bank(Rng& r, std::vector<u32>& out) {
+  static const u32 modes[] = {0x10, 0x11, 0x12, 0x13, 0x17, 0x1B, 0x1F};
+  const u32 mode = modes[r.below(7)];
+  const u32 load = r.coin(50);
+  u32 list;
+  do { list = r.next() & (load ? 0x7FFFu : 0xFFFFu); } while (!list);   // r15 in a load list is a CPSR restore, not a user-bank transfer
+  out.push_back(0xE1A00009);                            // mov r0, r9
+  out.push_back(0xE321F000 | (0xC0 | mode));            // msr cpsr_c, #(I|F|mode)
+  out.push_back(0xE8C00000 | (load << 20) | list);      // ldm/stm r0, {list}^
+  out.push_back(0xE321F0DF);                            // msr cpsr_c, #(I|F|SYS) -- a no-op from USR, which cannot leave
+}
+
 // ---- Thumb generator ---------------------------------------------------------
 // r6 = buffer base (kept), sp = stack.
 u16 gen_thumb(Rng& r) {
@@ -165,6 +187,25 @@ u16 gen_thumb(Rng& r) {
   }
 }
 
+// The machines are reused across trials, and a trial stores wherever its
+// registers point -- over its own code, past the ends of the buffer and stack
+// windows, anywhere in RAM. What it leaves behind is the next trial's starting
+// memory. That is harmless while the two engines agree, because then they
+// leave the SAME residue; it stops being harmless the moment a trial ends with
+// them holding different memory, after which a later seed can fail on residue
+// rather than on its own behaviour. Two mismatches found while adding the
+// user-bank gadget reproduced only in the full set and passed on their own,
+// and one of them was residue, not a defect.
+//
+// So: wipe main RAM only after a trial that could have left the two sides
+// different -- a mismatch, or an inconclusive run where both engines ran out
+// of budget in different places. Page at a time; a word at a time is a
+// page-table lookup per word and costs minutes a run under qemu.
+void wipe_ram(Machine& m) {
+  for (u32 a = MAIN_RAM; a < MAIN_RAM + MAIN_RAM_SIZE; a += mem::PAGE_SIZE)
+    std::memset(m.host(a), 0, mem::PAGE_SIZE);
+}
+
 struct Trial {
   bool thumb;
   std::vector<u32> code;   // ARM words or Thumb halfwords
@@ -172,8 +213,19 @@ struct Trial {
   u32 cpsr;
 };
 
+u32 g_selfmod = 0;
+bool g_ram_dirty = false;   // the last trial may have left the two machines' RAM different
+u8 g_code_image[0x1000];    // the code page as load_trial wrote it
+
+bool wrote_own_code(Machine& m) { return std::memcmp(m.host(CODE_BASE), g_code_image, sizeof g_code_image) != 0; }
+
 void load_trial(Machine& m, const Trial& t, bool a9) {
   write_halt_stub(m, a9);
+  // Clear the code page first. A trial whose base register wanders into this
+  // page stores over its own code, and what it leaves behind would otherwise
+  // be fetched by the next trial once that one runs off the end of its own
+  // code. Cheap (4 KB); the wider version of the problem is `wipe_ram`.
+  for (u32 i = 0; i < 0x1000; i += 4) m.poke32(CODE_BASE + i, 0);
   u32 addr = CODE_BASE;
   if (t.thumb) {
     for (u32 h : t.code) { m.poke16(addr, static_cast<u16>(h)); addr += 2; }
@@ -193,6 +245,16 @@ void load_trial(Machine& m, const Trial& t, bool a9) {
   for (u32 i = 0; i < 0x400; i += 4) m.poke32(STACK - 0x200 + i, 0x11111111u * (i >> 2));
   CpuContext& c = m.cpu;
   c.set_cpsr(0x1F);                // SYS mode, ARM
+  // The banked registers are part of the starting state, and the machines are
+  // reused across trials: without this a trial that ends in a non-SYS mode
+  // leaves its banks to the next one, which then depends on trial order
+  // rather than on its own seed. It never mattered while nothing switched
+  // mode; the user-bank gadget does.
+  std::memset(c.bank_r8_r12, 0, sizeof c.bank_r8_r12);
+  std::memset(c.bank_r13, 0, sizeof c.bank_r13);
+  std::memset(c.bank_r14, 0, sizeof c.bank_r14);
+  std::memset(c.bank_spsr, 0, sizeof c.bank_spsr);
+  c.hot.spsr = 0;
   for (int i = 0; i < 15; ++i) c.hot.regs[i] = t.regs[i];
   c.hot.cpsr = t.cpsr | 0x1F | (t.thumb ? 0x20 : 0);
   c.hot.regs[15] = CODE_BASE + (t.thumb ? 4 : 8);
@@ -205,6 +267,7 @@ void load_trial(Machine& m, const Trial& t, bool a9) {
   c.hot.cycle_budget = 1 << 24;
   c.budget_at_halt = 0;
   c.jumped = false;
+  std::memcpy(g_code_image, m.host(CODE_BASE), sizeof g_code_image);
 }
 
 void run_machine(Machine& m, RunFn fn) {
@@ -218,7 +281,14 @@ bool compare(Machine& a, Machine& b, const Trial& t, u32 seed, bool report) {
   // clobbered its own code, a loop through stale memory) only differs in
   // where the budget ran out, which is the one thing the engines are allowed
   // to differ in. Count it and move on.
-  if (!a.cpu.halted && !b.cpu.halted && a.cpu.hot.cycle_budget <= 0 && b.cpu.hot.cycle_budget <= 0) { ++g_inconclusive; return true; }
+  if (!a.cpu.halted && !b.cpu.halted && a.cpu.hot.cycle_budget <= 0 && b.cpu.hot.cycle_budget <= 0) { ++g_inconclusive; g_ram_dirty = true; return true; }
+  // A trial that stores over its own code is outside what the recompiler
+  // promises: the interpreter fetches the new word, while a translated block
+  // keeps running the code it was built from, and the two legitimately part
+  // ways. It is the generator wandering, not a defect -- the same divergence
+  // appears for a plain STM with no user-bank bit. Judge only the trials that
+  // left their own instructions alone.
+  if (wrote_own_code(a) || wrote_own_code(b)) { ++g_selfmod; g_ram_dirty = true; return true; }
   bool ok = true;
   for (int i = 0; i < 16; ++i) if (a.cpu.hot.regs[i] != b.cpu.hot.regs[i]) ok = false;
   if (a.cpu.hot.cpsr != b.cpu.hot.cpsr) ok = false;
@@ -230,6 +300,7 @@ bool compare(Machine& a, Machine& b, const Trial& t, u32 seed, bool report) {
   if (ba != bb) ok = false;
   if (std::memcmp(a.host(BUF_BASE), b.host(BUF_BASE), 0x2000) != 0) ok = false;
   if (std::memcmp(a.host(STACK - 0x200), b.host(STACK - 0x200), 0x400) != 0) ok = false;
+  if (!ok) g_ram_dirty = true;
   if (ok || !report) return ok;
   std::fprintf(stderr, "MISMATCH seed %u (%s), shortest failing prefix:\n", seed, t.thumb ? "thumb" : "arm");
   for (size_t i = 0; i < t.code.size(); ++i) std::fprintf(stderr, "  %08x: %0*x\n", CODE_BASE + static_cast<u32>(i * (t.thumb ? 2 : 4)), t.thumb ? 4 : 8, t.code[i]);
@@ -244,15 +315,53 @@ bool compare(Machine& a, Machine& b, const Trial& t, u32 seed, bool report) {
     u32 x, y; std::memcpy(&x, a.host(BUF_BASE + i), 4); std::memcpy(&y, b.host(BUF_BASE + i), 4);
     if (x != y) { std::fprintf(stderr, "  buf[%04x] %08x %08x\n", i, x, y); }
   }
+  // The code region is not part of the comparison (a trial that overwrites its
+  // own code is allowed to end differently), but when something else differs
+  // it is usually the cause, so report it.
+  for (u32 i = 0; i < 0x1000; i += 4) {
+    u32 x, y; std::memcpy(&x, a.host(CODE_BASE + i), 4); std::memcpy(&y, b.host(CODE_BASE + i), 4);
+    if (x != y) { std::fprintf(stderr, "  code[%04x] %08x %08x\n", i, x, y); }
+  }
   return false;
 }
 
+// DS_FUZZ_TRACE=<path-prefix>: dump a per-instruction trace of both engines.
+// Debug scaffolding for localising a mismatch -- the comparison itself only
+// looks at the end state, which names the symptom and not the instruction.
+std::FILE* g_trace_fp = nullptr;
+void trace_cb(ds::CpuContext& c, u32 instr, void*) {
+  if (!g_trace_fp) return;
+  std::fprintf(g_trace_fp, "%08x %08x cpsr=%08x", c.hot.regs[15], instr, c.hot.cpsr);
+  for (int i = 0; i < 15; ++i) std::fprintf(g_trace_fp, " %08x", c.hot.regs[i]);
+  std::fprintf(g_trace_fp, " | b13=%08x b14=%08x\n", c.bank_r13[0], c.bank_r14[0]);
+}
+
 bool run_both(Machine& mi, Machine& mj, const Trial& tr, bool a9, u32 seed, bool report) {
+  const char* tp = std::getenv("DS_FUZZ_TRACE");
+  if (g_ram_dirty) { wipe_ram(mi); wipe_ram(mj); g_ram_dirty = false; }
   jit::flush(mj.cpu);
   load_trial(mi, tr, a9);
   load_trial(mj, tr, a9);
-  run_machine(mi, &interp::run);
-  run_machine(mj, &jit::run);
+  if (tp) {
+    std::string base = std::string(tp);
+    g_trace_fp = std::fopen((base + ".interp").c_str(), "w");
+    mi.nds.trace = &trace_cb;
+    run_machine(mi, &interp::run);
+    std::fclose(g_trace_fp);
+    mi.nds.trace = nullptr;
+    g_trace_fp = std::fopen((base + ".jit").c_str(), "w");
+    mj.nds.trace = &trace_cb;
+    jit::set_trace(true);
+    jit::flush(mj.cpu);
+    run_machine(mj, &jit::run);
+    jit::set_trace(false);
+    std::fclose(g_trace_fp);
+    g_trace_fp = nullptr;
+    mj.nds.trace = nullptr;
+  } else {
+    run_machine(mi, &interp::run);
+    run_machine(mj, &jit::run);
+  }
   return compare(mi, mj, tr, seed, report);
 }
 
@@ -347,6 +456,80 @@ void directed() {
     // Thumb: movs then ldr [r6 + r0] far away.
     {Cpu::ARM9, true, {0x2001, 0x5871}, {0, 0x12345678, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
     {Cpu::ARM7, true, {0x2001, 0x5871}, {0, 0x12345678, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
+
+    // `LDM ^` / `STM ^` -- the user-bank transfer. The interpreter switches to
+    // user mode and back; the JIT inlines it in IRQ/SVC/ABT/UND, where only
+    // r13/r14 are banked away from the live set, and keeps the interpreter in
+    // FIQ (r8-r12 banked too) and USR/SYS (the live bank already IS bank 0).
+    // Each case ends `msr cpsr_c, #SYS` so the user bank is back in hot.regs
+    // for the comparison -- without it a wrong bank would be invisible.
+    //
+    // LDM: give the entered mode its own r13/r14 (0xAA/0xBB) first; those must
+    // survive, and the loaded words must land in the user bank.
+    {Cpu::ARM9, false, {0xE321F0D2, 0xE3A0D0AA, 0xE3A0E0BB, 0xE8D07FFF, 0xE321F0DF}, {BUF_BASE, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},   // IRQ
+    {Cpu::ARM7, false, {0xE321F0D2, 0xE3A0D0AA, 0xE3A0E0BB, 0xE8D07FFF, 0xE321F0DF}, {BUF_BASE, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},   // IRQ
+    {Cpu::ARM9, false, {0xE321F0D3, 0xE3A0D0AA, 0xE3A0E0BB, 0xE8D07FFF, 0xE321F0DF}, {BUF_BASE, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},   // SVC
+    {Cpu::ARM7, false, {0xE321F0D3, 0xE3A0D0AA, 0xE3A0E0BB, 0xE8D07FFF, 0xE321F0DF}, {BUF_BASE, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},   // SVC
+    {Cpu::ARM9, false, {0xE321F0D7, 0xE3A0D0AA, 0xE3A0E0BB, 0xE8D07FFF, 0xE321F0DF}, {BUF_BASE, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},   // ABT
+    {Cpu::ARM7, false, {0xE321F0D7, 0xE3A0D0AA, 0xE3A0E0BB, 0xE8D07FFF, 0xE321F0DF}, {BUF_BASE, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},   // ABT
+    {Cpu::ARM9, false, {0xE321F0DB, 0xE3A0D0AA, 0xE3A0E0BB, 0xE8D07FFF, 0xE321F0DF}, {BUF_BASE, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},   // UND
+    {Cpu::ARM7, false, {0xE321F0DB, 0xE3A0D0AA, 0xE3A0E0BB, 0xE8D07FFF, 0xE321F0DF}, {BUF_BASE, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},   // UND
+    {Cpu::ARM9, false, {0xE321F0D1, 0xE3A0D0AA, 0xE3A0E0BB, 0xE8D07FFF, 0xE321F0DF}, {BUF_BASE, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},   // FIQ
+    {Cpu::ARM7, false, {0xE321F0D1, 0xE3A0D0AA, 0xE3A0E0BB, 0xE8D07FFF, 0xE321F0DF}, {BUF_BASE, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},   // FIQ
+    {Cpu::ARM9, false, {0xE321F0DF, 0xE3A0D0AA, 0xE3A0E0BB, 0xE8D07FFF, 0xE321F0DF}, {BUF_BASE, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},   // SYS
+    {Cpu::ARM7, false, {0xE321F0DF, 0xE3A0D0AA, 0xE3A0E0BB, 0xE8D07FFF, 0xE321F0DF}, {BUF_BASE, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},   // SYS
+    // STM: the user r13/r14 (0xAA/0xBB) are set before the mode change and the
+    // entered mode's are 0x11/0x22 -- the store must write the former.
+    {Cpu::ARM9, false, {0xE3A0D0AA, 0xE3A0E0BB, 0xE321F0D2, 0xE3A0D011, 0xE3A0E022, 0xE8C07FFF, 0xE321F0DF}, {BUF_BASE, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},   // IRQ
+    {Cpu::ARM7, false, {0xE3A0D0AA, 0xE3A0E0BB, 0xE321F0D2, 0xE3A0D011, 0xE3A0E022, 0xE8C07FFF, 0xE321F0DF}, {BUF_BASE, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},   // IRQ
+    {Cpu::ARM9, false, {0xE3A0D0AA, 0xE3A0E0BB, 0xE321F0D3, 0xE3A0D011, 0xE3A0E022, 0xE8C07FFF, 0xE321F0DF}, {BUF_BASE, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},   // SVC
+    {Cpu::ARM7, false, {0xE3A0D0AA, 0xE3A0E0BB, 0xE321F0D3, 0xE3A0D011, 0xE3A0E022, 0xE8C07FFF, 0xE321F0DF}, {BUF_BASE, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},   // SVC
+    {Cpu::ARM9, false, {0xE3A0D0AA, 0xE3A0E0BB, 0xE321F0D7, 0xE3A0D011, 0xE3A0E022, 0xE8C07FFF, 0xE321F0DF}, {BUF_BASE, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},   // ABT
+    {Cpu::ARM7, false, {0xE3A0D0AA, 0xE3A0E0BB, 0xE321F0D7, 0xE3A0D011, 0xE3A0E022, 0xE8C07FFF, 0xE321F0DF}, {BUF_BASE, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},   // ABT
+    {Cpu::ARM9, false, {0xE3A0D0AA, 0xE3A0E0BB, 0xE321F0DB, 0xE3A0D011, 0xE3A0E022, 0xE8C07FFF, 0xE321F0DF}, {BUF_BASE, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},   // UND
+    {Cpu::ARM7, false, {0xE3A0D0AA, 0xE3A0E0BB, 0xE321F0DB, 0xE3A0D011, 0xE3A0E022, 0xE8C07FFF, 0xE321F0DF}, {BUF_BASE, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},   // UND
+    {Cpu::ARM9, false, {0xE3A0D0AA, 0xE3A0E0BB, 0xE321F0D1, 0xE3A0D011, 0xE3A0E022, 0xE8C07FFF, 0xE321F0DF}, {BUF_BASE, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},   // FIQ
+    {Cpu::ARM7, false, {0xE3A0D0AA, 0xE3A0E0BB, 0xE321F0D1, 0xE3A0D011, 0xE3A0E022, 0xE8C07FFF, 0xE321F0DF}, {BUF_BASE, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},   // FIQ
+    {Cpu::ARM9, false, {0xE3A0D0AA, 0xE3A0E0BB, 0xE321F0DF, 0xE3A0D011, 0xE3A0E022, 0xE8C07FFF, 0xE321F0DF}, {BUF_BASE, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},   // SYS
+    {Cpu::ARM7, false, {0xE3A0D0AA, 0xE3A0E0BB, 0xE321F0DF, 0xE3A0D011, 0xE3A0E022, 0xE8C07FFF, 0xE321F0DF}, {BUF_BASE, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},   // SYS
+    // Base in the list (Golden Sun's `ldm r0, {r0-r14}^`) is above; here the
+    // base is outside it, the low-register-only list that needs no bank slot
+    // at all, and a store with r15 in the list.
+    {Cpu::ARM9, false, {0xE321F0D2, 0xE8D07FFE, 0xE321F0DF}, {BUF_BASE, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
+    {Cpu::ARM9, false, {0xE321F0D2, 0xE8D000FE, 0xE321F0DF}, {BUF_BASE, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
+    {Cpu::ARM9, false, {0xE321F0D2, 0xE8C0FFFF, 0xE321F0DF}, {BUF_BASE, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
+    {Cpu::ARM7, false, {0xE321F0D2, 0xE8C0FFFF, 0xE321F0DF}, {BUF_BASE, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
+    // A base 0x7D0 into the buffer: the 15/16 words straddle the 2 KB page
+    // boundary, so the transfer takes the per-word slow path -- which has to
+    // redirect r13/r14 to the user bank just as the inline one does.
+    {Cpu::ARM9, false, {0xE321F0D2, 0xE3A0D0AA, 0xE3A0E0BB, 0xE8D07FFF, 0xE321F0DF}, {BUF_BASE + 0x7D0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
+    {Cpu::ARM7, false, {0xE321F0D2, 0xE3A0D0AA, 0xE3A0E0BB, 0xE8D07FFF, 0xE321F0DF}, {BUF_BASE + 0x7D0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
+    {Cpu::ARM9, false, {0xE3A0D0AA, 0xE3A0E0BB, 0xE321F0D2, 0xE3A0D011, 0xE3A0E022, 0xE8C07FFF, 0xE321F0DF}, {BUF_BASE + 0x7D0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
+    {Cpu::ARM7, false, {0xE3A0D0AA, 0xE3A0E0BB, 0xE321F0D2, 0xE3A0D011, 0xE3A0E022, 0xE8C07FFF, 0xE321F0DF}, {BUF_BASE + 0x7D0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
+    // STM with r15 in the list, based 0x7D0 into the buffer so it straddles
+    // the 2 KB page and every word takes the per-word slow path. That path
+    // had no r15 case and stored r14 instead (host_reg(15) IS r14's host
+    // register); plain and user-bank forms both reach it.
+    {Cpu::ARM9, false, {0xE880FFFF}, {BUF_BASE + 0x7D0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
+    {Cpu::ARM7, false, {0xE880FFFF}, {BUF_BASE + 0x7D0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
+    {Cpu::ARM9, false, {0xE321F0D2, 0xE8C0FFFF, 0xE321F0DF}, {BUF_BASE + 0x7D0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
+    // `LDM ^` with writeback and r13 as the base -- why the inline path
+    // excludes writeback. The interpreter writes the base back while still
+    // switched to user mode, so the new base lands in the USER r13 and the
+    // entered mode's r13 is left alone; an inline path would write the mode's
+    // own r13, which is a different register. Architecturally UNPREDICTABLE,
+    // so either is defensible -- but they must not disagree, and the only way
+    // to not disagree is to keep the interpreter.
+    {Cpu::ARM9, false, {0xE321F0D2, 0xE1A0D000, 0xE8FD00FF, 0xE321F0DF}, {BUF_BASE, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
+    {Cpu::ARM7, false, {0xE321F0D2, 0xE1A0D000, 0xE8FD00FF, 0xE321F0DF}, {BUF_BASE, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
+    {Cpu::ARM9, false, {0xE321F0D3, 0xE1A0E000, 0xE8FE00FF, 0xE321F0DF}, {BUF_BASE, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
+    // The store counterpart, where the interpreter writes the base back AFTER
+    // switching home and an inline path would agree -- kept on the same rule.
+    {Cpu::ARM9, false, {0xE321F0D2, 0xE1A0D000, 0xE8ED00FF, 0xE321F0DF}, {BUF_BASE, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
+    // Conditional, taken and not taken (the condition wraps the whole body,
+    // mode guard included).
+    {Cpu::ARM9, false, {0xE321F0D2, 0xE1500000, 0x08D07FFF, 0xE321F0DF}, {BUF_BASE, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
+    {Cpu::ARM9, false, {0xE321F0D2, 0xE1500000, 0x18D07FFF, 0xE321F0DF}, {BUF_BASE, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
   };
   u32 n = 0;
   for (const Directed& d : cases) {
@@ -381,7 +564,10 @@ void fuzz(Cpu which, bool thumb, u32 trials, u32 seed0) {
     Trial t;
     t.thumb = thumb;
     const u32 len = 1 + r.below(24);
-    for (u32 i = 0; i < len; ++i) t.code.push_back(thumb ? gen_thumb(r) : gen_arm(r));
+    for (u32 i = 0; i < len; ++i) {
+      if (!thumb && r.coin(12)) { gen_user_bank(r, t.code); continue; }
+      t.code.push_back(thumb ? gen_thumb(r) : gen_arm(r));
+    }
     for (int i = 0; i < 15; ++i) t.regs[i] = r.coin(30) ? (r.below(5) - 2) : r.next();
     t.regs[9] = BUF_BASE + (r.below(4) << 10);
     t.regs[6] = BUF_BASE + (r.below(4) << 10);
@@ -398,8 +584,9 @@ void fuzz(Cpu which, bool thumb, u32 trials, u32 seed0) {
     if (++fails >= 3) break;
   }
   CHECK(fails == 0);
-  std::printf("jit fuzz %s %s: %u trials ok (%u inconclusive)\n", a9 ? "arm9" : "arm7", thumb ? "thumb" : "arm", trials, g_inconclusive);
-  g_inconclusive = 0;
+  std::printf("jit fuzz %s %s: %u trials ok (%u inconclusive, %u self-modifying)\n",
+              a9 ? "arm9" : "arm7", thumb ? "thumb" : "arm", trials, g_inconclusive, g_selfmod);
+  g_inconclusive = 0; g_selfmod = 0;
   jit::detach(mj.nds);
 }
 
@@ -407,10 +594,14 @@ void fuzz(Cpu which, bool thumb, u32 trials, u32 seed0) {
 
 int main(int argc, char** argv) {
   const u32 trials = argc > 1 ? static_cast<u32>(std::atoi(argv[1])) : 400;
-  if (argc > 2) {   // single trial: test_jit 1 <seed> [set]; set = 0..3 (arm9 arm/thumb, arm7 arm/thumb), default by seed range
+  // test_jit <count> <seed> [set]: run <count> trials from <seed> in one set,
+  // and nothing else. <count> 1 is the single-trial form; a larger count
+  // reproduces a failure that only appears with the set's earlier trials run
+  // before it (the runtime is global and carries state across them).
+  if (argc > 2) {   // set = 0..3 (arm9 arm/thumb, arm7 arm/thumb), default by seed range
     const u32 seed = static_cast<u32>(std::atoi(argv[2]));
     const int set = argc > 3 ? std::atoi(argv[3]) : (seed >= 3000 ? 2 : 0) + ((seed / 1000) % 2 == 0 ? 1 : 0);
-    fuzz(set >= 2 ? Cpu::ARM7 : Cpu::ARM9, set & 1, 1, seed);
+    fuzz(set >= 2 ? Cpu::ARM7 : Cpu::ARM9, set & 1, trials, seed);
     return 0;
   }
   directed();

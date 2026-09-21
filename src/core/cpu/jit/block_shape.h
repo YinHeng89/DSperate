@@ -41,6 +41,31 @@ inline bool msr_inline(u32 instr) {
   return !(arm::decode_arm(instr) == arm::AOp::MsrReg && (instr & 0xF) == 15);
 }
 
+// `LDM ^` / `STM ^` (the S bit without r15 in a load list): a user-bank
+// transfer, and 120 k fallbacks a run in Golden Sun's IRQ exit. Inlined for
+// the shapes where the architecture -- not the interpreter -- says the user
+// bank is reachable without a mode switch. `bank_r8_r12` covers USR and FIQ
+// only and `bank_r13`/`bank_r14` are per mode (cpu.h), so in IRQ/SVC/ABT/UND
+// the live r0-r12 ARE the user's and only r13/r14 belong elsewhere. Those two
+// modes-with-banked-r8 (FIQ) and the banks-are-current modes (USR/SYS) are
+// tested at run time and keep the interpreter.
+//
+// Writeback stays on the interpreter: architecturally UNPREDICTABLE with S,
+// and the interpreter writes the base back while still switched to user mode,
+// so a base of r13/r14 would land in a different bank than an inline path
+// would choose. No cost to excluding it -- the shape does not occur.
+inline bool ldm_user_inline(u32 instr) {
+  using arm::AOp;
+  const AOp op = arm::decode_arm(instr);
+  if (op != AOp::Ldm && op != AOp::Stm) return false;
+  if (!(instr & (1u << 22))) return false;                      // S
+  if (instr & (1u << 21)) return false;                         // writeback
+  const u32 list = instr & 0xFFFF;
+  if (list == 0 || ((instr >> 16) & 0xF) == 15) return false;
+  const bool load = instr & (1u << 20);
+  return !(load && (list & 0x8000));                            // else: CPSR restore, not a user-bank transfer
+}
+
 inline bool arm_ends_block(u32 instr, bool a9) {
   using arm::AOp;
   const u32 cond = instr >> 28;

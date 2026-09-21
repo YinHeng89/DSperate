@@ -71,6 +71,7 @@ struct FlagUse { u32 reads, writes; };
 // Instructions the translator hands to the interpreter whole. The liveness
 // pass treats these as reading every flag (the helper syncs CPSR and may
 // observe it: exceptions, MSR, MRS...), so the two must agree.
+using shape::ldm_user_inline;
 using shape::mcr_is_nop;
 using shape::msr_inline;
 
@@ -112,7 +113,7 @@ bool arm_needs_fallback(u32 instr, bool a9) {
     return (!l && sh != 1) || rd == 15 || (rn == 15 && (!p || w)) || (op == AOp::LdrStrHReg && (instr & 0xF) == 15);
   }
   case AOp::Ldm: case AOp::Stm:
-    return (instr & (1u << 22)) || (instr & 0xFFFF) == 0 || rn == 15;
+    return ((instr & (1u << 22)) && !ldm_user_inline(instr)) || (instr & 0xFFFF) == 0 || rn == 15;
   default:
     return true;
   }
@@ -1101,7 +1102,11 @@ private:
   // nothing else has to be saved around the calls. r15 in the list still
   // falls back: its branch and post-jump CDI charge are the inline path's.
   void emit_exc_return(u32 instr, u32 opcode, u32 rn);
-  void emit_block_slow(u32 list, bool load, bool writeback, u32 rn, u32 n) {
+  // The USR/SYS slot r`i` lives in for a user-bank transfer, or 0 when the
+  // pinned host register is already the user's one (r0-r12 outside FIQ).
+  static u32 user_bank_off(u32 i) { return i == 13 ? OFF_BANK_R13 : i == 14 ? OFF_BANK_R14 : 0; }
+
+  void emit_block_slow(u32 list, bool load, bool writeback, u32 rn, u32 n, bool user_bank, u32 pc_store_value) {
     e().and_imm(SCRATCH1, SCRATCH1, ~3u);
     // The cost FIRST, while the scratch registers are still free: the slow
     // stubs preserve only x1 and x7, so an accumulator cannot survive them.
@@ -1129,15 +1134,22 @@ private:
     bool first = true;
     for (u32 i = 0; i < 16; ++i) {
       if (!(list & (1u << i))) continue;
+      const u32 ub = user_bank ? user_bank_off(i) : 0;
       if (load) {
         call_stub(rt().slow_load[2]);
-        e().mov(host_reg(i), SCRATCH0);
+        if (ub) e().str_w(SCRATCH0, R_CTX, ub); else e().mov(host_reg(i), SCRATCH0);
       } else {
         // STM storing its own base: the value is the OLD base when the base is
         // the first register in the list and the NEW one otherwise. Same rule
         // as the inline path above.
-        const u32 src = (i == rn && !first && writeback) ? SCRATCH7 : host_reg(i);
-        e().mov(SCRATCH2, src);
+        // r15 stores the pipeline value, as the inline path does. Without
+        // this it took `host_reg(15)`, which is r14's host register -- an STM
+        // with r15 in the list stored r14 whenever it came down here (a page
+        // split, or a write-protected page). Loads with r15 never reach this
+        // path: they leave through emit_fallback above.
+        if (i == 15) e().mov_imm(SCRATCH2, pc_store_value);
+        else if (ub) e().ldr_w(SCRATCH2, R_CTX, ub);
+        else e().mov(SCRATCH2, (i == rn && !first && writeback) ? SCRATCH7 : host_reg(i));
         call_stub(rt().slow_store[2]);
       }
       e().add_imm(SCRATCH1, SCRATCH1, 4, true);
@@ -1149,9 +1161,24 @@ private:
     else if (writeback) e().mov(host_reg(rn), SCRATCH7);
   }
 
-  void emit_block_transfer(u32 instr, u32 list, bool load, bool writeback, u32 rn, bool interwork_pc, u32 pc_store_value) {
+  void emit_block_transfer(u32 instr, u32 list, bool load, bool writeback, u32 rn, bool interwork_pc, u32 pc_store_value,
+                           bool user_bank = false) {
     const u32 n = static_cast<u32>(__builtin_popcount(list));
     flush_pending();
+    // `LDM ^` / `STM ^`: the user bank is only reachable inline from a mode
+    // whose r8-r12 are not banked and whose r13/r14 are not already the user's
+    // -- IRQ, SVC, ABT, UND. Test the mode against a 32-bit mask of those four
+    // and send every other mode (USR, SYS, FIQ and the reserved encodings) to
+    // the interpreter. Nothing has been written yet, so this leg is clean.
+    FailList mode_fail;
+    if (user_bank) {
+      constexpr u32 INLINABLE_MODES = (1u << 0x12) | (1u << 0x13) | (1u << 0x17) | (1u << 0x1B);
+      e().ldr_w(SCRATCH2, R_CTX, OFF_CPSR);
+      e().and_imm(SCRATCH2, SCRATCH2, 0x1F);
+      e().mov_imm(SCRATCH4, INLINABLE_MODES);
+      e().lsrv(SCRATCH4, SCRATCH4, SCRATCH2);
+      mode_fail.push_back(e().tbz_fwd(SCRATCH4, 0));
+    }
     FailList fail;
     e().add_imm(SCRATCH2, SCRATCH1, n * 4 - 1);
     e().eor_reg(SCRATCH2, SCRATCH2, SCRATCH1);
@@ -1185,7 +1212,11 @@ private:
       for (u32 i = 0; i < 16; ++i) {
         if (!(list & (1u << i))) continue;
         if (k == 0 && fast) fm_fault_here();
-        e().ldr_w(i == 15 ? SCRATCH0 : host_reg(i), SCRATCH3, 4 * k);
+        const u32 ub = user_bank ? user_bank_off(i) : 0;
+        // SCRATCH2 is dead from here to the cost code below, so it shuttles
+        // the two banked words without costing a register.
+        e().ldr_w(ub ? SCRATCH2 : i == 15 ? SCRATCH0 : host_reg(i), SCRATCH3, 4 * k);
+        if (ub) e().str_w(SCRATCH2, R_CTX, ub);
         ++k;
       }
       if (writeback && !(list & (1u << rn))) e().mov(host_reg(rn), SCRATCH7);
@@ -1193,7 +1224,9 @@ private:
       for (u32 i = 0; i < 16; ++i) {
         if (!(list & (1u << i))) continue;
         u32 src;
-        if (i == 15) { e().mov_imm(SCRATCH0, pc_store_value); src = SCRATCH0; }
+        const u32 ub = user_bank ? user_bank_off(i) : 0;
+        if (ub) { e().ldr_w(SCRATCH2, R_CTX, ub); src = SCRATCH2; }
+        else if (i == 15) { e().mov_imm(SCRATCH0, pc_store_value); src = SCRATCH0; }
         else if (i == rn && !first && writeback) src = SCRATCH7;
         else src = host_reg(i);
         if (k == 0 && fast) fm_fault_here();
@@ -1233,9 +1266,14 @@ private:
     const size_t join = hot_.size();
     cold_begin(fail);
     const size_t fb = cold_.size();
-    emit_block_slow(list, load, writeback, rn, n);
+    emit_block_slow(list, load, writeback, rn, n, user_bank, pc_store_value);
     cold_end_jump(join);
     fm_walk(fb);
+    if (!mode_fail.empty()) {
+      cold_begin(mode_fail);
+      emit_fallback(instr, false);   // no user-bank form writes r15: it always returns to the block
+      cold_end_jump(join);
+    }
   }
 
   // Effective address of a single transfer -> w1; the writeback value -> w7
@@ -1515,7 +1553,7 @@ void Translator::arm_ldm_stm(u32 instr, bool load) {
     e().sub_imm(SCRATCH7, hb, n * 4);
   }
   e().and_imm(SCRATCH1, SCRATCH1, ~3u);
-  emit_block_transfer(instr, list, load, w, rn, a9_, pc_ + 12);
+  emit_block_transfer(instr, list, load, w, rn, a9_, pc_ + 12, (instr & (1u << 22)) != 0);
 }
 
 // MSR CPSR_<fields>, Rm / #imm. Inline when the mode stays the same and the

@@ -31,6 +31,12 @@ constexpr u32 OFF_JC_TIM   = sizeof(void*);        // JitCpuHot::timing
 constexpr u32 OFF_JC_ARENA = 2 * sizeof(void*);    // JitCpuHot::arena
 constexpr u32 OFF_JC_TABLE = 3 * sizeof(void*);    // JitCpuHot::table
 inline constexpr u32 off_reg(u32 r) { return OFF_REGS + 4 * r; }
+// The USR/SYS bank slots of r13/r14, for the inline `LDM ^` / `STM ^` (bank 0
+// of CpuContext::bank_r13 / bank_r14). Outside `hot`, so far enough from the
+// context base to be worth checking the scaled-immediate reach.
+constexpr u32 OFF_BANK_R13 = offsetof(CpuContext, bank_r13);
+constexpr u32 OFF_BANK_R14 = offsetof(CpuContext, bank_r14);
+static_assert(OFF_BANK_R13 < 16380 && OFF_BANK_R14 < 16380, "user bank slots out of ldr_w/str_w immediate range");
 
 // Alert bits (JitHot::alerts): set by the runtime while translated code is
 // inside a helper; the post-helper poll leaves the block when any is set.

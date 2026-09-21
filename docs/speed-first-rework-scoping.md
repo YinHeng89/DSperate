@@ -1127,16 +1127,89 @@ switch and the exception return -- guarded by a runtime check that the mode is
 not USR/SYS (where bank 0 is current) or FIQ (where r8-r12 are banked too),
 which keep the interpreter.
 
-Not attempted yet, deliberately: its correctness is MODE-DEPENDENT, and the
-failure mode is writing the wrong bank, which corrupts an interrupted context
-and surfaces as a rare crash rather than a clean gate failure. It wants a
-fresh session and its own compatibility sweep.
+**Built and measured (2026-09-21). Golden Sun -0.094 ms median, -0.120 mean;
+the other three scenes inside the noise.** The emitter is what the paragraph
+above describes: a runtime test of CPSR's mode field against a 32-bit mask of
+the four inlinable modes (IRQ/SVC/ABT/UND), the ordinary inline block transfer
+with r13/r14 redirected to `bank_r13[0]`/`bank_r14[0]`, and USR, SYS, FIQ and
+the reserved encodings branching to the interpreter. Writeback also keeps the
+interpreter: it is UNPREDICTABLE with S, and the interpreter writes the base
+back while still switched to user mode, so a base of r13/r14 would land in a
+different bank than an inline path would pick -- no cost, the shape does not
+occur.
+
+| scene | base median | with the emitter | median | mean |
+|---|---|---|---|---|
+| gsdd | 20.737 | 20.643 | **-0.094** | -0.120 |
+| mlbis | 12.197 | 12.260 | +0.063 | -0.001 |
+| sm64 | 9.266 | 9.230 | -0.036 | +0.040 |
+| dbori | 11.315 | 11.345 | +0.030 | -0.036 |
+
+Three reps, alternating order, both arms built from the same tree with the
+same flags (the base is this tree with `ldm_user_inline()` forced false, so
+the A/B isolates the emitter and nothing else). Only gsdd separates: all three
+candidate reps (20.643 / 20.627 / 20.645) sit below all three base reps
+(20.737 / 20.889 / 20.721). The other three scenes overlap rep for rep.
+
+The fallback census predicted more than the clock delivered, exactly as
+SS3.12's rule warns. Serial, 900 frames: Golden Sun 509,730 -> 372,499
+fallback executions (**-137 k, -27 %**), FF3 -11 %, SM64DS -4 %. 137 k
+fallbacks removed bought 0.1 ms -- about 0.7 us per thousand. Count the time,
+not the events.
+
+*Gate:* `tools/jit_gate.sh`, four scenes, all pass; sm64, dbori and mlbis
+1800 of 1800 frames byte-exact, meteos 1799 of 1800. The cadence lines that
+differ from the fixtures (GXSTAT poll counts, and sm64's swap counts by one
+or two) predate this change: they come from the timing work earlier in
+Phase 2 and the fixtures have not been re-baselined since. Verified rather
+than assumed -- the same gate run against the BASE binary prints the identical
+diff (sm64 851 -> 850 kept, 1416 -> 1417 swaps, 384 -> 386 empty vblanks,
+GXSTAT 29720 -> 24372), so none of it is attributable to the emitter.
+
+*Fuzzer:* the generator never left SYS mode, where the user bank IS the live
+one and `LDM ^` is indistinguishable from a plain LDM -- so nothing had ever
+reached this path. It now emits a self-contained gadget (copy the base into
+r0, enter one of the seven modes, transfer, return to SYS) and there are 96
+directed cases pinning each mode class. Admitting USR, SYS or FIQ to the
+inline path, dropping either bank redirect, and dropping the writeback
+exclusion are each caught; dropping a mode FROM the mask is not, and should
+not be -- that leg just falls back, which is still correct.
 
 **The general lesson, since it has now cost two wrong rejections in one
 session: when deciding whether a fallback can be inlined, derive the
 requirement from the architecture, not from the interpreter's implementation.
 The interpreter is written for clarity in C and routinely does more than the
 hardware demands.**
+
+### 3.14 A defect the user-bank work uncovered: `STM` with r15 on the slow path
+
+`emit_block_slow` -- the per-word path a block transfer takes when it straddles
+a page or lands on a write-protected one -- had no `i == 15` case, and
+`host_reg(15)` returns **28, which is r14's host register**. So an `STM` with
+r15 in the list stored r14's value instead of the pipeline value, whenever the
+transfer could not stay inline. The inline loop had always handled r15; only
+the slow twin did not, and loads with r15 leave through `emit_fallback`
+earlier, so this was stores only.
+
+Pre-existing and unrelated to the user bank -- a plain `STM` with no S bit
+reproduces it. It surfaced now because `STM ^` made one more shape reach that
+path. Fixed by passing `pc_store_value` down and emitting it for r15; the
+regression test is a page-straddling `STM r0, {r0-r15}` based 0x7D0 into the
+buffer, in plain and user-bank form.
+
+**What this says about the fuzzer.** It found this in 6000 trials, but only
+after the mode-switching gadget existed, and only in the full set -- the seed
+passed on its own. Two things were hiding it. The machines are reused across
+trials and nothing reset main RAM, so a seed's result depended on the trials
+before it; and a trial that stores over its own code is outside what the
+recompiler promises (the interpreter fetches the new word, a translated block
+keeps running what it was built from), which is a divergence the harness was
+counting as a failure. Both are now handled: the code page is cleared per
+trial, RAM is wiped after any trial that could have left the two sides
+different, and self-modifying trials are declined and counted rather than
+judged (25 / 32 / 10 / 28 per set at 6000 trials). `DS_FUZZ_TRACE=<prefix>`
+dumps a per-instruction trace of both engines, which is what localised this;
+the end-state comparison names the symptom, not the instruction.
 
 ### Phase 3 — DMA, SPU and scheduler granularity (week 4-5) — target **-2.5 ms**
 
@@ -1222,11 +1295,50 @@ it is where DraStic's remaining quarter of a frame lives.
 
 ### Phase 6 — Stability as a workstream (throughout, converging weeks 8-9)
 
-**The FF3 both-recompiler freeze is scheduled after Phase 3**, not before: it
-is a JIT-interaction defect (alive under `--interp`, `--jit9` and `--jit7`
-separately, frozen with both, confirmed on hardware and reproducible under
-qemu), so it is chased once the JIT work of Phases 2-3 has settled rather than
-against a moving target. It is bisectable off-device whenever it is picked up.
+**The FF3 both-recompiler freeze is not a JIT defect. It is interleave
+granularity, and it belongs WITH the Phase 3 scheduler row, not after it.**
+Measured 2026-09-21, off-device under qemu-aarch64, 6000 frames from a direct
+boot, judged by `tools/frame_health.py` (the frame counter keeps advancing
+through the freeze, so `--frames` alone shows nothing; `DS_WATCHDOG` catches a
+stalled pipeline, not a game that has stopped):
+
+| configuration | distinct frames / 6000 | frozen |
+|---|---|---|
+| `--interp`, quantum 2048 | 1107 | 0.8137 |
+| `--jit9`, quantum 2048 | 1107 | 0.8137 |
+| `--jit7`, quantum 2048 | 1107 | 0.8137 |
+| **both recompilers, quantum 2048** | **95** | **0.9823** |
+| both recompilers, quantum 1024 / 1536 / 1792 | 1107 | 0.8137 |
+
+`--quantum 0` IS 2048 (`set_quantum` maps a non-positive value to
+`EVENT_BOUND_QUANTUM`), and both spellings freeze identically -- so the old
+note's "frozen with both recompilers" was really "frozen at the event-bound
+quantum with both recompilers". Two readings are ruled out by the table. It is
+not the recompiler miscompiling anything: at the SAME quantum the interpreter
+is healthy. It is not the quantum alone: at the same quantum one recompiler is
+healthy. What is left is the two CPUs' relative progress inside one slice,
+which only differs when both run under the recompiler's cycle accounting --
+and only bites once the slice is 2048 cycles wide. The cliff is sharp: 1792
+is clean, 2048 freezes, with nothing in between.
+
+**A candidate mitigation, and a constraint that has expired.** The reason
+given elsewhere in this document for pinning `EVENT_BOUND_QUANTUM` at 2048 is
+that "SM64DS boots at 2048 and does not at 2560". That is no longer true on
+this tree: SM64DS boots identically at 1792, 2048 and 2560 (2093 distinct
+frames of 2400, blank 0.039, in all three). So lowering the constant to 1792
+fixes FF3 at no measured cost -- FF3 at 1792 stays healthy out to 9000 frames
+(1703 distinct). Treat that as a mitigation to keep in the pocket, not the
+fix: it moves a cliff without explaining it, and the explanation is a cycle
+accounting difference between the two engines that Phase 3's scheduler work
+should find. Re-verify the SM64DS boot constraint before relying on either
+number.
+
+mGBA's "Holy grail bugs II" describes an FF3 intro freeze with the same
+timing-sensitive character ("the slower memory timings were, the longer it
+would play for"), fixed there by using the KEY1 gap parameters for KEY2
+accesses. That is NOT this: `cart_write_romctrl` already applies the gap1
+field (ROMCTRL bits 0-12) in every command mode, and gap2 per 512-byte block.
+Worth re-reading if the scheduler line of enquiry runs out.
 
 Not a phase that follows the others — a track that runs alongside, with its
 own gates. The user named three things; each maps to concrete work already
