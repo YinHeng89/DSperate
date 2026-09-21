@@ -957,6 +957,57 @@ shown in the picture gate. That matters the more because the JIT's other
 correctness route, `--interp` against the recompiler with `--dump-frames`, is
 broken for Golden Sun on the unmodified tree (SS3.9).
 
+
+### 3.11 Phase 2's second lever: wider idle skipping, measured (2026-09-20)
+
+Two changes, stacked so either reverts alone.
+
+**The GX veto is gone** (`017c4e5`). It refused a skip whenever the geometry
+engine had anything queued -- which mattered when a queued command carried a
+cycle cost, an observable FIFO level and a stall. Phase 1 removed all three.
+The loop analyser, which rejects a poll of any port with a side effect, is
+what kept this safe and still does.
+
+**A skipped CPU now advances its own DMA** (`ffb29f0`). On hardware a transfer
+runs while the core is halted; here DMA is driven from inside `run_cpu`, so a
+skipped slice froze it, which is why the veto existed. `advance_dma_only`
+makes the same call with the CPU left alone. The veto narrows to the DSi,
+where `a9_dma_iter_` hands the slice back mid-transfer and has no meaning when
+no CPU ran.
+
+Sized first by survey (counting only), split by which veto held each slice:
+
+| scene | opportunity | behind GX | behind DMA |
+|---|---|---|---|
+| sm64 | 721,368 | 721,368 | 0 |
+| mlbis | 447,883 | 414,818 | 33,065 |
+| dbori | 272,358 | 26,909 | **245,449** |
+| gsdd | 1,688 | 1,688 | 0 |
+
+Device, three reps, alternating order:
+
+| scene | base | with both | median | mean | p99 |
+|---|---|---|---|---|---|
+| sm64 | 9.441 | **9.300** | -0.141 | -0.035 | +0.73 |
+| dbori | 11.622 | **11.479** | -0.143 | -0.088 | -0.28 |
+| gsdd | 21.628 | **21.519** | -0.109 | -0.107 | **-1.28** |
+| mlbis | 12.303 | 12.299 | -0.004 | -0.018 | +0.28 |
+
+Median better on three, mean and total on all four, and Golden Sun's p99 down
+1.28 ms -- the largest p99 movement anything in this rework has produced.
+
+**The instrument was wrong again, in a new costume.** The survey counted
+SLICES, and a recovered skip saves only the CPU work that slice would have
+run -- and those slices are idle loops, a few cheap instructions an iteration.
+721 k recovered slices on sm64 buys 0.141 ms; mlbis recovered 414 k for
+nothing measurable. Cycles skipped (`C_CYC_IDLE_SKIPPED`) would have been the
+honest instrument. Count what the change removes in TIME, not in events.
+
+**Cadence was checked apart from the picture**, because a DMA-timing change
+moves when geometry arrives and the gate's alignment window absorbs exactly
+that: gsdd, dbori, mlbis and sm64 show only the differences already recorded
+for Phase 1's model, mlbis is identical, and no scene draws fewer frames.
+
 ### Phase 3 — DMA, SPU and scheduler granularity (week 4-5) — target **-2.5 ms**
 
 Three small rows that together are as big as Phase 1.
