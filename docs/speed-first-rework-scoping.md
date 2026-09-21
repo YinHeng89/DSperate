@@ -631,6 +631,91 @@ workers remains right, `def` and `DS_R3D_THREADS=3` are within noise (the lag
 rule is inert), two workers still loses badly on etody and dbori, and four
 never wins. No change.
 
+
+### 3.6 The rasteriser does not steal from the emulation thread (2026-09-20)
+
+A standing suspicion -- that the band workers take time from the emulation
+thread through memory and cache contention even though nothing waits for them
+-- was tested directly. `3d band wait` measures blocking; it says nothing
+about interference. The instrument is `cpu9`, the emulation thread's own ARM9
+execution stage, which contains no waiting: if the raster interferes, cpu9
+must rise as band workers are added.
+
+Golden Sun, `tools/raster_contention.sh`, rotating arm order:
+
+| band workers | cpu9 | r3d_spans | r3d_wait | frame |
+|---|---|---|---|---|
+| 0 (inline) | 8.846 | 15.984 | 0.0000 | 27.808 |
+| 1 | 8.857 | 0 | 0.0004 | 21.949 |
+| 2 | 8.818 | 0 | 0.0004 | 22.738 |
+| 3 | 8.750 | 0 | 0.0003 | 22.216 |
+
+cpu9 is flat to 1.2 % and is LOWEST at three workers. The hypothesis is dead:
+the ARM9 row is ARM9 work, and a cheaper raster will not narrow it.
+
+This settles the phase order against a reorder that the DraStic comparison
+seemed to argue for. `gpu-path` measured our software raster at 19 ms of
+band-worker CPU on Golden Sun at 1x against DraStic's 9.5 ms for a whole 2x
+frame -- about eight times the cost per pixel, "the price of the exact span
+rules and the per-pixel resolve". That is the largest quantified inefficiency
+in the project and the accuracy scope explicitly licenses relaxing it. But it
+is not on the critical path here: at three workers the raster is hidden
+entirely, and at zero it costs 15.98 ms on the emulation thread and 5.6 ms of
+frame. So Phase 4 keeps its original scoping -- p99, thermals, 2x and devices
+with fewer cores -- and does not move ahead of the ARM9 row.
+
+Where Golden Sun's emulation thread actually goes, three workers:
+
+| stage | ms |
+|---|---|
+| **cpu9** | **8.776** |
+| **dma** | **3.011** |
+| cpu7 | 1.484 |
+| spu | 1.171 |
+| sched | 1.031 |
+| gpu_line | 0.571 |
+| all 2D (bg, select, window, journal) | 0.64 |
+
+cpu9 + cpu7 + dma is 13.3 ms, which is the "~13 ms against DraStic's 8.3" that
+`gpu-path` recorded independently. That gap is Phases 2 and 3, in the order
+already written. **Phase 5 (the 2D engines) is dropped**: 0.64 ms on the
+heaviest scene, with the line-worker join at 0.0 %.
+
+Two cautions for anyone reading these numbers:
+
+* The profile line's `typ` values are per-stage MEDIANS, and a sum of medians
+  is not the median of the sum. Summing them and subtracting from the frame
+  appears to show ~5 ms unaccounted on Golden Sun -- but the same arithmetic
+  gives NEGATIVE unaccounted time at zero band workers, which is impossible.
+  Any claim about unprofiled time needs per-frame accounting.
+* One band worker (`DS_R3D_THREADS=1`) is a real separate-core worker -- only
+  `maxb == 0` rasterises inline -- and it has the BEST median of any arm
+  (21.95) with the worst tail (mean 30.0, p90 43.1): ~16 ms of serial raster
+  keeps up on light frames and not on heavy ones. The stall does not appear in
+  `r3d_wait`, which is the per-line compositing wait; the `sync_all()` at
+  render_frame is in no scope at all. That blind spot is real.
+
+### 3.7 The goal line, restated
+
+`gpu-path` (2026-09-18, user-verified) measured DraStic live rather than
+through its `--benchmark`, which skips the screen path: on Golden Sun hi-res
+its own overlay reads 64.8 % speed, about 25.7 ms a frame, against ours at
+20.4 ms at 2x and 15.3 at 1x. The earlier reading of "DraStic 4.5 ms ahead at
+every resolution" was an artefact of benchmarking a path players never use.
+
+So "as fast or faster than DraStic" is already met on the hardest scene. What
+remains is margin, thermals, and the scenes where we are not ahead -- and the
+two measured gaps behind it: CPU emulation 8.3 ms against our ~13, and the
+raster at roughly eight times the cost per pixel. Its threading is our shape
+already (kicked a scanline earlier, per-band masks, engine B on a 2D worker),
+so there is nothing there to adopt.
+
+Note for whoever merges the GPU work: `gpu-raster` concluded its own column
+would only match software once the list conversion moved onto the geometry
+worker -- and Phase 1a deleted that worker. The 1x decision on `gpu-path` is
+software raster through the GPU present stage; the GPU raster stays the opt-in
+route to 2x.
+
 ### Phase 2 — The ARM9 row (weeks 2-4) — target **revised, see §3.2 and §3.3**
 
 The biggest row, and the one with the least prior work, because the JIT was
@@ -748,7 +833,7 @@ it costs nothing at runtime.
 *Exit gate:* perceptual gate with per-scene floors; worker time per frame
 halved; p99 on NSMB within 2 ms of the median.
 
-### Phase 5 — The 2D engines (week 7-8) — target **-0.4 ms + worker time**
+### Phase 5 — The 2D engines — DROPPED (§3.6: 0.64 ms on Golden Sun, 0.0 % join wait)
 
 2D is 25.2 % of DraStic's frame and our lazy-2D work already took the biggest
 bite (11-21 % on the headless scenes). What is left is representation:
