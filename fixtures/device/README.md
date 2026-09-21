@@ -110,3 +110,46 @@ Two traps this run walked into, both worth remembering:
   14 ticks of CPU in 92 minutes, loadavg 0.17) but only because it was
   blocked rather than spinning; check `/proc/<pid>/stat` before trusting or
   discarding a run, rather than assuming either way.
+
+---
+
+# Device baseline after Phase 2 — `baseline-phase3.jsonl`, 2026-09-21
+
+`baseline.jsonl` above is `exact-reference`. Phase 1 replaced the geometry
+model and Phase 2 the JIT's fallback handling, so **none of its per-stage rows
+is this tree's any more** and it cannot serve as Phase 3's before-line. It is
+kept as the rework's origin, not as a current reading.
+
+`baseline-phase3.jsonl` is that before-line: `dsperate-p2g`, byte-identical to
+the AArch64 build of `83898bf`, `--quantum 0`, 1800 frames from 200 (gsdd from
+700), **three reps per scene**, medians of the three below. Two deliberate
+differences from the old baseline: three reps rather than one, because every
+Phase 3 claim gets diffed against this; and **gsdd is included**, having been
+absent before.
+
+| ms | gsdd | mlbis | dbori | sm64 | etody |
+|---|---|---|---|---|---|
+| **frame median** | **20.67** | 12.30 | 11.33 | 9.26 | 5.05 |
+| cpu9 | 8.08 | 5.45 | 8.08 | 3.17 | 0.88 |
+| cpu7 | 1.42 | 1.28 | 0.66 | 1.27 | 0.68 |
+| dma | **2.54** | 0.40 | 0.37 | 0.26 | 0.87 |
+| spu | **1.13** | 0.41 | 0.14 | 0.59 | 0.17 |
+| sched | 0.82 | 0.40 | 0.45 | 0.50 | 0.31 |
+| events | 0.148 | 0.016 | 0.040 | 0.014 | 0.009 |
+| gx_geom | **0.00** | **0.00** | **0.00** | **0.00** | **0.00** |
+| **Phase 3 surface** (dma+spu+sched+events) | **4.64** | 1.23 | 1.00 | 1.36 | 1.37 |
+
+**`gx_geom` is gone.** It was 1.05-1.50 ms on the four old scenes and is 0.00
+on all five now — Phase 1 did not shrink the row, it deleted it.
+
+**Golden Sun is the only scene outside the 16.74 ms budget**, by 3.93 ms, and
+it holds 4.64 ms of the 8.60 ms of Phase 3 surface across all five scenes. The
+other four clear the budget already and offer 1.0-1.4 ms each *in total*
+across DMA, SPU and the scheduler.
+
+Read the plan's Phase 3 target against that before scoping work to it: -2.5 ms
+is not reachable on four of the five scenes because the rows do not contain it,
+and on gsdd it requires removing about 85 % of the whole surface. The -2.5 ms
+figure comes from the 2026-09-16 NSMB profile, taken in the SDL frontend with
+`--dual-window` on a tree two phases old, and NSMB has never been device-scened
+in this rework.

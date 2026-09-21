@@ -73,3 +73,49 @@ This is the gate Phase 2's exit criteria call the real one — "the sweep, not
 the four scenes" — and it cannot run on the host: the JIT has AArch64 and
 ARM32 backends only, so the x86 build is interpreter-only. Run it under qemu
 (as here, ~25 s a title) or on the device.
+
+## After Phase 2 closed (`a64-jit-phase3a.tsv`, 2026-09-21)
+
+The same command, titles and frame count, run because the Phase 2 sweep above
+was produced at `1f82522` and **three changes landed after it** -- the
+mode-switch restore (`58fca58`), the exception return (`f72421e`) and the
+user-bank work (`83898bf`). All three touch banked registers or mode
+switching, whose failure mode is a corrupted interrupted context rather than a
+clean gate failure, so the earlier sweep did not cover them.
+
+| | ok | static | fail |
+|---|---|---|---|
+| `a64-jit-phase2.tsv` | 39 | 7 | 0 |
+| `a64-jit-phase3a.tsv` | 39 | 7 | 0 |
+
+**No title changed status**, and the seven static titles are the same seven.
+Phase 2's exit gate is met.
+
+### But the status column is too coarse, and three titles moved underneath it
+
+Joining on `distinct` rather than on `status`:
+
+| title | phase2 | 3a | |
+|---|---|---|---|
+| Final Fantasy III | 167 | **95** | **-43 %** |
+| Animal Crossing - Wild World | 2318 | 2724 | +17.5 % |
+| Advance Wars - Days of Ruin | 774 | 791 | +2.2 % |
+
+**Final Fantasy III now freezes earlier.** It was already the one real finding
+in this directory -- `static` under the recompiler, `ok` under the
+interpreter, a defect that predates the rework -- and Phase 2 moved the freeze
+forward by 43 % of the frames it used to draw. Its `frozen` fraction rises
+0.9506 -> 0.9706. The status column cannot see this, because the title was
+already `static`.
+
+That number matches the plan's Phase 6 table exactly -- 95 distinct for "both
+recompilers, quantum 2048", measured on the current tree over 6000 frames,
+against 167 here at 3600 on the older one. Distinct frames stop accumulating
+at the freeze, so the count matching across two different run lengths means
+both runs froze at the same point. This is the known interleave defect, not a
+new one -- but it is now reachable sooner, which makes it a better bisect
+target and a worse thing to hit while playing.
+
+The lesson is the same one the cadence counters just taught: **a pass/fail
+column is not the whole gate.** Diff `distinct` and `frozen` as well as
+`status` after every phase; the numbers are in the TSV already.
