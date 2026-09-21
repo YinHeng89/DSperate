@@ -267,7 +267,18 @@ bool Gpu::vram_remap_begin(u32 moved_2d) {
     prof::add(prof::C_VRAM_REMAP, 1);
     prof::add(moved_2d ? prof::C_VRAM_REMAP_2D_MOVED : prof::C_VRAM_REMAP_2D_STILL, 1);
     // Before the join below, which is what clears it.
-    if (lines_in_flight()) prof::add(prof::C_VRAM_REMAP_INFLIGHT, 1);
+    if (lines_in_flight()) {
+      prof::add(prof::C_VRAM_REMAP_INFLIGHT, 1);
+      // capture_on_ is cleared at VBlank, before these remaps land, so it is
+      // trivially false here and says nothing. What matters is whether the JOB
+      // IN FLIGHT is rendering a capture -- capture_render_, latched when the
+      // job was handed over -- because that is the job a snapshot would let
+      // keep running across the remap.
+      const bool alt = phase_period_ > 1, cap = capture_render_;
+      if (alt) prof::add(prof::C_VRAM_REMAP_INFLIGHT_ALT, 1);
+      if (cap) prof::add(prof::C_VRAM_REMAP_INFLIGHT_CAP, 1);
+      if (!alt && !cap) prof::add(prof::C_VRAM_REMAP_INFLIGHT_CLEAN, 1);
+    }
     const u32 f = frontier();
     if (f && ((render_next_[0] < f && render_next_[0] < SCREEN_H) ||
               (render_next_[1] < f && render_next_[1] < SCREEN_H)))

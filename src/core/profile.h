@@ -121,6 +121,10 @@ enum Counter : u32 { C_POLY_LINES, C_SPAN_PIXELS, C_RESOLVED_PIXELS, C_TEX_FAST,
   // exactly the population a per-job VramMap snapshot would change: today each
   // one blocks, and with a snapshot each one would not.
   C_VRAM_REMAP_INFLIGHT,
+  // ...and that population split by the frame it lands on, which is what says
+  // whether gating the snapshot on "capture off, phase not alternating" would
+  // keep any of its value or none of it.
+  C_VRAM_REMAP_INFLIGHT_ALT, C_VRAM_REMAP_INFLIGHT_CAP, C_VRAM_REMAP_INFLIGHT_CLEAN,
   // Frames whose display setup alternates (display_phase_period() > 1) and
   // frames with display capture on. A game that swaps POWCNT1's screen bit
   // every frame, or alternates capture banks, is the case a snapshot is most

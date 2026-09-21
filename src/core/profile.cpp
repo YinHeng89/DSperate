@@ -69,6 +69,7 @@ const char* const count_names[] = {"3d polygon lines", "3d span pixels", "3d res
   "2d lazy frames", "2d lazy frames skipped (futile)", "2d vram trap hits", "2d lag frames", "2d lag: trapped stores", "2d lag: stores that joined a line", "2d lag: frames that hit the trap limit", "2d lag: lines left in flight", "2d engine A batch: stores that joined it", "2d engine A batch: capture-bank reads that joined it",
   "2d join calls", "vramcnt remaps", "vramcnt remaps: a 2d view moved", "vramcnt remaps: no 2d view moved", "vramcnt remaps with lines pending",
   "vramcnt remaps while a 2d job is in flight",
+  "  ...of those, on an alternating-phase frame", "  ...of those, the in-flight job is a capture", "  ...of those, on a clean frame (neither)",
   "frames with an alternating display phase", "frames with capture on", "frames total",
   "2d join ns: catch_up", "2d join ns: vram trap", "2d join ns: journal full", "2d join ns: line 0", "2d join ns: vram remap", "2d join ns: render_ranges pre", "2d join ns: render_ranges post", "2d join ns: other",
   "3d resolve kernel calls", "3d resolve parts entered",

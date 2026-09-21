@@ -1934,6 +1934,41 @@ putting a frame on the wrong screen, on capture-heavy titles. Gating the
 snapshot on `!capture_on_ && phase_period_ == 1` would be provably safe and
 would return nothing on st-intro or gsdd.
 
+**Refined once the right thing was measured.** The table above counts frames
+with capture on; the question that matters is whether the *job in flight* is a
+capture job, and `capture_on_` is cleared at VBlank before these remaps land,
+so it is trivially false at that point and says nothing. `capture_render_`,
+latched when the job was handed over, is the signal:
+
+| in-flight remaps | total | on an alternating frame | **in-flight job is a capture** | clean |
+|---|---|---|---|---|
+| st-intro | 2179 | 2162 (99.2 %) | **2169 (99.5 %)** | 10 |
+| dbori | 943 | 913 | **920 (97.6 %)** | 23 |
+| etody | 874 | 779 | **821 (94 %)** | 53 |
+| gsdd | 27 | 0 | 0 | 27 |
+
+**The jobs do not alternate with the captures** — the job in flight at remap
+time *is* the capture job, 99.5 % of the time on Spirit Tracks. Gating on
+"not alternating" keeps 10 of 2179 there, so it is worth nothing on the scene
+that needs it, and the same for capture.
+
+**But most of what that implies is already defended.** A capture job in flight
+writes an LCDC bank the guest might read before the join, and `render_ranges`
+already sets an LCDC *read* trap on exactly that bank when it hands the job
+over — and `vram_remap_begin` does not touch it, so **the guard survives the
+remap**. It is cleared only in `finish_a()`, at the frame's end, and in
+`prepare_load()`. So the loudest-sounding hazard, a guest read of a
+half-written capture bank, has machinery for it already.
+
+That leaves the residual hazard much narrower than "capture is dangerous":
+
+* What the job reads to composite — the BG/OBJ views a remap moves — is what
+  the snapshot **fixes**, since those lines are meant to read the old mapping.
+* What the guest *writes* into a bank the snapshot still references, where that
+  bank has left the engines' current view and is therefore no longer trapped,
+  is the one real hole. **That is the SS3.25 hazard, unchanged: the write
+  trap's coverage has to follow the job rather than the live map.**
+
 **This is not a refusal, it is a scoping result.** Three ways forward, in the
 order they should be tried:
 
