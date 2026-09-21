@@ -237,6 +237,7 @@ private:
   u8 idle_skip_ = 1;
   bool idle_survey_ = false;      // DS_IDLE_SURVEY: count what the dma/gx vetoes cost, change nothing
   bool idle_analyse(bool& skip9, bool& skip7, bool survey) const;
+  void advance_dma_only(CpuContext& cpu);   // a skipped CPU still lets its DMA run
   // The event table is split by field and gated by a bitmask: firing scans
   // only the armed events (typically six to eight of the twenty) and touches
   // three cache lines of deadlines instead of eight of interleaved records.

@@ -189,8 +189,11 @@ bool Scheduler::machine_idle(bool& skip9, bool& skip7) const {
   // dropping this one would stall a DMA the idle loop may be waiting on.
   // Restoring hardware behaviour there needs a helper that advances the
   // ARM9's DMA without running the CPU -- see the plan.
+  // The DMA veto now applies only to the DSi, where a9_dma_iter_ hands the
+  // slice back mid-transfer and has no meaning when no CPU ran. Elsewhere a
+  // skipped slice advances the channel itself (advance_dma_only).
   bool vetoed = false;
-  if (nds_.dma.any_running(Cpu::ARM9) || nds_.dma.any_running(Cpu::ARM7)) { prof::add(prof::C_IDLE_NO_DMA, 1); vetoed = true; }
+  if (dsi_ && (nds_.dma.any_running(Cpu::ARM9) || nds_.dma.any_running(Cpu::ARM7))) { prof::add(prof::C_IDLE_NO_DMA, 1); vetoed = true; }
   else if (prof::enabled && !nds_.gpu3d.idle()) prof::add(prof::C_IDLE_NO_GX, 1);   // counted, no longer vetoed
   if (vetoed) {
     // DS_IDLE_SURVEY: run the analysis anyway, purely to count what these two
@@ -440,6 +443,22 @@ void Scheduler::defer_preempt_cost(CpuContext& cpu) {
   cpu.defer_cost += over;
 }
 
+// A skipped CPU still has to let its DMA advance. On hardware a transfer runs
+// while the core is halted; here DMA is driven from inside run_cpu, so a
+// skipped slice froze it -- which is why machine_idle vetoed the skip whenever
+// a channel was running, and why dbori kept 245 k of its idle opportunity
+// behind that veto. This is the same call run_cpu makes, with the CPU left
+// alone. DSi keeps the veto instead: its ARM9 DMA hands the slice back through
+// a9_dma_iter_, which has no meaning when no CPU ran.
+void Scheduler::advance_dma_only(CpuContext& cpu) {
+  const Cpu which = cpu.which;
+  if (!nds_.dma.any_running(which)) return;
+  DS_PROF(DMA);
+  in_dma_ = true; dma_used_ = 0;
+  cpu.hot.cycle_budget -= static_cast<s32>(nds_.dma.run(which, static_cast<u32>(cpu.hot.cycle_budget)));
+  in_dma_ = false; dma_used_ = 0;
+}
+
 void Scheduler::run_cpu(CpuContext& cpu, RunFn run) {
   const Cpu which = cpu.which;
   for (;;) {
@@ -531,7 +550,7 @@ begin:
     if (a9.irq_offline) { a9.irq_skip_once = !a9.halted; a9.irq_offline = false; }
     running_ = &a9; running_start_budget_ = budget9_; running_shift_ = 0; running_rshift_ = dsi_ ? shift9_ + 1 : 0; running_base_ = now_; running_carry_ = static_cast<u64>(arm9_carry_);
     sl_.phase = SL_A9; cpu = &a9; run = nds_.run_arm9;
-    if (sl_.skip9) goto a9_done;
+    if (sl_.skip9) { advance_dma_only(a9); goto a9_done; }
   }
 cpu_begin:   // run_cpu loop head
   {
@@ -596,7 +615,7 @@ a9_done:
     running_ = &a7; running_start_budget_ = sl_.budget7; running_shift_ = 1; running_rshift_ = 0;
     running_base_ = dsi_ ? static_cast<u64>(static_cast<s64>(now_) + sl_.ran9 - arm7_debt_) : now_;
     sl_.phase = SL_A7; cpu = &a7; run = nds_.run_arm7;
-    if (sl_.skip7) goto a7_done;
+    if (sl_.skip7) { advance_dma_only(a7); goto a7_done; }
     goto cpu_begin;
   }
 a7_done:
@@ -675,7 +694,7 @@ u64 Scheduler::run_until_impl(u64 until, bool until_frame) {
     if (a9.boot_stall) take_stall(a9);
     if (a9.irq_offline) { a9.irq_skip_once = !a9.halted; a9.irq_offline = false; }
     running_ = &a9; running_start_budget_ = budget9_; running_shift_ = 0; running_rshift_ = dsi_ ? shift9_ + 1 : 0; running_base_ = now_; running_carry_ = static_cast<u64>(arm9_carry_);
-    if (!skip9) run_cpu(a9, nds_.run_arm9);
+    if (skip9) advance_dma_only(a9); else run_cpu(a9, nds_.run_arm9);
     // A halted CPU consumes exactly the slice; a running one may overshoot,
     // and the overshoot is real time (it carries into the next slice).
     const bool full9 = (a9.halted || skip9) && !a9_dma_iter_;
@@ -696,7 +715,7 @@ u64 Scheduler::run_until_impl(u64 until, bool until_frame) {
       if (a7.irq_offline) { a7.irq_skip_once = !a7.halted; a7.irq_offline = false; }
       running_ = &a7; running_start_budget_ = budget7; running_shift_ = 1; running_rshift_ = 0;
       running_base_ = dsi_ ? static_cast<u64>(static_cast<s64>(now_) + ran9 - arm7_debt_) : now_;
-      if (!skip7) run_cpu(a7, nds_.run_arm7);
+      if (skip7) advance_dma_only(a7); else run_cpu(a7, nds_.run_arm7);
       // A BPTWL soft reset halted the ARM7 mid-slice (Io::bptwl_write). Reset
       // as its run returns, as melonDS does at the end of ARM7::Execute; the
       // ARM7 is un-halted with a zero budget, so the slice counts as run.
