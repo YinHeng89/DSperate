@@ -362,16 +362,20 @@ private:
   // Lazy-2D state for the frame in progress.
   bool lazy_enabled_ = true;      // DS_2D_LAZY != 0
   bool lazy_frame_ = false;       // this frame may batch
-  // Per engine. A store into one engine's BG/OBJ VRAM cannot change what the
-  // other engine fetches, so only that engine has to leave the batch: Golden
-  // Sun streams ~96 KB a frame into engine B's BG and took engine A -- the
-  // screen carrying the 3D composite and the capture -- out of batched mode
-  // with it, 16 times a frame. DS_2D_SPLIT=1 enables the split; without it the
-  // two entries are kept in lockstep and the behaviour is the old one.
+  // Per engine, and kept in lockstep: a trapped store takes BOTH engines out
+  // of batched mode.
+  //
+  // DS_2D_SPLIT once let them diverge, on the argument that a store into one
+  // engine's BG/OBJ VRAM cannot change what the other fetches. It was removed
+  // 2026-09-21 (plan SS3.22): 8bdcd13's futility skip, which landed the day
+  // after it and stops arming the trap at all once a scene never batches, left
+  // it with nothing to do -- measured null on all five device scenes, with
+  // Golden Sun's worker join unmoved at 2.9 ms. It also carried the hazard
+  // 31a7ab6 had to fix, which the scene set cannot exercise because no scene
+  // in it streams to both engines.
   bool per_line_[2] = {false, false};
   bool per_line_prev_[2] = {false, false};
   u32  render_next_[2] = {SCREEN_H, SCREEN_H};
-  bool split_ = false;            // DS_2D_SPLIT=1
   bool frame_finished_ = false;   // frame_done() called for both engines
   bool trap_armed_ = false, trap_lcdc_ = false, trap_a_only_ = false;
   // Which engines a store can change, by address alone: bit 0 engine A, bit
@@ -409,8 +413,7 @@ private:
   u32  lazy_probe_period_ = LAZY_PROBE_PERIOD, lazy_probe_in_ = LAZY_PROBE_PERIOD;   // frames until the next probe
   bool lazy_tried_ = false;
   // A frame that spent its burst budget is futile whatever the engines'
-  // state at line 191 (with DS_2D_SPLIT the other engine may still be
-  // batching): counted at the fallback. A probe frame gets a smaller budget
+  // state at line 191: counted at the fallback. A probe frame gets a smaller budget
   // (LAZY_PROBE_BURSTS) and falls both engines back at once when it runs
   // out, so re-checking a per-line scene costs half the arms it used to.
   static constexpr u32 LAZY_PROBE_BURSTS = 8;
@@ -427,7 +430,6 @@ private:
   // Only the fixed BG/OBJ address ranges are attributed; anything else (LCDC,
   // an unmapped alias) is charged to both, so the split can only ever be more
   // conservative than the address map.
-  u32 store_engines(u32 addr) const;
   void step_engine(int e, u32 line);        // one engine's display line: replay, latches, render, output
 
   // One worker thread beside the emulation thread, drawing a run of one

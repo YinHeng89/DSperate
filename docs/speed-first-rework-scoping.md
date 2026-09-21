@@ -1423,9 +1423,10 @@ corrected in SS3.18: Phase 1 deleted the INSTRUMENT.** `GX_RUN` has had no
 scope site since, so the row could only ever read zero; the geometry work moved
 into its callers' rows and is 3.56 ms of a typical Golden Sun frame.
 
-**Golden Sun is the only scene outside the 16.74 ms budget**, by 3.93 ms, and
-it holds 4.64 of the 9.59 ms of Phase 3 surface across all five scenes -- just
-under half. The
+**Golden Sun is the only scene outside the 16.74 ms budget** *of the five
+measured* -- SS3.24 adds Spirit Tracks at 19.08 ms, which is not in this
+baseline at all -- by 3.93 ms, and it holds 4.64 of the 9.59 ms of Phase 3
+surface across all five scenes -- just under half. The
 other four clear the budget already and offer 1.0-1.4 ms each across DMA, SPU
 and the scheduler *combined*. **Phase 3's -2.5 ms target is therefore not
 reachable on four of the five scenes, because the rows do not contain it**, and
@@ -1774,6 +1775,65 @@ judging**, after the cadence counters (SS3.17), the sweep's status column
 (SS3.17) and `GX_RUN`/`W2D_JOIN` (SS3.18). The remaining unaudited one is the
 self-consistency runner, and it should be audited before Phase 3 leans on it.
 
+### 3.24 Spirit Tracks joins as hard as Golden Sun, by a completely different route
+
+The join census extended past the four A/B scenes, because Spirit Tracks was
+expected to look like Golden Sun -- another per-line streamer, with edge
+marking on top. It does not. It joins just as badly and almost nothing about
+the mechanism is the same.
+
+| scene | frame median | join typ | join p99 | join tail | lazy frames | dominant site |
+|---|---|---|---|---|---|---|
+| gsdd | **20.96** | **2.947** | **15.689** | **+12.742** | 232 / 1801 | `render_ranges` pre, 99.8 % |
+| **st-intro** | **19.08** | **0.872** | **9.649** | **+8.777** | **2401 / 2401** | **vram remap, 99.85 %** |
+| meteos | 7.79 | 0.004 | 0.353 | +0.349 | 1801 / 1801 | — |
+
+**Two things this settles and one it opens.**
+
+**1. Spirit Tracks is also outside the budget, and was never in the
+before-line.** 19.08 ms against 16.74. `fixtures/device/baseline-phase3.jsonl`
+covers gsdd, mlbis, dbori, sm64 and etody, so SS3.17's and SS3.22's "Golden
+Sun is the only scene outside the budget" is true of the scenes measured and
+false of the scene set. **Two scenes miss, not one**, and Phase 3's framing
+must carry both. (`docs/frame-profile-2026-09-16.md` had Spirit Tracks as the
+worst scene of its four at 21.3 ms; it was dropped from the device work when
+it became a boot scene, and the omission was never noticed.)
+
+**2. Batching is not a defence against the join.** Spirit Tracks batches
+*perfectly* -- 2401 lazy frames of 2401, no futile frames, no lag frames --
+and still spends 0.87 ms a typical frame and 9.65 ms at p99 waiting for the
+worker, which is the largest single contributor to its tail exactly as on
+Golden Sun. The two scenes are the opposite of each other in every respect
+except the outcome:
+
+* **Golden Sun** never batches (232 lazy frames of 1801), so `render_ranges`
+  hands off per line and pays the pre-join every line -- **many cheap waits**.
+* **Spirit Tracks** batches every frame, and a VRAMCNT remap then forces the
+  whole pending frame out. `Gpu::vram_remap_begin()` calls `catch_up(3)` --
+  both engines, everything pending -- and joins, unconditionally. **2485 join
+  calls in the run against Golden Sun's hundreds of thousands, at roughly
+  700 us each**: about one flushed batch per frame.
+
+So the lever that would fix one does nothing for the other, and neither is the
+deeper-queue change SS3.20 proposed. A deeper queue helps Golden Sun's
+per-line hand-off and is irrelevant to a remap that must flush by definition.
+
+**3. What to look at for Spirit Tracks.** `vram_remap_begin` catches up *both*
+engines and joins for *any* mapping change. A remap knows which bank moved,
+and `reach_engines`-style reasoning already exists for stores: a bank that
+neither batching engine is reading needs no catch-up at all, and a bank only
+one engine reads needs only that engine's. `e12cee7` already narrowed the
+remap's *trap toggling* to mapped pages; the catch-up and the join were left
+whole. **Census first** -- how many of the ~1 remap a frame actually move a
+bank an engine is fetching from -- because if the answer is "most of them"
+this lever does not exist and the batch genuinely has to flush.
+
+*Coverage gap found while doing this:* Art Academy is in `games-bugtest` on
+the host but **is not on the device at all**, so `artacd` has never been part
+of any device measurement in this rework. It is the most 2D-heavy title in the
+set and the likeliest third scene to have a join problem. Copy the ROM over
+before the next census.
+
 ### Phase 3 — DMA, SPU and scheduler granularity (week 4-5) — target **per scene, see below**
 
 **Rescoped 2026-09-21 against SS3.17's before-line, the way SS3.3 rescoped
@@ -1783,7 +1843,10 @@ the SDL frontend with `--dual-window` on a tree two phases old, on a scene that
 has never been device-measured in this rework. Measured on the device, the
 rows do not contain that much time on four of the five scenes.
 
-**Phase 3 is the Golden Sun phase.** That is the whole shape of it:
+**Phase 3 is the Golden Sun phase** — and, since SS3.24, the Spirit Tracks
+phase with it. Both miss the budget; the table below is the five scenes that
+were in the before-line, and Spirit Tracks at 19.08 ms is a sixth that was
+not:
 
 | | gsdd | mlbis | dbori | sm64 | etody |
 |---|---|---|---|---|---|
@@ -1791,10 +1854,13 @@ rows do not contain that much time on four of the five scenes.
 | over/under 16.74 | **+3.93** | -4.44 | -5.41 | -7.48 | -11.69 |
 | Phase 3 surface | **4.64** | 1.23 | 1.00 | 1.36 | 1.36 |
 
-Four scenes are already inside the budget and hold 1.0-1.4 ms each across DMA,
-SPU and the scheduler *combined*; there is no -2.5 ms in them to find. Golden
-Sun misses by 3.93 ms and holds 4.64 ms of surface. **So the target is: gsdd
-inside 16.74 ms, and no regression anywhere else.** Hitting it means taking
+Four of the five are already inside the budget and hold 1.0-1.4 ms each across
+DMA, SPU and the scheduler *combined*; there is no -2.5 ms in them to find.
+Golden Sun misses by 3.93 ms and holds 4.64 ms of surface; Spirit Tracks
+misses by 2.34 ms and has never had a stage baseline taken. **So the target
+is: gsdd and st-intro inside 16.74 ms, and no regression anywhere else** --
+and the first thing Phase 3 owes itself is a before-line for the scene it
+forgot. Hitting it means taking
 about 85 % of gsdd's DMA, SPU and scheduler time, which is a harder ask than
 the -2.5 ms it replaces, and it is the honest one.
 
@@ -2118,6 +2184,65 @@ enforces.
 * Rewrite `docs/techniques/06-implementation-checklist.md`'s status column and
   the audit summary. The document's purpose does not change — "every omission
   is a decision" — but most of the `no`-by-choice rows become `same`.
+
+
+### Phase 8 — The scaffolding out (week 10)
+
+Phase 7 deletes the knobs a *player* can reach. This deletes the ones only we
+ever reach, and it is a separate phase because the justification is different:
+those were an accuracy-for-speed trade offered to the user, these are
+experiments that have finished.
+
+**The tree carries 146 distinct `DS_*` environment knobs.** Most arrived to
+settle one question, settled it, and stayed. `DS_2D_SPLIT` is the worked
+example (SS3.22): written to fix a real problem, superseded by a different fix
+the following day, inert ever since, still a branch and still a supported
+configuration that anything claiming to be exhaustive has to cover.
+
+**The line to draw is not "experiment versus product" but what the knob costs
+when it is off.**
+
+* **A knob that selects between two code paths is the dual-path tax SS2
+  names** — a branch in a hot path, a state the tests must cover, a
+  combination that can deadlock, and a reason a bug report is not
+  reproducible. These go. `DS_2D_SPLIT`, `DS_JIT_FASTCOST` (measured *slower*,
+  SS3.2), `DS_R3D_ADAPT` and its `_BUSY`/`_SHIFT` (Phase 4 deletes the adaptive
+  controller anyway), `DS_2D_LAZY` / `DS_2D_THREAD` / `DS_2D_LAG` /
+  `DS_2D_DEFER` / `DS_SPU_BATCH` / `DS_IDLE_SKIP` once each has one settled
+  value, and `DS_CART_BULK` once 3c defaults it.
+* **A knob that only turns on reporting costs one `getenv` at construction and
+  nothing after.** `DS_DEBUG_*`, the `_LOG` and `_TRACE` families, `DS_PROFILE`
+  and its friends. **These stay** — they are how every number in this document
+  was produced, and deleting them would be deleting the instruments while the
+  lesson of SS3.11, SS3.12, SS3.18 and SS3.19 is that we need *more* of them
+  and better ones.
+* **A census knob that sits on a per-access path is the awkward middle.**
+  `profile.h` already records that `PageTable::write_ptr`'s counters cost a
+  global load and a branch on every store even when disabled, which is why
+  `DSPERATE_CENSUS` is a compile-time switch. Anything in that class either
+  moves behind the compile-time switch or goes.
+
+**Also in scope, and the reason this is a phase rather than a chore:**
+
+* **Dead profile stages.** `GX_RUN` and `GX_JOIN` sat declared and siteless
+  through two phases while `gx_geom` read 0.00 and was twice written up as work
+  that had been deleted (SS3.18). A stage with no site is worse than no stage:
+  it reports a confident zero. Assert at startup that every stage has a site,
+  or drop the enumerator.
+* **Knobs referenced only by a `tools/` script that no longer runs**, and
+  scripts whose arms name binaries that no longer exist.
+* **The `ab*.sh` family on the device**, which is nine copies of one script
+  whose header comment is wrong in eight of them (SS3.16). One parameterised
+  runner.
+
+*Exit gate:* the knob count, stated. Every removal is a deletion of a
+*configuration*, so the compatibility sweep and the four gates run once at the
+end — not per removal. Nothing here should change a measurement, and a removal
+that does is a finding, not a regression to paper over.
+
+*Expected gain: 0 ms, and that is the point.* This phase buys reproducibility,
+a smaller test surface, and the ability to say what the emulator does without
+qualifying it.
 
 ---
 

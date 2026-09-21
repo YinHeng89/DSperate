@@ -74,7 +74,6 @@ Gpu::Gpu(NDS& nds) : engine{Engine2D(nds, 0), Engine2D(nds, 1)}, nds_(nds) {
   }
   if (const char* l = std::getenv("DS_2D_LAG")) lag_enabled_ = std::atoi(l) != 0;
   if (const char* l = std::getenv("DS_2D_DEFER")) defer_join_ = std::atoi(l) != 0;
-  if (const char* l = std::getenv("DS_2D_SPLIT")) split_ = std::atoi(l) != 0;   // opt-in, see gpu.h
 }
 
 void Gpu::reset() {
@@ -207,10 +206,10 @@ void Gpu::vram_store_trap(Cpu cpu, u32 addr) {
     if (reach_engines(addr) & 1) { prof::add(prof::C_2D_A_JOIN_STORES, 1); join_worker(JoinSite::Trap); }
     return;
   }
-  const u32 mask = store_engines(addr);
-  // Already per-line everywhere this store can reach: nothing to do but the
-  // lag-mode join below.
-  if ((per_line_[0] || !(mask & 1)) && (per_line_[1] || !(mask & 2))) {
+  // Both engines already per line: nothing to do but the lag-mode join below.
+  // A store is charged to BOTH engines -- see the note on the removed
+  // per-engine split in gpu.h -- so this is the whole frame being per line.
+  if (per_line_[0] && per_line_[1]) {
     // Lag mode: the store may land on a line engine B is still drawing.
     prof::add(prof::C_2D_LAG_STORES, 1);
     const u32 reach = reach_engines(addr);
@@ -219,8 +218,9 @@ void Gpu::vram_store_trap(Cpu cpu, u32 addr) {
     // Past the limit the lag is dropped and the trap lifted -- but the trap is
     // still the other engine's guard if it is batching, and lifting it there
     // would let a store into ITS vram land unseen before its batch renders.
-    // Reachable now that this branch only needs the addressed engine to be
-    // per-line; before the split it needed the whole frame to be.
+    // (That hazard is why the per-engine split needed 31a7ab6; with the split
+    // gone this branch needs the whole frame per line again, so the guard is
+    // belt and braces rather than load-bearing -- keep it.)
     // Count the stores that actually cost something -- the ones that joined a
     // line in flight -- not every store that reached the trap. The limit is
     // there to drop the lag when joining gets expensive, and on Golden Sun it
@@ -233,12 +233,12 @@ void Gpu::vram_store_trap(Cpu cpu, u32 addr) {
     return;
   }
   prof::add(prof::C_2D_TRAP_HITS, 1);
-  // Burst only the engines this store can actually reach. The budget is per
-  // engine: one engine streaming tiles must not spend the other's.
+  // The budget stays per engine: one engine streaming tiles must not spend the
+  // other's, even though a store is now charged to both.
   u32 burst_mask = 0;
   const u32 limit = lazy_probe_ ? LAZY_PROBE_BURSTS : LAZY_BURST_LIMIT;
   for (int e = 0; e < 2; ++e)
-    if ((mask & (1u << e)) && !per_line_[e] && ++lazy_bursts_[e] < limit) burst_mask |= 1u << e;
+    if (!per_line_[e] && ++lazy_bursts_[e] < limit) burst_mask |= 1u << e;
   if (burst_mask) {
     // Lines whose HBlank has passed are drawn before the bytes change; the
     // burst continues per line, and the frame re-batches when it ends.
@@ -254,7 +254,7 @@ void Gpu::vram_store_trap(Cpu cpu, u32 addr) {
   // Out of bursts: the frame is futile (see begin_frame); a probe frame
   // gives up on both engines at once.
   lazy_limit_hit_ = true;
-  fall_back_per_line(lazy_probe_ ? 3 : mask);
+  fall_back_per_line(3);   // both engines: a store is charged to both (see gpu.h)
 }
 
 bool Gpu::vram_remap_begin() {
@@ -294,18 +294,6 @@ void Gpu::disarm_trap() {
   trap_armed_ = false;
 }
 
-// The DS maps BG and OBJ VRAM to fixed address ranges, one engine each, so a
-// store's address alone says which engine can see it. LCDC (0x06800000+) is
-// charged to both: it is a bank alias, and engine A can display it directly.
-u32 Gpu::store_engines(u32 addr) const {
-  if (!split_) return 3;
-  if ((addr >> 24) != 0x06) return 3;
-  switch ((addr >> 21) & 3) {   // 0x000000 bgA, 0x200000 bgB, 0x400000 objA, 0x600000 objB
-  case 0: case 2: return 1;
-  case 1: case 3: return 2;
-  }
-  return 3;
-}
 
 void Gpu::catch_up(u32 mask) {
   const u32 f = frontier();
@@ -339,8 +327,7 @@ void Gpu::on_hblank() {
     // last one. The per-line latches (pre/post_draw, the sprites one line
     // ahead) run inside step_engine, in front of the journal replay.
     // Each engine is either batching (render everything at the last line) or
-    // per-line. With DS_2D_SPLIT off the two are always in the same mode and
-    // this is the old single range.
+    // per-line, and the two are always in the same mode.
     u32 f[2], l[2];
     for (int e = 0; e < 2; ++e) {
       const bool batch = lazy_frame_ && !per_line_[e];
