@@ -896,11 +896,27 @@ interpreter prices each from its own -- a Thumb LDM consumed 162 cycles
 against 161. It now sums the true per-word costs before the transfer, while
 the scratch registers are still free (the slow stubs preserve only x1 and x7).
 
-**A gate that does not work, found here.** The JIT's dump differs from the
-INTERPRETER's by 11,347,831 bytes -- 3.6 % -- on Golden Sun, and does so on
-the unmodified tree as well. So "`--interp` vs default with `--dump-frames`",
-one of the three verification routes the JIT README names, is not currently
-usable for this game. Worth resolving before Phase 2 leans on it.
+**A gate that looked broken and was not.** The JIT's dump differs from the
+INTERPRETER's by 11,347,831 bytes -- 3.6 % -- on Golden Sun, on the unmodified
+tree as well, and this was first recorded here as "one of the three
+verification routes the JIT README names is not usable for this game". That
+was the wrong standard. Judged by RESULT rather than by bytes, the same pair
+reads ssim mean 0.9999, p01 0.9986, min 0.9983, no structural faults, 359 of
+800 frames merely realigned: the two engines run at marginally different
+speeds and frames land at different moments. The JIT is correct; byte equality
+was never the question.
+
+No new comparison was needed for it either. `golden_dump.sh` already forces
+`--interp` on the reference side and `run_candidate.sh` runs the candidate as
+played, so handing `gate.sh` the SAME JIT-capable binary twice IS the JIT's
+correctness gate -- floors, structural faults and cadence counters included.
+`tools/jit_gate.sh` is that one line, with the reasoning attached.
+
+The real constraint is narrower than "no gate": the JIT has AArch64 and ARM32
+backends only, so the x86 host build is interpreter-only and neither this nor
+`title_sweep.sh` -- which Phase 2's exit gate calls the real gate -- can
+exercise the recompiler on the host. Both have to run under qemu or on the
+device.
 
 **What is left of the census** is all one problem: MSR CPSR with a mode change
 (~361 k), `SUBS pc, lr, #4`, `LDM ^` and a CP15 read (~117 k each). Every one
