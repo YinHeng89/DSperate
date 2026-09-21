@@ -1991,6 +1991,66 @@ order they should be tried:
    the sweep does not produce. **The sweep as it stands could not see this
    bug.** That gap should be closed before route 3 is taken, not after.
 
+### 3.27 Why the join is really there: the worker reads the live `VramMap`
+
+The remap join has been treated throughout SS3.24-SS3.26 as a *semantic*
+guard — make the pending lines land before the mapping they read changes.
+Reading the code it is mostly a *synchronisation*, and that reframes the whole
+change.
+
+**The deferred 2D job reads `Bus::vram_map_` live, on the worker thread.**
+`Engine2D::vram()` is `return nds_.bus.vram_map();` — the live object, not a
+copy — and `Gpu::capture()`, which runs inside the job, opens with
+`const VramMap& vm = nds_.bus.vram_map();` and consults `vm.lcdc_mask` and
+`vm.bank()` at render time. Meanwhile `Bus::update_vram` assigns
+`vram_map_ = next` on the emulation thread. **The join in `vram_remap_begin`
+is what stops those two overlapping.** Remove it naively and the worker is
+reading a `VramMap` while it is being rebuilt underneath it.
+
+So the cost is not the price of correctness in the emulated machine. It is the
+price of the worker and the emulation thread **sharing one mutable object**,
+paid once a frame at about 700 us on Spirit Tracks.
+
+**Two things make the snapshot cheaper than it first looked.**
+
+1. **Bank storage never moves.** `Bus::vram_bank(i)` is `vram.get() + off`
+   over fixed `VRAM_BANK_SIZES`, and `VramMap::rebuild` copies those same
+   pointers into `banks_` every time. So `vm.bank(i)` is **remap-invariant**;
+   a remap moves the *views* and `lcdc_mask`, never the storage. A job's
+   snapshot therefore does not have to own memory, only a description.
+2. **`Gpu::capture()`'s only remap-sensitive reads are `lcdc_mask` and the
+   source-bank choice** — its destination pointer is `vm.bank(dst_bank)`,
+   which by (1) is stable. Latching a couple of words at hand-off would take
+   capture off the live map entirely.
+
+**The 3D side already solved its half of this the narrow way.** `Renderer3D`
+also takes `vm_ = &nds_.bus.vram_map()`, and `Bus::update_vram` calls
+`sync_raster()` only when the texture or texture-palette views actually move —
+*"whether the band workers must be joined depends on whether the two views
+they index actually move, and most VRAMCNT traffic ... leaves them alone"*.
+The 2D side cannot use that test, because SS3.25 measured that its views move
+on 99.9 % of remaps. **It has to go the other way: stop sharing the object.**
+
+**So the change to make is one thing, and it is smaller than SS3.25 implied:**
+give a dispatched job the mapping description it should render against, and
+`vram_remap_begin`'s join goes with it. That is also the right answer on the
+merits — a job rendering lines 0..191 *should* read the mapping those lines
+were displayed under, not whatever the guest has installed since.
+
+**What still has to be handled, unchanged from SS3.25/SS3.26:** a guest write
+into a bank the snapshot still references, where that bank has left the
+engines' current view and is no longer write-trapped. The capture *read* side
+is already covered (SS3.26: the LCDC read trap is set at hand-off and survives
+the remap). This is the one hole, it is on the write side, and it is a
+question about what the trap covers rather than about the snapshot.
+
+*Recommended order:* latch capture's two words first — it is self-contained,
+testable on its own, and takes the hottest reader off the live map — then the
+job-wide snapshot, then the trap-follows-the-job work, each with the gate and
+the sweep. And close the sweep's blind spot first (SS3.26 route 3): it runs
+with no input and no reference dump, so the `swapped` detector cannot run
+against it, and a wrong-screen latch is what all of this risks.
+
 ### Phase 3 — DMA, SPU and scheduler granularity (week 4-5) — target **per scene, see below**
 
 **Rescoped 2026-09-21 against SS3.17's before-line, the way SS3.3 rescoped
