@@ -1312,12 +1312,34 @@ emitter clusters and the idle-skip relaxation, and left translated guest code
 * **`const_nd` as a flat cost model** (SS3.2 named it "the real floor" and
   "cheap to try because the code is written"). Tried, and worse on all four
   scenes: gsdd +0.28, dbori +0.10, sm64 +0.10, mlbis +0.055 ms of median, with
-  every candidate rep above every base rep on dbori and mlbis. *Provenance
-  caveat:* `fixtures/device/phase2-constnd-ab.jsonl` carries the run, but no
-  commit, branch or script survives it, so the arm's exact content is inferred
-  from the filename. Re-derive before quoting it as the last word on SS3.2's
-  recommendation. **With this, every lever SS3.2 and SS3.3 nominated has been
-  measured, and the cost model is closed as a dead end.**
+  every candidate rep above every base rep on dbori and mlbis. No commit or
+  branch survives it -- it was a dead end, branched off the accepted lineage
+  and abandoned -- but the device still carries the run
+  (`/storage/dsperate-test/abconst.sh`, `dsperate-p2c`, built 23:14 on
+  2026-09-20 against `dsperate-p2b` as its base), which is what the fixture
+  `fixtures/device/phase2-constnd-ab.jsonl` holds. **With this, every lever
+  SS3.2 and SS3.3 nominated has been measured, and the cost model is closed as
+  a dead end.**
+
+**Two traps in the device A/B records, found while confirming that.** Both
+would mislead anyone re-reading the Phase 2 fixtures.
+
+* **Every `ab*.sh` on the device carries the same header comment** -- "the
+  idle-skip work (GX veto removed + advance_dma_only) against the tree with
+  only the JIT emitters" -- because each was copied from the last as a
+  template and the comment was never updated. It is accurate only for
+  `abidle.sh`. Read the arms, not the header.
+* **`phase2-modeswitch-ab.jsonl` labels its candidate arm `p2c`, but the
+  binary it ran was `p2d`** (`abmsr.sh`: `b=dsperate-p2d; bt=p2c`) -- the label
+  string was copied from `abconst.sh` along with everything else. The base is
+  `p2b`, so the measurement itself is sound and the rejected `const_nd` arm is
+  *not* in the mode switch's lineage. Only the label is wrong.
+
+The accepted lineage, for the record: `dsperate-1c2` (Phase 1 closed) ->
+`p2a` emitters -> `p2b` idle skipping -> `p2d` mode switch -> `p2e` exception
+return -> `p2g` user bank (against `p2f`, the same tree with
+`ldm_user_inline()` forced false). `p2c` is the abandoned `const_nd` branch
+and appears in no later arm.
 
 **The exit gate is not yet met.** Phase 2's exit criteria are self-consistency,
 the perceptual gate, and -- "the real gate, not the four scenes" -- the

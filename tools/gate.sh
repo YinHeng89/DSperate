@@ -60,6 +60,47 @@ with open(sys.argv[1], 'rb') as f:
 PY
 }
 
+# The cadence counters do not all carry the same weight -- and until 2026-09-21
+# none of them carried any: a diff was printed and the gate passed regardless.
+#
+# Frames kept, swap counts and no-swap vblanks are what the census exists for
+# ("did the game draw fewer frames?"), and they do not depend on which engine
+# produced them: the same tree reads 850 / 1417 / 386 on sm64 from the x86
+# interpreter and from the AArch64 recompiler. These fail the gate.
+#
+# GXSTAT reads are a POLL count. They move with how often the guest looked,
+# which depends on where the two engines' slices fall, and the same tree reads
+# 24,772 on the host against 24,372 on AArch64 -- 1.6 % apart with nothing
+# wrong. Reported, never fatal. SS3.13 spent a whole verification run proving
+# one such diff was not its emitter's doing; that is the cost this avoids.
+cadence_cmp() {   # <fixture> <candidate> -> prints, nonzero if a hard counter moved
+  python3 - "$1" "$2" <<'CADPY'
+import sys
+HARD = ('3d frames kept', 'gx swap_buffers', 'gx vblanks with no swap')
+SOFT = ('gx reads of GXSTAT',)
+def read(p):
+    try: lines = open(p).read().splitlines()
+    except OSError: return None
+    d = {}
+    for l in lines:
+        for k in HARD + SOFT:
+            if k in l:
+                try: d[k] = int(l.split()[-1])
+                except ValueError: pass
+    return d
+a, b = read(sys.argv[1]), read(sys.argv[2])
+if not a or not b:
+    print('  CADENCE: census missing or empty -- not judged'); sys.exit(0)
+for k in SOFT:
+    if k in a and k in b and a[k] != b[k]:
+        print(f'  cadence note: {k} {a[k]} -> {b[k]} (poll count, engine-dependent; not gated)')
+bad = [(k, a[k], b[k]) for k in HARD if k in a and k in b and a[k] != b[k]]
+for k, x, y in bad:
+    print(f'  CADENCE FAIL: {k} {x} -> {y}')
+sys.exit(1 if bad else 0)
+CADPY
+}
+
 MODE=${1:?usage: tools/gate.sh baseline|check ...}; shift
 
 if [ "$MODE" = baseline ]; then
@@ -115,9 +156,7 @@ for s in $SCENES; do
       ${floors:+$([ -f "$floors" ] && echo --floors "$floors")} || rc=1
   if [ -f "$FIX/$s.cadence" ]; then
     "$HERE/cadence_census.sh" "$CAND" "$s" "$n" "$SCRATCH/$s.cadence" "${EXTRA[@]+"${EXTRA[@]}"}" >/dev/null 2>&1 || true
-    if ! diff -q "$FIX/$s.cadence" "$SCRATCH/$s.cadence" >/dev/null 2>&1; then
-      echo "  CADENCE changed:"; diff "$FIX/$s.cadence" "$SCRATCH/$s.cadence" | sed 's/^/    /'
-    fi
+    cadence_cmp "$FIX/$s.cadence" "$SCRATCH/$s.cadence" || rc=1
   fi
   rm -f "$g" "$c"
 done
