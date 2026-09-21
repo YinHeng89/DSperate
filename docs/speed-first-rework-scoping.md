@@ -2256,6 +2256,71 @@ goal, the raster's cost stops being hidden and starts being the blocker.**
 * **Two open items that travel with the tree:** the SS3.25 write-side hazard,
   and the mlbis regression, which is unexplained rather than attributed.
 
+### 3.31 What `gpu-path` already answers for the refactor
+
+Read before the refactor starts, because two of its questions are already
+measured there and one of them is worth more than anything Phase 3 delivered.
+
+**"NEON raster into GPU dmabufs" is not a new idea — it is the landed 1x
+design.** `docs/gpu-path-scoping.md` P0.1 measured importing the frontend's
+`/dev/dma_heap/linux,cma` buffers into Vulkan: **PASS**, as storage buffers and
+as LINEAR images (`VK_EXT_image_drm_format_modifier`, explicit plane layout,
+`size = 0`), with GPU writes visible to the CPU and the display without
+`DMA_BUF_IOCTL_SYNC`, and driver pitch matching ours. `DmabufOut`/`DrmOut`
+already exist on `main`; the Vulkan import and the present compute shader are
+on `gpu-path` behind `--gpu-present`.
+
+And the 1x verdict settled the raster question the same way: **software raster
++ GPU present**, because GPU raster and software raster measured *equal* at 1x
+(15.9 against 15.6 ms of work on Spirit Tracks) and the pictures are not equal
+— the hardware rasteriser never produces the partially covered edge pixels the
+DS's AA depends on, so the triangle path has no cheap DS-exact AA. The GPU
+raster stays the opt-in route to 2x.
+
+**The number that matters: the GPU present stage is worth ~2.3 ms on Spirit
+Tracks.** Device, SDL, `--dual-window`, same binary, flag on and off, both
+orders (`work ms` = emulation + present):
+
+| scene | GPU present | CPU scaler |
+|---|---|---|
+| **Spirit Tracks** | **18.6-18.9** | **21.1** |
+| NSMB | 12.7-12.9 | 14.9-15.3 |
+| Golden Sun | 19.4-19.8 | 19.7-20.1 |
+
+That is **five times what removing the remap join delivered on the same
+scene** (-0.44 ms, SS3.28), and it is already built. *Caveat before anyone
+quotes it against our numbers:* this is the SDL frontend's `work ms`, not the
+headless `frame ms` these sections use, so the delta transfers and the absolute
+does not.
+
+**Golden Sun does not move**, and the doc says why: *"its frame is the
+emulation thread with the scaler already off it."* Which is the same conclusion
+SS3.18-SS3.29 reached from the other end. **The two over-budget scenes need
+different things: st-intro needs the present stage, gsdd needs the emulation
+thread.**
+
+**And the two-worker shape has direct support.** Measured on the device at 1x:
+Golden Sun's software raster is 19 ms of band-worker CPU a frame — *"bands 0
+and 1 at 9.5 ms each, **band 2 idle**: the scene fills the top two thirds"*,
+Spirit Tracks 17 ms. **The third band worker is already doing nothing on the
+scene that needs the most raster.** So two workers carrying the raster at
+~9.5 ms each is not a stretch target, it is roughly what happens today — which
+supports route 1 of SS3.30 (the per-screen rule governs 2D, the raster keeps
+its own split) without needing Phase 4 first.
+
+**Two more things worth taking:**
+
+* **`P0.4` — the 2D/3D composite on the GPU passes comfortably at 1x**
+  (0.43 ms throughput, 0.85 ms round trip, against a 1.5 ms gate). The
+  palette/BG/OBJ work stays on NEON. That is more CPU taken off the per-screen
+  workers, on top of the present stage.
+* **DraStic's threading has nothing to adopt.** Read in full from GammaOS's
+  runner: band pipeline kicked at scanline 214, per-band bitmask, engine B on a
+  2D worker — *"that is our software raster's shape already... there is nothing
+  in the threading to adopt."* **What differs is the cost per pixel, about
+  eight times.** So the refactor should not expect a topology win from copying
+  DraStic; the win there is Phase 4's algorithmic one.
+
 ### Phase 3 — DMA, SPU and scheduler granularity (week 4-5) — target **per scene, see below**; **STOWED at 3b, see SS3.29** — 3c/3d/3e/3f untouched
 
 **Rescoped 2026-09-21 against SS3.17's before-line, the way SS3.3 rescoped
