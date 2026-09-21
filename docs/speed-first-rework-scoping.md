@@ -1024,6 +1024,67 @@ moves when geometry arrives and the gate's alignment window absorbs exactly
 that: gsdd, dbori, mlbis and sm64 show only the differences already recorded
 for Phase 1's model, mlbis is identical, and no scene draws fewer frames.
 
+
+### 3.12 The instruction census is only valid run serially -- and what that voids
+
+Two runs of the SAME binary, Golden Sun, 900 frames, default threading:
+
+    a64.head  29,860,253,706
+    a64.head  28,884,498,240      <- 976 M apart, 3.4 %
+
+The same binary with `DS_R3D_THREADS=0 DS_2D_THREAD=0`:
+
+    3,566,577,697
+    3,566,577,317                 <- 380 apart, 0.00001 %
+
+The count includes every thread, and the band-worker count is chosen
+adaptively per frame from measured wall times, so the work partition differs
+run to run. Emulation is deterministic; the instruction count is not, unless
+the renderer is serial -- which `golden_dump.sh` has always done for the
+picture and which no census here had done for the counts.
+
+**Run every instruction census in the golden config's serial settings.** A
+single threaded pair cannot resolve anything below about 4 %.
+
+**What this voids.** Figures quoted in SS3.9-SS3.10 from single threaded pairs,
+against a 3.4 % noise floor:
+
+| claim | figure | standing |
+|---|---|---|
+| mode switch rejected (SS3.10) | +1.53 % | **void -- inside the noise** |
+| MSR SPSR kept | -2.3 % | unsupported by that measurement |
+| 1b measured (SS3.5) | -0.05 % / +0.47 % | unsupported |
+| block transfer kept | -4.33 % | marginal at best |
+
+The CONCLUSIONS may still hold -- the block transfer and MSR SPSR were also
+measured on the device at -0.09 to -0.25 ms, which is the instrument that has
+held up -- but the instruction figures behind them should not be cited. The
+mode switch has no device measurement at all: it was discarded on a number
+that cannot distinguish it from zero, and so were `LDM ^` and
+`SUBS pc, lr, #4`, which inherited the reasoning without being measured. All
+three want a device A/B before the rule in SS3.10 is allowed to stand.
+
+**Row 1.26, measured properly, is a regression.** Known-constant tracking was
+built (MOV/MVN immediates and the immediate data-processing forms folded onto
+a known register; literal-pool CONTENTS deliberately not read, since baking a
+value a later store could change would need SMC cover the block does not
+have), fuzzer-clean, byte-identical on 800 frames. On the device, three reps,
+alternating order:
+
+| scene | base | with row 1.26 | median | mean |
+|---|---|---|---|---|
+| gsdd | 21.477 | 21.734 | **+0.257** | +0.084 |
+| dbori | 11.502 | 11.611 | +0.109 | +0.052 |
+| sm64 | 9.283 | 9.385 | +0.102 | +0.088 |
+| mlbis | 12.269 | 12.352 | +0.083 | +0.060 |
+
+Worse on all four, median and mean. Reverted. The per-access saving it aims
+at is real -- four instructions and a dependent load become one immediate
+subtract -- but it fires too rarely to pay for what it costs: at 400 frames
+the block, fallback, slow-access and invalidation counters are IDENTICAL with
+and without it, so on that stretch it essentially never fires, while
+`const_step` runs at translate time for every instruction translated.
+
 ### Phase 3 — DMA, SPU and scheduler granularity (week 4-5) — target **-2.5 ms**
 
 Three small rows that together are as big as Phase 1.
