@@ -41,6 +41,13 @@ void main() {
         if (xmajor) edge |= 0x2000u | ((left != neg) ? 0x4000u : 0u);
       }
     }
+    // Edge marking alone: the flags come from the DS span but the coverage is
+    // the GPU's, and where the two disagree by a pixel the pixel drawn gets no
+    // flag (outside the span) or an interior one -- the outline went missing
+    // on whichever sides of a polygon rounded that way (Zelda's dress, Spirit
+    // Tracks). Without anti-aliasing the flags carry nothing else, so every
+    // pixel is a candidate again and the neighbour test decides, as above.
+    if ((pc.f.dispcnt & 16u) == 0u) edge = 0xFu;
   }
   o_attr = f.polyattr | edge;
   o_z = f.depth;
