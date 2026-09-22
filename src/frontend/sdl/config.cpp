@@ -321,6 +321,12 @@ R"(# DSperate settings. Command-line flags override this file. Two files next
                                 # thread dead for up to 50 ms. A scene with no slack to sleep in
                                 # wears that as a hitch about every second. This gives the same 5 %
                                 # back ~0.8 ms at a time instead. false = let the kernel take it
+# gpu_irq_avoid = true          # with realtime on and video.gpu_raster on: keep the emulator off
+                                # the CPU that services the GPU's interrupts. The Mali driver grows
+                                # its tiler heap through page faults handled by a worker on that
+                                # CPU; a real-time thread there starves it until the bandwidth cap
+                                # opens, and a GPU frame lands up to a second late. Only when a
+                                # core of equal capacity remains (big.LITTLE keeps its big cores)
 # pacing = auto                 # auto | sleep | busy: how the wait for the next frame is spent.
                                 # A governor that sets the CPU clock from how busy the last few
                                 # milliseconds looked (ondemand, conservative, powersave) reads

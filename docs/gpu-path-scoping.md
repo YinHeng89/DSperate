@@ -227,3 +227,45 @@ plane is the follow-up; the box filter / grid / bilinear / chunky tables
 are P4; nearest here is `floor(x * 256 / w)`, not the CPU's run table, so
 a run boundary can differ by a pixel (allowed on the GPU path; P4 adopts
 the tables).
+
+## GPU-side stalls: the Mali fault worker starved on CPU0 (2026-09-18, RESOLVED)
+
+A fence not signalled in 100 ms, caught three times in one run by
+`DS_GPU_STALL_PROBE=1` (which dumps this process's kbase context from
+debugfs and keeps waiting). Mid-stall: a tiler/compute atom running for
+hundreds of milliseconds, the frame's fragment atom queued behind it with no
+start time, a JIT_FREE soft job queued, JIT memory in use (the tiler heap).
+
+**The mechanism.** The Mali JM driver grows the tiler heap on demand through
+GPU page faults. The MMU interrupt and the two other GPU interrupts are
+serviced on **CPU0 only**, and the fault is completed by a kernel worker on
+that CPU. Our SCHED_RR threads saturate whichever core they land on; when
+that is CPU0 the worker runs only when the RT bandwidth cap opens — which
+gives the 0.2–0.95 s hold, the per-run bimodality (where the RT threads
+landed at start), and the same frames within a stalling run (where the heap
+grows). Content only sets the fault points.
+
+| configuration | runs | stalls |
+| --- | --- | --- |
+| baseline, RR 5, all CPUs | ~20 | ~12 runs, 0.2–0.95 s |
+| `serialize_jobs=full` (kbase) | 4 | 2 runs |
+| `emu.realtime=off` | 6 | 0 (max frame 51 ms; costs 1.5–2 ms median) |
+| RR 5, `taskset -c 1-3` | 4 | 0 (max 56 ms; median unchanged, 15.1 vs 15.2) |
+| RR 5, automatic avoidance | 4 | 0, 0, 0, one 85 ms |
+
+**Landed.** `ds::gpu_irq_cpus()` reads the CPUs servicing any gpu/mali
+interrupt from `/proc/interrupts` (effective affinity); `ds::avoid_cpus()`
+drops them from the process affinity when at least two CPUs remain and every
+dropped CPU has an equal-or-greater `cpu_capacity` among the rest, so a
+big.LITTLE device keeps its big cores. `emu.gpu_irq_avoid` (default on)
+applies it at start-up when real-time scheduling took.
+`fully_backed_gpf_memory`, the kbase parameter that would remove the faults,
+is read-only on ROCKNIX.
+
+**The gate now includes the present stage**, against the original reasoning.
+That read *"the present stage alone is a compute dispatch with no tiler and
+no page faults, and its software raster wants every core"* — and measurement
+on `speed-first` contradicted it: with present on and the raster off, two runs
+of the same binary on Golden Sun read p99 19.04 / max 25.3 and p99 41.58 /
+max 74.1, the same bimodality, while the present-off arm was metronomic
+(max 26.8 and 27.1). See the speed-first scoping doc, SS3.33.

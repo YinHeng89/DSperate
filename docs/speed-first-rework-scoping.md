@@ -684,6 +684,34 @@ spike from a defect.
 would not get it even if merged. **That is the one thing to fix before
 shipping present as the default.**
 
+**SS3.37 — The GPU-interrupt mitigation does not pay for the present stage.**
+`9781507`'s `ds::gpu_irq_cpus()` / `ds::avoid_cpus()` cherry-picked, and its
+gate widened from `video.gpu_raster` to include `video.gpu_present`. Proven to
+fire (`gpu irq avoid: off cpu 0 (GPU interrupts), on 1,2,3`) against a control
+binary from the same tree that only lacks the widened gate; all three GPU
+interrupts are serviced on CPU 0. gsdd, five reps each:
+
+| | median | p90 | **p95** | p99 | **max** | over-budget | longest burst |
+|---|---|---|---|---|---|---|---|
+| mitigation on (3 cores) | 13.9 | **24.7** | **25.3** | 26.5 | **28.8–33.5** | 31 % | 15–31 |
+| mitigation off (4 cores) | 13.6 | **17.7** | **18.2** | 23.8 | **36.8–79.6** | 30 % | 11–27 |
+
+**It works and it still loses.** Every unmitigated run carried a 36.8–79.6 ms
+frame and no mitigated run exceeded 33.5 — the stall is real and this removes
+it. But on four cores the core it costs is worth more: **p95 regresses
+7.1 ms** while the over-budget count and the longest burst are unchanged, so
+by §0's bar it is a loss. Both effects land in the loading windows (both arms
+are near-perfect in windows 6–10), which is where a spike is tolerable.
+
+**Reverted to the raster-only gate**, with the measurement in the code comment
+so it is not re-tried blind. The infrastructure is kept: the GPU raster has
+the tiler that actually faults, so it is a different trade.
+
+*Cheaper mitigations not yet tried*, if the outlier ever needs removing
+without a core: `emu.realtime=off` (gpu-path measured 0 stalls, costs
+1.5–2 ms of median everywhere), and lowering RT bandwidth so the kbase fault
+worker on CPU 0 gets a slot without the process leaving the core.
+
 **SS3.34 — What the target devices actually expose.** Probed over ssh. The
 present stage requests **Vulkan 1.1** (`vk_device.cpp` `apiVersion`, shaders
 built `--target-env vulkan1.1`); the version was never the portability
