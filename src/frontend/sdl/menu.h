@@ -175,6 +175,10 @@ public:
   // what is down now (key repeat), `ms` is elapsed time (repeat, marquee).
   Result update(u32 presses, u32 held, u32 ms);
   Result input(u32 presses) { return update(presses, 0, 0); }
+  // Pad face presses by position (Input::take_menu_faces), for the next
+  // update. With a pad, the Controls page's CLEAR and DEFAULTS are the west
+  // and north buttons whatever DS Y/X are bound to.
+  void face_presses(u32 faces) { faces_ |= faces; }
   void   draw(const Canvas& d) const;
 
   // True when the picture would differ from the last draw. The frontend
@@ -302,6 +306,8 @@ private:
   // indexes the host's binding list.
   bool bind_pad_ = false;
   int  bind_row_ = 0;
+  bool reset_armed_ = false;   // first press of DEFAULTS; the second resets the column
+  u32  faces_ = 0;
   mutable int bind_top_ = 0;
   void move_bind_row(int delta);
   void build_lines();

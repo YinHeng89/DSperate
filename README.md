@@ -122,10 +122,14 @@ hardware. No DraStic code is in this tree. See [docs/techniques](docs/techniques
 - **Controls.** Keyboard and controller remapping, controller hotkeys as
   `mod+button` chords, a stick as the d-pad or face buttons, a stick-driven
   stylus crosshair, per-axis analog remapping for pads whose sticks SDL reports
-  rotated or mirrored, and touch or mouse on the bottom screen.
+  rotated or mirrored, and touch or mouse on the bottom screen. Pad buttons are
+  read by position (SDL's a/b/x/y as south/east/west/north), which the menu
+  shows as position pips; if a pip doesn't match the button pressed, the
+  controller's SDL mapping is wrong and should be fixed there
+  (`SDL_GAMECONTROLLERCONFIG`), not by rebinding.
 - **Config.** An INI in `~/.config/dsperate/` with every key commented, per-game
-  override files by ROM name or game code, and ready-made profiles in
-  [configs/](configs/) (melonDS-like, DraStic-like, Knulli "Advanced DraStic").
+  override files by ROM name or game code; [configs/default.ini](configs/default.ini)
+  is the full default file.
 
 ### Display
 

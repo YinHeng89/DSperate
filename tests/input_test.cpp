@@ -249,6 +249,71 @@ void test_reachable_counts_every_way_in() {
     CHECK(w[0].find("UNREACHABLE") != std::string::npos); }
 }
 
+// A hotkey on DS A's own control used to hide it from the menu too, so a
+// stray unmodified screenshot = A locked the player out. In the menu only
+// Pause and Quit still fire; those two (and the modifier) stay a real lockout.
+void test_hotkey_cannot_hide_a_from_the_menu() {
+  constexpr u32 kA = 1u << B::BTN_A;
+  { Rig r; Input& in = r.set("keys.a", "X").set("hotkeys.screenshot", "X").go();
+    T::tap_key(in, SDLK_x);
+    CHECK(in.take_actions().size() == 1);             // in game the hotkey wins
+    CHECK(in.take_menu_presses() == 0);
+    in.set_menu_open(true);
+    T::tap_key(in, SDLK_x);
+    CHECK(in.take_actions().empty());                 // in the menu, A does
+    CHECK(in.take_menu_presses() == kA);
+    CHECK(T::reachable(in, B::BTN_A)); }
+  { Rig r; Input& in = r.set("keys.a", "X").set("keys.start", "none").set("keys.select", "Return").set("hotkeys.pause", "X").go();
+    CHECK(!T::reachable(in, B::BTN_A));
+    CHECK(in.collisions()[0].find("UNREACHABLE") != std::string::npos); }
+}
+
+// Face presses by position reach the menu whatever they're bound to, and only
+// while it is open.
+void test_menu_faces_ignore_bindings() {
+  Rig r; Input& in = r.set("pad.x", "a").set("pad.y", "b").go();
+  T::tap_pad(in, SDL_CONTROLLER_BUTTON_Y);
+  CHECK(in.take_menu_faces() == 0);
+  in.set_menu_open(true);
+  T::tap_pad(in, SDL_CONTROLLER_BUTTON_Y);
+  T::tap_pad(in, SDL_CONTROLLER_BUTTON_X);
+  CHECK(in.take_menu_faces() == ((1u << 3) | (1u << 2)));
+  CHECK(in.take_menu_faces() == 0);
+}
+
+// "mod" alone: the modifier released with nothing else pressed while it was
+// held fires that hotkey; any other press in between makes it a chord run.
+void test_modifier_alone_is_a_hotkey() {
+  using SB = SDL_GameControllerButton;
+  const auto only = [](Input& in, Action a) { const std::vector<Action> v = in.take_actions(); return v.size() == 1 && v[0] == a; };
+  { Rig r; Input& in = r.set("padhotkeys.modifier", "guide").set("padhotkeys.pause", "mod").set("padhotkeys.quit", "mod+start").go();
+    T::tap_pad(in, SDL_CONTROLLER_BUTTON_GUIDE);
+    CHECK(only(in, Action::Pause));
+    T::pad(in, SDL_CONTROLLER_BUTTON_GUIDE, true);
+    T::tap_pad(in, SDL_CONTROLLER_BUTTON_START);
+    T::pad(in, SDL_CONTROLLER_BUTTON_GUIDE, false);
+    CHECK(in.quit() && in.take_actions().empty());          // the chord, and no pause on the modifier's release
+    T::pad(in, SDL_CONTROLLER_BUTTON_GUIDE, true);
+    T::tap_pad(in, static_cast<SB>(SDL_CONTROLLER_BUTTON_DPAD_UP));
+    T::pad(in, SDL_CONTROLLER_BUTTON_GUIDE, false);
+    CHECK(in.take_actions().empty()); }                     // a DS button counts as a press too
+  { Rig r; Input& in = r.set("hotkeys.modifier", "Left Ctrl").set("hotkeys.pause", "mod").go();
+    T::tap_key(in, SDLK_LCTRL);
+    CHECK(only(in, Action::Pause)); }
+  // Held actions can't fire on release: refused.
+  { Rig r; Input& in = r.set("padhotkeys.modifier", "guide").set("padhotkeys.fast_forward", "mod").go();
+    T::tap_pad(in, SDL_CONTROLLER_BUTTON_GUIDE);
+    CHECK(in.take_actions().empty() && !in.fast_forward_held()); }
+  // It takes the lone press from a DS button on the modifier, and says so.
+  { Rig r; Input& in = r.set("padhotkeys.modifier", "guide").set("pad.x", "guide").set("padhotkeys.pause", "mod").go();
+    T::tap_pad(in, SDL_CONTROLLER_BUTTON_GUIDE);
+    CHECK(only(in, Action::Pause));
+    CHECK(in.take_menu_presses() == 0);
+    bool said = false;
+    for (const std::string& w : in.collisions()) said |= w.find("HIDES PAD") != std::string::npos;
+    CHECK(said); }
+}
+
 // The pen follows a stick, not one of its two axes, so the Controls page
 // stores which stick the player pushed rather than the axis event it saw.
 void test_stylus_axis_reads_the_stick() {
@@ -454,6 +519,9 @@ int main() {
   ds::sdl::test_pad_capture_swallows_keys_and_escape_cancels();
   ds::sdl::test_capture_composes_a_chord_with_the_modifier();
   ds::sdl::test_reachable_counts_every_way_in();
+  ds::sdl::test_hotkey_cannot_hide_a_from_the_menu();
+  ds::sdl::test_menu_faces_ignore_bindings();
+  ds::sdl::test_modifier_alone_is_a_hotkey();
   ds::sdl::test_keyboard_capture_backs_out_on_pad_input();
   ds::sdl::test_stylus_axis_reads_the_stick();
   ds::sdl::test_extra_defaults_match_configure();

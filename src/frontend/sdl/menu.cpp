@@ -398,7 +398,7 @@ Menu::Result Menu::update(u32 presses, u32 held, u32 ms) {
   using B = io::Io::Button;
   const int was_row = list_row();
   const int before = marquee_offset(marquee_overflow_);
-  if (presses) dirty_ = true;
+  if (presses || faces_) dirty_ = true;
 
   // Key repeat on list pages only; other pages are a handful of rows where a
   // held direction would overshoot more often than it helps.
@@ -423,6 +423,7 @@ Menu::Result Menu::update(u32 presses, u32 held, u32 ms) {
   }
 
   const Result r = handle(presses);
+  faces_ = 0;
 
   // A name only scrolls once the selection has settled on it.
   if (list_row() != was_row) marquee_ms_ = 0;
@@ -1020,6 +1021,7 @@ Menu::Result Menu::handle_options(u32 presses) {
     bind_pad_ = host_->has_pad();
     bind_row_ = 0;
     bind_top_ = 0;
+    reset_armed_ = false;
     return Result::None;
   }
   // Land on something selectable: the first row of a page can be switched off.
@@ -1191,6 +1193,20 @@ Menu::Result Menu::handle_controls(u32 presses) {
     }
     return Result::None;
   }
+  // With a pad, CLEAR and DEFAULTS are the west and north buttons by position,
+  // so rebinding DS Y/X on this page can't move them. Keyboard has no
+  // positions: DS Y/X as bound.
+  const bool pad = host_->has_pad();
+  const bool clear = pad ? (faces_ >> 2) & 1 : hit(B::BTN_Y);
+  const bool reset = pad ? (faces_ >> 3) & 1 : hit(B::BTN_X);
+  // DEFAULTS wipes the whole column, so it takes a second press; any other
+  // press backs out and does only that.
+  if (reset_armed_ && (presses || faces_)) {
+    reset_armed_ = false;
+    dirty_ = true;
+    if (reset) host_->reset_bindings(bind_pad_);
+    return Result::None;
+  }
   if (hit(B::BTN_UP))   move_bind_row(-1);
   if (hit(B::BTN_DOWN)) move_bind_row(+1);
   // Shoulders swap columns rather than paging (list is short, two columns).
@@ -1202,12 +1218,12 @@ Menu::Result Menu::handle_controls(u32 presses) {
   // A alone opens a capture: START may be the control being bound, so it
   // cannot also be the opener.
   if (hit(B::BTN_A)) host_->begin_capture(bind_pad_);
-  // Y clears a binding: no key press means "no key".
-  if (hit(B::BTN_Y)) {
+  // CLEAR: no key press means "no key".
+  if (clear) {
     const SettingsHost::Binding b = host_->binding(bind_pad_, bind_row_);
     if (!b.key.empty()) host_->bind(b.key, "none");
   }
-  if (hit(B::BTN_X)) host_->reset_bindings(bind_pad_);
+  if (reset) { reset_armed_ = true; dirty_ = true; }
   if (hit(B::BTN_B)) pop();
   return Result::None;
 }
@@ -1252,10 +1268,13 @@ void Menu::draw_controls(const Canvas& d) const {
   fill_rect(d, f.px0 + m.pad, foot_y, f.w - 2 * m.pad, std::max(1, m.list_s), kPanelEdgeDim);
   // Footer names DS buttons by position pip, since the pad in hand may print
   // different letters on the same four buttons.
-  const char* help1 = listening ? "PRESS THE CONTROL TO BIND," : "\x02 BIND   \x03 CLEAR   \x04 DEFAULTS";
+  const bool pad = host_->has_pad();
+  const char* help1 = listening ? "PRESS THE CONTROL TO BIND,"
+                    : reset_armed_ ? (pad ? "\x04 AGAIN: RESET ALL" : "X AGAIN: RESET ALL")
+                    : pad ? "\x02 BIND   \x03 CLEAR   \x04 DEFAULTS" : "A BIND   Y CLEAR   X DEFAULTS";
   const char* help2 = listening ? "OR ESCAPE TO CANCEL"
                     : host_->has_pad() ? "L/R KEYBOARD OR PAD" : "L/R SWAP COLUMN";
-  draw_text(d, f.text_x, foot_y + 2 * m.list_s, m.list_s, kDim, fit(help1, m.list_s, f.avail).c_str());
+  draw_text(d, f.text_x, foot_y + 2 * m.list_s, m.list_s, reset_armed_ && !listening ? kDanger : kDim, fit(help1, m.list_s, f.avail).c_str());
   draw_text(d, f.text_x, foot_y + 2 * m.list_s + m.list_row_h, m.list_s, kDim, fit(help2, m.list_s, f.avail).c_str());
   const std::vector<std::string> clash = host_->collisions();
   if (!clash.empty())

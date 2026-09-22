@@ -1275,10 +1275,45 @@ void test_controls_binding() {
   CHECK(h.writes.back() == "keys.k1");
   CHECK(h.kv["keys.k1"] == "J");
   CHECK(!h.capturing());
-  // Y clears the row it is on; X puts the column back.
+  // Y clears the row it is on; X twice puts the column back.
   m.input(press(B::BTN_Y));
   CHECK(h.kv["keys.k1"] == "none");
+  m.input(press(B::BTN_X));                                    // armed only
+  CHECK(h.writes.back() != "reset");
+  m.input(press(B::BTN_DOWN));                                 // backs out, doesn't move
+  CHECK(h.writes.back() != "reset");
   m.input(press(B::BTN_X));
+  m.input(press(B::BTN_X));
+  CHECK(h.writes.back() == "reset");
+}
+
+// With a pad, CLEAR and DEFAULTS are the west and north buttons by position:
+// rebinding DS Y/X can't move them, so a DS X press does nothing here.
+void test_controls_clear_and_reset_are_positional_on_a_pad() {
+  constexpr u32 kWest = 1u << 2, kNorth = 1u << 3;
+  FakeHost h;
+  h.pad = true;
+  Menu m;
+  m.set_settings_host(&h);
+  m.set_open(true);
+  for (int i = 0; i < 3; ++i) m.input(press(B::BTN_DOWN));
+  m.input(press(B::BTN_A));                                    // Options
+  for (int i = 0; i < 3; ++i) m.input(press(B::BTN_DOWN));     // CONTROLS
+  m.input(press(B::BTN_A));
+  h.kv["pad.k0"] = "b";
+  m.input(press(B::BTN_Y));                                    // bound DS Y: ignored
+  m.input(press(B::BTN_X));
+  m.input(press(B::BTN_X));
+  CHECK(h.kv["pad.k0"] == "b");
+  CHECK(h.writes.empty() || h.writes.back() != "reset");
+  m.face_presses(kWest);
+  m.input(0);
+  CHECK(h.kv["pad.k0"] == "none");
+  m.face_presses(kNorth);
+  m.input(0);
+  CHECK(h.writes.back() != "reset");                           // armed only
+  m.face_presses(kNorth);
+  m.input(0);
   CHECK(h.writes.back() == "reset");
 }
 
@@ -1557,6 +1592,7 @@ int main() {
   test_disabled_row_does_not_step();
   test_commit_on_closing();
   test_controls_binding();
+  test_controls_clear_and_reset_are_positional_on_a_pad();
   test_controls_list_can_shrink();
   test_controls_repaints_when_a_capture_is_cancelled();
   test_controls_opens_on_the_pad();

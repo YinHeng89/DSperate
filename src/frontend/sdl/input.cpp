@@ -99,6 +99,7 @@ const char* action_name(Action a) { return kActionNames[static_cast<int>(a)]; }
 
 Input::Bind Input::parse_key(const std::string& s0) {
   Bind b;
+  if (s0 == "mod") { b.kind = Bind::ModAlone; return b; }
   std::string s = s0;
   if (s.compare(0, 4, "mod+") == 0) { b.mod = true; s = s.substr(4); }
   if (s.empty() || s == "none") return b;
@@ -110,6 +111,7 @@ Input::Bind Input::parse_key(const std::string& s0) {
 
 Input::Bind Input::parse_pad(const std::string& s0) {
   Bind b;
+  if (s0 == "mod") { b.kind = Bind::ModAlone; return b; }
   std::string s = s0;
   if (s.compare(0, 4, "mod+") == 0) { b.mod = true; s = s.substr(4); }
   if (s.empty() || s == "none" || s == "null") return b;
@@ -180,6 +182,36 @@ void Input::configure(const Config& cfg) {
   if (pad_mod_.kind == Bind::PadButton)
     for (int i = 0; i < static_cast<int>(B::BTN_COUNT); ++i)
       if (pad_map_[i].kind == Bind::PadButton && pad_map_[i].code == pad_mod_.code) pad_mod_button_ = i;
+  // "mod" alone: hotkeys only, one-shot actions only, one per device.
+  for (int i = 0; i < static_cast<int>(B::BTN_COUNT); ++i) {
+    for (Bind* b : {&key_map_[i], &pad_map_[i]})
+      if (b->kind == Bind::ModAlone) {
+        std::fprintf(stderr, "config: %s = mod: only a hotkey can be the modifier alone\n", kButtonNames[i]);
+        *b = Bind{};
+      }
+  }
+  key_mod_alone_ = pad_mod_alone_ = -1;
+  for (int a = 0; a < static_cast<int>(Action::Count); ++a)
+    for (int sl = 0; sl < HOT_SLOTS; ++sl)
+      for (const bool pad : {false, true}) {
+        Bind& b = pad ? pad_hot_[a][sl] : key_hot_[a][sl];
+        if (b.kind != Bind::ModAlone) continue;
+        const char* sec = pad ? "padhotkeys" : "hotkeys";
+        int& slot = pad ? pad_mod_alone_ : key_mod_alone_;
+        if (is_hold(static_cast<Action>(a))) {
+          std::fprintf(stderr, "config: %s.%s%s = mod: a held action can't fire on release\n", sec, kActionNames[a], hot_suffix(sl));
+          b = Bind{};
+        } else if (slot >= 0) {
+          std::fprintf(stderr, "config: %s.%s%s = mod: already %s.%s; only that one will fire\n", sec, kActionNames[a], hot_suffix(sl), sec, kActionNames[slot]);
+          b = Bind{};
+        } else slot = a;
+      }
+  if (key_mod_alone_ >= 0 && key_mod_.kind == Bind::None)
+    std::fprintf(stderr, "config: hotkeys.%s = mod, but hotkeys.modifier is none\n", kActionNames[key_mod_alone_]);
+  if (pad_mod_alone_ >= 0 && pad_mod_.kind == Bind::None)
+    std::fprintf(stderr, "config: padhotkeys.%s = mod, but padhotkeys.modifier is none\n", kActionNames[pad_mod_alone_]);
+  if (pad_mod_alone_ >= 0 && pad_mod_button_ >= 0)
+    std::fprintf(stderr, "config: padhotkeys.%s = mod takes the modifier's lone press from pad.%s\n", kActionNames[pad_mod_alone_], kButtonNames[pad_mod_button_]);
   {
     // stylus_axis: right (default) | left | none; stylus_stick = false is old spelling of none.
     const std::string ax = cfg.str("pad.stylus_axis", stylus_axis_default(cfg));
@@ -324,11 +356,20 @@ void Input::fire(Action a, bool down) {
 
 // Keyboard: hotkeys first (with the modifier when bound), then DS buttons.
 bool Input::key_down(SDL_Keycode k, bool down) {
-  if (key_mod_.kind == Bind::Key && key_mod_.code == k) { key_mod_down_ = down; return true; }
+  if (key_mod_.kind == Bind::Key && key_mod_.code == k) {
+    if (down) { key_mod_down_ = true; key_mod_used_ = false; }
+    else {
+      key_mod_down_ = false;
+      if (!key_mod_used_ && key_mod_alone_ >= 0 && hotkey_live(static_cast<Action>(key_mod_alone_), true)) fire(static_cast<Action>(key_mod_alone_), true);
+    }
+    return true;
+  }
+  if (down && key_mod_down_) key_mod_used_ = true;
   for (int i = 0; i < static_cast<int>(Action::Count) * HOT_SLOTS; ++i) {
     const Bind& b = key_hot_[i / HOT_SLOTS][i % HOT_SLOTS];
     if (b.kind != Bind::Key || b.code != k || (b.mod && !key_mod_down_)) continue;
     const Action a = static_cast<Action>(i / HOT_SLOTS);
+    if (!hotkey_live(a, down)) continue;
     if (a == Action::FastForward) ff_key_ = down;
     else if (a == Action::Mic) mic_key_ = down;
     else fire(a, down);
@@ -370,6 +411,9 @@ void Input::menu_fallback_key(SDL_Keycode k, bool down) {
 
 // Controller: `b` is the button or axis edge that just changed.
 bool Input::pad_down(const Bind& b, bool down) {
+  if (menu_open_ && down && b.kind == Bind::PadButton && b.code <= SDL_CONTROLLER_BUTTON_Y) menu_faces_ |= 1u << b.code;
+  // Anything else pressed under the modifier means it wasn't alone.
+  if (down && pad_mod_down_ && !(b.kind == pad_mod_.kind && b.code == pad_mod_.code)) pad_mod_used_ = true;
   auto same = [&](const Bind& x) { return x.kind == b.kind && x.code == b.code && (x.kind != Bind::PadAxis || x.neg == b.neg); };
   if (b.kind == Bind::PadButton) { if (down) held_ |= 1u << b.code; else held_ &= ~(1u << b.code); }
   // Tap button and d-pad chord yield to the pad modifier: mod+<tap button>
@@ -408,8 +452,10 @@ bool Input::pad_down(const Bind& b, bool down) {
     if (down) { pad_mod_down_ = true; pad_mod_used_ = false; }
     else {
       pad_mod_down_ = false;
-      // Released alone: doubles as its button for one frame.
-      if (!pad_mod_used_ && pad_mod_button_ >= 0) pressed_ |= 1u << pad_mod_button_;
+      // Released alone: the "mod" hotkey if there is one, else its button for one frame.
+      if (!pad_mod_used_ && pad_mod_alone_ >= 0) {
+        if (hotkey_live(static_cast<Action>(pad_mod_alone_), true)) fire(static_cast<Action>(pad_mod_alone_), true);
+      } else if (!pad_mod_used_ && pad_mod_button_ >= 0) pressed_ |= 1u << pad_mod_button_;
     }
     return true;
   }
@@ -418,6 +464,7 @@ bool Input::pad_down(const Bind& b, bool down) {
   for (int i = 0; i < static_cast<int>(Action::Count) * HOT_SLOTS; ++i) {
     const Bind& h = pad_hot_[i / HOT_SLOTS][i % HOT_SLOTS];
     if (h.kind == Bind::None || (h.mod && !pad_mod_down_)) continue;
+    if (!hotkey_live(static_cast<Action>(i / HOT_SLOTS), down)) continue;
     const bool own = same(h) && (h.with < 0 || (held_ >> h.with) & 1);
     const bool partner = h.with >= 0 && b.kind == Bind::PadButton && b.code == h.with && h.kind == Bind::PadButton && ((held_ >> h.code) & 1);
     if (!own && !partner) continue;
@@ -706,15 +753,29 @@ bool Input::bound_and_present(int ds_button) const {
 #endif
 }
 
+bool Input::shadowed_in_menu(int ds_button) const {
+  const Bind& b = pad_ ? pad_map_[ds_button] : key_map_[ds_button];
+  const auto on = [&](const Bind& x) {
+    return x.kind != Bind::None && x.kind == b.kind && x.code == b.code && (x.kind != Bind::PadAxis || x.neg == b.neg);
+  };
+  if (on(pad_ ? pad_mod_ : key_mod_) && !(pad_ && pad_mod_button_ == ds_button && pad_mod_alone_ < 0)) return true;   // a pad modifier released alone presses it, unless "mod" is a hotkey
+  for (const Action a : {Action::Pause, Action::Quit})
+    for (int sl = 0; sl < HOT_SLOTS; ++sl) {
+      const Bind& h = pad_ ? pad_hot_[static_cast<int>(a)][sl] : key_hot_[static_cast<int>(a)][sl];
+      if (on(h) && !h.mod && h.with < 0) return true;
+    }
+  return false;
+}
+
 bool Input::reachable(int ds_button) const {
-  if (bound_and_present(ds_button)) return true;
+  if (bound_and_present(ds_button) && !shadowed_in_menu(ds_button)) return true;
   // The menu's own fallback also counts as a way to press it.
   if (ds_button == B::BTN_A && (pad_ ? pad_control_free(SDL_CONTROLLER_BUTTON_B) : key_control_free(SDLK_RETURN))) return true;
   if (ds_button == B::BTN_B && (pad_ ? pad_control_free(SDL_CONTROLLER_BUTTON_A) : key_control_free(SDLK_ESCAPE))) return true;
   // START confirms on every page but this one, so it's still a way in to the
   // reset page; not offered for B, whose way out is the pause hotkey.
   if (ds_button == B::BTN_A)
-    return bound_and_present(B::BTN_START) || (pad_ && pad_control_free(SDL_CONTROLLER_BUTTON_START));
+    return (bound_and_present(B::BTN_START) && !shadowed_in_menu(B::BTN_START)) || (pad_ && pad_control_free(SDL_CONTROLLER_BUTTON_START));
   return false;
 }
 
@@ -723,7 +784,7 @@ std::vector<std::string> Input::collisions() const {
   // First: this one cannot be recovered from without a text editor.
   for (const int i : {static_cast<int>(B::BTN_A), static_cast<int>(B::BTN_B)})
     if (!reachable(i))
-      out.push_back(std::string(kButtonNames[i]) + " IS UNREACHABLE; X RESETS");
+      out.push_back(std::string(kButtonNames[i]) + (pad_ ? " IS UNREACHABLE; \x04 TWICE RESETS" : " IS UNREACHABLE; X TWICE RESETS"));
   const auto same = [](const Bind& a, const Bind& b) {
     return a.kind != Bind::None && a.kind == b.kind && a.code == b.code &&
            a.neg == b.neg && a.mod == b.mod && a.with == b.with;
@@ -734,6 +795,8 @@ std::vector<std::string> Input::collisions() const {
       if (same(key_map_[i], key_map_[j])) out.push_back(std::string(kButtonNames[i]) + " AND " + kButtonNames[j] + " SHARE A KEY");
       if (same(pad_map_[i], pad_map_[j])) out.push_back(std::string(kButtonNames[i]) + " AND " + kButtonNames[j] + " SHARE A BUTTON");
     }
+  if (pad_mod_alone_ >= 0 && pad_mod_button_ >= 0)
+    out.push_back(std::string(kActionNames[pad_mod_alone_]) + " HIDES PAD " + kButtonNames[pad_mod_button_]);
   // A hotkey on the same control as a DS button: hotkey tried first, button dead.
   for (int a = 0; a < static_cast<int>(Action::Count); ++a)
     for (int i = 0; i < static_cast<int>(B::BTN_COUNT); ++i) {

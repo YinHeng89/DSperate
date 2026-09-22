@@ -531,9 +531,15 @@ bool load_state_file(NDS& nds, const std::string& path, ds::sdl::Display::Layout
 
 // Game library for the loader cart's picker. Row title is the filename
 // without extension (the ROM header's 12-byte title is often cryptic).
-// NAND title shortcuts: paths.dsi_shortcuts, or the games folder if unset.
+// paths.dsi_games; paths.dsi_shortcuts is its old name.
+std::string dsi_games_dir(const ds::sdl::Config& cfg) {
+  const std::string d = cfg.str("paths.dsi_games");
+  return d.empty() ? cfg.str("paths.dsi_shortcuts") : d;
+}
+
+// NAND title shortcuts: paths.dsi_games, or the games folder if unset.
 std::string shortcuts_dir(const ds::sdl::Config& cfg) {
-  const std::string d = cfg.str("paths.dsi_shortcuts");
+  const std::string d = dsi_games_dir(cfg);
   return d.empty() ? cfg.str("paths.games") : d;
 }
 
@@ -572,7 +578,7 @@ std::vector<ds::sdl::Menu::GameEntry> enumerate_games(const std::string& dir) {
 // Games folder plus the shortcut folder's titles when that's elsewhere.
 std::vector<ds::sdl::Menu::GameEntry> enumerate_library(const ds::sdl::Config& cfg) {
   std::vector<ds::sdl::Menu::GameEntry> games = enumerate_games(cfg.str("paths.games"));
-  const std::string sc = cfg.str("paths.dsi_shortcuts");
+  const std::string sc = dsi_games_dir(cfg);
   if (sc.empty() || sc == cfg.str("paths.games")) return games;
   for (ds::sdl::Menu::GameEntry& g : enumerate_games(sc))
     if (ds::io::is_shortcut_name(g.path)) games.push_back(std::move(g));
@@ -1466,6 +1472,11 @@ static int run(int argc, char** argv) {
   const std::string audio_driver = cfg.str("audio.driver", "pipewire");
   const bool driver_forced = std::getenv("SDL_AUDIODRIVER") != nullptr;
   if ((init & SDL_INIT_AUDIO) && !driver_forced && !audio_driver.empty()) setenv("SDL_AUDIODRIVER", audio_driver.c_str(), 1);
+#ifdef SDL_HINT_GAMECONTROLLER_USE_BUTTON_LABELS
+  // Pad a/b/x/y are positions (south/east/west/north) everywhere: bindings
+  // and the menu's pips assume it. SDL2 otherwise uses labels on Nintendo pads.
+  SDL_SetHint(SDL_HINT_GAMECONTROLLER_USE_BUTTON_LABELS, "0");
+#endif
   if (SDL_Init(init) != 0) {
     if ((init & SDL_INIT_AUDIO) && !driver_forced && !audio_driver.empty()) {
       unsetenv("SDL_AUDIODRIVER");
@@ -1912,7 +1923,7 @@ sdl_ready:
   // paths.dsi_nand while on, none while off. Refreshed at every start and
   // when the row is toggled. Reads its own NAND copy; session's untouched.
   auto sync_nand_shortcuts = [&](bool on) -> std::string {
-    // A folder paths.dsi_shortcuts has since moved away from keeps its
+    // A folder paths.dsi_games has since moved away from keeps its
     // shortcuts; only the currently-named folder is updated or cleared.
     const std::string dir = shortcuts_dir(cfg);
     if (dir.empty()) return "NO SHORTCUT FOLDER";
@@ -2238,6 +2249,14 @@ sdl_ready:
         if (!stick) return;
         value = stick;
       }
+      // The modifier captured on its own for a hotkey row is "mod" alone: its
+      // own name there would be a hotkey the modifier always swallows.
+      {
+        const bool pad_hot = key.compare(0, 11, "padhotkeys.") == 0, key_hot = key.compare(0, 8, "hotkeys.") == 0;
+        if ((pad_hot || key_hot) && key != "padhotkeys.modifier" && key != "hotkeys.modifier" &&
+            value == cfg.str(pad_hot ? "padhotkeys.modifier" : "hotkeys.modifier", ds::sdl::Input::mod_default(pad_hot)))
+          value = "mod";
+      }
       // A modifier can't be built on itself, nor can the pen's tap.
       if ((key == "hotkeys.modifier" || key == "padhotkeys.modifier" ||
            key == "pad.stylus_button" || key == "pad.stylus_button.alt" || key == "pad.stylus_dpad") &&
@@ -2411,7 +2430,7 @@ sdl_ready:
       case ds::sdl::Dep::NetSession:
         return (net_live && *net_live) ? "NOT DURING A NETWORK SESSION" : "";
       case ds::sdl::Dep::ShortcutsPath:
-        return shortcuts_dir(cfg).empty() ? "NEEDS PATHS.DSI_SHORTCUTS OR PATHS.GAMES" : "";
+        return shortcuts_dir(cfg).empty() ? "NEEDS PATHS.DSI_GAMES OR PATHS.GAMES" : "";
       case ds::sdl::Dep::GpuRaster:
         return flag("video.gpu_raster", false) ? "" : "ONLY WITH GPU 3D RASTER ON";
       case ds::sdl::Dep::GpuPath:
@@ -3076,6 +3095,7 @@ sdl_ready:
       const u32 elapsed = static_cast<u32>(now_ms - menu_ms);
       menu_ms = now_ms;
       if (host.capturing()) menu_dirty = true;   // shows "PRESS ANY..." until collected
+      menu.face_presses(input.take_menu_faces());
       switch (menu.update(input.take_menu_presses(), input.menu_held(), elapsed)) {
       case Menu::Result::None: break;
       case Menu::Result::Resume:
@@ -3159,6 +3179,7 @@ sdl_ready:
   };
   while (!input.quit() && !g_signalled && (frame_limit == 0 || frames < static_cast<u64>(frame_limit))) {
     SDL_Event e;
+    input.set_menu_open(menu.open());
     while (SDL_PollEvent(&e)) input.handle(e, display, dual_window ? &display2 : nullptr);
     for (ds::sdl::Action a : input.take_actions()) {
       using A = ds::sdl::Action;

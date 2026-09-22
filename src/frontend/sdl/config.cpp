@@ -194,9 +194,9 @@ R"(# DSperate settings. Command-line flags override this file. Two files next
 # games = /path/to/games        # the library the loader card lists on a firmware boot (.nds and .zip,
                                 # one level; DSiWare .nds/.dsi/.srl/.cia too, zipped or not, marked
                                 # [DSi]). Unset, the picker says so.
-# dsi_shortcuts = /path/to/folder  # where [emu] dsi_nand_shortcuts keeps its .dspr.nds files, e.g. a
-                                # frontend's own DSiWare folder. Unset: games above. The loader card
-                                # lists the shortcuts from here too
+# dsi_games = /path/to/folder   # the DSi games folder (e.g. a frontend's own DSiWare folder): where
+                                # [emu] dsi_nand_shortcuts keeps its .dspr.nds files. Unset: games
+                                # above. The loader card lists the shortcuts from here too
 # saves = /path/to/saves        # battery saves. Default: next to the ROM
 # states = /path/to/states      # save states (and the autosave's PNG). Default: next to the ROM
 # screenshots = /path/to/shots  # the screenshot hotkey. Default: the states directory
@@ -342,7 +342,7 @@ R"(# DSperate settings. Command-line flags override this file. Two files next
                                 # SIGTERM, not SIGKILL. Resume with autoload below (or --load-state
                                 # <that path>); the slot never shows in the menu. Skipped during a
                                 # replay or recording
-# dsi_nand_shortcuts = false    # a <title>.dspr.nds file in paths.dsi_shortcuts (else paths.games) for
+# dsi_nand_shortcuts = false    # a <title>.dspr.nds file in paths.dsi_games (else paths.games) for
                                 # each DSiWare title on paths.dsi_nand, named in plain ASCII (a FAT
                                 # card may take nothing else): opening one starts the title straight from the NAND
                                 # (its saves and settings), skipping the DSi Menu and its slow load.
@@ -453,6 +453,8 @@ R"(# DSperate settings. Command-line flags override this file. Two files next
 # load_state slot_next slot_prev volume_up volume_down mute layout_next
 # layout_prev screen_swap pip_corner_next fullscreen screenshot lid mic (held) fps. A value is a key name, or
 # "mod+name" meaning the modifier must be held with it; "none" unbinds.
+# "mod" alone fires when the modifier is released with nothing else pressed
+# while it was held (pause = mod, quit = mod+start); one-shot actions only.
 # Every action also takes a second control, "<action>.alt" (pause.alt = F1,
 # padhotkeys.lid.alt = mod+dpup), which fires the same action; it is unset
 # unless you set it. DS buttons have one binding each.
@@ -481,7 +483,8 @@ R"(# DSperate settings. Command-line flags override this file. Two files next
 
 # The same on the controller. The modifier is the pad's mode/home button
 # ("guide"); if it doubles as a DS button it is withheld from the game
-# while held and delivered as a tap when released alone. A chord
+# while held and delivered as a tap when released alone, unless a hotkey
+# is "mod". A chord
 # "mod+start+back" needs both buttons (SDL calls the DS Select "back").
 [padhotkeys]
 # modifier = guide

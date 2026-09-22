@@ -54,6 +54,13 @@ public:
   }
   // What is held right now, for the menu's key repeat (unlike the edges above).
   u32 menu_held() const { return buttons_ | stick_ | menu_fb_held_; }
+  // While the menu is open only Pause and Quit hotkeys fire, so a hotkey that
+  // shares a control with a DS button can't hide that button from the menu.
+  void set_menu_open(bool on) { menu_open_ = on; if (!on) menu_faces_ = 0; }
+  // Pad face buttons pressed while the menu is open, by SDL position and
+  // regardless of bindings: bit n = SDL_CONTROLLER_BUTTON n (south, east,
+  // west, north). Controls-page actions that must not move when rebound.
+  u32 take_menu_faces() { const u32 f = menu_faces_; menu_faces_ = 0; return f; }
   bool fast_forward_held() const { return ff_key_ || ff_pad_; }
 
   // A real lid switch (lid.h) drives set_lid() directly; the `lid` hotkey
@@ -133,7 +140,8 @@ private:
   // One binding: a keyboard key, a pad button or a pad axis direction, with
   // or without the modifier. `with` is a second pad button that must be held
   // (a chord); the most specific matching binding wins.
-  struct Bind { enum Kind : u8 { None, Key, PadButton, PadAxis } kind = None; int code = 0; bool neg = false; bool mod = false; int with = -1; };
+  // ModAlone: a hotkey of just "mod", fired when the modifier is released with nothing pressed while it was held.
+  struct Bind { enum Kind : u8 { None, Key, PadButton, PadAxis, ModAlone } kind = None; int code = 0; bool neg = false; bool mod = false; int with = -1; };
   static Bind parse_key(const std::string& s);
   static Bind parse_pad(const std::string& s);
 
@@ -144,6 +152,8 @@ private:
   void warn_collisions() const;   // bindings that shadow one another, at configure time
   bool reachable(int ds_button) const;   // is there a control for it on the hardware in hand?
   bool bound_and_present(int ds_button) const;   // bound to a control this hardware has
+  bool hotkey_live(Action a, bool down) const { return !down || !menu_open_ || a == Action::Pause || a == Action::Quit; }
+  bool shadowed_in_menu(int ds_button) const;    // its control is the modifier or an unmodified Pause/Quit hotkey
   bool pad_control_free(int sdl_button) const;   // nothing bound to it, so the menu fallback has it
   bool key_control_free(SDL_Keycode k) const;
   void fire(Action a, bool down);
@@ -187,7 +197,8 @@ private:
   Bind key_hot_[static_cast<int>(Action::Count)][HOT_SLOTS];
   Bind pad_hot_[static_cast<int>(Action::Count)][HOT_SLOTS];
   Bind key_mod_, pad_mod_;
-  bool key_mod_down_ = false, pad_mod_down_ = false, pad_mod_used_ = false;
+  bool key_mod_down_ = false, key_mod_used_ = false, pad_mod_down_ = false, pad_mod_used_ = false;
+  int  key_mod_alone_ = -1, pad_mod_alone_ = -1;   // the action bound to "mod" alone, or -1
   int  pad_mod_button_ = -1;   // the DS button the pad modifier would otherwise be
   bool axis_state_[SDL_CONTROLLER_AXIS_MAX][2] = {};   // per axis: - and + past the threshold
   int  axis_src_[SDL_CONTROLLER_AXIS_MAX] = {0, 1, 2, 3, 4, 5};   // pad.axis_<name>: the physical axis feeding it, -1 none
@@ -214,6 +225,8 @@ private:
   int  stylus_hide_ = 90, stylus_idle_ = 1 << 30;   // frames without movement or a touch; starts hidden
   std::vector<Action> actions_;
   bool capturing_ = false, capture_pad_ = false;
+  bool menu_open_ = false;
+  u32  menu_faces_ = 0;
   std::string captured_;
   std::string captured_raw_axis_;
   bool capture_swallow_ = false;   // swallows release of whatever was captured
