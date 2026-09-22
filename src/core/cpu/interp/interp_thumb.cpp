@@ -2,7 +2,7 @@
 // DSperate - Nintendo DS emulator. Copyright (C) 2026 DSperate contributors.
 //
 // Thumb-state executor (Thumb v2 on the ARM9: BLX, BKPT). Each handler
-// charges its cycles where melonDS does (cpu_cycles.h).
+// charges its cycles where melonDS does.
 #include "core/cpu/interp/interp_internal.h"
 
 namespace ds::interp {
@@ -69,7 +69,7 @@ void exec_thumb(CpuContext& cpu, u16 instr) {
     case 0xD: {                                                                 // MUL
       r = a * b; R(cpu, rd) = r; set_nz(cpu, r);
       if (is_arm9(cpu)) { charge_CI(cpu, 3); return; }
-      cpu.hot.cpsr &= ~FLAG_C;                                                  // ARM7: carry destroyed (melonDS)
+      cpu.hot.cpsr &= ~FLAG_C;                                                  // ARM7: carry destroyed
       u32 k; if ((a & 0xFFFFFF00) == 0 || (a & 0xFFFFFF00) == 0xFFFFFF00) k = 1; else if ((a & 0xFFFF0000) == 0 || (a & 0xFFFF0000) == 0xFFFF0000) k = 2; else if ((a & 0xFF000000) == 0 || (a & 0xFF000000) == 0xFF000000) k = 3; else k = 4;
       charge_CI(cpu, k);
       return;
@@ -83,7 +83,7 @@ void exec_thumb(CpuContext& cpu, u16 instr) {
   case TOp::HiRegOp: {
     const u32 rd = (instr & 7) | ((instr >> 4) & 8), rs = (instr >> 3) & 0xF;
     const u32 b = R(cpu, rs);
-    charge_C(cpu);                          // before the jump (melonDS T_ADD/MOV_HIREG)
+    charge_C(cpu);                          // before the jump
     switch ((instr >> 8) & 3) {
     case 0:
       if (rd == 15) { cpu.jump(R(cpu, 15) + b, false); return; }
@@ -175,7 +175,7 @@ void exec_thumb(CpuContext& cpu, u16 instr) {
         u32 pc = mem_read32(cpu, addr, !first); addr += 4;
         R(cpu, 13) = addr;
         cpu.jump(pc, is_arm9(cpu));
-        charge_CDI_after_jump(cpu);         // after the jump (melonDS T_POP)
+        charge_CDI_after_jump(cpu);         // after the jump
         return;
       }
       R(cpu, 13) = addr;
@@ -227,7 +227,7 @@ void exec_thumb(CpuContext& cpu, u16 instr) {
     return;
   }
   case TOp::Swi:
-    if ((cpu.nds->dsi_font_hle || cpu.nds->dsi_loader_watch) && cpu.nds->dsi_hle_swi(cpu, instr & 0xFF)) return;   // see NDS::dsi_hle_swi
+    if ((cpu.nds->dsi_font_hle || cpu.nds->dsi_loader_watch) && cpu.nds->dsi_hle_swi(cpu, instr & 0xFF)) return;
     cpu.raise_exception(CpuContext::Exception::Swi); return;
   case TOp::Bkpt:
     if (!is_arm9(cpu)) break;

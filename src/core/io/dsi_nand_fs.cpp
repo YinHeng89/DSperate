@@ -112,8 +112,7 @@ bool FatVolume::open(ReadFn read, WriteFn write, std::string* err) {
   if (b[0x1FE] != 0x55 || b[0x1FF] != 0xAA) return fail("no boot sector signature");
   const u32 bps = rd16(b + 0x0B), spc = b[0x0D], rsv = rd16(b + 0x0E);
   const u32 nfats = b[0x10], root = rd16(b + 0x11);
-  // FAT32 has no 16-bit FAT size and no fixed root directory.
-  const bool fat32 = rd16(b + 0x16) == 0;
+  const bool fat32 = rd16(b + 0x16) == 0;   // no 16-bit FAT size, no fixed root directory
   const u32 spf = fat32 ? rd32(b + 0x24) : rd16(b + 0x16);
   const u64 total = rd16(b + 0x13) ? rd16(b + 0x13) : rd32(b + 0x20);
   if (bps != 512 || spc == 0 || (spc & (spc - 1)) || nfats == 0 || spf == 0 || rsv == 0 || (fat32 ? root != 0 : root == 0))
@@ -150,9 +149,7 @@ bool FatVolume::format(const WriteFn& write, const FormatSpec& s, std::string* e
   const u32 total = static_cast<u32>(s.sectors);
   const u32 rsv = fat32 ? 32 : 1, nfats = 2, root_entries = fat32 ? 0 : 512;
   const u32 root_sectors = root_entries * 32 / 512;
-  // Enough FAT for every cluster the volume could hold without its FATs: a
-  // slight overestimate, as formatters make.
-  const u64 clusters_max = (total - rsv - root_sectors) / spc;
+  const u64 clusters_max = (total - rsv - root_sectors) / spc;   // slight overestimate, as formatters make
   const u32 spf = static_cast<u32>(((clusters_max + 2) * (fat32 ? 4 : 2) + 511) / 512);
   const u64 data = rsv + static_cast<u64>(nfats) * spf + root_sectors;
   if (total <= data + spc) return fail("format: volume smaller than its own metadata");
@@ -237,9 +234,7 @@ void FatVolume::fat_set(u32 c, u32 v) {
     const bool was_free = fat_get(c) == 0;
     if (was_free && v != 0) --free_count_;
     if (!was_free && v == 0) ++free_count_;
-    // next_free_ stays at or below the lowest free cluster, so an allocation
-    // that starts there finds what a scan from cluster 2 would.
-    if (v == 0 && c < next_free_) next_free_ = c;
+    if (v == 0 && c < next_free_) next_free_ = c;   // stays at or below the lowest free cluster
   }
   if (fat_bits_ == 12) {
     if (c & 1) { fat_[o] = static_cast<u8>((fat_[o] & 0x0F) | ((v << 4) & 0xF0)); fat_[o + 1] = static_cast<u8>(v >> 4); }
@@ -488,8 +483,7 @@ bool FatVolume::add_entry(const Entry& parent, const u8* raw, u32 count, u64& di
   const u32 cs = cluster_bytes();
   const size_t limit = first ? d.size() : static_cast<size_t>(root_entries_) * 32;
   auto at = [&](size_t i) { return first ? cluster_offset(cl[i / cs]) + i % cs : root_off_ + i; };
-  // The first run of `count` free slots. Everything from the first 0x00 entry
-  // on is free, so a run may start there and continue into a new cluster.
+  // First run of `count` free slots; everything from the first 0x00 entry on is free.
   size_t run = 0;
   for (size_t i = 0; i + 32 <= limit; i += 32) {
     if (d[i] != 0x00 && d[i] != 0xE5) { run = 0; continue; }
@@ -500,8 +494,7 @@ bool FatVolume::add_entry(const Entry& parent, const u8* raw, u32 count, u64& di
     return true;
   }
   if (!first || cl.empty()) return false;   // the fixed root directory is full
-  // Grow the directory by a zeroed cluster and put the entries at its start
-  // (a run cut by the cluster end is abandoned: those slots stay free).
+  // Grow by a zeroed cluster, entries at its start (a run cut by the cluster end is abandoned).
   if (count * 32 > cs) return false;
   u32 c;
   if (!alloc_chain(1, c)) return false;
@@ -667,8 +660,7 @@ bool FatVolume::mkdir(const std::string& path, std::string* err, const Stamp* st
   return true;
 }
 
-// A new directory's cluster: "." and "..", the rest zero. ".." names the root
-// as cluster 0, FAT32 included.
+// A new directory's cluster: "." and "..", rest zero. ".." names the root as cluster 0.
 void FatVolume::write_dir_cluster(u32 cluster, u32 parent_cluster, const Stamp* stamp) {
   const u16 date = stamp ? stamp->date : kFatDate, time = stamp ? stamp->time : 0;
   auto dot = [&](u8* p, const char* n, u32 c) {
@@ -696,7 +688,6 @@ bool FatVolume::populate(const Entry& dir, std::vector<NewEntry>& items, std::st
   size_t used = 0;
   while (used + 32 <= d.size() && d[used] != 0x00) used += 32;
 
-  // Names, clusters and raw entries first; where they go in the directory after.
   std::vector<u8> buf;
   std::vector<std::pair<size_t, size_t>> placed;   // item, offset of its short entry in buf
   for (size_t k = 0; k < items.size(); ++k) {
@@ -798,7 +789,6 @@ void NandFs::setup_crypto(NandImage& nand, const u8* bios7i) {
   const u32 lo = static_cast<u32>(id), hi = static_cast<u32>(id >> 32);
   u8 kx[16], ky[16], tmp[16];
 
-  // The filesystem key and counter (melonDS DSi_NAND.cpp NANDImage::NANDImage).
   wr32(kx, lo); wr32(kx + 4, lo ^ 0x24EE6906); wr32(kx + 8, hi ^ 0xE65B601D); wr32(kx + 12, hi);
   wr32(ky, 0x0AB9DC76); wr32(ky + 4, 0xBD4DC4D3); wr32(ky + 8, 0x202DDD1D); wr32(ky + 12, 0xE1A00005);
   DsiAes::derive_normal_key(kx, ky, tmp);
@@ -809,8 +799,7 @@ void NandFs::setup_crypto(NandImage& nand, const u8* bios7i) {
   crypto::sha1(nand.emmc_cid(), 16, digest);
   bswap16(fat_iv_, digest);
 
-  // The ES key, from the DSi ARM7 BIOS.
-  es_key_ok_ = bios7i != nullptr;
+  es_key_ok_ = bios7i != nullptr;   // ES key, from the DSi ARM7 BIOS
   if (es_key_ok_) {
     wr32(kx, 0x4E00004A); wr32(kx + 4, 0x4A00004E); wr32(kx + 8, hi ^ 0xC80C4B72); wr32(kx + 12, lo);
     DsiAes::derive_normal_key(kx, bios7i + 0x8308, tmp);
@@ -844,9 +833,7 @@ bool NandFs::format(NandImage& nand, const u8* bios7i, std::string* err) {
   setup_crypto(nand, bios7i);
   const std::vector<u8> zero(512, 0);
 
-  // The partition table of a retail DSi (read from a dump): the main FAT16
-  // partition, the photo partition, and a small FAT12 one nothing mounts.
-  // Geometry only; the MBR has no boot code.
+  // A retail DSi's partition table: main FAT16, photo, and a small FAT12 nothing mounts.
   u8 mbr[512] = {};
   static const u8 kParts[3][16] = {
     {0x00, 0x03, 0x18, 0x04, 0x06, 0x0F, 0xE0, 0x3B, 0x77, 0x08, 0x00, 0x00, 0x89, 0x6F, 0x06, 0x00},
@@ -857,9 +844,8 @@ bool NandFs::format(NandImage& nand, const u8* bios7i, std::string* err) {
   mbr[0x1FE] = 0x55; mbr[0x1FF] = 0xAA;
   crypt_write(0, 512, mbr);
 
-  // Each FAT16 partition's boot sector (the DSi's formatter: OEM "TWL", 32
-  // sectors per cluster, 512 root entries, no boot code) and empty FATs and
-  // root directory.
+  // Each FAT16 partition's boot sector (OEM "TWL", 32 sectors/cluster, 512 root entries) plus
+  // empty FATs and root directory.
   auto fat16 = [&](int index, u16 fat_sectors) {
     const u8* p = kParts[index];
     const u32 start = rd32(p + 8), sectors = rd32(p + 12);
@@ -890,8 +876,8 @@ bool NandFs::format(NandImage& nand, const u8* bios7i, std::string* err) {
   return mount(nand, bios7i, err);
 }
 
-// AES-CTR over byte-reversed 16-byte blocks, the counter the base IV plus the
-// block's position in the image (so any sector decrypts on its own).
+// AES-CTR over byte-reversed 16-byte blocks; counter is the base IV plus block position, so
+// any sector decrypts on its own.
 void NandFs::xcrypt(u64 offset, u8* buf, u32 len) const {
   for (u32 i = 0; i < len; i += 16) {
     u8 ctr[16];

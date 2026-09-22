@@ -6,23 +6,14 @@
 
 namespace ds::sdl {
 
-// INI-style settings: `[section]` headers, `key = value` lines, `#` or `;`
-// comments. Values are kept as strings and typed at the point of use, so the
-// same map serves the global file, a per-game override and the command line
-// (later loads win, in that order).
-//
-//   ~/.config/dsperate/dsperate.ini          (or $XDG_CONFIG_HOME/dsperate/)
-//   ~/.config/dsperate/games/<rom name>.ini  overrides for one ROM file
-//   ~/.config/dsperate/games/<GAMECODE>.ini  overrides for one title (any file)
-//
-// Keys are addressed as "section.key".
+// INI-style settings ("section.key" -> value, strings typed at point of use).
+// Later loads win: global file, then per-game override, then command line.
 class Config {
 public:
-  static std::string dir();                        // the config directory, created on demand
+  static std::string dir();                        // config directory, created on demand
   static std::string global_path() { return dir() + "/dsperate.ini"; }
-  // The per-game files, in load order: the title-ID one first, then the one
-  // named after the ROM file (its basename without the extension), so the
-  // filename wins. Both live in games/; `rom` may be a full path.
+  // Per-game files, in load order (filename wins): games/<GAMECODE>.ini then
+  // games/<rom basename>.ini.
   static std::string game_path_code(const char code[4]);
   static std::string game_path_rom(const std::string& rom);
 
@@ -35,10 +26,8 @@ public:
   double real(const std::string& key, double def) const;
   bool   flag(const std::string& key, bool def) const;
 
-  // Rewrites one `key = value` in `path`, adding the section or the file if
-  // needed; used to remember a layout picked with a hotkey.
+  // Rewrites one `key = value` in `path`, adding the section/file if needed.
   static bool store(const std::string& path, const std::string& key, const std::string& value);
-  // Writes the commented default file if there is none.
   static void write_default(const std::string& path, bool force = false);
 
 private:

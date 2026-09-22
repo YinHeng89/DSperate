@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // DSperate - Nintendo DS emulator. Copyright (C) 2026 DSperate contributors.
 //
-// See slirp_driver.h.
-
 #include "net/slirp_driver.h"
 
 #include <algorithm>
@@ -21,14 +19,10 @@ extern "C" {
 namespace ds::net {
 namespace {
 
-// The same switch the LAN transport logs behind (lan_mp.cpp): this is
-// diagnostic chatter, not something a player acts on. Failures are not
-// gated -- they go to stderr regardless.
 bool slirp_log() { static const bool on = std::getenv("DS_WIFI_LOG") != nullptr; return on; }
 #define SLIRP_LOG(...) do { if (slirp_log()) std::fprintf(stderr, "[slirp] " __VA_ARGS__); } while (0)
 
-// slirp's conventional numbers, the same ones QEMU's user networking uses
-// and the same ones melonDS hands the DS. Host order.
+// slirp's conventional subnet, host order.
 constexpr u32 kNetwork    = 0x0A000200;   // 10.0.2.0/24
 constexpr u32 kNetmask    = 0xFFFFFF00;
 constexpr u32 kHost       = 0x0A000202;   // 10.0.2.2, the gateway
@@ -64,9 +58,8 @@ u16 checksum_patch(u16 old_sum, u32 old_addr, u32 new_addr) {
   return static_cast<u16>(~sum);
 }
 
-// The IPv4/UDP offsets of one Ethernet frame, or false if it is not an
-// IPv4 UDP datagram with the given port. No options are tolerated beyond
-// what IHL says; a fragment past the first carries no UDP header at all.
+// IPv4/UDP offsets of one Ethernet frame; false if not an IPv4 UDP datagram
+// (fragment past the first has no UDP header).
 struct UdpView {
   u8* ip = nullptr;      // start of the IPv4 header
   u8* udp = nullptr;     // start of the UDP header
@@ -87,9 +80,8 @@ bool udp_view(u8* frame, int len, UdpView* out) {
 
 } // namespace
 
-// The libslirp callback table. A struct so its members can reach into
-// SlirpDriver's privates (it is a friend) while keeping libslirp's types
-// out of the header.
+// A struct (not free functions) so members can reach SlirpDriver's privates
+// as a friend, keeping libslirp's types out of the header.
 struct SlirpCallbacks {
   static SlirpDriver* self(void* opaque) { return static_cast<SlirpDriver*>(opaque); }
 
@@ -97,8 +89,7 @@ struct SlirpCallbacks {
     SlirpDriver* d = self(opaque);
     if (len == 0 || len > SlirpDriver::kMaxFrame) return static_cast<ssize_t>(len);
     if (d->rx_.size() >= kMaxRxQueue) {
-      // The guest is not draining. Dropping is what libslirp expects here;
-      // TCP will slow down and retransmit.
+      // Dropping here is what libslirp expects; TCP backs off and retransmits.
       d->frames_dropped_++;
       return static_cast<ssize_t>(len);
     }
@@ -128,8 +119,7 @@ struct SlirpCallbacks {
 
   static void timer_free(void* timer, void* opaque) {
     SlirpDriver* d = self(opaque);
-    // Disarm in place rather than erase: slirp holds this pointer, and the
-    // handful of timers it makes are freed only at cleanup.
+    // Disarm in place, don't erase: slirp keeps this pointer.
     for (auto& t : d->timers_) {
       if (&t == timer) { t.expire_ms = -1; t.cb_opaque = nullptr; return; }
     }
@@ -142,10 +132,8 @@ struct SlirpCallbacks {
 
   static void notify(void* opaque) { (void)opaque; }
 
-  // Socket registration: nothing to do, since process() hands libslirp a
-  // fresh poll set every call. At config version 4 libslirp calls the fd
-  // variants on every new socket, and a null one crashed the first UDP
-  // socket it opened (DNS through the host resolver).
+  // No-ops: process() hands libslirp a fresh poll set every call. Must be
+  // non-null: at config version 4 libslirp calls these on every new socket.
   static void register_poll_fd(int fd, void* opaque) { (void)fd; (void)opaque; }
   static void unregister_poll_fd(int fd, void* opaque) { (void)fd; (void)opaque; }
 
@@ -184,7 +172,6 @@ bool SlirpDriver::start(Dns dns, u32 dns_addr) {
   dns_ = dns;
   dns_addr_ = dns_addr;
   if (dns_ == Dns::Custom && dns_addr_ == 0) {
-    // Nothing to rewrite to; fall back rather than black-hole every query.
     std::fprintf(stderr, "slirp: no DNS address given; using the host resolver\n");
     dns_ = Dns::Host;
   }
@@ -252,8 +239,8 @@ s64 SlirpDriver::now_ms() const {
 
 void SlirpDriver::fire_due_timers() {
   const s64 now = now_ms();
-  // By value and disarmed first: slirp_handle_timer re-arms the timer from
-  // inside the call, and re-arming must not be undone by this loop.
+  // id/cb_opaque copied and disarmed before the call: slirp_handle_timer may
+  // re-arm this timer, which must not be undone afterward.
   for (auto& t : timers_) {
     if (t.expire_ms < 0 || t.expire_ms > now || !t.cb_opaque) continue;
     const int id = t.id;
@@ -267,7 +254,7 @@ void SlirpDriver::pump() {
   if (!slirp_) return;
 
   pollfds_.clear();
-  u32 timeout = 0;   // we never wait: recv() is on the ARM7's timeline
+  u32 timeout = 0;   // never wait: recv() is on the ARM7's timeline
   slirp_pollfds_fill_socket(slirp_, &timeout, &SlirpCallbacks::add_poll, this);
 
   int select_error = 0;
@@ -315,14 +302,9 @@ int SlirpDriver::recv(u8* data) {
   return len;
 }
 
-// ---- DNS policy ---------------------------------------------------------
-//
-// The DS was handed 10.0.2.3 as its nameserver by DHCP (or has it from the
-// firmware AP slot), so every query it makes is addressed there. Sending it
-// somewhere else is a destination rewrite on the way out and a source
-// rewrite on the way back -- the second half matters just as much, because
-// the reply must appear to come from the address the DS asked, or its
-// socket will not match it.
+// ---- DNS policy ----
+// Rewriting needs both directions: destination out, source back -- the reply
+// must appear to come from the address the DS asked, or its socket won't match it.
 
 bool SlirpDriver::rewrite_dns_dst(u8* frame, int len, u32 from, u32 to) {
   UdpView v;
@@ -332,7 +314,7 @@ bool SlirpDriver::rewrite_dns_dst(u8* frame, int len, u32 from, u32 to) {
 
   st16be(&v.ip[10], checksum_patch(ld16be(&v.ip[10]), from, to));
   const u16 udp_sum = ld16be(&v.udp[6]);
-  if (udp_sum != 0)   // 0 means the sender computed none; leave it that way
+  if (udp_sum != 0)   // 0 means no checksum was computed; leave it that way
     st16be(&v.udp[6], checksum_patch(udp_sum, from, to));
   st32be(&v.ip[16], to);
   return true;

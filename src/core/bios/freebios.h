@@ -1,13 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // DSperate - Nintendo DS emulator. Copyright (C) 2026 DSperate contributors.
 //
-// Built-in replacements for the images a DS boots from, used when the user
-// has no dumps. Neither is Nintendo's: the BIOS is FreeBIOS (Gilead Kutnick,
-// BSD-3-Clause, see LICENSE.freebios), a SWI table and IRQ dispatcher with no
-// boot code, and the firmware is a data-only image with default user
-// settings. Both only work with direct boot -- there is nothing to boot the
-// DS menu from -- and the SWI routines are not cycle-matched to Nintendo's,
-// so timing-sensitive comparisons (scene hashes, replays) need real dumps.
+// Built-in replacements for the images a DS boots from when the user has no
+// dumps. BIOS is FreeBIOS (BSD-3-Clause): SWI table + IRQ dispatcher, no boot
+// code. Firmware is data-only. Both work only with direct boot; SWI routines
+// are not cycle-matched to Nintendo's.
 #pragma once
 #include "core/types.h"
 
@@ -16,51 +13,39 @@
 
 namespace ds::bios {
 
-// FreeBIOS images. Smaller than the BIOS regions they fill (the rest is zero).
-// The ARM9 image leaves the logo area at 0x20 blank, and the ARM7 image has
-// no KEY1 table at 0x30 -- see NDS::setup_direct_boot and cart.cpp.
+// Smaller than the BIOS regions they fill (rest is zero). ARM9 image leaves
+// the logo area at 0x20 blank; ARM7 image has no KEY1 table at 0x30.
 extern const u8 kFreeBios9[];
 extern const u32 kFreeBios9_len;
 extern const u8 kFreeBios7[];
 extern const u32 kFreeBios7_len;
 
-// What the generated firmware exposes to games as the console's owner: the
-// fields the DS menu's settings pages would have written. Nickname and
-// message are UTF-16 in the firmware; here they are plain strings of which
-// the first 10 / 26 characters are used, each byte one code unit.
+// Fields the DS menu's settings pages would have written. Nickname/message
+// are plain strings here; only the first 10 / 26 chars are used.
 struct UserSettings {
   std::string nickname = "DSperate";
   std::string message;
   u8 birthday_month = 1;   // 1..12
   u8 birthday_day = 1;     // 1..31
-  u8 favourite_colour = 0; // 0..15 (GBATEK order: grey, brown, red, pink, orange, yellow, lime, green, ...)
+  u8 favourite_colour = 0; // 0..15 (GBATEK order)
   u8 language = 1;         // 0 ja, 1 en, 2 fr, 3 de, 4 it, 5 es
 };
 
-// A 256 KB firmware image: header (DS Lite, W006 wifi, generated identifier
-// "DSPR"), two user-settings copies at 0x3FE00 with valid checksums, three
-// wifi access-point blocks. No code. Touch calibration is left for
-// NDS::normalise_touch_calibration, as with a real dump.
+// 256 KB firmware image: header, two user-settings copies, three wifi
+// access-point blocks. No code.
 std::vector<u8> generate_firmware(const UserSettings& user);
-// The DSi's: 128 KB, console type DSi, a retail DSi's Wi-Fi board, the same
-// user settings and access points in its last pages, plus the DSi's extended
-// user settings: `language` (0-7) and the region's `language_mask`.
+// The DSi's: 128 KB, plus extended user settings (`language`, `language_mask`).
 std::vector<u8> generate_firmware_dsi(const UserSettings& user, u8 language, u16 language_mask);
 
-// The SSID of DSperate's emulated access point: the DS Wi-Fi's (io::Wifi)
-// and the DSi Atheros module's (io::NWifi) both answer under it.
+// SSID of DSperate's emulated access point (io::Wifi and io::NWifi both answer under it).
 inline constexpr const char* kAccessPointSsid = "DSperate-AP";
-// One 0x100-byte Wi-Fi access point slot: an open network under
-// kAccessPointSsid with DHCP (MTU 1400 on a DSi), or an unconfigured slot.
-// melonDS Firmware::WifiAccessPoint.
+// One 0x100-byte Wi-Fi access point slot: open network under kAccessPointSsid
+// with DHCP, or unconfigured.
 void fill_access_point(u8* ap, bool configured, bool dsi);
-// Put the emulated access point in a firmware image's first unconfigured
-// slot of the three below the user settings, unless a slot already names
-// it. Returns that slot (0-2), or -1 when every slot holds another network
-// or the image has no settings pages. The image in memory only.
+// Places the emulated AP in the first unconfigured slot of three below the
+// user settings, unless already present. Returns the slot (0-2), or -1.
 int stamp_access_point(std::vector<u8>& firmware);
 
-// The DS firmware CRC16 (GBATEK "Firmware Header").
 u16 crc16(const u8* data, u32 len, u16 start);
 
 } // namespace ds::bios

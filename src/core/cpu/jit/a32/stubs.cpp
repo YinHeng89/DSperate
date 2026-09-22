@@ -1,27 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // DSperate - Nintendo DS emulator. Copyright (C) 2026 DSperate contributors.
 //
-// ARMv7 (A32) backend: the entry/exit/call/dispatch stubs, and the code
-// patches the common runtime needs (entry redirect, link patch, relative
-// branch test). See a32/convention.h for the register map.
-//
-// Stub calling convention, as on AArch64: a block reaches a stub with `bl`
-// and the stub reads its literal arguments from the words after the `bl`
-// through lr, skipping them before it returns with `bx lr`. A linked
-// `bl link; .word key` becomes a bare `b` whose literal is never executed.
-//
-// What a block owns at every stub boundary: the pinned guest registers in
-// r4-r8, the guest NZCVQ in the APSR, the budget in r9. Everything else
-// guest-side is in memory (the translator writes its cache back before any
-// `bl`). A32 has no flag-neutral compare, so every stub that tests something
-// keeps the guest flags in a register across the test, or tests before the
-// guest flags are reloaded from memory.
-//
-// Two AAPCS32 points the AArch64 stubs did not have to know:
-//  - C helpers are Thumb-2 on the handheld toolchains, so they are called
-//    with `blx r12`, never `bl`; they return to ARM state through lr.
-//  - A struct of two pointers (SliceNext) is returned in memory: the caller
-//    passes the result address in r0 and the arguments shift up one.
+// ARMv7 (A32) stubs and runtime code patches. Stubs are entered by `bl`; literal
+// args follow the bl and are read/skipped via lr. At stub boundaries: pinned guest
+// regs in r4-r8, guest NZCVQ in APSR, budget in r9, rest in memory. No flag-neutral
+// compare: a stub that tests must park guest flags first. C helpers may be Thumb-2
+// (call via `blx r12`); SliceNext returns in memory (r0 = &result, args shift up).
 #include "core/cpu/jit/jit_internal.h"
 #include "core/cpu/jit/a32/convention.h"
 #include "core/cpu/jit/a32/emit.h"
@@ -38,22 +22,21 @@ namespace {
 
 constexpr u32 M(u32 r) { return 1u << r; }
 constexpr u32 CALLEE_SAVED = M(4) | M(5) | M(6) | M(7) | M(8) | M(9) | M(10) | M(11);
-constexpr u32 PINNED_LOW = M(4) | M(5) | M(6) | M(7);   // guest r0-r3; guest r13 is r8
+constexpr u32 PINNED_LOW = M(4) | M(5) | M(6) | M(7);   // guest r0-r3
 
-// The budget register holds `cycle_budget - 1`; the C side sees the real value.
+// R_BUDGET holds cycle_budget - 1.
 void emit_store_budget(Emitter& e, u32 t) {
   e.add_imm(t, R_BUDGET, 1, t);
   e.str(t, R_CTX, OFF_BUDGET);
 }
 void emit_load_budget(Emitter& e) {
   e.ldr(R_BUDGET, R_CTX, OFF_BUDGET);
-  e.sub_imm(R_BUDGET, R_BUDGET, 1, R_BUDGET);   // encodes without the temp
+  e.sub_imm(R_BUDGET, R_BUDGET, 1, R_BUDGET);
 }
 void emit_load_pt(Emitter& e) {
   e.ldr(R_PT, R_CTX, OFF_JIT);
   e.ldr(R_PT, R_PT, OFF_JC_PT);
 }
-// Pinned guest registers <-> JitHot::regs (guest r0-r3 are contiguous: one ldm/stm).
 void emit_store_pinned(Emitter& e, u32 t) {
   e.add_imm(t, R_CTX, off_reg(0), t);
   e.stm(t, PINNED_LOW);
@@ -64,7 +47,6 @@ void emit_load_pinned(Emitter& e, u32 t) {
   e.ldm(t, PINNED_LOW);
   e.ldr(8, R_CTX, off_reg(13));
 }
-// Guest NZCVQ: APSR bits 31:27 <-> ctx.cpsr bits 31:27.
 void emit_save_flags(Emitter& e, u32 t0, u32 t1) {
   e.mrs_apsr(t0);
   e.lsr_imm(t0, t0, 27);
@@ -77,10 +59,8 @@ void emit_load_flags(Emitter& e, u32 t) {
   e.msr_apsr_nzcvq(t);
 }
 
-// Leave-or-continue after a helper: budget exhausted, an alert, or an IRQ
-// pending with I clear. Fills `leave` with forward branches to bind at the
-// leave path. Clobbers r0, r1 and the host flags: callers reload the guest
-// flags afterwards, or kept them in a register.
+// Branches to `leave` on budget exhausted, alert, or unmasked IRQ.
+// Clobbers r0, r1 and host flags.
 void emit_poll(Emitter& e, std::vector<size_t>& leave) {
   e.tst_imm(R_BUDGET, 0x80000000u);
   leave.push_back(e.b_fwd(NE));
@@ -91,7 +71,7 @@ void emit_poll(Emitter& e, std::vector<size_t>& leave) {
   e.cmp_imm(0, 0);
   size_t none = e.b_fwd(EQ);
   e.ldr(1, R_CTX, OFF_CPSR);
-  e.tst_imm(1, 0x80);              // I
+  e.tst_imm(1, 0x80);
   leave.push_back(e.b_fwd(EQ));
   e.bind(none);
 }
@@ -104,20 +84,15 @@ void emit_stubs(Runtime& rt) {
   Emitter e(rt.arena, rt.cap);
   e.set_pos(LUT_AREA);
 
-  // Stack discipline: AAPCS wants sp 8-byte aligned at every C call, and NEON
-  // code below ds_slice_next stores to the stack with :64 alignment -- a
-  // misaligned frame here is a SIGBUS deep in the renderer. Every frame in
-  // this file is a multiple of 8 bytes, so the block level and the C calls
-  // both see an aligned sp.
-  // ---- enter(ctx, native): C-callable ---------------------------------------------
+  // Every frame is a multiple of 8 bytes: AAPCS sp alignment at C calls.
+  // ---- enter(ctx, native): C-callable ----
   rt.enter = reinterpret_cast<void (*)(CpuContext*, const void*)>(e.cur());
-  e.push(CALLEE_SAVED | M(R_LR));            // 36 bytes
-  e.dp_imm(SUB, false, R_SP, R_SP, 4);       // 40
+  e.push(CALLEE_SAVED | M(R_LR));
+  e.dp_imm(SUB, false, R_SP, R_SP, 4);       // pad to 40
   size_t to_light = e.bl_fwd();
   e.dp_imm(ADD, false, R_SP, R_SP, 4);
   e.pop(CALLEE_SAVED | M(R_PC));
-  // ---- enter_light(ctx, native): an 8-byte frame; exits return here -------------------
-  // The caller saved r4-r11 itself and keeps nothing in them.
+  // ---- enter_light(ctx, native): an 8-byte frame; exits return here ----
   e.bind(to_light);
   rt.enter_light = e.cur();
   e.push(M(R_FN) | M(R_LR));
@@ -128,28 +103,27 @@ void emit_stubs(Runtime& rt) {
   emit_load_flags(e, 2);
   e.bx(1);
 
-  // ---- exit_key_lit: `bl exit_key_lit; .word key` ---------------------------------
+  // ---- exit_key_lit: `bl exit_key_lit; .word key` ----
   rt.exit_key_lit = e.cur();
   e.ldr(0, R_LR, 0);
-  // ---- exit_key: r0 = key of the next instruction (flag-neutral arithmetic) --------
+  // ---- exit_key: r0 = next key; must not touch flags ----
   rt.exit_key = e.cur();
-  e.and_imm(1, 0, 1);                       // T
-  e.and_imm(2, 0, ~1u);                     // pc
+  e.and_imm(1, 0, 1);
+  e.and_imm(2, 0, ~1u);
   e.add_imm(2, 2, 8, 3);
   e.sub_reg(2, 2, 1, LSL, 2);               // pc + 8 - 4T
   e.str(2, R_CTX, off_reg(15));
-  // ---- exit_r15: ctx.r15 already correct -------------------------------------------
+  // ---- exit_r15: ctx.r15 already correct ----
   rt.exit_r15 = e.cur();
   emit_store_pinned(e, 0);
   emit_save_flags(e, 0, 1);
   emit_store_budget(e, 0);
   e.pop(M(R_FN) | M(R_PC));
 
-  // ---- run_loop(scheduler): the native slice loop -----------------------------------
-  // SliceNext comes back in memory: r0 = &result, r1 = scheduler.
+  // ---- run_loop(scheduler): the native slice loop ----
   rt.run_loop = reinterpret_cast<void (*)(void*)>(e.cur());
-  e.push(CALLEE_SAVED | M(R_LR));           // 36 bytes
-  e.dp_imm(SUB, false, R_SP, R_SP, 20);     // 56: [sp] = SliceNext, [sp+8] = scheduler
+  e.push(CALLEE_SAVED | M(R_LR));
+  e.dp_imm(SUB, false, R_SP, R_SP, 20);     // [sp] = SliceNext, [sp+8] = scheduler
   e.str(0, R_SP, 8);
   const size_t loop_top = e.size();
   e.mov(0, R_SP);
@@ -166,32 +140,27 @@ void emit_stubs(Runtime& rt) {
   e.dp_imm(ADD, false, R_SP, R_SP, 20);
   e.pop(CALLEE_SAVED | M(R_PC));
 
-  // ---- flush_exit: r0 = key; arena full --------------------------------------------
+  // ---- flush_exit: r0 = key; arena full ----
   rt.flush_exit = e.cur();
   e.mov_ptr(1, &rt.need_reset);
   e.mov_imm(2, 1);
   e.strb(2, 1, 0);
   e.b(rt.exit_r15);
 
-  // ---- call_pure: r12 = fn, args in r0-r3 ---------------------------------------------
-  // The helper touches no guest state: keep the flags on the stack across
-  // it, spill the budget (helpers read and charge it), reload it. Two
-  // one-word pushes make the 8-byte frame.
+  // ---- call_pure: r12 = fn, args r0-r3; helper touches no guest state ----
   rt.call_pure = e.cur();
   e.push(M(R_LR));
-  e.add_imm(R_LR, R_BUDGET, 1, R_LR);       // lr is free until the return
+  e.add_imm(R_LR, R_BUDGET, 1, R_LR);
   e.str(R_LR, R_CTX, OFF_BUDGET);
   e.mrs_apsr(R_LR);
   e.push(M(R_LR));
   e.blx(R_FN);
   emit_load_budget(e);
-  e.pop(M(1));                              // r1 = flags (r0 is the result)
+  e.pop(M(1));
   e.msr_apsr_nzcvq(1);
   e.pop(M(R_PC));
 
-  // ---- call_full: r12 = fn, args in r0-r2 ---------------------------------------------
-  // The helper may read or write any guest state: sync the pinned registers
-  // and the flags to memory, call, reload everything (r3 and lr are temps).
+  // ---- call_full: r12 = fn, args r0-r2; helper may touch guest state ----
   rt.call_full = e.cur();
   e.push(M(3) | M(R_LR));
   emit_save_flags(e, 3, R_LR);
@@ -204,7 +173,7 @@ void emit_stubs(Runtime& rt) {
   emit_load_flags(e, 3);
   e.pop(M(3) | M(R_PC));
 
-  // ---- call2: `bl call2; .word a; .word b; .word fn` -> fn(ctx, a, b) -----------------
+  // ---- call2: `bl call2; .word a; .word b; .word fn` -> fn(ctx, a, b) ----
   rt.call2 = e.cur();
   e.ldr(1, R_LR, 0);
   e.ldr(2, R_LR, 4);
@@ -215,7 +184,7 @@ void emit_stubs(Runtime& rt) {
   e.bl(rt.call_full);
   e.pop(M(3) | M(R_PC));
 
-  // ---- poll: `bl poll; .word next_key` --------------------------------------------------
+  // ---- poll: `bl poll; .word next_key` ----
   rt.poll = e.cur();
   {
     std::vector<size_t> leave;
@@ -230,9 +199,7 @@ void emit_stubs(Runtime& rt) {
     e.b(rt.exit_key);
   }
 
-  // ---- slow loads/stores: r1 = address (r2 = value) -> r0; r1-r3, r12 preserved ------
-  // The translator's cache slots are all caller-saved, so the stub keeps them
-  // (24-byte frame); the result goes back through the saved r0.
+  // ---- slow loads/stores: r1 = address (r2 = value) -> r0; r1-r3, r12 preserved ----
   {
     const void* lds[3] = {reinterpret_cast<const void*>(&jit_h_ld8), reinterpret_cast<const void*>(&jit_h_ld16), reinterpret_cast<const void*>(&jit_h_ld32)};
     const void* sts[3] = {reinterpret_cast<const void*>(&jit_h_st8), reinterpret_cast<const void*>(&jit_h_st16), reinterpret_cast<const void*>(&jit_h_st32)};
@@ -246,21 +213,20 @@ void emit_stubs(Runtime& rt) {
       e.pop(M(0) | M(1) | M(2) | M(3) | M(R_FN) | M(R_PC));
     }
   }
-  rt.merge_keep_cv = rt.merge_set_c = nullptr;   // flags merge natively on this host
+  rt.merge_keep_cv = rt.merge_set_c = nullptr;
 
-  // ---- per-CPU stubs ------------------------------------------------------------------
+  // ---- per-CPU stubs ----
   for (int c = 0; c < 2; ++c) {
     JitCpu& jc = rt.cpus[c];
     const u8* lut = rt.arena + c * LUT_STRIDE;
 
-    // dispatch: r0 = key. LUT entry = (native offset << 32) | key, 8 bytes.
-    // The tag compare needs the flags: r12 keeps the guest's.
+    // dispatch: r0 = key. LUT entry = (native offset << 32) | key.
     jc.dispatch = e.cur();
     e.mrs_apsr(R_FN);
     e.ubfx(2, 0, 1, LUT_BITS);
     e.mov_ptr(1, lut);
     e.add_reg(1, 1, 2, LSL, 3);
-    e.ldrd(2, 1, 0);                        // r2 = key, r3 = offset
+    e.ldrd(2, 1, 0);
     e.cmp_reg(2, 0);
     size_t miss = e.b_fwd(NE);
     e.msr_apsr_nzcvq(R_FN);
@@ -277,21 +243,19 @@ void emit_stubs(Runtime& rt) {
     // link: `bl link; .word key`
     jc.link = e.cur();
     e.ldr(1, R_LR, 0);
-    e.sub_imm(2, R_LR, 4, 3);               // patch site
+    e.sub_imm(2, R_LR, 4, 3);
     e.mov(0, R_CTX);
     e.mov_ptr(R_FN, reinterpret_cast<const void*>(&jit_h_link));
     e.bl(rt.call_pure);
     e.bx(0);
 
-    // fallback: `bl fallback; .word instr; .word key`. The interpreter runs
-    // one instruction from memory state; the poll runs before the guest
-    // flags are reloaded, so it may use the host flags freely.
+    // fallback: `bl fallback; .word instr; .word key`; interprets one instruction.
     jc.fallback = e.cur();
     {
       e.ldr(1, R_LR, 0);
       e.ldr(2, R_LR, 4);
       e.add_imm(R_LR, R_LR, 8, 3);
-      e.push(M(2) | M(R_LR));               // key, return address
+      e.push(M(2) | M(R_LR));
       emit_save_flags(e, 3, R_LR);
       emit_store_pinned(e, 3);
       e.add_imm(3, R_BUDGET, 1, 3);
@@ -306,12 +270,12 @@ void emit_stubs(Runtime& rt) {
       emit_poll(e, leave);
       emit_load_pinned(e, 3);
       emit_load_flags(e, 3);
-      e.pop(M(2) | M(R_PC));                // continue with the block
+      e.pop(M(2) | M(R_PC));
       for (size_t f : leave) e.bind(f);
       e.pop(M(2) | M(R_LR));
       emit_load_pinned(e, 3);
       emit_load_flags(e, 3);
-      e.and_imm(3, 2, 1);                   // next key = key + 4 - 2T
+      e.and_imm(3, 2, 1);                   // key + 4 - 2T
       e.add_imm(0, 2, 4, 0);
       e.sub_reg(0, 0, 3, LSL, 1);
       e.b(rt.exit_key);
@@ -323,10 +287,10 @@ void emit_stubs(Runtime& rt) {
       emit_load_flags(e, 3);
       e.ldr(0, R_CTX, off_reg(15));
       e.ldr(1, R_CTX, OFF_CPSR);
-      e.ubfx(2, 1, 5, 1);                   // T
+      e.ubfx(2, 1, 5, 1);
       e.sub_imm(0, 0, 8, 3);
       e.add_reg(0, 0, 2, LSL, 2);           // r15 - 8 + 4T
-      e.orr_reg(0, 0, 2);                   // | T
+      e.orr_reg(0, 0, 2);
       e.b(jc.dispatch);
       for (size_t f : leave2) e.bind(f);
       emit_load_pinned(e, 3);
@@ -334,19 +298,15 @@ void emit_stubs(Runtime& rt) {
       e.b(rt.exit_r15);
     }
 
-    // branch_indirect_cdi: r0 = target (bit 0 = new T), r1 = numD, r2 = data
-    // address. Charges the CDI cost of an LDM/POP that loaded pc the way the
-    // interpreter does *after* the jump (new pc, state and code region), then
-    // continues as branch_indirect. Both are reached with `b`, so lr is a
-    // temporary; the guest flags wait on the stack (8-byte frame) so the
-    // cost arithmetic may compare and predicate freely.
+    // branch_indirect_cdi: r0 = target | T, r1 = numD, r2 = data address. Charges
+    // LDM/POP-to-pc CDI cost as the interpreter does, then joins branch_indirect.
     const u32 OFF_TIMING9 = offsetof(CpuContext, timing9), OFF_TIMING7 = offsetof(CpuContext, timing7);
     jc.branch_indirect_cdi = e.cur();
     e.mrs_apsr(R_FN);
     e.dp_imm(SUB, false, R_SP, R_SP, 8);
     e.str(R_FN, R_SP, 0);
     e.tst_imm(0, 1);
-    e.and_imm(0, 0, ~3u, EQ);                   // ARM target: word aligned
+    e.and_imm(0, 0, ~3u, EQ);
     e.and_imm(3, 0, ~1u);                       // a
     if (c == 0) {
       // numC after the jump: ARM cost(a+4, S); Thumb odd cost(a+2, S); Thumb even 0.
@@ -376,21 +336,20 @@ void emit_stubs(Runtime& rt) {
       e.add_reg(3, R_FN, 1);
       e.sub_imm(3, 3, 6, R_LR);
       e.cmp_reg(R_FN, 1);
-      e.mov(R_FN, 1, LS);                       // unsigned max(nc, d)
+      e.mov(R_FN, 1, LS);
       e.cmp_reg(3, R_FN);
-      e.mov(R_FN, 3, GT);                       // signed max with nc + d - 6
+      e.mov(R_FN, 3, GT);                       // signed
       e.sub_reg(R_BUDGET, R_BUDGET, R_FN);
     } else {
-      // numC = t_new[T ? 0 : 2]; then charge_CDI's main-RAM rules with the
-      // code region = target, data region = r2.
+      // numC = t_new[T ? 0 : 2], then charge_CDI's main-RAM rules (code = target, data = r2).
       e.ldr(R_LR, R_CTX, OFF_TIMING7);
       e.lsr_imm(R_FN, 3, 15);
       e.add_reg(R_FN, R_LR, R_FN, LSL, 2);
       e.tst_imm(0, 1);
       e.ldrb(R_FN, R_FN, 0, NE);
       e.ldrb(R_FN, R_FN, 2, EQ);                // nc
-      e.lsr_imm(R_LR, 3, 24);                   // code region
-      e.lsr_imm(3, 2, 24);                      // data region
+      e.lsr_imm(R_LR, 3, 24);
+      e.lsr_imm(3, 2, 24);
       e.cmp_imm(3, 2);
       size_t not_data_main = e.b_fwd(NE);
       e.cmp_imm(R_LR, 2);
@@ -419,7 +378,7 @@ void emit_stubs(Runtime& rt) {
     }
     size_t to_body = e.b_fwd();
 
-    // branch_indirect: r0 = target address, bit 0 = new T.
+    // branch_indirect: r0 = target | T.
     jc.branch_indirect = e.cur();
     e.mrs_apsr(R_FN);
     e.dp_imm(SUB, false, R_SP, R_SP, 8);
@@ -428,24 +387,24 @@ void emit_stubs(Runtime& rt) {
     e.and_imm(0, 0, ~3u, EQ);
     e.bind(to_body);
     e.ldr(1, R_CTX, OFF_CPSR);
-    e.bfi(1, 0, 5, 1);                          // T
+    e.bfi(1, 0, 5, 1);
     e.str(1, R_CTX, OFF_CPSR);
     e.and_imm(2, 0, ~1u);                       // a
     if (c == 0) {
       // ARM9 refill: ARM cost(a,B)+cost(a+4,S); Thumb odd cost(a-2,B)+cost(a+2,S), even cost(a,B).
       // first = a - 2*odd (B fetch), second = a + 4 - 2*T (S fetch, dropped when T && !odd).
       e.ldr(R_LR, R_CTX, OFF_TIMING9);
-      e.and_imm(3, 0, 1);                       // T
+      e.and_imm(3, 0, 1);
       e.ubfx(R_FN, 2, 1, 1);                    // odd
-      e.sub_reg(1, 2, R_FN, LSL, 1);            // first
-      e.bic_reg(R_FN, 3, R_FN);                 // skip = T && !odd
+      e.sub_reg(1, 2, R_FN, LSL, 1);
+      e.bic_reg(R_FN, 3, R_FN);
       e.sub_reg(3, 2, 3, LSL, 1);
-      e.add_imm(3, 3, 4, 2);                    // second (a is dead now)
+      e.add_imm(3, 3, 4, 2);                    // a is dead now
       e.lsr_imm(1, 1, 12);
       e.add_reg(1, R_LR, 1, LSL, 3);
       e.ldrb(1, 1, 0);
       e.cmp_imm(1, 0xFF);
-      e.mov_imm(1, 3, EQ);                      // cost(first, B)
+      e.mov_imm(1, 3, EQ);
       e.lsr_imm(2, 3, 12);
       e.add_reg(2, R_LR, 2, LSL, 3);
       e.ldrb(2, 2, 0);
@@ -453,10 +412,10 @@ void emit_stubs(Runtime& rt) {
       size_t have2 = e.b_fwd(NE);
       e.tst_imm(3, 0x1F);
       e.mov_imm(2, 3, EQ);
-      e.mov_imm(2, 1, NE);                      // cost(second, S)
+      e.mov_imm(2, 1, NE);
       e.bind(have2);
       e.cmp_imm(R_FN, 0);
-      e.mov_imm(2, 0, NE);                      // no second fetch
+      e.mov_imm(2, 0, NE);
       e.add_reg(1, 1, 2);
     } else {
       // ARM7 refill: t = timing7[a >> 15]; Thumb t0 + t1, ARM t2 + t3.
@@ -490,7 +449,6 @@ void write_entry_redirect(u8* entry, u32 key, const u8* dispatch) {
   e.b(dispatch);
 }
 
-// `bl link` at `site` becomes `b target` (same encoding, L bit clear).
 bool fastmem_capable() { return true; }
 
 void patch_link(u8* site, const u8* target) {

@@ -26,56 +26,38 @@ enum Region : u8 {
 //   [1] data N16, [2] data N32, [3] data S32, in ARM9 cycles.
 class Timing {
 public:
-  // Bumped at the END of every retime (set_region9/7): translation bakes
-  // values from these tables, so a block built under one stamp is not the
-  // block that would be built under another. The JIT pre-translation worker
-  // records the stamp (acquire) before it reads the tables and its output is
-  // discarded at adoption when the stamp has moved -- bumping after the
-  // writes (release) makes that a seqlock: a build overlapping a retime can
-  // never be adopted, whichever halves of the tables it saw.
+  // Bumped after every retime (set_region9/7), seqlock-style: a JIT
+  // pre-translation worker that saw the stamp move mid-build discards its
+  // output rather than adopting a block baked from mixed table halves.
   std::atomic<u64> stamp{0};
 
-  // Bus cycles to ARM9 cycles: 1 on a DS (the ARM9 runs at twice the bus
-  // clock), 2 on a DSi with SCFG_CLK9 bit 0 set (four times). Read by
-  // reset() and update_cpu9(); Bus::set_clock9_shift changes it live.
+  // Bus cycles to ARM9 cycles: 1 on DS, 2 on DSi with SCFG_CLK9 bit 0 set.
+  // Bus::set_clock9_shift changes it live.
   u32 clock9_shift = 1;
 
-  // Bumped by every change to the ARM9 CPU table (update_cpu9, reset): a
-  // cost derived from it (the BIOS SHA-1 hook's, jit/bios_sha1.cpp) is kept
-  // until this moves.
+  // Bumped on every ARM9 CPU table change; a cost cached from it (BIOS
+  // SHA-1 hook, jit/bios_sha1.cpp) is kept until this moves.
   u64 cpu9_version = 0;
 
-  // ARM7 precomputed data-cost table. The ARM7 rule --
-  // costs add when code and data share a region, overlap into a max when they
-  // do not -- has exactly one dynamic input, the data page; `nc`, `cdi`,
-  // `code_main` and the access width are all known when a block is translated.
-  // So the whole model is evaluated here once and the recompiler spends a
-  // load, replacing a mispredictable branch over up to fourteen instructions.
-  //
-  // 32 bytes per 32 KB page: [code_main][cdi][nc_idx][word]. It is allocated
-  // after the raw ARM7 bus table so the pinned timing register still points at
-  // the raw table and every existing user of it is unchanged; the recompiler
-  // reaches the cost table with one add of COST7_OFFSET.
+  // ARM7 precomputed data-cost table: `nc`/`cdi`/`code_main`/width are all
+  // known at translation time, so the cost model is evaluated once here and
+  // the recompiler spends a load instead of a branch tree.
+  // 32 bytes per 32 KB page: [code_main][cdi][nc_idx][word]. Allocated right
+  // after the raw ARM7 bus table so the pinned timing register still points
+  // at it; the recompiler reaches the cost table with +COST7_OFFSET.
   static constexpr u32 COST7_STRIDE = 32;
   static constexpr u32 BUS7_BYTES   = 0x20000 * 4;
   static constexpr u32 COST7_OFFSET = BUS7_BYTES;
   static constexpr u32 COST7_BYTES  = 0x20000 * COST7_STRIDE;
   static constexpr u32 NC7_SLOTS    = 4;
 
-  // ARM9 precomputed pipeline-refill table: what an indirect branch to a
-  // page costs, for every shape refill_cycles() can take, so the recompiler's
-  // branch_indirect stub spends one byte load where it used to evaluate the
-  // two-fetch formula with two dependent timing-table loads. Four bytes per
-  // 4 KB page, indexed by the *second* fetch's placement (the first fetch is
-  // always a line fill on a cacheable page, `X` below):
-  //   [0] first + second, second mid-line        (X + Y)
-  //   [1] first + second, second line-aligned     (X + X)
-  //   [2] first + second, second in the next page (X + X[page+1])
-  //   [3] first only (Thumb, target word-aligned) (X)
-  // with X = fetch_cost9(page, branch) and Y = fetch_cost9(page, sequential).
-  // Built from the same bytes fetch_cost9 reads, so it is exact by
-  // construction; it follows cpu9_ in one allocation so the pinned timing
-  // register reaches it with one add of REFILL9_OFFSET.
+  // ARM9 precomputed pipeline-refill table: indirect-branch cost per page,
+  // 4 bytes indexed by the second fetch's placement (first fetch is always a
+  // line fill on a cacheable page, `X` below):
+  //   [0] X + Y (second mid-line)  [1] X + X (second line-aligned)
+  //   [2] X + X[page+1] (second in next page)  [3] X only (Thumb, aligned)
+  // with X = fetch_cost9(page, branch), Y = fetch_cost9(page, sequential).
+  // Follows cpu9_ in one allocation; reached via +REFILL9_OFFSET.
   static constexpr u32 CPU9_BYTES     = 0x100000 * 8;
   static constexpr u32 REFILL9_OFFSET = CPU9_BYTES;
   static constexpr u32 REFILL9_BYTES  = 0x100000 * 4;
@@ -83,24 +65,22 @@ public:
   Timing();
   void reset();
 
-  // Region definitions. Addresses are in bytes; the table granularity rounds.
+  // Addresses are in bytes; table granularity rounds.
   void set_region9(u32 start, u32 end, Region r, int bus_width, int nonseq, int seq);
   void set_region7(u32 start, u32 end, Region r, int bus_width, int nonseq, int seq);
 
-  // Rebuild [start, end) of the ARM9 per-4 KB CPU table from the PU map; `notify` reports the change to
-  // the recompiler (pass false while rebuilding several ranges, then call
-  // notify_cpu9 once).
+  // Rebuild [start, end) of the ARM9 per-4 KB CPU table from the PU map;
+  // pass notify=false while rebuilding several ranges, then call
+  // notify_cpu9 once.
   void update_cpu9(const CpuContext& cpu, u32 start, u32 end, bool notify = true);
   void notify_cpu9(const CpuContext& cpu);
 
   const u8 (*cpu9() const)[8] { return reinterpret_cast<const u8 (*)[8]>(cpu9_.get()); }
   const u8 (*cpu7() const)[4] { return reinterpret_cast<const u8 (*)[4]>(bus7()); }
 
-  // Base of the ARM7 cost table. It sits at +COST7_OFFSET from the raw bus
-  // table, which is what the recompiler pins, so one add reaches it.
   const u8* cost7() const { return tim7_.get() + COST7_OFFSET; }
-  // Slot for a code-fetch cost, or -1 when this `nc` was not one of the values
-  // the region table produces (the recompiler then keeps the inline model).
+  // Slot for a code-fetch cost, or -1 if `nc` isn't a value the region table
+  // produces (recompiler then keeps the inline model).
   int nc7_index(u32 nc) const {
     for (u32 i = 0; i < NC7_SLOTS; ++i) if (nc7_values_[i] == nc) return static_cast<int>(i);
     return -1;
@@ -109,15 +89,11 @@ public:
     return (code_main ? 16u : 0u) + (cdi ? 8u : 0u) + nc_idx * 2u + (word ? 1u : 0u);
   }
   u32 region(bool arm9, u32 addr) const { return arm9 ? regions9_[addr >> 14] : regions7_[addr >> 15]; }
-  // CPU-side N32/S32 bus costs (with the ARM9's non-sequential penalty):
-  // what the DSi's NDMA is priced from (melonDS DSi_NDMA::Run9/Run7).
+  // CPU-side N32/S32 bus costs (with ARM9 non-sequential penalty); what the DSi's NDMA is priced from.
   void ndma_cost(bool arm9, u32 addr, u32& n32, u32& s32) const {
     if (arm9) { const u8* t = &bus9_[(addr >> 14) * 8]; n32 = t[2]; s32 = t[3]; }
     else      { const u8* t = &bus7()[(addr >> 15) * 4]; n32 = t[2]; s32 = t[3]; }
   }
-  // The ARM9's bus price of a data access at `addr` in its own cycles, as
-  // update_cpu9 builds a store entry under DS_STORE_BUS -- whatever the store
-  // rule currently in the table. What the underclock tier of --cpu-oc charges.
   u32 bus9_data(u32 addr, bool word, bool seq) const {
     const u8* t = &bus9_[(addr >> 14) * 8];
     return static_cast<u32>(seq ? t[3] : word ? t[2] : t[0]) << clock9_shift;
@@ -130,23 +106,18 @@ public:
   // PU map for the ARM9: per 4 KB, bit 4 = data cacheable, bit 6 = code cacheable.
   std::unique_ptr<u8[]> pu_map;
 
-  // The PU state pu_map was last built from (cp15_update_pu_map): with it, a
-  // PU write only re-derives the pages inside the regions that changed instead
-  // of rebuilding and comparing the whole 1 M-page map. Invalid after reset().
+  // PU state pu_map was last built from (cp15_update_pu_map), so a PU write
+  // re-derives only the changed regions' pages. Invalid after reset().
   struct PuMemo { bool valid = false; u32 ctl = 0, dc = 0, cc = 0, region[8] = {}; } pu_memo;
 
-  // Retime dependency set for the recompiler. A translation bakes at most two
-  // bytes of a 4 KB entry: c[0] (code fetch cost: its own pages, a static
-  // branch target's refill) and c[2] (N32 load: a pc-relative literal). Every
-  // other cost is read at run time. update_cpu9 flags the pages where one of
-  // those bytes actually changed; the JIT kills only the blocks that depend on
-  // a flagged page, then calls retime_clear(). Flags are sticky across the
-  // several update_cpu9 calls of one notify (cp15_update_pu_map, update_tcm).
+  // Retime dependency set for the recompiler. A translation bakes at most
+  // c[0] (code fetch cost) and c[2] (N32/pc-relative load) of a 4 KB entry;
+  // update_cpu9 flags pages where either byte changed, the JIT kills blocks
+  // depending on a flagged page, then calls retime_clear(). Flags are sticky
+  // across the several update_cpu9 calls of one notify.
   static constexpr u8 RETIME_CODE = 1, RETIME_DATA = 2;
   u8 retime_flag(u32 page) const { return retime_flags_[page]; }
   bool retime_pending() const { return retime_overflow_ || !retime_list_.empty(); }
-  // Past RETIME_LIST_MAX flagged pages (a clock change flags them all) the
-  // list stops growing and the clear wipes the whole flag table instead.
   void retime_clear() {
     if (retime_overflow_) std::fill_n(retime_flags_.get(), 0x100000, u8{0});
     else for (u32 p : retime_list_) retime_flags_[p] = 0;

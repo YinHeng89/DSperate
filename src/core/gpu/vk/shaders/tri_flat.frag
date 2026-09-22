@@ -1,6 +1,5 @@
 #version 450
-// Attribution only (DS_VK_TRI_FLAT=1): the opaque draw with a constant
-// colour and no texel, to price the real fragment stage against it.
+// DS_VK_TRI_FLAT=1: opaque draw with a constant colour and no texel.
 #extension GL_GOOGLE_include_directive : require
 #define DS_GLSL 1
 #include "vk_layout.h"

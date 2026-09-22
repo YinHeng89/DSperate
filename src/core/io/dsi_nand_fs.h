@@ -1,18 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // DSperate - Nintendo DS emulator. Copyright (C) 2026 DSperate contributors.
 //
-// The emulator's own view of the DSi NAND filesystem (docs/dsiware-scoping.md
-// 2.3): read the dump's files, and write into the session's in-memory
-// sectors -- saves and settings in, a virtual title installed. The guest never
-// goes through here; it reads raw sectors from the SD host.
+// The emulator's own view of the DSi NAND filesystem, for reading dump files and writing into
+// the session's in-memory sectors. The guest never goes through here; it reads raw sectors from
+// the SD host.
 //
-// Two layers. FatVolume is FAT12/16/32 over any byte-addressed device, so the
-// same code reads the NAND's partitions, the FAT12 volume inside a title's
-// public.sav, or the SD card (dsi_sd_card.h). NandFs is the NAND: the MBR, the AES-CTR
-// every filesystem sector is encrypted with (melonDS DSi_NAND.cpp: the key
-// from the console ID, the counter from the SHA-1 of the eMMC CID), and the
-// ES encryption tickets carry. tools/dsi_nand.py is the independent reference
-// for both.
+// Two layers: FatVolume is FAT12/16/32 over any byte-addressed device (NAND partitions, a
+// title's public.sav, or the SD card). NandFs is the NAND itself: the MBR, the AES-CTR every
+// sector is encrypted with (key from the console ID, counter from the eMMC CID's SHA-1), and
+// the ES encryption tickets carry.
 #pragma once
 #include "core/types.h"
 
@@ -47,12 +43,10 @@ class FatVolume {
     const std::string& display_name() const { return long_name.empty() ? name : long_name; }
   };
 
-  // A FAT timestamp for the entries a write creates or updates. Without one,
-  // entries carry 2000-01-01 00:00, the date the DSi's own files have.
+  // FAT timestamp for entries a write creates/updates; default 2000-01-01 00:00.
   struct Stamp { u16 date = 0, time = 0; };
 
-  // `read`/`write` address the device in bytes from the start of the volume
-  // (its boot sector) and are only ever called with whole sectors.
+  // `read`/`write` address the device in bytes from the volume's boot sector, whole sectors only.
   bool open(ReadFn read, WriteFn write, std::string* err = nullptr);
   bool valid() const { return bps_ != 0; }
   int  fat_bits() const { return fat_bits_; }
@@ -61,11 +55,9 @@ class FatVolume {
   u32  cluster_count() const { return clusters_; }
   Entry root() const;
 
-  // Write an empty volume through `write`: boot sector (plus FSInfo and the
-  // backup boot sector on FAT32), FATs and root directory. The layout is
-  // computed from the size; `fat_bits` must suit the cluster count it gives.
-  // With `zeroed`, the device already reads zero and all-zero sectors are
-  // skipped (an in-memory image stays sparse).
+  // Writes an empty volume through `write`; layout computed from the size, `fat_bits` must suit
+  // the resulting cluster count. `zeroed`: device already reads zero, so all-zero sectors are
+  // skipped.
   struct FormatSpec {
     u64 sectors = 0;          // the volume's length in 512-byte sectors
     u32 hidden = 0;           // sectors before it (its partition's start)
@@ -78,38 +70,30 @@ class FatVolume {
   };
   static bool format(const WriteFn& write, const FormatSpec& spec, std::string* err = nullptr);
 
-  // Names created on this volume keep their case: a name that is 8.3 apart
-  // from lower-case letters gets long-name entries as well, as a PC writes
-  // "readme.txt". Off for the NAND, whose files are all upper-case 8.3.
+  // Names created on this volume keep their case, getting long-name entries when not 8.3. Off
+  // for the NAND, whose files are all upper-case 8.3.
   void set_preserve_case(bool on) { preserve_case_ = on; }
 
-  // Paths are '/'-separated from the root and matched case-insensitively
-  // against the 8.3 names and the long names. A file written under a name
-  // that is not 8.3 gets a NAME~N.EXT short name and long-name entries, as
-  // the DSi's /sys/TWLFontTable.dat has.
+  // Paths are '/'-separated from the root, matched case-insensitively against short and long
+  // names. A non-8.3 write gets a NAME~N.EXT short name plus long-name entries.
   bool lookup(const std::string& path, Entry& out) const;
   std::vector<Entry> list(const Entry& dir) const;
   bool read(const Entry& file, std::vector<u8>& out) const;
-  // `len` bytes of a file from `offset`, reading only the sectors that hold
-  // them (a DSiWare banner without the whole .app); false past its end.
+  // `len` bytes of a file from `offset`, reading only the sectors that hold them; false past end.
   bool read_part(const Entry& file, u64 offset, u32 len, u8* out) const;
 
-  // Replace a file's contents (existing file: its chain is grown or trimmed;
-  // otherwise created in its parent directory, which must exist).
+  // Replaces a file's contents (chain grown/trimmed), or creates it in its parent (must exist).
   bool write(const std::string& path, const u8* data, u32 len, std::string* err = nullptr, const Stamp* stamp = nullptr);
-  // The same without the data: the entry and a chain of `len` bytes, whose
-  // clusters are left as the device has them. For contents that live
-  // somewhere else (the SD card's host files); `out` is the new entry.
+  // Same without the data: entry plus a `len`-byte chain, clusters left as the device has them
+  // (for contents living elsewhere, e.g. the SD card's host files); `out` is the new entry.
   bool create(const std::string& path, u32 len, Entry* out, std::string* err = nullptr, const Stamp* stamp = nullptr);
-  // Create a directory (its parent must exist); true if it already exists.
+  // Creates a directory (parent must exist); true if it already exists.
   bool mkdir(const std::string& path, std::string* err = nullptr, const Stamp* stamp = nullptr);
 
-  // Fill a directory with many new entries in one pass: a bulk build, where
-  // create()/mkdir() would re-read the directory for every entry. Files get
-  // a chain of `size` bytes with their clusters left as the device has them;
-  // directories get one cluster holding "." and "..". An item that cannot be
-  // made (name, space) is left with ok false and why set; the call fails
-  // only when the entries do not fit the directory (a FAT16 root holds 512).
+  // Bulk-fills a directory with new entries in one pass (avoids re-reading the directory per
+  // entry). Files get a `size`-byte chain, clusters as the device has them; directories get one
+  // cluster holding "." and "..". An item that cannot be made is left with ok false and why set;
+  // the call fails only if entries don't fit the directory.
   struct NewEntry {
     std::string name;
     bool dir = false;
@@ -120,17 +104,16 @@ class FatVolume {
     Entry out;
   };
   bool populate(const Entry& dir, std::vector<NewEntry>& items, std::string* err = nullptr);
-  // Clusters nothing has used read zero, as on a volume just formatted onto a
-  // zeroed device: new directory clusters then skip their zero fill.
+  // Set when unused clusters already read zero (freshly formatted onto a zeroed device): new
+  // directory clusters then skip their zero fill.
   void set_fresh(bool on) { fresh_ = on; }
   u64 data_offset() const { return data_off_; }   // cluster 2's byte offset in the volume
-  // Delete a file, or a directory with everything in it; true if absent.
+  // Deletes a file, or a directory with everything in it; true if already absent.
   bool remove(const std::string& path, std::string* err = nullptr);
 
   // Every file and directory below the root, parents before children.
   void walk(const std::function<void(const std::string& path, const Entry&)>& fn) const;
-  // Where a file lives: the volume-relative byte offset of each of its
-  // clusters (cluster_bytes() long), for telling which files a session wrote.
+  // Volume-relative byte offset of each of a file's clusters (cluster_bytes() long).
   std::vector<u64> extents(const Entry& file) const;
 
  private:
@@ -146,11 +129,10 @@ class FatVolume {
   u32  entry_cluster(const u8* e) const;
   void set_entry_cluster(u8* e, u32 c) const;
   std::vector<u8> dir_bytes(const Entry& dir) const;
-  // Store `count` consecutive 32-byte entries (long-name entries, then the
-  // short one); `dirent_out` is the last's offset.
+  // Stores `count` consecutive 32-byte entries (long-name, then short); `dirent_out` is the
+  // last's offset.
   bool add_entry(const Entry& parent, const u8* raw, u32 count, u64& dirent_out);
-  // The short name and long-name entries for `name` in `parent`: 1 entry when
-  // it is already 8.3, else the long-name entries first.
+  // Short name plus long-name entries for `name` in `parent`; 1 entry if already 8.3.
   bool make_entries(const Entry& parent, const std::string& name, std::vector<u8>& raws, std::string* why) const;
   bool make_entries_in(const std::unordered_set<std::string>& taken, const std::string& name, std::vector<u8>& raws, std::string* why) const;
   void write_dir_cluster(u32 cluster, u32 parent_cluster, const Stamp* stamp);
@@ -175,13 +157,12 @@ class FatVolume {
 
 class NandFs {
  public:
-  // `bios7i` (64 KB) supplies the ES key's KeyY at 0x8308; without it tickets
-  // cannot be made or read, and everything else still works.
+  // `bios7i` (64 KB) supplies the ES key's KeyY at 0x8308; without it, tickets cannot be made
+  // or read, but everything else works.
   bool mount(NandImage& nand, const u8* bios7i, std::string* err = nullptr);
-  // Write an empty DSi filesystem over `nand` (for a synthesised image, see
-  // dsi_nand_synth.h) and mount it: the MBR and the two FAT16 partitions with
-  // a retail DSi's geometry, encrypted under the image's console ID and CID.
-  // The image must be at least kImageBytes long.
+  // Writes an empty DSi filesystem over `nand` and mounts it: MBR plus two FAT16 partitions
+  // with a retail DSi's geometry, encrypted under the image's console ID and CID. `nand` must
+  // be at least kImageBytes long.
   static constexpr u64 kImageBytes = 0xF000000;
   bool format(NandImage& nand, const u8* bios7i, std::string* err = nullptr);
   bool valid() const { return main_.valid(); }
@@ -191,8 +172,7 @@ class NandFs {
   u64 main_base() const { return main_base_; }     // each partition's byte offset in the image
   u64 photo_base() const { return photo_base_; }
 
-  // melonDS NANDImage::ESEncrypt/ESDecrypt. `data` holds `len` bytes followed
-  // by a 0x20-byte MAC + footer area; decrypt returns false on a bad MAC.
+  // `data` holds `len` bytes followed by a 0x20-byte MAC + footer area; decrypt fails on a bad MAC.
   bool has_es_key() const { return es_key_ok_; }
   void es_encrypt(u8* data, u32 len, const u8 nonce[12]) const;
   bool es_decrypt(u8* data, u32 len) const;

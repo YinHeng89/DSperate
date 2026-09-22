@@ -8,9 +8,9 @@
 
 namespace ds::jit {
 
-// ---- host register convention -------------------------------------------------
-// Translated code runs with the guest registers pinned; every block and every
-// stub agrees on this map, so linked blocks reconcile nothing at the edge.
+// ---- host register convention --------------------------------------------
+// Guest registers are pinned; every block and stub agrees on this map, so
+// linked blocks reconcile nothing at the edge.
 //
 //   x0-x7, x16, x17   scratch (also C call arguments)
 //   w8                cycle budget minus one (bit 31 set => leave): one `tbnz`
@@ -38,6 +38,5 @@ inline constexpr u32 host_reg(u32 guest) {
   return guest < 8 ? 19 + guest : guest < 13 ? 9 + (guest - 8) : guest == 13 ? 27 : 28;
 }
 inline constexpr bool host_reg_callee_saved(u32 guest) { return guest < 8 || guest >= 13; }
-
 
 } // namespace ds::jit

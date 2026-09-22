@@ -65,7 +65,6 @@ enum class TOp : u8 {
 constexpr inline u32 arm_index(u32 instr) { return ((instr >> 16) & 0xFF0) | ((instr >> 4) & 0xF); }
 constexpr inline u32 thumb_index(u16 instr) { return instr >> 6; }
 
-// Classify an ARM instruction from its 12-bit table index.
 constexpr AOp classify_arm(u32 idx) {
   const u32 hi = idx >> 4;        // bits 27:20
   const u32 lo = idx & 0xF;       // bits 7:4
@@ -184,7 +183,6 @@ inline constexpr std::array<TOp, 1024> THUMB_TABLE = detail::build_thumb();
 inline AOp decode_arm(u32 instr)   { return ARM_TABLE[arm_index(instr)]; }
 inline TOp decode_thumb(u16 instr) { return THUMB_TABLE[thumb_index(instr)]; }
 
-// Condition codes: bit (cond) of CONDITION_TABLE[NZCV] set => execute.
 constexpr inline bool check_condition(u32 cond, u32 cpsr) {
   const bool n = cpsr & 0x80000000, z = cpsr & 0x40000000, c = cpsr & 0x20000000, v = cpsr & 0x10000000;
   switch (cond) {

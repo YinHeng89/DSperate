@@ -2,13 +2,9 @@
 // DSperate - Nintendo DS emulator. Copyright (C) 2026 DSperate contributors.
 #ifndef DS_VK_LAYOUT_H
 #define DS_VK_LAYOUT_H
-// The host/shader interface for the GPU raster. Included by C++ and, with
-// DS_GLSL defined, textually by the shaders, so a field can never drift
-// between the two: change it here and both sides move.
-//
-// std430 layout throughout. Every member is 4 bytes and every struct is a
-// multiple of 16, so the C++ and GLSL layouts agree without padding rules
-// coming into it.
+// Host/shader interface for the GPU raster. Included by C++ and, with
+// DS_GLSL, textually by the shaders, so a field can't drift between the two.
+// std430 layout: every member 4 bytes, every struct a multiple of 16.
 
 #ifndef DS_GLSL
 #include "core/types.h"
@@ -19,42 +15,21 @@ using uint = u32;
 #define DS_INT int
 #endif
 
-// Tiles. One workgroup draws one tile, one invocation one pixel, so the tile
-// holds a workgroup's worth of pixels: W*H must stay inside the G52's limit
-// of 384 invocations, and 256 is the shape that divides the screen evenly.
-//
-// Which 256 used to be a real trade: the raster recomputed each polygon's
-// scanline setup once per tile it touched, so wide tiles spared a
-// screen-spanning polygon that work while narrow ones culled better. The
-// span pass removed the recomputation, and with it the trade -- narrow is now
-// simply better, because the per-pixel loop walks every polygon binned to the
-// tile and a narrow tile bins fewer.
-//
-// Measured before and after, fence wait per frame on Etrian Odyssey:
-//   before the span pass:  16x16 14.14   32x8 10.89   64x4 10.33   128x2 11.95
-//   after:                  8x32  5.61   16x16 5.83   32x8  6.29   64x4  6.84
-// The optimum walked from 64x4 to 8x32 exactly as removing the redundancy
-// predicted it would. mlbis agrees (2.50 / 2.72 / 2.91 / 3.53); Golden Sun is
-// flat between 8x32 and 16x16 (8.32 / 8.27) and slower either side.
+// Tiles. One workgroup per tile, one invocation per pixel: W*H must stay
+// inside the GPU's invocation limit; narrow tiles bin fewer polygons per pixel loop.
 #ifndef DS_TILE_W
 #define DS_TILE_W 8
 #endif
-// The tile's height, i.e. the workgroup's lane count over its width. 256
-// lanes by default; overridable for the raster-floor sweep.
 #ifndef DS_TILE_H
 #define DS_TILE_H (256 / DS_TILE_W)
 #endif
 #define DS_TILES_X (256 / DS_TILE_W)
 #define DS_TILES_Y (192 / DS_TILE_H)
 #define DS_TILE_COUNT (DS_TILES_X * DS_TILES_Y)
-// Polygons a single tile will hold. Overflow is not silently dropped: the
-// binning pass records it and the frame falls back to the CPU raster, which
-// keeps "the GPU path is either right or absent" true.
+// Overflow is recorded, not dropped: binning sets it and the frame falls back to the CPU raster.
 #define DS_TILE_POLYS 512
 
-// The hardware's own limits, so the buffers are sized once at startup and a
-// frame can never need a bigger one. 2048 polygons, and a clipped polygon has
-// at most 10 vertices.
+// Hardware limits, so buffers size once at startup. Clipped polygon: max 10 vertices.
 #define DS_MAX_POLYS 2048
 #define DS_MAX_VERTS (DS_MAX_POLYS * 10)
 
@@ -65,40 +40,24 @@ using uint = u32;
 #define DS_PF_TEXTURED    0x0008u
 #define DS_PF_SHADOW_MASK 0x0010u
 #define DS_PF_SHADOW      0x0020u
-// The texture can produce a 0-alpha texel: colour-0-transparent (TEXIMAGE_PARAM
-// bit 29), the compressed format's transparent index, or the direct-colour
-// format's alpha bit. Without it every texel of an opaque-group polygon has
-// alpha 31 and its alpha test needs no texture sample at all.
+// Texture can produce a 0-alpha texel (colour-0-transparent, compressed
+// transparent index, or direct-colour alpha bit); without it every texel is
+// alpha 31 and needs no sample for the alpha test.
 #define DS_PF_TEX_ALPHA   0x0040u
 
-// Shadow mask RUN INDEX, per polygon per scanline.
-//
-// The DS clears the shadow stencil for a whole SCANLINE when a run of shadow
-// mask polygons begins -- when the previous polygon drawn on that line was not
-// itself a mask. A tiled raster cannot see that: the polygon that ended the
-// run may cover the line somewhere else entirely and never reach this tile.
-//
-// Recording "this mask clears here" is not enough either, and that was a real
-// bug rather than a theoretical one: a pixel only sees the masks binned to ITS
-// tile, so it can miss the very mask that carried the clear, and the amount it
-// misses depends on the tile width. Narrowing the tiles made Spirit Tracks
-// measurably worse, which is how it was found.
-//
-// Identifying the RUN instead is tile-independent. The host numbers the runs
-// per scanline; a pixel clears whenever the run it sees differs from the run
-// it saw last, so it reaches the right answer from any subsequence of the
-// masks -- including one that skips whole runs, because a run it never saw
-// contributed nothing to its stencil anyway.
+// Shadow mask RUN INDEX, per polygon per scanline. The DS clears the stencil
+// per-scanline at the start of a mask run, but a tiled raster can't see that
+// (the polygon ending a run may never reach this tile). Numbering runs
+// per-scanline is tile-independent: a pixel clears when the run it sees
+// differs from the one it saw last.
 #define DS_SHRUN_LINES 192
 
-// One screen-space vertex of one polygon, after the viewport transform and
-// after clipping -- flattened per polygon rather than shared, because z and w
-// live in the Polygon (p.z[i], p.w[i]) while position and attributes live in
-// the Vertex, and the raster always wants them together. 48 bytes.
+// One screen-space vertex, after viewport transform and clipping. Flattened
+// per polygon, not shared: the raster wants position/depth/attrs together. 48 bytes.
 struct GpuVert {
   DS_INT sx, sy;        // screen position
   DS_INT z, w;          // depth and normalised W for this polygon's slot
-  DS_INT r, g, b;       // Vertex::fcol, 9-bit; the raster narrows to 6 with >> 3
+  DS_INT r, g, b;       // 9-bit vertex colour; the raster narrows to 6 with >> 3
   DS_INT s, t;          // 12.4 texture coordinates
   uint   pad_[3];
 };
@@ -119,18 +78,9 @@ struct GpuPoly {
   uint   pad_;
 };
 
-// One scanline of one polygon, computed once for the whole frame.
-//
-// This is the Y stage: walking the two edge chains, setting up both slopes,
-// and interpolating w, z and the five attributes to the ends of the span. It
-// depends on the polygon and the scanline and NOT on x, so it wants to exist
-// exactly once per (polygon, scanline) -- which is what the span pass makes
-// it. Previously the raster recomputed it per tile, and since a polygon
-// spans several tile columns that was the dominant redundancy AND the reason
-// tile shape mattered at all (see the scoping doc's sweep).
-//
-// Sixteen words. The five attributes at each end pack into two apiece: three
-// 9-bit colours into 10:10:10, two 12.4 texture coordinates into 16:16.
+// One scanline of one polygon (the Y stage's output), computed once per
+// (polygon, scanline) by the span pass. 16 words; endpoint attributes pack
+// two apiece (3x9-bit colour into 10:10:10, two 12.4 texcoords into 16:16).
 struct GpuRow {
   DS_INT xstart, xend, lim0, lim1;
   DS_INT wl, wr, zl, zr;
@@ -139,28 +89,19 @@ struct GpuRow {
   uint   rcp;           // and its reciprocal-of-xdiff
   uint   fl;            // 1 valid, 2 l_fill, 4 r_fill, 8 w-buffer, 16 linear, 5-8 yedge, 512 mask, 1024 shadow, 2048/4096 left/right edge runs down-left (smooth filter)
   uint   poly;          // the polygon this row belongs to, so a pass driven by rows can find it
-  uint   lcov, rcov;    // anti-aliasing coverage of the left and right edge runs, as Renderer3D::Slope::edge_params packs it (bit 31: X-major, start << 12 | increment)
+  uint   lcov, rcov;    // AA coverage of the left/right edge runs (bit 31: X-major, start << 12 | increment)
 };
 
-// The visibility pass's workgroup: DS_VIS_ROWS span rows per workgroup, a
-// subgroup of DS_VIS_LANES lanes per row, the lanes taking the row's pixels
-// in stride. One row per 32-lane workgroup was the first shape and it was
-// launch-bound on Mario & Luigi: 5000 workgroups a frame for 13-pixel spans,
-// with most lanes idle. Eight lanes is the G52's subgroup, so a row is one
-// subgroup and rows never diverge against each other.
+// Visibility pass workgroup: DS_VIS_ROWS rows, a DS_VIS_LANES-lane subgroup
+// per row. 8 lanes matches a typical GPU subgroup so rows never diverge.
 #define DS_VIS_ROWS  8
 #define DS_VIS_LANES 8
 
-// Rows the span table holds. A frame needs one per visible polygon scanline
-// -- the sum of the polygons' clamped heights -- and one that wants more is
-// refused rather than truncated, like every other budget here. Measured peak
-// over the six benchmark scenes is 15874 (Spirit Tracks), so this is about
-// three times the worst seen; the theoretical worst is 2048 * 192, which no
-// real frame approaches and which would fall back to the CPU.
+// Span table rows a frame needs (sum of polygons' clamped heights); refused,
+// not truncated, if it wants more. Worst case 2048*192 falls back to the CPU.
 #define DS_MAX_SPAN_ROWS 49152
 
-// Per-frame constants. Pushed, not a buffer: it changes every frame and is
-// small enough for the push-constant budget.
+// Per-frame constants; pushed, not a buffer (changes every frame, small).
 struct GpuFrame {
   uint   npoly;
   uint   scale;         // internal resolution multiplier (1 for P1)
@@ -169,16 +110,10 @@ struct GpuFrame {
   uint   clear_color;   // the record clear_line() fills: RGB666 + alpha << 24
   uint   clear_depth;
   uint   clear_attr;    // polygon id in bits 24-29, fog bit 15
-  uint   tile_y0;       // first tile row of this dispatch: see the bands note in vk_raster.h
-  // The ORDER-FREE PREFIX of the list. The hardware sorts every opaque polygon
-  // before every translucent one, and for an opaque polygon the pixel's final
-  // owner is a minimum under a total order -- (z, back-facing, list index) --
-  // so draw order does not matter for them (see vis.comp). Polygons
-  // [0, first_ordered) are drawn that way; [first_ordered, npoly) are the
-  // ordered tail the per-pixel loop still walks in list order. The first
-  // translucent, shadow-mask or shadow polygon ends the prefix, so the tail
-  // may still hold opaque polygons and that is fine: the loop handles them
-  // exactly as before. opaque_rows is the prefix's span-table size.
+  uint   tile_y0;       // first tile row of this dispatch (banded dispatch)
+  // ORDER-FREE PREFIX: [0, first_ordered) are opaque polygons, whose pixel
+  // owner is a (z, back-facing, list index) minimum so order doesn't matter;
+  // [first_ordered, npoly) is the ordered tail. opaque_rows is the prefix's span-table size.
   uint   first_ordered;
   uint   opaque_rows;
   uint   nrows;         // span rows this frame, all polygons: the span pass is one lane per row
@@ -186,40 +121,29 @@ struct GpuFrame {
   uint   flags2;        // DS_FF2_* (flags is full: bits 16-31 are the shadow run)
 };
 
-#define DS_FF_WBUFFER 0x1u   // the frame depth-tests on W (SWAP_BUFFERS bit 1); the triangle path picks its pipelines by it
-#define DS_FF_FACE_BACK  0x4u  // the triangle path's opaque draw, back-facing polygons only (tri.vert collapses the rest)
-#define DS_FF_FACE_FRONT 0x8u  // ... front-facing only: drawn second, LESS_OR_EQUAL, so a front face at the depth of an opaque back-facing pixel wins (Renderer3D::depth_pass mode 1)
-#define DS_FF_RUN_SHIFT 16u  // bits 16-31: the shadow-mask run this draw belongs to (the shadow plane holds run ids; see vk_raster.cpp)
-#define DS_FF_ONLY_PLAIN 0x40u  // the triangle path: draw only polygons WITHOUT DS_PF_TEX_ALPHA (the depth prepass and its EQUAL shaded pass)
-#define DS_FF_ONLY_ALPHA 0x80u  // ... only polygons WITH it (drawn after, with the normal test: they never went through the prepass)
-#define DS_FF_SORTED   0x100u  // the triangle path: this draw's instance i is polygon order[i] (the opaque prefix near to far)
-#define DS_FF_TAIL1X   0x200u  // the translucent tail drawn at native resolution on the shrunk planes (tri.vert divides positions by scale; tri_tail.frag depth-tests in the shader)
-#define DS_FF_SHRINK3  0x400u  // downsample.comp: shrink the attribute and depth records too (before the native tail)
-#define DS_FF_SPANCULL 0x1000u // the AA pass: tri.vert grows every polygon by a pixel and the fragment shader keeps only the pixels of its DS span (tri_aa_common.glsl) -- the DS's coverage, not the hardware's
-#define DS_FF_ROWS     0x2000u // the span table holds this frame's rows: the fragment shaders take edge flags and coverage from it (edge marking, fast AA)
-#define DS_FF_AAFAST   0x4000u // post.comp: the fast anti-aliasing -- edge pixels blended with their outside neighbour, in two stages
-#define DS_FF_POST2    0x8000u // post.comp: stage 2 of the fast anti-aliasing (stage 1 wrote fogged, edge-marked pixels to the scratch plane)
-// The smooth-3D present filter (docs/gpu-path-scoping.md, P4): the fast
-// anti-aliasing's second stage writes each pixel's edge record -- side flags,
-// coverage, X-major, covered half -- to the edge plane instead of blending,
-// and the present stage splits every panel pixel of an edge along the DS's
-// own coverage. The frame is drawn as if DISP3DCNT anti-aliasing were on, so
-// the span table carries coverage whether or not the game asked for it.
+#define DS_FF_WBUFFER 0x1u   // frame depth-tests on W (SWAP_BUFFERS bit 1); triangle path picks pipelines by it
+#define DS_FF_FACE_BACK  0x4u  // triangle path opaque draw, back-facing only
+#define DS_FF_FACE_FRONT 0x8u  // ... front-facing only, drawn second, LESS_OR_EQUAL (wins ties over opaque back-facing)
+#define DS_FF_RUN_SHIFT 16u  // bits 16-31: shadow-mask run this draw belongs to
+#define DS_FF_ONLY_PLAIN 0x40u  // triangle path: only polygons WITHOUT DS_PF_TEX_ALPHA (depth prepass + its EQUAL shaded pass)
+#define DS_FF_ONLY_ALPHA 0x80u  // ... only WITH it (drawn after, normal test, skips the prepass)
+#define DS_FF_SORTED   0x100u  // triangle path: instance i is polygon order[i] (opaque prefix near to far)
+#define DS_FF_TAIL1X   0x200u  // translucent tail drawn at native resolution on the shrunk planes
+#define DS_FF_SHRINK3  0x400u  // downsample.comp: shrink attribute and depth too (before the native tail)
+#define DS_FF_SPANCULL 0x1000u // AA pass: tri.vert grows polygons by a pixel, fragment shader trims to the DS span
+#define DS_FF_ROWS     0x2000u // span table holds this frame's rows (edge flags/coverage for edge marking, fast AA)
+#define DS_FF_AAFAST   0x4000u // post.comp: fast AA, edge pixels blended with outside neighbour, two stages
+#define DS_FF_POST2    0x8000u // post.comp: stage 2 of fast AA (stage 1 wrote fogged/marked pixels to the scratch plane)
+// Smooth-3D present filter: fast AA's stage 2 writes each pixel's edge
+// record to the edge plane instead of blending; present stage splits it.
 #define DS_FF2_SMOOTH  0x1u
-#define DS_FF_AA       0x800u  // the anti-aliasing pass ran: the final pass blends edge pixels with the layer underneath (post.comp)
-#define DS_FF_TEX0     0x20u  // attribution (DS_VK_TRI_TEX0=1): every texel fetch reads the polygon's first texel (the fetch without its cache misses)
-#define DS_FF_NOTEX    0x10u  // attribution (DS_VK_TRI_NOTEX=1): shade every polygon as untextured
-#define DS_FF_IDCOLOUR 0x2u  // debugging (DS_VK_TRI_IDCOL=1): the opaque draw writes the polygon INDEX as its colour (r = i & 63, g = i >> 6 & 63, b = i >> 12 & 63)
+#define DS_FF_AA       0x800u  // AA pass ran: the final pass blends edge pixels with the layer underneath
+#define DS_FF_TEX0     0x20u  // debug (DS_VK_TRI_TEX0=1): every texel fetch reads the polygon's first texel
+#define DS_FF_NOTEX    0x10u  // debug (DS_VK_TRI_NOTEX=1): shade every polygon as untextured
+#define DS_FF_IDCOLOUR 0x2u  // debug (DS_VK_TRI_IDCOL=1): the opaque draw writes the polygon INDEX as its colour (r = i & 63, g = i >> 6 & 63, b = i >> 12 & 63)
 
-// Render state too large for the push constants: the fog table, the edge
-// colours and the toon table. Uploaded every frame -- it is 320 bytes, which
-// is cheaper to write than to track for changes.
-//
-// The final pass exists because edge marking reads a pixel's four NEIGHBOURS,
-// which in a tiled raster are in other workgroups. Fog needs no neighbour and
-// could have been folded into the raster -- but the hardware applies edge
-// marking first and fog to its result, so they belong in the same pass, in
-// that order, exactly as Renderer3D::final_pass_ref has them.
+// Render state too large for push constants (fog table, edge colours, toon
+// table). Uploaded every frame, 320 bytes, cheaper than tracking changes.
 struct GpuPost {
   uint fog_color;       // RenderState::fog_color: 15-bit colour in 0-14, 5-bit alpha in 16-20
   uint fog_offset;

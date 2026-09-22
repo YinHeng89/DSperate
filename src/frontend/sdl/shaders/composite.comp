@@ -1,22 +1,17 @@
 #version 450
-// The 2D/3D composite at the internal resolution (P2c). Engine A's resolved
-// planes come from the CPU at native resolution (Engine2D::export_planes),
-// the 3D layer from the triangle path at S times that; every output pixel
-// runs kern::composite_line with the hi-res 3D pixel substituted, then the
-// master brightness and the 6 -> 8 bit expansion of Gpu::output_engine. A
-// line that was not exported (no 3D, or not display mode 1) is the finished
-// pixels the core wrote. At S = 1 this is the CPU composite bit for bit.
+// 2D/3D composite at the internal resolution: 2D planes come from the CPU at
+// native res, the 3D layer at S times that. Mirrors kern::composite_line with
+// the hi-res 3D pixel substituted, then master brightness + 6->8 bit expand.
+// At S=1 this matches the CPU composite bit for bit.
 layout(local_size_x = 16, local_size_y = 8) in;
 layout(std430, binding = 1) readonly buffer Src    { uint fb[]; };      // the finished DS frames (slot base + screen * 49152)
 layout(std430, binding = 2) readonly buffer Planes { uint pl[]; };      // top | second | meta | win (49152 each) | line[192] | mbright[192]
 layout(std430, binding = 3) readonly buffer L3D    { uint l3d[]; };     // 256S x 192S RGB666 + alpha5 << 24
 layout(std430, binding = 4) writeonly buffer Dst   { uint dst[]; };     // 256S x 192S 0xAARRGGBB
 layout(std430, binding = 5) readonly buffer EdgeIn { uint ein[]; };     // the raster's edge plane (the smooth filter; pc.flags bit 0 says it is bound)
-// The smooth filter's edge record rides in the output's alpha byte, which
-// nothing downstream used: bit 0 right run (else left), bit 1 X-major, bit 2
-// covered half is the top, bits 3-7 coverage. 0xFF = no edge (a record's
-// coverage is never 31, so no edge encodes to 0xFF). The plane's word
-// (post.comp) holds the unblended pixel in bits 0-22 and the record above.
+// Edge record in the output alpha byte: bit0 right run (else left), bit1
+// X-major, bit2 covered half is top, bits3-7 coverage; 0xFF = no edge
+// (coverage is never 31). Plane word holds unblended pixel in bits 0-22.
 uint edge_byte(uint e) {
   if ((e & 0x80000000u) == 0u) return 0xFFu;
   return ((e >> 28) & 7u) | (((e >> 23) & 31u) << 3);
@@ -60,13 +55,12 @@ void main() {
   if (kind == K_3D) {
     uint px3 = l3d[p.y * W + p.x];
     if ((pc.flags & 1u) != 0u) {
-      // An edge pixel of the smooth filter: the polygon's own pixel, not the
-      // anti-aliased blend the layer holds; the filter gives the outside part
-      // of the pixel to the neighbour at panel resolution.
+      // Smooth filter: use the polygon's own pixel, not the layer's AA blend;
+      // the outside part goes to the neighbour at panel resolution.
       uint rec = ein[p.y * W + p.x];
       if ((rec & 0x80000000u) != 0u) { px3 = edge_pixel(rec); e = rec; }
     }
-    if (((px3 >> 24) & 0x1Fu) == 0u) { a = b; kind = 0u; t1 = t2 >> 8; e = 0u; }   // transparent at this subpixel: the layer beneath
+    if (((px3 >> 24) & 0x1Fu) == 0u) { a = b; kind = 0u; t1 = t2 >> 8; e = 0u; }   // transparent: fall to layer beneath
     else a = px3;
   }
   uint effect = (bldcnt >> 6) & 3u;
@@ -82,7 +76,7 @@ void main() {
     else if (effect == 3u) o = darken(a, evy, 0x7u);
   }
   o &= 0xFFFFFFu;
-  // Master brightness (kern::master_brightness), then expand_colours.
+  // Master brightness, then expand_colours.
   uint mode = (mb >> 14) & 3u, factor = min(mb & 0x1Fu, 16u);
   if (mode == 1u) { uint rb = o & 0x3F003Fu, g = o & 0x3F00u; rb += ((((0x3F003Fu - rb) * factor) >> 4) & 0x3F003Fu); g += ((((0x3F00u - g) * factor) >> 4) & 0x3F00u); o = rb | g; }
   else if (mode == 2u) { uint rb = o & 0x3F003Fu, g = o & 0x3F00u; rb -= ((((rb * factor) + (0xFu * 0x010001u)) >> 4) & 0x3F003Fu); g -= ((((g * factor) + (0xFu * 0x000100u)) >> 4) & 0x3F00u); o = rb | g; }

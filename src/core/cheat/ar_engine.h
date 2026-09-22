@@ -11,35 +11,25 @@ namespace ds { struct NDS; }
 namespace ds::cheat {
 
 // Action Replay DS codes: pairs of 32-bit words, run once a frame from the
-// ARM7's VBlank IRQ, which is where the real cartridge hooks itself. The
-// opcode set is GBATEK's (writes, conditionals, a loop, a data register, two
-// block copies); the interpreter follows melonDS's, which is the reference
-// this was checked against.
-//
-// Writes go to the ARM7's address space through the bus's DMA accessors: the
-// bytes are not the guest's, so they are not charged CPU cycles, but they do
-// go through the page table and so invalidate JIT blocks like any other store.
+// ARM7's VBlank IRQ, where the real cartridge hooks itself. Writes go
+// through the bus's DMA accessors (uncharged for CPU cycles, but still
+// invalidate JIT blocks).
 struct Code {
   std::string name;
-  std::string description;   // the database carries one; often empty
+  std::string description;   // often empty
   int group = -1;            // index into GameCheats::groups, -1 for none
   bool enabled = false;
   std::vector<u32> words;    // an even number; an odd tail is ignored
 
-  // The database carries notes, credits and headings as items with a name and
-  // no code at all. They are not cheats and doing anything to them does
-  // nothing; a menu should show them rather than offer them as a toggle.
   bool is_note() const { return words.empty(); }
 };
 
-// Why a code stopped, for the log and the tests. A code that simply ran off
-// its end is Ok; everything else names something wrong with the code itself.
 enum class Stop : u8 {
-  Ok,          // ran to the end of the words
-  BadOpcode,   // an opcode outside the set
+  Ok,
+  BadOpcode,
   Truncated,   // an operand or a block ran past the end of the words
   Unsupported, // C2 (native code injection) or C4 (self-modifying code)
-  RunawayLoop, // the iteration budget was exhausted (a code that never ends)
+  RunawayLoop,
 };
 const char* stop_name(Stop s);
 
@@ -47,22 +37,13 @@ class Engine {
 public:
   std::vector<Code> codes;
 
-  // Runs every enabled code, in order. Safe to call with no codes.
   void run(NDS& nds);
-  // One code, whatever its `enabled`. Returns why it stopped.
   Stop run_code(NDS& nds, const Code& code);
 
-  // A code that loops for ever must not hang the emulator, so execution is
-  // capped. The limit is per code per run and far above any real code: the
-  // largest published ones are a few hundred word pairs with loops of a few
-  // thousand iterations.
   static constexpr u64 MAX_STEPS = 1u << 20;
 
 private:
-  // Diagnostics are logged once per code, not once per frame: a bad code
-  // fires every frame and would otherwise bury the log. Tracked by index and
-  // reset whenever the list's length changes, so nothing here outlives the
-  // vector it refers to.
+  // Logged once per code, not once per frame, else a bad code buries the log.
   std::vector<u8> complained_;
 };
 

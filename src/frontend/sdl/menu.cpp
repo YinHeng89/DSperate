@@ -14,11 +14,7 @@ namespace ds::sdl {
 namespace {
 
 // 5x7 glyphs, one byte per row, bits 4..0 left to right; ' ' (0x20) to ']'
-// (0x5D) -- the brackets are there because the cheats page draws its
-// checkboxes with them.
-// Wider than the 3x5 the slot digit uses: at this size M/N/W are distinct and
-// a word is read rather than decoded, which a menu needs and an OSD digit
-// does not.
+// (0x5D) -- brackets are there for the cheats page's checkboxes.
 constexpr u8 kFont[92][7] = {
   { 0, 0, 0, 0, 0, 0, 0}, { 4, 4, 4, 4, 4, 0, 4}, {10,10, 0, 0, 0, 0, 0}, {10,10,31,10,31,10,10},
   { 4,15,20,14, 5,30, 4}, {24,25, 2, 4, 8,19, 3}, { 8,20,20, 8,21,18,13}, { 4, 4, 0, 0, 0, 0, 0},
@@ -37,23 +33,12 @@ constexpr u8 kFont[92][7] = {
   {17,17,17,17,17,17,14}, {17,17,17,17,17,10, 4}, {17,17,17,21,21,27,17}, {17,17,10, 4,10,17,17},
   {17,17,10, 4, 4, 4, 4}, {31, 1, 2, 4, 8,16,31},
   { 6, 4, 4, 4, 4, 4, 6}, {16,16, 8, 4, 2, 1, 1}, {12, 4, 4, 4, 4, 4,12},
-  // Face-button positions, indices 62..65, addressed as the control bytes
-  // \x01..\x04 (Menu::kFaceSouth and friends). A diamond of four pips with
-  // the named one filled: which corner of the cluster a pad button sits in is
-  // the same on every pad, where its letter is not.
-  // East and west are two columns wide against north and south's three, so
-  // that they stop short of the cell's centre column -- the axis the top and
-  // bottom pips sit on -- and the diamond keeps its hole.
+  // Face-button positions, indices 62..65 (\x01..\x04, Menu::kFaceSouth and
+  // friends). Diamond of four pips with the named one filled.
   { 0, 4, 0,17,14,14,14}, { 0, 4, 3,19, 3, 4, 0}, { 0, 4,24,25,24, 4, 0}, {14,14,14,17, 0, 4, 0},
-  // Lower case, indices 66..91. The rest of the menu still folds a-z onto the
-  // capitals -- a row of settings reads better in one case -- but the name
-  // editor draws what is actually being typed, because a player choosing
-  // between "n" and "N" for a password has to be able to see which one they
-  // have. Reached through glyph_cased(), never through glyph().
-  //
-  // Seven rows and no room below the baseline, so g/j/p/q/y put their tails on
-  // the last row rather than under it: at this size a descender that dropped
-  // into the next row's space would collide with it.
+  // Lower case, indices 66..91. Rest of the menu folds a-z onto capitals;
+  // only the name editor needs true case (n vs N for a password). Reached
+  // through glyph_cased(), never glyph().
   { 0, 0,14, 1,15,17,15}, {16,16,22,25,17,17,30}, { 0, 0,14,16,16,17,14},   // a b c
   { 1, 1,13,19,17,17,15}, { 0, 0,14,17,31,16,14}, { 6, 9, 8,28, 8, 8, 8},   // d e f
   { 0, 0,15,17,15, 1,14}, {16,16,22,25,17,17,17}, { 4, 0,12, 4, 4, 4,14},   // g h i
@@ -66,15 +51,11 @@ constexpr u8 kFont[92][7] = {
 
 constexpr int kGlyphW = 5, kGlyphH = 7, kAdvance = 6;   // advance includes the one-pixel gap
 
-// Panel geometry, derived at draw time from the canvas rather than fixed for a
-// 256x192 one. Rows are `row_h` tall around a `glyph_px` glyph, so a selected
-// row's bar sits evenly above and below its text -- derive it, do not
-// hand-tune it, or the bar drifts off the text the next time either changes.
-//
-// Every measure is a multiple of the glyph scale, so at scale 2 -- which is
-// what a 256x192 canvas gives, the size the menu had when it was drawn into a
-// DS framebuffer -- these come out at exactly the old constants. That is
-// deliberate: the DS-space fallback path draws the same pixels it always did.
+// Panel geometry, derived at draw time from the canvas rather than fixed for
+// a 256x192 one. Rows are `row_h` tall around a `glyph_px` glyph so the
+// selection bar sits evenly above and below its text; every measure is a
+// multiple of the glyph scale, so scale 2 (a 256x192 canvas) reproduces the
+// old fixed constants exactly.
 struct Metrics {
   int s;            // glyph scale for ordinary rows
   int list_s;       // ... and for the scrolling list pages
@@ -82,16 +63,14 @@ struct Metrics {
   int list_row_h, list_rows_y;
 };
 
-// Metrics for an explicit glyph scale. The pages that must shrink to fit step
+// Metrics for an explicit glyph scale. Pages that must shrink to fit step
 // this down directly: deriving a smaller scale by shrinking the canvas and
-// asking again does not always converge -- 640x480 asks for 5, and the
-// canvas that would give 4 gives 4 again forever.
+// re-asking does not always converge.
 Metrics metrics_for(int s) {
   Metrics m{};
   m.s = std::clamp(s, 2, 10);
-  // Cheat names are sentences ("Press L+R+SELECT For 7 Red Coins") and a game
-  // can have thousands of them, so the list pages drop to half scale: about
-  // thirty characters across and twelve at a time, against fifteen and five.
+  // Cheat names are sentences and a game can have thousands, so list pages
+  // drop to half scale (about thirty characters across, twelve at a time).
   m.list_s = std::max(1, m.s / 2);
   m.glyph_px = kGlyphH * m.s;
   m.row_h    = m.glyph_px + 2 * m.s;
@@ -107,8 +86,7 @@ Metrics metrics_for(int s) {
 Metrics metrics(const Canvas& d) { return metrics_for(ui_scale(d)); }
 
 int panel_height(const Metrics& m, int rows) { return m.rows_y + rows * m.row_h + m.pad; }
-// The list pages take most of the canvas: they are the ones with thousands of
-// entries, and rows they cannot show are rows the player has to scroll to.
+// List pages take most of the canvas: rows they cannot show are rows the player scrolls to.
 int list_panel_w(const Canvas& d, const Metrics& m) { return std::min(d.w - m.pad, 120 * m.s); }
 int list_panel_h(const Canvas& d, const Metrics& m) { return std::min(d.h - m.pad, 89 * m.s); }
 int list_visible(const Metrics& m, int panel_h) {
@@ -116,29 +94,23 @@ int list_visible(const Metrics& m, int panel_h) {
 }
 
 int glyph(char c) {
-  // The face-position pips live below the printable range rather than after
-  // ']': the next free codes up there are 0x5E..0x61, and 0x61 is 'a', which
-  // the fold below would swallow.
+  // Face-position pips live below the printable range rather than after ']':
+  // the free codes there overlap 'a', which the fold below would swallow.
   if (c >= 1 && c <= 4) return 62 + c - 1;
   if (c >= 'a' && c <= 'z') c = static_cast<char>(c - 'a' + 'A');
   const int i = static_cast<int>(static_cast<unsigned char>(c)) - 0x20;
   return (i >= 0 && i < 62) ? i : 0;
 }
 
-// The same, but keeping a lower-case letter lower case. Only the name editor
-// wants this; everywhere else the fold to capitals is deliberate.
+// Keeps a lower-case letter lower case, for the name editor only.
 int glyph_cased(char c) {
   if (c >= 'a' && c <= 'z') return 66 + (c - 'a');
   return glyph(c);
 }
 
-// Text arrives as UTF-8 -- achievement and game titles come from
-// RetroAchievements as the game is actually named, "Ōkamiden" -- and the font
-// is ASCII. Rather than draw a blank per byte, a Latin letter with a mark is
-// folded onto the letter it decorates, which the player can read; anything
-// else that is not ASCII draws as '?', which at least admits something is
-// there. Returns the next glyph's ASCII code and advances `p` past however
-// many bytes it took.
+// Text arrives as UTF-8 but the font is ASCII: a Latin letter with a mark
+// folds onto the letter it decorates ("Ōkamiden"); anything else draws '?'.
+// Returns the next glyph's ASCII code and advances `p` past its bytes.
 char next_char(const char*& p) {
   const unsigned char b0 = static_cast<unsigned char>(*p++);
   if (b0 < 0x80) return static_cast<char>(b0);
@@ -150,12 +122,11 @@ char next_char(const char*& p) {
     if ((b & 0xC0) != 0x80) return '?';            // truncated sequence: leave the tail for the next glyph
     cp = (cp << 6) | (b & 0x3F);
   }
-  // Latin-1 Supplement letters, U+00C0..U+00FF.
+  // Latin-1 Supplement, U+00C0..U+00FF.
   static constexpr char kLatin1[64 + 1] =
       "AAAAAAACEEEEIIII" "DNOOOOOxOUUUUYTs"
       "aaaaaaaceeeeiiii" "dnooooo/ouuuuyty";
-  // Latin Extended-A, U+0100..U+017F: the macrons, carons, ogoneks and
-  // strokes of most European spellings.
+  // Latin Extended-A, U+0100..U+017F.
   static constexpr char kLatinA[128 + 1] =
       "AaAaAaCcCcCcCcDd" "DdEeEeEeEeEeGgGg" "GgGgHhHhIiIiIiIi" "IiIiJjKkkLlLlLlL"
       "lLlNnNnNnnNnOoOo" "OoOoRrRrRrSsSsSs" "SsTtTtTtUuUuUuUu" "UuUuWwYyYZzZzZzs";
@@ -164,8 +135,7 @@ char next_char(const char*& p) {
   return '?';
 }
 
-// Drops the last code point of a UTF-8 string, so trimming for width never
-// leaves a lead byte behind.
+// Drops the last code point, so trimming for width never leaves a lead byte behind.
 void pop_char(std::string& s) {
   while (!s.empty()) {
     const unsigned char b = static_cast<unsigned char>(s.back());
@@ -174,14 +144,11 @@ void pop_char(std::string& s) {
   }
 }
 
-// One pixel. Clipped to the canvas so a caller may lay out past the edges
-// without checking. Columns outside [clip_x0, clip_x1) are dropped, which is
-// what lets a name scroll under the panel edge instead of over it; the
-// default admits everything, and draw sets it around a scrolling row.
+// Columns outside [clip_x0, clip_x1) are dropped, letting a name scroll
+// under the panel edge instead of over it; draw sets this around a
+// scrolling row, default admits everything.
 int g_clip_x0 = 0, g_clip_x1 = 1 << 30;
 
-// Clipped once around the whole span rather than per pixel: a filled row is
-// the commonest thing drawn and the panel is mostly fill.
 void fill_rect(const Canvas& d, int x, int y, int w, int h, u32 colour) {
   const int x0 = std::max({x, 0, g_clip_x0}), x1 = std::min({x + w, d.w, g_clip_x1});
   const int y0 = std::max(y, 0), y1 = std::min(y + h, d.h);
@@ -192,9 +159,9 @@ void fill_rect(const Canvas& d, int x, int y, int w, int h, u32 colour) {
 }
 
 constexpr u32 kInk = 0xFFFFFFFF, kDim = 0xFF909090, kPanel = 0xFF101018, kEdge = 0xFF5060A0, kSel = 0xFF3050A0;
-constexpr u32 kEdgeText = 0xFFA0B0E0, kPanelEdgeDim = 0xFF303040;   // group headings; the scroll-bar track
-constexpr u32 kDanger = 0xFFFF5050;  // the slot page's delete mode, and the slot about to go
-constexpr u32 kWarn = 0xFFFFC050;   // the slot row when a state was refused
+constexpr u32 kEdgeText = 0xFFA0B0E0, kPanelEdgeDim = 0xFF303040;   // group headings; scroll-bar track
+constexpr u32 kDanger = 0xFFFF5050;  // slot delete mode, slot about to go
+constexpr u32 kWarn = 0xFFFFC050;   // slot row when a state was refused
 
 // The panel every page sits in: a filled box with a one-pixel edge.
 void panel(const Canvas& d, int x, int y, int w, int h) {
@@ -220,9 +187,8 @@ void scroll_bar(const Canvas& d, const Metrics& m, int px0, int py0, int panel_w
   fill_rect(d, track_x, track_y + (span > 0 ? span * top / (n - visible) : 0), w, bar, kEdge);
 }
 
-// The root page, in order. A null label is the slot row: it is formatted from
-// the current slot and opens the slot page rather than returning a result.
-// New entries go here and nowhere else -- the panel sizes itself to the count.
+// The root page, in order. A null label is the slot row: formatted from the
+// current slot, opens the slot page rather than returning a result.
 constexpr int kSlotRow = 2;
 constexpr int kCheatRow = 3;   // hidden when no database matched this ROM
 constexpr int kOptionsRow = 4; // hidden when the frontend gave no settings host
@@ -245,9 +211,6 @@ static_assert(kRoot[kOptionsRow].result == Menu::Result::None, "kOptionsRow must
 static_assert(kRoot[kSlotRow].label == nullptr, "kSlotRow must name the slot row");
 static_assert(kRoot[kCheatRow].result == Menu::Result::None, "kCheatRow must name the cheats row");
 static_assert(kRoot[kCheevosRow].result == Menu::Result::None, "kCheevosRow must name the achievements row");
-// Rows are cheap to add (one entry above). The panel is sized from the canvas
-// at draw time and the glyph scale steps down if it would not fit, so a new
-// row costs height rather than clipping in silence the way `put` would.
 
 } // namespace
 
@@ -271,10 +234,8 @@ int draw_text(const Canvas& d, int x, int y, int scale, u32 colour, const char* 
 }
 
 int ui_scale(const Canvas& d) {
-  // Twice the canvas's reduction against a DS screen: the menu used to draw at
-  // scale 2 into a 256x192 buffer that was then upscaled to the panel, so this
-  // is the same size on the glass. A 256x192 canvas -- the DS-space fallback --
-  // therefore lands back on exactly 2.
+  // Twice the canvas's reduction against a DS screen, matching the old
+  // scale-2-into-256x192-then-upscale size; a 256x192 canvas lands back on 2.
   const double r = std::min(static_cast<double>(d.w) / ds::SCREEN_W, static_cast<double>(d.h) / ds::SCREEN_H);
   const int s = static_cast<int>(std::lround(2.0 * r));
   return std::clamp(s, 2, 10);
@@ -287,10 +248,8 @@ void dim_framebuffer(u32* px, u32 n) {
 
 
 void Menu::set_open(bool o) {
-  // Everything a change asked for that would move the picture about is done
-  // here rather than as it is asked for: the player is choosing settings, not
-  // watching the screen jump under the page they are reading. This is the one
-  // place every way out of the menu goes through.
+  // Layout-affecting changes commit here, not as they're asked for, so the
+  // player doesn't watch the screen jump mid-read. Every way out goes through here.
   if (!o && open_ && host_) host_->commit();
   open_ = o;
   depth_ = 1;
@@ -304,9 +263,7 @@ void Menu::set_cheats(std::vector<cheat::Code>* codes, const std::vector<cheat::
   lines_.clear();
 }
 
-// The root page hides the rows that would have nothing behind them -- cheats
-// when no database matched, options when the frontend gave no host -- so what
-// is on screen is a subset of the table and the two have to be mapped.
+// Hides rows with nothing behind them (cheats with no match, options with no host).
 bool Menu::root_visible(int item) const {
   // RESET goes with the state rows: it ends a session just as surely.
   if (kRoot[item].result == Result::Save || kRoot[item].result == Result::Load ||
@@ -339,9 +296,8 @@ bool Menu::pop() {
   return true;
 }
 
-// The display list: a heading wherever the group changes, then every code.
-// Notes keep their place in it, because where the database's author put a
-// "(M) must be on" is what tells you which codes it applies to.
+// Display list: a heading wherever the group changes, then every code. Notes
+// keep their place so a "(M) must be on" stays with the codes it applies to.
 void Menu::build_lines() {
   lines_.clear();
   if (!codes_) return;
@@ -358,8 +314,7 @@ void Menu::build_lines() {
 }
 
 // Moves to the next selectable line in `delta`'s direction, stopping at the
-// ends rather than wrapping: a list of thousands is not one to wrap around by
-// accident, and the ends are where the scroll bar says you are.
+// ends rather than wrapping.
 void Menu::move_cheat_row(int delta) {
   if (lines_.empty()) return;
   const int n = static_cast<int>(lines_.size());
@@ -369,8 +324,7 @@ void Menu::move_cheat_row(int delta) {
     if (at < 0 || at >= n) return;
     if (lines_[static_cast<size_t>(at)].kind == Line::Toggle) {
       cheat_row_ = at;
-      // Scroll only as far as it takes to bring the selection back into view,
-      // so paging through a long list does not reset it to the top edge.
+      // Scroll only as far as it takes to bring the selection back into view.
       if (cheat_row_ < cheat_top_) cheat_top_ = cheat_row_;
       if (cheat_row_ >= cheat_top_ + visible_) cheat_top_ = cheat_row_ - visible_ + 1;
       if (cheat_top_ > n - visible_) cheat_top_ = n - visible_;
@@ -387,9 +341,7 @@ void Menu::toggle_cheat() {
   cheat::Code& c = (*codes_)[static_cast<size_t>(l.at)];
   c.enabled = !c.enabled;
   cheats_dirty_ = true;
-  // In a group the database marked as alternatives, turning one on turns the
-  // rest off -- they are a choice of difficulty or character, not switches,
-  // and two at once is what the flag exists to prevent.
+  // In a group marked as alternatives, turning one on turns the rest off.
   if (!c.enabled || c.group < 0 || !groups_ || static_cast<size_t>(c.group) >= groups_->size()) return;
   if (!(*groups_)[static_cast<size_t>(c.group)].exclusive) return;
   for (size_t i = 0; i < codes_->size(); ++i) {
@@ -409,9 +361,7 @@ void Menu::open_games() {
   dirty_ = true;
 }
 
-// The games list is selectable all the way down -- there are no headings in
-// it -- so this is the plain clamped step, with the same "scroll only as far
-// as it takes" rule the cheats list uses.
+// No headings in the games list, so a plain clamped step; same scroll rule as cheats.
 void Menu::move_game_row(int delta) {
   if (!games_ || games_->empty()) return;
   const int n = static_cast<int>(games_->size());
@@ -425,9 +375,8 @@ void Menu::move_game_row(int delta) {
 
 int Menu::list_row() const {
   if (page() == Page::Games) return game_row_;
-  // Not in list_page(): the achievements list has its own shoulder paging and
-  // no key repeat, but it does marquee, and the marquee restarts on "has the
-  // selection moved", which is what this answers.
+  // Not in list_page(): achievements has its own shoulder paging and no key
+  // repeat, but does marquee, restarted on "has the selection moved".
   if (page() == Page::Cheevos) return cheevos_row_;
   if (settings_page()) return set_row_[table_slot()];
   if (controls_page()) return bind_row_;
@@ -451,8 +400,8 @@ Menu::Result Menu::update(u32 presses, u32 held, u32 ms) {
   const int before = marquee_offset(marquee_overflow_);
   if (presses) dirty_ = true;
 
-  // Key repeat, on the cheats page only: the other pages are a handful of
-  // rows where a held direction would overshoot more often than it helps.
+  // Key repeat on list pages only; other pages are a handful of rows where a
+  // held direction would overshoot more often than it helps.
   if (list_page()) {
     const int dir = (held & (1u << B::BTN_UP)) ? -1 : (held & (1u << B::BTN_DOWN)) ? 1 : 0;
     if (dir != repeat_dir_) { repeat_dir_ = dir; repeat_ms_ = 0; repeating_ = false; }
@@ -487,12 +436,10 @@ Menu::Result Menu::handle(u32 presses) {
   const auto hit = [&](B b) { return (presses >> b) & 1; };
   if (page() == Page::Slot) {
     // Ten slots as two columns of five: up/down walk a column, left/right
-    // cross between them. slot_row_ is the slot itself, 0-4 left and 5-9
-    // right. It is not row_, which is the root page's selection: they used to
-    // share one variable and be reset on every entry and exit, which a page
-    // stack cannot do -- popping has to leave the page below as it was.
-    // Delete mode: Y in and out, B out. A arms a used slot and A again is the
-    // delete; any other press in between disarms it.
+    // cross between them. slot_row_ is 0-4 left, 5-9 right; distinct from
+    // row_ so popping back leaves the root page's selection untouched.
+    // Delete mode: Y in and out, B out. A arms a used slot, A again deletes;
+    // any other press disarms.
     const bool confirm = hit(B::BTN_A) || hit(B::BTN_START);
     if (slot_armed_ && presses && !confirm) { slot_armed_ = false; return Result::None; }   // the press that backs out does only that
     if (hit(B::BTN_Y)) {
@@ -528,7 +475,6 @@ Menu::Result Menu::handle(u32 presses) {
     return Result::None;
   }
   if (page() == Page::Games) {
-    // The same walk as the cheats page: up/down step, the shoulders page.
     // A is the only way off it -- see open_games() on why B is inert.
     if (hit(B::BTN_UP))   move_game_row(-1);
     if (hit(B::BTN_DOWN)) move_game_row(+1);
@@ -547,8 +493,6 @@ Menu::Result Menu::handle(u32 presses) {
   if (page() == Page::Cheevos) return handle_cheevos(presses);
   if (page() == Page::CheevosAccount) return handle_cheevos_account(presses);
   if (page() == Page::Cheats) {
-    // Up/down step, the shoulders page: a list of thousands is not one to
-    // walk a row at a time.
     if (hit(B::BTN_UP))   move_cheat_row(-1);
     if (hit(B::BTN_DOWN)) move_cheat_row(+1);
     if (hit(B::BTN_L)) for (int i = 0; i < visible_; ++i) move_cheat_row(-1);
@@ -560,8 +504,7 @@ Menu::Result Menu::handle(u32 presses) {
   const int rows = root_rows();
   if (hit(B::BTN_UP))   row_ = (row_ + rows - 1) % rows;
   if (hit(B::BTN_DOWN)) row_ = (row_ + 1) % rows;
-  // Left/right are a shortcut on the slot row, so the common adjustment does
-  // not need the page at all.
+  // Left/right are a shortcut on the slot row.
   const int item = root_item(row_);
   if (item == kSlotRow) {
     if (hit(B::BTN_LEFT))  { slot_ = (slot_ + 9) % 10; slot_notice_.clear(); }
@@ -580,10 +523,8 @@ Menu::Result Menu::handle(u32 presses) {
   }
   if (item == kOptionsRow) { push(Page::Options); return Result::None; }
   if (item == kCheevosRow) {
-    // Always the account page. It answers "am I signed in", "does this game
-    // have a set" and "why not", carries the switches, and the list is one row
-    // away -- whereas arriving straight in the list leaves the player with no
-    // sight of any of that.
+    // Always the account page: answers signed-in/has-set/why-not and carries
+    // the switches; the achievement list is one row away from there.
     account_row_ = 0;
     push(Page::CheevosAccount);
     return Result::None;
@@ -591,8 +532,7 @@ Menu::Result Menu::handle(u32 presses) {
   return kRoot[item].result;
 }
 
-// Truncated to fit, with an ellipsis, so a long name still says which cheat
-// it is rather than running under the panel edge.
+// Truncated to fit, with an ellipsis.
 namespace {
 std::string fit(const std::string& text, int scale, int width_px) {
   if (text_width(scale, text.c_str()) <= width_px) return text;
@@ -611,18 +551,16 @@ void draw_notice(const Canvas& d, const char* title, const char* line2, const ch
   const auto centred = [&](int y, int scale, u32 ink, const char* s) {
     draw_text(d, x0 + (w - text_width(scale, s)) / 2, y, scale, ink, s);
   };
-  // Titles run long ("Mario & Luigi - Bowser's Inside Story"): cut to the
-  // panel with an ellipsis, as the game list does.
+  // Long titles are cut to the panel with an ellipsis, as the game list does.
   centred(y0 + m.title_y, m.s, kInk, fit(title, m.s, w - 8 * m.s).c_str());
   centred(y0 + m.title_y + m.glyph_px + 3 * m.s, m.s, kInk, line2);
   centred(y0 + m.title_y + m.glyph_px * 2 + 6 * m.s, m.list_s, kDim, line3);
 }
 
-// An unlock, while the game is being played. Bottom-right and only as wide as
-// it needs to be: draw_notice takes the middle of the screen because nothing is
-// running behind it, and this must not.
+// An unlock, while the game is being played. Bottom-right and only as wide
+// as it needs to be, unlike draw_notice's centred panel.
 namespace {
-// One place that decides the geometry, so draw_toast and toast_rect cannot
+// One place decides the geometry, so draw_toast and toast_rect cannot
 // disagree and leave a strip of an old toast on the canvas.
 struct ToastBox { Metrics m; int x0, y0, w, h, lines; };
 
@@ -634,19 +572,16 @@ ToastBox toast_box(const Canvas& d, const char* header, const char* title, const
   if (points) head += "  " + std::to_string(points) + "P";
   b.lines = 1 + (header && *header ? 1 : 0) + (detail && *detail ? 1 : 0);
 
-  // Wide enough for whatever it has to say, up to two thirds of the screen.
-  // Past that it stops reading as a notification and starts hiding the game,
-  // so the text is truncated instead -- but titles like "Signed in to
-  // RetroAchievements" and most game names now fit rather than being cut at a
-  // width fixed in advance.
+  // Wide enough for whatever it has to say, up to two thirds of the screen
+  // (past that it starts hiding the game); truncated beyond that.
   const int want = std::max({text_width(m.list_s, head.c_str()),
                              header ? text_width(m.list_s, header) : 0,
                              detail ? text_width(m.list_s, detail) : 0});
   const int cap = std::min(d.w - 2 * m.pad, d.w * 2 / 3);
   b.w = std::clamp(want + 6 * m.list_s, std::min(40 * m.list_s, cap), cap);
   b.h = 2 * m.list_s + b.lines * m.list_row_h + 2 * m.list_s;
-  // Bottom right. The DS picture is centred, so the corner is the part of the
-  // screen a notification is least likely to cover something being read.
+  // Bottom right: the DS picture is centred, so the corner is least likely
+  // to cover something being read.
   b.x0 = std::max(0, d.w - b.w - 2 * m.pad);
   // One text row of clearance below, not four: the old gap floated it a whole
   // banner's height off the bottom, which read as neither anchored nor
@@ -666,8 +601,7 @@ void draw_toast(const Canvas& d, const char* header, const char* title, const ch
   const Metrics& m = b.m;
   panel(d, b.x0, b.y0, b.w, b.h);
   std::string head = title ? title : "";
-  // Points only when there are any: RetroAchievements has 0-point achievements
-  // (its "unknown emulator" warning is one) and "0P" reads like a bug.
+  // Points only when there are any: 0-point achievements exist and "0P" reads like a bug.
   if (points) head += "  " + std::to_string(points) + "P";
   const int avail = b.w - 4 * m.list_s;
   const int x = b.x0 + 2 * m.list_s;
@@ -681,9 +615,9 @@ void draw_toast(const Canvas& d, const char* header, const char* title, const ch
     draw_text(d, x, y + m.list_row_h, m.list_s, kDim, fit(detail, m.list_s, avail).c_str());
 }
 
-// The two scrolling pages share their frame: panel, centred title, rule, and
-// the geometry every row is laid out against. `visible_` is measured here
-// because update() needs it and only draw knows the canvas.
+// The scrolling pages share their frame: panel, centred title, rule, and the
+// geometry every row is laid out against. `visible_` is measured here
+// because only draw knows the canvas.
 namespace {
 struct ListFrame { Metrics m; int px0, py0, w, h, visible, text_x, avail; };
 
@@ -696,8 +630,7 @@ ListFrame list_frame(const Canvas& d, const char* title) {
   f.py0 = (d.h - f.h) / 2;
   f.visible = list_visible(f.m, f.h);
   panel(d, f.px0, f.py0, f.w, f.h);
-  // Fitted, not just centred. Every caller until now had a short title, so a
-  // long one ran off both edges of the panel rather than being cut.
+  // Fitted, not just centred, so a long title doesn't run off both edges.
   const std::string t = fit(title, f.m.s, f.w - 4 * f.m.s);
   draw_text(d, f.px0 + (f.w - text_width(f.m.s, t.c_str())) / 2, f.py0 + f.m.title_y, f.m.s, kInk, t.c_str());
   fill_rect(d, f.px0 + f.m.pad, f.py0 + f.m.rule_y, f.w - 2 * f.m.pad, std::max(1, f.m.s / 2), kEdge);
@@ -708,10 +641,8 @@ ListFrame list_frame(const Canvas& d, const char* title) {
 }
 } // namespace
 
-// The cheats page: one scrolling list with the database's own headings in it.
 void Menu::draw_cheats(const Canvas& d) const {
-  // The heading counts the codes, not the lines, so it matches the number the
-  // frontend logged when it loaded them.
+  // Heading counts the codes, not the lines, to match the frontend's log.
   size_t on = 0;
   if (codes_) for (const cheat::Code& c : *codes_) if (c.enabled) ++on;
   char title[32];
@@ -745,7 +676,6 @@ void Menu::draw_cheats(const Canvas& d) const {
     }
     const cheat::Code& c = (*codes_)[static_cast<size_t>(l.at)];
     if (l.kind == Line::Note) {
-      // A note is the database author talking, not a switch: no box for it.
       draw_text(d, f.text_x + 4 * m.list_s, ry, m.list_s, kDim, fit(c.name, m.list_s, f.avail - 4 * m.list_s).c_str());
       continue;
     }
@@ -755,10 +685,7 @@ void Menu::draw_cheats(const Canvas& d) const {
       draw_text(d, f.text_x, ry, m.list_s, ink, fit(std::string(box) + c.name, m.list_s, f.avail).c_str());
       continue;
     }
-    // The selected row scrolls its name rather than cutting it, so the whole
-    // of it can be read without leaving the row. The checkbox stays put --
-    // it is the thing being toggled, and it must not scroll out of sight --
-    // so only the name moves, inside what is left of the row.
+    // The selected row scrolls its name; the checkbox stays put.
     const int box_w = text_width(m.list_s, box) + m.list_s;
     draw_text(d, f.text_x, ry, m.list_s, ink, box);
     const int name_x = f.text_x + box_w, name_avail = f.avail - box_w;
@@ -778,9 +705,6 @@ void Menu::draw_cheats(const Canvas& d) const {
   scroll_bar(d, m, f.px0, f.py0, f.w, f.visible, n, top);
 }
 
-// The game picker: the cheats page's list, with a row per ROM and nothing to
-// toggle. A long filename is the rule rather than the exception here, so the
-// selected row scrolls its name exactly as a long cheat name does.
 void Menu::draw_games(const Canvas& d) const {
   const int n = games_ ? static_cast<int>(games_->size()) : 0;
   char title[32];
@@ -790,8 +714,6 @@ void Menu::draw_games(const Canvas& d) const {
   visible_ = f.visible;
 
   if (n == 0) {
-    // Say what is wrong rather than showing an empty box: an unset or empty
-    // games directory is the likely reason, and it is fixable.
     const char* why[] = {"NO GAMES FOUND -- SET", "[PATHS] GAMES IN THE", "CONFIG FILE"};
     for (int i = 0; i < 3; ++i)
       draw_text(d, f.text_x + m.list_s * 2, f.py0 + m.list_rows_y + m.list_s * 4 + i * m.list_row_h, m.list_s, kDim, why[i]);
@@ -827,12 +749,8 @@ void Menu::draw_games(const Canvas& d) const {
 // ---------------------------------------------------------------------------
 // The achievement pages.
 
-// The list. Two lines per achievement -- the name, then its description or
-// measured progress -- because one line of either is not enough to know which
-// achievement it is, and the description is where a set tells you what to do.
+// Two lines per achievement: name, then description or measured progress.
 void Menu::draw_cheevos(const Canvas& d) const {
-  // The count goes in the title because it is short; the points total is on the
-  // account page, where there is room for a line of its own.
   char title[40] = "ACHIEVEMENTS";
   if (cheevos_ && cheevos_->row_count() > 0) {
     int unlocked = 0;
@@ -841,12 +759,7 @@ void Menu::draw_cheevos(const Canvas& d) const {
   }
   const ListFrame f = list_frame(d, title);
   const Metrics& m = f.m;
-  // Each entry is two text rows, so the count comes from the panel's own
-  // height rather than from halving list_visible(), which is measured for
-  // one-line rows: the rounding there left an entry hanging below the panel.
-  // list_row_h, not row_h: the latter is the page scale used by the root and
-  // settings pages, and is nearly twice as tall. Using it here fitted three
-  // entries on a 640x480 panel that comfortably holds six.
+  // Two text rows per entry; list_visible() assumes one-line rows.
   const int entry_h = 2 * m.list_row_h + 2 * m.list_s;   // a little air between entries
   visible_ = std::max(1, (f.h - m.list_rows_y - m.pad) / entry_h);
 
@@ -879,9 +792,7 @@ void Menu::draw_cheevos(const Canvas& d) const {
     if (detail.empty()) continue;
     const int dx = f.text_x + 4 * m.list_s, davail = f.avail - 4 * m.list_s;
     const int dy = y + m.list_row_h;
-    // A description is the one line here worth reading in full -- it is what
-    // a set tells you to do -- so the selected entry scrolls it instead of
-    // cutting it, exactly as the games and cheats lists scroll a long name.
+    // Selected entry scrolls its description instead of cutting it.
     if (at != cheevos_row_) {
       draw_text(d, dx, dy, m.list_s, kPanelEdgeDim, fit(detail, m.list_s, davail).c_str());
       continue;
@@ -901,8 +812,7 @@ void Menu::draw_cheevos(const Canvas& d) const {
   scroll_bar(d, m, f.px0, f.py0, f.w, visible_, n, top);
 }
 
-// Keeps the selection on screen, as the cheats list does, and stops at the
-// ends rather than wrapping: a hundred-row list that wraps loses your place.
+// Keeps the selection on screen and stops at the ends rather than wrapping.
 void Menu::move_cheevos_row(int delta) {
   const int n = cheevos_ ? cheevos_->row_count() : 0;
   if (n == 0) return;
@@ -920,16 +830,14 @@ Menu::Result Menu::handle_cheevos(u32 presses) {
   if (hit(B::BTN_DOWN)) move_cheevos_row(+1);
   if (hit(B::BTN_L)) move_cheevos_row(-std::max(1, visible_));
   if (hit(B::BTN_R)) move_cheevos_row(+std::max(1, visible_));
-  // A goes to the account, which is the only action this page has: the list is
-  // for reading, and an achievement is not something to do anything to.
+  // A goes to the account; the list itself is for reading only.
   if (hit(B::BTN_A) || hit(B::BTN_START)) { account_row_ = 0; push(Page::CheevosAccount); }
   if (hit(B::BTN_B)) pop();
   return Result::None;
 }
 
 namespace {
-// The account page's rows, chosen at draw and handle time from the same state
-// so the two cannot disagree about what row 1 is.
+// Account page rows, chosen at draw and handle time from the same state.
 enum class AccountRow : u8 { SignIn, SignOut, List, Toasts, Screenshot, Encore };
 constexpr int kAccountRows = 6;
 int account_rows(const CheevosHost* h, AccountRow out[kAccountRows]) {
@@ -944,8 +852,7 @@ int account_rows(const CheevosHost* h, AccountRow out[kAccountRows]) {
   return n;
 }
 
-// The switch rows draw as "LABEL        ON", so the label and the state are
-// found in the same two places on every row.
+// Switch rows draw as "LABEL        ON".
 struct AccountLabel { const char* text; bool toggle; CheevosHost::Option opt; };
 AccountLabel account_label(AccountRow r) {
   switch (r) {
@@ -954,27 +861,20 @@ AccountLabel account_label(AccountRow r) {
   case AccountRow::List:       return {"VIEW ACHIEVEMENTS", false, CheevosHost::Option::Toasts};
   case AccountRow::Toasts:     return {"UNLOCK NOTICES", true, CheevosHost::Option::Toasts};
   case AccountRow::Screenshot: return {"SCREENSHOT ON UNLOCK", true, CheevosHost::Option::Screenshot};
-  // Encore is read when a game loads, so changing it here cannot affect the
-  // game already running. Saying so in the label beats a player deciding it
-  // is broken.
+  // Read only when a game loads, so it can't affect one already running.
   case AccountRow::Encore:     return {"ENCORE (NEXT LAUNCH)", true, CheevosHost::Option::Encore};
   }
   return {"", false, CheevosHost::Option::Toasts};
 }
 } // namespace
 
-// Status and the two things that can be done about it. Deliberately small: the
-// interesting content is the status line, which is where "no achievements for
-// this ROM" and "no network on this device" get said.
 void Menu::draw_cheevos_account(const Canvas& d) const {
   const ListFrame f = list_frame(d, "RETROACHIEVEMENTS");
   const Metrics& m = f.m;
 
   const std::string status = cheevos_ ? cheevos_->status() : std::string{};
   int y = f.py0 + m.list_rows_y;
-  // The status can be long ("RetroAchievements does not recognise this dump"):
-  // wrapped over as many lines as it takes rather than cut, because this is
-  // the one sentence on the page that has to be readable.
+  // Status can be long; wrapped over as many lines as it takes rather than cut.
   std::string rest = status;
   const int cols = std::max(8, f.avail / (kAdvance * m.list_s));
   while (!rest.empty()) {
@@ -1008,7 +908,7 @@ void Menu::draw_cheevos_account(const Canvas& d) const {
     draw_text(d, f.text_x, y, m.list_s, kInk, L.text);
     if (L.toggle) {
       const char* state = cheevos_->option(L.opt) ? "ON" : "OFF";
-      // Right-aligned inside the same margin the scroll bar leaves.
+      // Right-aligned, in the scroll bar's margin.
       draw_text(d, f.px0 + f.w - m.pad - text_width(m.list_s, state), y, m.list_s,
                 cheevos_->option(L.opt) ? kInk : kDim, state);
     }
@@ -1026,9 +926,7 @@ Menu::Result Menu::handle_cheevos_account(u32 presses) {
   if (hit(B::BTN_DOWN)) account_row_ = (account_row_ + 1) % n;
   if (hit(B::BTN_B)) { pop(); return Result::None; }
   const AccountRow at = rows[std::clamp(account_row_, 0, n - 1)];
-  // A switch works with left/right as well as A, the way the settings pages
-  // and the slot row do -- a two-way choice should not need a different key
-  // here than everywhere else.
+  // Left/right toggle too, matching the settings pages and slot row.
   const AccountLabel L = account_label(at);
   if (L.toggle && (hit(B::BTN_LEFT) || hit(B::BTN_RIGHT) || hit(B::BTN_A) || hit(B::BTN_START))) {
     cheevos_->set_option(L.opt, !cheevos_->option(L.opt));
@@ -1037,7 +935,7 @@ Menu::Result Menu::handle_cheevos_account(u32 presses) {
   if (!hit(B::BTN_A) && !hit(B::BTN_START)) return Result::None;
   switch (at) {
   case AccountRow::SignIn:
-    // Two prompts, name then password: the editor does one field at a time.
+    // Two prompts: name then password.
     open_credential_edit(EditDest::CheevosUser);
     break;
   case AccountRow::SignOut:
@@ -1057,8 +955,6 @@ Menu::Result Menu::handle_cheevos_account(u32 presses) {
   return Result::None;
 }
 
-// The Options tree. Four pages of settings and, when there is a game in the
-// slot, where a change is remembered: the global file, or this game's own.
 const Setting* Menu::table() const {
   switch (page()) {
   case Page::Emulation: return kEmuSettings;
@@ -1080,8 +976,7 @@ int Menu::table_slot() const {
 
 int Menu::settings_rows() const { return settings_count(table()); }
 
-// Walks past the rows the host has switched off, exactly as the cheats list
-// walks past its headings, and stops at the ends rather than wrapping.
+// Walks past rows the host has switched off, and stops at the ends rather than wrapping.
 bool Menu::move_setting_row(int delta) {
   const Setting* t = table();
   const int n = settings_count(t);
@@ -1115,8 +1010,7 @@ Menu::Result Menu::handle_options(u32 presses) {
   if (hit(B::BTN_UP))   opt_row_ = (opt_row_ + rows - 1) % rows;
   if (hit(B::BTN_DOWN)) opt_row_ = (opt_row_ + 1) % rows;
   const bool save_row = host_->has_game() && opt_row_ == kOptionPages;
-  // Left/right work the save-to switch in place, the way they work the slot
-  // on the root page: it is a two-way choice, not a page to enter.
+  // Left/right work the save-to switch in place, as they do the slot row.
   if (save_row && (hit(B::BTN_LEFT) || hit(B::BTN_RIGHT) || hit(B::BTN_A) || hit(B::BTN_START)))
     host_->set_save_per_game(!host_->save_per_game());
   if (hit(B::BTN_B)) { pop(); return Result::None; }
@@ -1124,15 +1018,13 @@ Menu::Result Menu::handle_options(u32 presses) {
   static constexpr Page kPages[kOptionPages] = {Page::Emulation, Page::VisualFx, Page::Layout, Page::Controls, Page::DsOptions};
   push(kPages[opt_row_]);
   if (page() == Page::Controls) {
-    // A handheld's only input is its pad, so open on that column when one is
-    // plugged in; a desktop with no pad opens on the keyboard.
+    // Open on the pad column when one is plugged in; keyboard otherwise.
     bind_pad_ = host_->has_pad();
     bind_row_ = 0;
     bind_top_ = 0;
     return Result::None;
   }
-  // Land on something selectable: the first row of a page can be switched off
-  // (the layout page's pip rows in a stacked layout, say).
+  // Land on something selectable: the first row of a page can be switched off.
   const int slot = table_slot();
   set_row_[slot] = 0;
   if (!host_->enabled(table()[0]) && !move_setting_row(+1)) set_row_[slot] = 0;
@@ -1146,8 +1038,7 @@ Menu::Result Menu::handle_settings(u32 presses) {
   if (hit(B::BTN_DOWN))  move_setting_row(+1);
   if (hit(B::BTN_LEFT))  step_setting(-1);
   if (hit(B::BTN_RIGHT)) step_setting(+1);
-  // A steps a setting forward as well, so the whole page can be worked with
-  // one button on a handheld whose d-pad the player is already holding.
+  // A steps a setting forward too, so the page can be worked with one button.
   if (hit(B::BTN_A) || hit(B::BTN_START)) {
     const Setting& cur = table()[set_row_[table_slot()]];
     if (cur.type == Setting::Type::Text && host_->enabled(cur)) open_text_edit();
@@ -1164,10 +1055,8 @@ void Menu::draw_options(const Canvas& d) const {
   const bool per_game = host_ && host_->save_per_game();
   char save_row[40];
   std::snprintf(save_row, sizeof save_row, "SAVE TO < %s >", per_game ? "THIS GAME" : "GLOBAL");
-  // Sized for the widest row the page can ever draw, not the one it is drawing
-  // now: the save-to switch is longer on "THIS GAME" than on "GLOBAL", and
-  // measuring the current text made the whole panel change width as it was
-  // toggled. Always measure the long one.
+  // Sized for the widest row the page can ever draw, not the current one, so
+  // toggling save-to doesn't resize the panel.
   static constexpr const char* kWidestSaveRow = "SAVE TO < THIS GAME >";
   const auto widest_row = [&](const Metrics& mm) {
     int w = 0;
@@ -1175,9 +1064,7 @@ void Menu::draw_options(const Canvas& d) const {
     if (rows > kOptionPages) w = std::max(w, text_width(mm.s, kWidestSaveRow));
     return w;
   };
-  // Step the scale down rather than clip, as the root page does. The margin is
-  // the row's own indent on the left and the same again past the closing
-  // arrow, so the switch does not sit against the panel edge.
+  // Step the scale down rather than clip, as the root page does.
   const int side = 3 * m.pad;
   while (m.s > 2 && (widest_row(m) + 2 * side > d.w || panel_height(m, rows) > d.h)) m = metrics_for(m.s - 1);
   const int panel_w = std::min(d.w - 2 * m.pad, widest_row(m) + 2 * (3 * m.pad));
@@ -1193,14 +1080,10 @@ void Menu::draw_options(const Canvas& d) const {
       draw_text(d, px0 + m.pad + 3 * m.s, ry, m.s, kInk, kItems[i]);
       continue;
     }
-    // The save-to switch, drawn as the slot row is: the value between arrows,
-    // so it reads as something to change rather than somewhere to go.
     draw_text(d, px0 + m.pad + 3 * m.s, ry, m.s, kInk, save_row);
   }
 }
 
-// A settings page: one scrolling list of label-and-value rows, laid out like
-// the cheats page because it is the same problem -- more rows than fit.
 void Menu::draw_settings(const Canvas& d) const {
   static constexpr const char* kTitles[4] = {"EMULATION", "VISUAL FX", "LAYOUT", "DS OPTIONS"};
   const ListFrame f = list_frame(d, kTitles[table_slot()]);
@@ -1210,11 +1093,7 @@ void Menu::draw_settings(const Canvas& d) const {
   const int n = settings_count(t);
   const int sel = set_row_[table_slot()];
 
-  // A note under the list explains the selected row: two lines for the note
-  // itself and a third for what it takes to apply, so a long note is not cut
-  // short to make room for "REOPENS THE DISPLAY". It costs three rows of list,
-  // and is worth them: these settings are not self-explanatory, and the
-  // alternative is the player guessing or reading the ini.
+  // Note under the list: two lines for the note, a third for what it takes to apply.
   const int note_lines = 2, note_rows = note_lines + 1;
   const int visible = std::max(1, f.visible - note_rows);
   int top = set_top_[table_slot()];
@@ -1231,15 +1110,13 @@ void Menu::draw_settings(const Canvas& d) const {
     const bool on = host_->enabled(s);
     const bool is_sel = top + i == sel;
     if (is_sel) fill_rect(d, f.px0 + m.list_s * 4, ry - m.list_s * 2, f.w - m.list_s * 14, m.list_row_h, kSel);
-    // A setting that trades accuracy for speed is coloured, not just noted:
-    // the ini's comments shout about these and the menu should too.
+    // A setting that trades accuracy for speed is coloured, not just noted.
     u32 ink = kInk;
     if (!on) ink = kPanelEdgeDim;
     else if (!is_sel && (s.flags & FlagInexact)) ink = kEdgeText;
     draw_text(d, f.text_x, ry, m.list_s, ink, fit(s.label, m.list_s, f.avail - value_w).c_str());
     const std::string v = on ? display_value(s, host_->get(s.key)) : "--";
-    // A text field is opened, not stepped, so it gets no arrows: they would
-    // promise that left and right do something there.
+    // A text field is opened, not stepped, so it gets no arrows.
     const bool steps = s.type != Setting::Type::Text;
     const std::string shown = on && is_sel && steps ? "< " + v + " >" : v;
     draw_text(d, f.text_x + f.avail - std::min(value_w, text_width(m.list_s, shown.c_str())),
@@ -1254,15 +1131,11 @@ void Menu::draw_settings(const Canvas& d) const {
   const char* why = host_->disabled_reason(cur);
   const char* line = why && *why ? why : cur.note;
   const u32 note_ink = why && *why ? kEdgeText : kDim;
-  // What it will take to see the change, when that is not "nothing". It takes
-  // the second note line, so the note itself wraps into one line when there is
-  // one and two when the row is free.
+  // What it takes to see the change; uses the second note line.
   const char* when = (cur.flags & FlagRestart) ? "RESTART REQUIRED"
                    : (cur.flags & FlagDeferred) ? "APPLIED WHEN THE MENU CLOSES" : nullptr;
   if (when && !host_->enabled(cur)) when = nullptr;
-  // Where it is kept matters on the DS Options page: with a firmware dump the
-  // changes go beside the dump rather than into the config, and the save-to
-  // switch does not apply to them.
+  // DS Options with a firmware dump: changes go beside the dump, not the config.
   std::string when_text;
   if (when) {
     when_text = when;
@@ -1272,8 +1145,7 @@ void Menu::draw_settings(const Canvas& d) const {
   }
   if (line) {
     const int lines = note_lines;
-    // Wrapped on spaces rather than cut with an ellipsis: a note that stops
-    // mid-sentence tells the player less than the room allows.
+    // Wrapped on spaces rather than cut with an ellipsis.
     std::string rest = line;
     for (int i = 0; i < lines && !rest.empty(); ++i) {
       std::string take = rest;
@@ -1294,9 +1166,7 @@ void Menu::draw_settings(const Canvas& d) const {
   if (when) draw_text(d, f.text_x, note_y + 2 * m.list_s + note_lines * m.list_row_h, m.list_s, kEdgeText, fit(when, m.list_s, f.avail).c_str());
 }
 
-// The Controls page. Two columns of bindings -- keyboard and pad -- with the
-// shoulders switching between them, because they are the same list twice and
-// a player only ever cares about the one their device has.
+// Controls page: two columns of bindings (keyboard, pad); shoulders switch.
 void Menu::move_bind_row(int delta) {
   const int n = host_->binding_count(bind_pad_);
   if (n <= 0) return;
@@ -1307,26 +1177,16 @@ void Menu::move_bind_row(int delta) {
 Menu::Result Menu::handle_controls(u32 presses) {
   using B = io::Io::Button;
   const auto hit = [&](B b) { return (presses >> b) & 1; };
-  // The list is not a fixed length: a hotkey's second row appears when its
-  // first is bound and goes away when that is cleared, so the row under the
-  // cursor may have stopped existing since the last press. Clamp before
-  // anything reads it -- acting on a row that is off the end binds nothing
-  // and silently does nothing at all.
+  // The list is not fixed length: a hotkey's second row appears/disappears as
+  // its first is bound/cleared, so the cursor's row may no longer exist.
   move_bind_row(0);
-  // The page draws "PRESS THE CONTROL TO BIND" for as long as the frontend is
-  // listening, so it has to be redrawn when that stops. Finishing a bind marks
-  // the page dirty below, but a capture the device itself cancelled -- Escape,
-  // or a pad press in the keyboard column -- changes nothing the menu would
-  // otherwise notice, and the prompt stayed on screen over a page that was no
-  // longer listening. The next press then went to reopening the capture rather
-  // than to leaving, which is what made backing out take two.
+  // Redraw when listening stops, even from a device-cancelled capture
+  // (Escape, wrong-column press) that leaves nothing else for the menu to notice.
   if (const bool listening = host_->capturing(); listening != listen_shown_) {
     listen_shown_ = listening;
     dirty_ = true;
   }
-  // While listening, the frontend is swallowing the real device, so none of
-  // it reaches the switch below. The press is collected here instead, on the
-  // idle tick after it happened, and bound to the row that asked for it.
+  // While listening, presses are swallowed elsewhere; collected here instead.
   if (host_->capturing()) {
     const std::string got = host_->take_capture();
     if (!got.empty()) {
@@ -1338,25 +1198,20 @@ Menu::Result Menu::handle_controls(u32 presses) {
   }
   if (hit(B::BTN_UP))   move_bind_row(-1);
   if (hit(B::BTN_DOWN)) move_bind_row(+1);
-  // The shoulders swap columns rather than paging: there are two columns and
-  // paging a list this short is worth less than reaching the other one.
+  // Shoulders swap columns rather than paging (list is short, two columns).
   if (hit(B::BTN_L) || hit(B::BTN_R)) {
     bind_pad_ = !bind_pad_;
     bind_row_ = 0;
     bind_top_ = 0;
   }
-  // A alone opens a capture here, where every other page also takes START:
-  // START is a control the player may be trying to bind, and it cannot both
-  // open the listener and be the thing the listener hears.
+  // A alone opens a capture: START may be the control being bound, so it
+  // cannot also be the opener.
   if (hit(B::BTN_A)) host_->begin_capture(bind_pad_);
-  // Y clears a binding, which is the only way to get back to "none" -- there
-  // is no key to press that means "no key".
+  // Y clears a binding: no key press means "no key".
   if (hit(B::BTN_Y)) {
     const SettingsHost::Binding b = host_->binding(bind_pad_, bind_row_);
     if (!b.key.empty()) host_->bind(b.key, "none");
   }
-  // X puts the whole column back to the built-in layout, for the player who
-  // has bound themselves into a corner.
   if (hit(B::BTN_X)) host_->reset_bindings(bind_pad_);
   if (hit(B::BTN_B)) pop();
   return Result::None;
@@ -1370,13 +1225,9 @@ void Menu::draw_controls(const Canvas& d) const {
   visible_ = f.visible;
 
   const int n = host_->binding_count(bind_pad_);
-  // Hiding a hotkey's second row can make the list shorter than the cursor
-  // was; drawing is const, so the clamp is local here and handle_controls()
-  // is what actually moves the cursor back.
+  // Drawing is const, so this clamp is local; handle_controls() moves the cursor back.
   const int sel = std::min(bind_row_, std::max(0, n - 1));
-  // Three rows at the foot: what the buttons do over two lines, since the
-  // whole legend does not fit one at this scale and being cut off is worse
-  // than costing a row, then any clash the bindings have made.
+  // Three rows at the foot: legend over two lines (doesn't fit one), plus a clash line.
   const int foot_rows = 3;
   const int visible = std::max(1, f.visible - foot_rows);
   int top = bind_top_;
@@ -1394,8 +1245,7 @@ void Menu::draw_controls(const Canvas& d) const {
     const bool is_sel = top + i == sel;
     if (is_sel) fill_rect(d, f.px0 + m.list_s * 4, ry - m.list_s * 2, f.w - m.list_s * 14, m.list_row_h, kSel);
     draw_text(d, f.text_x, ry, m.list_s, kInk, fit(b.label, m.list_s, f.avail - value_w).c_str());
-    // The row being rebound says so where its value was, so it is obvious
-    // which one the next press will land on.
+    // The row being rebound says so where its value was.
     const std::string v = is_sel && listening ? "PRESS ANY..." : (b.value.empty() || b.value == "none" ? "--" : b.value);
     const u32 ink = is_sel && listening ? kEdgeText : (v == "--" ? kDim : kInk);
     draw_text(d, f.text_x + f.avail - std::min(value_w, text_width(m.list_s, v.c_str())),
@@ -1405,10 +1255,8 @@ void Menu::draw_controls(const Canvas& d) const {
 
   const int foot_y = f.py0 + m.list_rows_y + visible * m.list_row_h + m.list_s;
   fill_rect(d, f.px0 + m.pad, foot_y, f.w - 2 * m.pad, std::max(1, m.list_s), kPanelEdgeDim);
-  // The footer names DS buttons, and the console puts A on the right, B at the
-  // bottom, X at the top and Y on the left -- so the pips say where to press
-  // without the player having to know whose letters these are. The pad in hand
-  // may print something else entirely on the same four buttons.
+  // Footer names DS buttons by position pip, since the pad in hand may print
+  // different letters on the same four buttons.
   const char* help1 = listening ? "PRESS THE CONTROL TO BIND," : "\x02 BIND   \x03 CLEAR   \x04 DEFAULTS";
   const char* help2 = listening ? "OR ESCAPE TO CANCEL"
                     : host_->has_pad() ? "L/R KEYBOARD OR PAD" : "L/R SWAP COLUMN";
@@ -1420,9 +1268,8 @@ void Menu::draw_controls(const Canvas& d) const {
               fit(clash[0], m.list_s, f.avail).c_str());
 }
 
-// The character editor. The firmware stores each byte as one UTF-16 unit
-// (firmware_gen.cpp put_utf16), so the tables are ASCII: anything above it
-// would be written as the wrong character rather than refused.
+// Firmware stores each byte as one UTF-16 unit (firmware_gen.cpp put_utf16),
+// so the tables are ASCII.
 namespace {
 const char* const kCharTables[] = {
   " ABCDEFGHIJKLMNOPQRSTUVWXYZ",
@@ -1431,12 +1278,10 @@ const char* const kCharTables[] = {
 };
 const char* const kCharTableNames[] = {"CAPITALS", "LOWERCASE", "NUM+SYM"};
 constexpr int kCharTableCount = 3;
-// The widest a field is laid out before it wraps, which puts the firmware's
-// 26-character message on two lines as the console's own screen has it.
+// Widest a field is laid out before it wraps (two lines, like the console's own screen).
 constexpr int kEditCols = 13;
 
-// Which table a character belongs to, so opening the editor on an existing
-// name lands on the right one rather than always on capitals.
+// Which table a character belongs to, so an existing name opens on the right one.
 int table_of(char c) {
   for (int t = 0; t < kCharTableCount; ++t)
     if (std::strchr(kCharTables[t], c)) return t;
@@ -1453,17 +1298,14 @@ void Menu::open_text_edit() {
   const std::string cur = host_->get(s.key);
   edit_buf_ = cur.empty() ? default_value(s) : cur;
   if (static_cast<int>(edit_buf_.size()) > edit_max_) edit_buf_.resize(static_cast<size_t>(edit_max_));
-  // An empty field starts as one space, so there is a character to cycle.
-  if (edit_buf_.empty()) edit_buf_ = " ";
+  if (edit_buf_.empty()) edit_buf_ = " ";   // one space, so there is a character to cycle
   edit_pos_ = 0;
   edit_table_ = table_of(edit_buf_[0]);
   push(Page::TextEdit);
 }
 
-// The same editor, collecting a credential instead of a setting. The field
-// limits are RetroAchievements' own (a username is at most 20 characters) and
-// generous for a password; the character tables are the ones the firmware name
-// editor uses, which is what a handheld with no keyboard has.
+// Same editor, collecting a credential instead of a setting. Field limits
+// are RetroAchievements' own (username 20 chars, password generous).
 void Menu::open_credential_edit(EditDest dest) {
   edit_dest_ = dest;
   edit_key_.clear();
@@ -1481,8 +1323,7 @@ Menu::Result Menu::handle_text_edit(u32 presses) {
   const char* tab = kCharTables[edit_table_];
   const int n = static_cast<int>(std::strlen(tab));
   if (hit(B::BTN_UP) || hit(B::BTN_DOWN)) {
-    // Where in this table the character is now; a character from another
-    // table starts the walk at its beginning rather than jumping.
+    // A character from another table starts the walk at its beginning.
     const char* at = std::strchr(tab, edit_buf_[static_cast<size_t>(edit_pos_)]);
     int i = at ? static_cast<int>(at - tab) : 0;
     i = (i + (hit(B::BTN_UP) ? 1 : n - 1)) % n;
@@ -1490,8 +1331,7 @@ Menu::Result Menu::handle_text_edit(u32 presses) {
   }
   if (hit(B::BTN_L) || hit(B::BTN_R)) {
     edit_table_ = (edit_table_ + (hit(B::BTN_L) ? kCharTableCount - 1 : 1)) % kCharTableCount;
-    // Move the character under the cursor into the new table, so the change
-    // is visible: switching to lower case should lower the letter you are on.
+    // Move the character under the cursor into the new table.
     const char c = edit_buf_[static_cast<size_t>(edit_pos_)];
     const char* from = kCharTables[table_of(c)];
     if (const char* at = std::strchr(from, c)) {
@@ -1518,12 +1358,9 @@ Menu::Result Menu::handle_text_edit(u32 presses) {
     // Trailing spaces are an artefact of moving right, not part of the name.
     std::string out = edit_buf_;
     while (!out.empty() && out.back() == ' ') out.pop_back();
-    // For a credential every space goes, not just the trailing ones: the
-    // editor starts each slot on a space, so one left in the middle means the
-    // cursor passed over that slot without choosing anything -- not that the
-    // player wants a space in their username. Neither field may contain one
-    // anyway, so submitting it would only produce a sign-in failure the player
-    // could not see the cause of.
+    // For a credential every space goes, not just trailing: a space in the
+    // middle means the cursor passed over that slot unchosen, and neither
+    // field may contain one anyway.
     if (edit_dest_ != EditDest::Setting)
       out.erase(std::remove(out.begin(), out.end(), ' '), out.end());
     switch (edit_dest_) {
@@ -1540,16 +1377,12 @@ Menu::Result Menu::handle_text_edit(u32 presses) {
     case EditDest::CheevosPassword:
       pop();
       if (cheevos_) cheevos_->sign_in(pending_user_, out);
-      // Neither is kept: sign_in hands the password to rcheevos, which
-      // exchanges it for a token, and that token is what gets stored.
       pending_user_.clear();
       out.assign(out.size(), ' ');
       break;
     }
-    // Deliberately no reset of edit_dest_ here: the CheevosUser case opens the
-    // password prompt from inside this switch, and a reset would send the
-    // password to the settings host instead. open_text_edit and
-    // open_credential_edit each set it, which is the invariant that matters.
+    // Deliberately no reset of edit_dest_ here: CheevosUser opens the
+    // password prompt from inside this switch, and a reset would misroute it.
     return Result::None;
   }
   if (hit(B::BTN_B)) {   // B abandons: nothing was written until A
@@ -1560,17 +1393,12 @@ Menu::Result Menu::handle_text_edit(u32 presses) {
 }
 
 void Menu::draw_text_edit(const Canvas& d) const {
-  // Two lines, so neither is cut off on a small panel: what moves about, then
-  // what finishes.
   static constexpr const char* kHelp1 = "UP/DOWN LETTER   L/R TABLE";
   static constexpr const char* kHelp2 = "\x02 DONE   \x01 CANCEL";
   Metrics m = metrics(d);
-  // Wide enough for the field at the page scale and for the help line at the
-  // list scale, whichever is wider; the scale steps down rather than clip.
-  // The firmware's message is 26 characters and the console's own settings
-  // screen takes it over two lines; the editor lays it out the same way, so
-  // what is typed here looks like what the DS menu will show. A field that
-  // fits one line keeps one.
+  // Wide enough for the field or the help line, whichever is wider; scale
+  // steps down rather than clip. A long field wraps over two lines, as the
+  // console's own settings screen does.
   const int cols = edit_max_ > kEditCols ? (edit_max_ + 1) / 2 : edit_max_;
   const int rows = (edit_max_ + cols - 1) / (cols > 0 ? cols : 1);
   const auto want = [&](const Metrics& mm) {
@@ -1584,31 +1412,23 @@ void Menu::draw_text_edit(const Canvas& d) const {
   const int px0 = (d.w - panel_w) / 2, py0 = (d.h - panel_h) / 2;
   panel(d, px0, py0, panel_w, panel_h);
 
-  // The label of the row being edited, as the title.
   draw_text(d, px0 + (panel_w - text_width(m.s, edit_label_.c_str())) / 2, py0 + m.title_y, m.s, kInk, edit_label_.c_str());
   fill_rect(d, px0 + m.pad, py0 + m.rule_y, panel_w - 2 * m.pad, std::max(1, m.s / 2), kEdge);
 
   const int fx = px0 + m.pad + 2 * m.s, fy = py0 + m.rows_y;
-  // The character under the cursor is highlighted rather than underlined: the
-  // font has no descender room, and a filled cell reads at any scale.
+  // Highlighted rather than underlined: the font has no descender room.
   for (int i = 0; i < static_cast<int>(edit_buf_.size()); ++i) {
     const int cx = fx + (i % cols) * kAdvance * m.s, cy = fy + (i / cols) * m.row_h;
     if (i == edit_pos_) fill_rect(d, cx - m.s, cy - m.s, kAdvance * m.s, m.glyph_px + 2 * m.s, kSel);
-    // A password shows only the character being chosen: the rest are masked,
-    // because the field is on a screen somebody else can see. The cursor's own
-    // character has to stay visible -- cycling A..Z blind is unusable.
-    //
-    // A space is not masked, because a space is not a character here: it is a
-    // slot the cursor passed over without anything being chosen (see the
-    // accept path). Drawing '*' for one claims a letter is there that is not,
-    // and the player then cannot tell how long what they typed actually is.
+    // Password masks everything but the character being chosen (must stay
+    // visible to cycle blind). A space is not masked: it's an unchosen slot,
+    // not a real character, and '*' would misreport the field's length.
     const char c = edit_buf_[static_cast<size_t>(i)];
     const bool mask = edit_dest_ == EditDest::CheevosPassword && i != edit_pos_ && c != ' ';
     const char one[2] = {mask ? '*' : c, 0};
     draw_text(d, cx, cy, m.s, kInk, one, true);
   }
-  // The font is uppercase-only, so a lower-case letter draws as a capital:
-  // the table's name is the only way to tell which case is being written.
+  // Font is uppercase-only; the table name is the only case indicator.
   const int below = fy + rows * m.row_h + m.s;
   const int avail = panel_w - 6 * m.s;
   draw_text(d, fx, below, m.list_s, kEdgeText, kCharTableNames[edit_table_]);
@@ -1627,11 +1447,8 @@ void Menu::draw(const Canvas& d) const {
   if (page() == Page::TextEdit) { draw_text_edit(d); return; }
   const bool slots = page() == Page::Slot;
   Metrics m = metrics(d);
-  const int rows = slots ? kSlotRows + 2 : root_rows();   // the slot page stacks its ten in two columns, over the auto state and a help line
-  // How wide the rows actually need to be. It used to be a flat 75 glyphs, on
-  // the reasoning that every label was short -- and then "ACHIEVEMENTS"
-  // arrived and ran off the right edge. Measured now, with the old width as a
-  // floor so a menu without that row looks exactly as it did.
+  const int rows = slots ? kSlotRows + 2 : root_rows();   // ten slots in two columns, plus auto state and a help line
+  // 75 glyphs is a floor for a short menu.
   const auto wanted_w = [&](const Metrics& mm) {
     int w = (slots ? 100 : 75) * mm.s;
     if (slots) return w;
@@ -1639,15 +1456,11 @@ void Menu::draw(const Canvas& d) const {
       if (!root_visible(i)) continue;
       // The slot row formats its own text; "SLOT < 0 >" is its widest form.
       const char* label = kRoot[i].label ? kRoot[i].label : (slot_notice_.empty() ? "SLOT < 0 >" : "SLOT < 0 > REJECTED");
-      // The 3*s the label is indented by, on both sides, plus the panel's own
-      // padding: without the second one the text sits hard against the edge.
       w = std::max(w, text_width(mm.s, label) + 6 * mm.s + 2 * mm.pad);
     }
     return w;
   };
-  // Step the glyph scale down rather than let a tall page run off a short
-  // canvas: `put` would clip it in silence, which is how the old fixed
-  // geometry failed. Two rows always fit at scale 2 on any canvas this runs on.
+  // Step the glyph scale down rather than let a tall page run off a short canvas.
   while (m.s > 2 && (panel_height(m, rows) > d.h || wanted_w(m) > d.w)) m = metrics_for(m.s - 1);
   const int scale = m.s, row_h = m.row_h, title_y = m.title_y, rule_y = m.rule_y, rows_y = m.rows_y;
   const int panel_w = std::min(d.w - 2 * m.pad, wanted_w(m));
@@ -1656,13 +1469,10 @@ void Menu::draw(const Canvas& d) const {
   const int py0 = (d.h - panel_h) / 2;
   panel(d, px0, py0, panel_w, panel_h);
 
-  // Not PAUSED during a network session: the game behind this page is still
-  // running, because a console that stops for the length of a menu visit has
-  // left the session.
+  // Not PAUSED during a network session: the game behind this page keeps running.
   const char* title = slots ? (slot_delete_ ? "DELETE STATE" : "STATE SLOT") : (net_session_ ? "MENU" : "PAUSED");
   draw_text(d, px0 + (panel_w - text_width(scale, title)) / 2, py0 + title_y, scale, slots && slot_delete_ ? kDanger : kInk, title);
   if (slots) {
-    // The pip is the DS's Y, on the left of the diamond, as on the Controls page.
     const char* help = slot_delete_ ? "\x03 DONE" : "\x03 DELETE";
     draw_text(d, px0 + (panel_w - text_width(scale, help)) / 2, py0 + rows_y + (kSlotRows + 1) * row_h, scale, kDim, help);
   }
@@ -1670,8 +1480,7 @@ void Menu::draw(const Canvas& d) const {
 
   char buf[24];
   for (int i = 0; i < (slots ? kAutoSlot + 1 : root_rows()); ++i) {
-    // Slots fill a column at a time: 0-4 on the left, 5-9 on the right, and
-    // the auto state in a row of its own under both.
+    // Slots fill a column at a time: 0-4 left, 5-9 right, auto state below both.
     const int col = slots && i != kAutoSlot ? i / kSlotRows : 0;
     const int cell_w = slots && i != kAutoSlot ? (panel_w - 2 * m.pad) / 2 : panel_w - 2 * m.pad;
     const int cell_x = px0 + m.pad + col * cell_w;
@@ -1686,13 +1495,10 @@ void Menu::draw(const Canvas& d) const {
     else if (item == kSlotRow) std::snprintf(buf, sizeof buf, "SLOT < %d >%s%s", slot_,
                                              slot_notice_.empty() ? "" : " ", slot_notice_.c_str());
     else label = kRoot[item].label;
-    // Loading an empty slot, and every empty slot in the list, reads dimmer:
-    // the menu says what is there before the player commits to it.
+    // An empty slot reads dimmer: the menu says what is there before the player commits.
     const bool weak = (slots && (!used_[i] || (i == kAutoSlot && !slot_delete_))) || (!slots && kRoot[item].result == Result::Load && !used_[slot_]);
-    // A refused state is the one thing on this page the player did not ask
-    // for and cannot see the consequence of -- the game just started at the
-    // beginning -- so the slot row says so in warning colour until they move
-    // off it. The console log says which BIOS, and why.
+    // A refused state warns in colour until the player moves off it; the
+    // console log says which BIOS, and why.
     const bool warn = !slots && item == kSlotRow && !slot_notice_.empty();
     const u32 ink = doomed ? kDanger : warn ? kWarn : (weak && i != (slots ? slot_row_ : row_) ? kDim : kInk);
     draw_text(d, cell_x + 3 * m.s, ry, scale, ink, label);

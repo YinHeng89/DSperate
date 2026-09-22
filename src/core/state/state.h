@@ -12,40 +12,23 @@
 namespace ds::state {
 
 // Save states. A file is "DSST", a u32 format version, then chunks: a
-// four-character tag, a u32 payload length and the payload. Every subsystem
-// serialises itself through one `template <class S> void sync_state(S& s)`
-// that lists its fields with `s.fields(a, b, c)`; the same function writes
-// (S = Writer) and reads (S = Reader), so the two cannot drift apart. Only
-// scalars and arrays of scalars are written -- never whole structs, whose
-// padding would make two saves of the same state differ byte for byte --
-// and never host pointers: everything derived from the saved fields is
-// rebuilt in the subsystem's after_load().
+// four-character tag, a u32 payload length, and the payload. Each subsystem
+// serialises via a shared `template <class S> void sync_state(S& s)` with
+// `s.fields(a, b, c)`, instantiated for both Writer and Reader so the two
+// can't drift. Only scalars/arrays of scalars are written, never structs
+// (padding) or host pointers (rebuilt in after_load()).
 //
-// A chunk may grow: a reader that reaches the end of a chunk early stops
-// taking fields (`more()` is false), and a writer that appends fields keeps
-// old files loadable as long as the new fields default sensibly.
-// 2: HEAD carries bios_id + firmware_id (the last format in a shipped
-// release). 3: the DSi (HEAD says DSi or DS, NAND and SDCD chunks, 16 MB main
-// RAM, the DSi scheduler events, the DSI and DSIH chunks). 4: the speed-first
-// rework's geometry engine (GX3D loses the FIFO stages, the cycle model and
-// the worker's mirrors -- docs/speed-first-rework-scoping.md §3.4).
-//
-// 4 exists because 3 does not distinguish the two GX3D layouts. Version 3 was
-// committed on 2026-09-11 (4dde102), nine days before the `exact-reference`
-// tag, so version-3 files -- including this repo's own scene states -- are
-// already written with the old layout. Reusing 3 would have made an old file
-// and a new one indistinguishable by version, which is a silent mis-parse
-// rather than a clean refusal. The rework breaks the layout once more at
-// most: further phases stay inside 4 until a release ships.
+// Chunks may grow: `more()` goes false at old chunk end on read, so new
+// trailing fields stay backward-loadable if they default sensibly.
 constexpr u32 FORMAT_VERSION = 4;
-constexpr u32 OLDEST_READABLE_VERSION = 4;   // the rework drops the older formats rather than carrying migration through seven phases
+constexpr u32 OLDEST_READABLE_VERSION = 4;
 
 class Writer {
 public:
   void begin(const char tag[4]) { blob(tag, 4); len_at_ = buf_.size(); u32 z = 0; blob(&z, 4); }
   void end() { const u32 n = static_cast<u32>(buf_.size() - len_at_ - 4); std::memcpy(&buf_[len_at_], &n, 4); }
   bool more() const { return true; }
-  size_t remaining() const { return 0; }   // mirrors Reader::remaining for sync_state templates
+  size_t remaining() const { return 0; }   // mirrors Reader::remaining
 
   template <class T> void put(const T& v) {
     if constexpr (std::is_arithmetic_v<T> || std::is_enum_v<T>) blob(&v, sizeof v);
@@ -55,7 +38,6 @@ public:
   }
   template <class... T> void fields(const T&... v) { (put(v), ...); }
   void blob(const void* p, size_t n) { const u8* b = static_cast<const u8*>(p); buf_.insert(buf_.end(), b, b + n); }
-  // A vector's live contents; the reader resizes to match.
   template <class T> void vec(const std::vector<T>& v) {
     put(static_cast<u32>(v.size()));
     if constexpr (std::is_arithmetic_v<T>) { if (!v.empty()) blob(v.data(), v.size() * sizeof(T)); }
@@ -64,7 +46,7 @@ public:
 
   std::vector<u8>& data() { return buf_; }
   static constexpr bool reading = false;
-  u32 version = FORMAT_VERSION;   // what this writer produces (mirrors Reader::version for sync_state templates)
+  u32 version = FORMAT_VERSION;   // mirrors Reader::version
 
 private:
   template <class T> struct is_std_array : std::false_type {};
@@ -76,12 +58,10 @@ private:
 class Reader {
 public:
   Reader(const u8* p, size_t n) : p_(p), end_(p + n) {}
-  // The file's format version (set by NDS::load_state before the chunks), for
-  // the few layouts that grew: a version-2 state has 21 scheduler events.
+  // File's format version, set by NDS::load_state before the chunks.
   u32 version = FORMAT_VERSION;
 
-  // Positions on the next chunk, which must carry `tag`; false (and the
-  // reader is failed) otherwise. end() skips whatever the chunk still holds.
+  // Positions on the next chunk; false (and reader fails) if it isn't `tag`.
   bool begin(const char tag[4]) {
     chunk_end_ = end_;
     if (!ok_ || end_ - p_ < 8 || std::memcmp(p_, tag, 4) != 0) { fail(std::string("expected chunk ") + std::string(tag, 4)); return false; }
@@ -93,27 +73,23 @@ public:
   }
   void end() { if (ok_) p_ = chunk_end_; }
   bool more() const { return ok_ && p_ < chunk_end_; }
-  // Bytes the current chunk still holds: for a layout whose element count
-  // the file does not carry (the version-2 scheduler events), the size is
-  // what says how many were written.
   size_t remaining() const { return ok_ ? static_cast<size_t>(chunk_end_ - p_) : 0; }
 
-  template <class T> void put(T& v) {   // named like the writer's so sync_state reads the same
+  template <class T> void put(T& v) {
     if constexpr (std::is_arithmetic_v<T> || std::is_enum_v<T>) { if (more()) blob(&v, sizeof v); }
     else if constexpr (std::is_array_v<T>) put_n(v, std::extent_v<T>);
     else if constexpr (is_std_array<T>::value) put_n(v.data(), v.size());
     else static_assert(sizeof(T) == 0, "sync_state: list the struct's fields, not the struct");
   }
-  // An array element by element, as put() would, but with the whole elements
-  // the chunk still holds copied in one go: the same bytes land in the same
-  // places, and GCC no longer reasons a per-element loop past the array's end.
+  // Like put() per element, but bulk-copies whole elements at once (avoids
+  // GCC reasoning a per-element loop past the array's end).
   template <class E> void put_n(E* e, size_t n) {
     if constexpr (std::is_arithmetic_v<E> || std::is_enum_v<E>) {
       if (!ok_) return;
       const size_t whole = static_cast<size_t>(chunk_end_ - p_) / sizeof(E);
       const size_t k = whole < n ? whole : n;
       if (k) { std::memcpy(e, p_, k * sizeof(E)); p_ += k * sizeof(E); }
-      if (k < n && more()) blob(&e[k], sizeof(E));   // a partial element: a short read, as before
+      if (k < n && more()) blob(&e[k], sizeof(E));   // partial element: short read
     } else for (size_t i = 0; i < n; ++i) put(e[i]);
   }
   template <class... T> void fields(T&... v) { (put(v), ...); }
@@ -124,7 +100,6 @@ public:
   }
   template <class T> void vec(std::vector<T>& v) {
     u32 n = 0; put(n);
-    // A length the chunk cannot hold is a damaged file, not an allocation.
     if (!ok_ || static_cast<size_t>(chunk_end_ - p_) / sizeof(T) < n) { if (n) fail("short read"); v.clear(); return; }
     v.resize(n);
     if constexpr (std::is_arithmetic_v<T>) { if (n) blob(v.data(), n * sizeof(T)); }
@@ -133,8 +108,6 @@ public:
 
   // Bytes outside any chunk (the file magic and version).
   void blob_raw(void* p, size_t n) { if (!ok_) return; if (static_cast<size_t>(end_ - p_) < n) { fail("short file"); std::memset(p, 0, n); return; } std::memcpy(p, p_, n); p_ += n; }
-  // Whether anything follows the chunks read so far: the frontend appends a
-  // chunk of its own after the machine's, and an older file simply ends.
   bool at_end() const { return !ok_ || p_ >= end_; }
   bool ok() const { return ok_; }
   const std::string& error() const { return err_; }

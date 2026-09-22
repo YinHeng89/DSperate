@@ -1,19 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // DSperate - Nintendo DS emulator. Copyright (C) 2026 DSperate contributors.
 //
-// AArch64 backend: the hand-built entry/exit/call/dispatch stubs (emitted
-// with the same encoder the translator uses, so there is no assembler
-// dependency), and the three code patches the common runtime needs from a
-// backend -- the killed-block entry redirect, the link patch that turns
-// `bl link` into `b block`, and the relative-branch test the pre-translation
-// verifier uses to tolerate emission-base differences.
-//
-// Stub calling convention: a block reaches a stub with `bl`, and the stub
-// reads its literal arguments (instruction word, key, ...) from the words
-// that follow the `bl` through x30, skipping them before it returns. A call
-// site is therefore the `bl` plus its literals; nothing is materialised in
-// registers at the site, and a linked `bl link; .word key` becomes a bare
-// `b` whose literal is never executed.
+// AArch64 stubs and runtime code patches. Stubs are entered by `bl`; literal args
+// follow the bl and are read/skipped via x30. x17 and x30 are free temps in stubs.
 #include "core/cpu/jit/jit_internal.h"
 #include "core/cpu/jit/a64/convention.h"
 #include "core/cpu/jit/a64/emit.h"
@@ -25,13 +14,10 @@
 
 namespace ds::jit {
 
-// Scheduler::slice_next, C-callable (scheduler.cpp): returns the context to
-// enter in x0 (nullptr at the end of the run) and the native entry in x1.
+// Returns x0 = context (nullptr ends the run), x1 = native entry.
 extern "C" ds::SliceNext ds_slice_next(void* scheduler);
 
 namespace {
-// ---- stub emission ---------------------------------------------------------------
-
 void emit_store_callee_saved_guest(Emitter& e) {
   for (u32 r = 0; r < 8; r += 2) e.stp_w(host_reg(r), host_reg(r + 1), R_CTX, off_reg(r));
   e.stp_w(host_reg(13), host_reg(14), R_CTX, off_reg(13));
@@ -40,7 +26,7 @@ void emit_load_callee_saved_guest(Emitter& e) {
   for (u32 r = 0; r < 8; r += 2) e.ldp_w(host_reg(r), host_reg(r + 1), R_CTX, off_reg(r));
   e.ldp_w(host_reg(13), host_reg(14), R_CTX, off_reg(13));
 }
-// w8 holds budget - 1; the context holds the budget (x17 is free in stubs).
+// R_BUDGET holds budget - 1.
 void emit_store_caller_saved_guest(Emitter& e) {
   e.stp_w(host_reg(8), host_reg(9), R_CTX, off_reg(8));
   e.stp_w(host_reg(10), host_reg(11), R_CTX, off_reg(10));
@@ -59,7 +45,6 @@ void emit_load_caller_saved_guest(Emitter& e) {
   e.ldr_x(R_TIM, 17, OFF_JC_TIM);
   e.ldr_x(R_ARENA, 17, OFF_JC_ARENA);
 }
-// Merge host NZCV into ctx.cpsr (tmp registers: 17 and 30 are free in stubs).
 void emit_save_flags(Emitter& e, u32 t0, u32 t1) {
   e.mrs_nzcv(t0);
   e.ldr_w(t1, R_CTX, OFF_CPSR);
@@ -72,9 +57,7 @@ void emit_load_flags(Emitter& e, u32 t0) {
   e.msr_nzcv(t0);
 }
 
-// Prefetch cost of one ARM9 fetch at address in `wa`, result in `wc`, using
-// cmp/csel (the stubs save and restore the guest flags around this).
-// c = tbl[a>>12][0] (8-byte ARM9 entries); c == 0xFF ? ((branch || !(a & 0x1F)) ? 3 : 1) : c
+// ARM9 fetch cost: c = tbl[a>>12][0]; c == 0xFF ? ((branch || !(a & 0x1F)) ? 3 : 1) : c
 void emit_fetch_cost9(Emitter& e, u32 wa, u32 wc, u32 t, bool branch) {
   e.lsr_imm(t, wa, 12);
   e.add_reg(t, R_TIM, t, LSL, 3, true);
@@ -93,8 +76,7 @@ void emit_fetch_cost9(Emitter& e, u32 wa, u32 wc, u32 t, bool branch) {
   }
 }
 
-// Poll after a helper: `leave` receives the fixups to bind at the leave
-// code; execution falls through when the block continues. Clobbers w3.
+// Branches to `leave` on budget exhausted, alert, or unmasked IRQ. Clobbers w3.
 void emit_poll(Emitter& e, std::vector<size_t>& leave) {
   leave.push_back(e.tbnz_fwd(R_BUDGET, 31));
   e.ldr_w(3, R_CTX, OFF_ALERTS);
@@ -108,16 +90,15 @@ void emit_poll(Emitter& e, std::vector<size_t>& leave) {
   e.bind(ok2);
 }
 
-
 } // namespace
 
 namespace backend {
 
 void emit_stubs(Runtime& rt) {
   Emitter e(rt.arena, rt.cap);
-  e.set_pos(LUT_AREA);          // the branch LUTs live at the front of the arena
+  e.set_pos(LUT_AREA);
 
-  // ---- enter(ctx, native): C-callable, saves the callee-saved registers ----------
+  // ---- enter(ctx, native): C-callable ----
   rt.enter = reinterpret_cast<void (*)(CpuContext*, const void*)>(e.cur());
   e.stp_x_pre(29, 30, SP, -96);
   e.stp_x(19, 20, SP, 16);
@@ -133,7 +114,7 @@ void emit_stubs(Runtime& rt) {
   e.ldp_x(27, 28, SP, 80);
   e.ldp_x_post(29, 30, SP, 96);
   e.ret();
-  // ---- enter_light(ctx, native): only x29/x30 are kept; exits return here ---------
+  // ---- enter_light(ctx, native): saves only x29/x30; exits return here ----
   e.bind(to_light);
   rt.enter_light = e.cur();
   e.stp_x_pre(29, 30, SP, -16);
@@ -143,18 +124,17 @@ void emit_stubs(Runtime& rt) {
   emit_load_flags(e, 17);
   e.br(1);
 
-  // ---- exit_key_lit: `bl exit_key_lit; .word key` -------------------------------
+  // ---- exit_key_lit: `bl exit_key_lit; .word key` ----
   rt.exit_key_lit = e.cur();
   e.ldr_w(0, 30, 0);
-  // fall through
-  // ---- exit_key: w0 = key of the next instruction -------------------------------
+  // ---- exit_key: w0 = key of the next instruction ----
   rt.exit_key = e.cur();
-  e.and_imm(1, 0, 1);                 // T
-  e.and_imm(2, 0, ~1u);               // pc
+  e.and_imm(1, 0, 1);
+  e.and_imm(2, 0, ~1u);
   e.add_imm(2, 2, 8);
   e.sub_reg(2, 2, 1, LSL, 2);         // pc + 8 - 4T
   e.str_w(2, R_CTX, off_reg(15));
-  // fall through
+  // exit_r15: ctx.r15 already correct
   rt.exit_r15 = e.cur();
   emit_store_callee_saved_guest(e);
   emit_store_caller_saved_guest(e);
@@ -162,11 +142,7 @@ void emit_stubs(Runtime& rt) {
   e.ldp_x_post(29, 30, SP, 16);
   e.ret();
 
-  // ---- run_loop(scheduler): the native slice loop -----------------------------------
-  // Saves the callee-saved registers once, then alternates the scheduler's
-  // state machine (slice_next: x0 = context or 0, x1 = native entry) with
-  // enter_light. Nothing lives in x19-x28 between calls: translated code
-  // owns them, and the C++ helpers preserve their own.
+  // ---- run_loop(scheduler): the native slice loop ----
   rt.run_loop = reinterpret_cast<void (*)(void*)>(e.cur());
   e.stp_x_pre(29, 30, SP, -112);
   e.stp_x(19, 20, SP, 16);
@@ -191,14 +167,14 @@ void emit_stubs(Runtime& rt) {
   e.ldp_x_post(29, 30, SP, 112);
   e.ret();
 
-  // ---- flush_exit: w0 = key; arena full ----------------------------------------
-  rt.flush_exit = e.cur();       // ctx.r15 already set by the helper
+  // ---- flush_exit: arena full; ctx.r15 already set ----
+  rt.flush_exit = e.cur();
   e.mov_imm64(1, reinterpret_cast<u64>(&rt.need_reset));
   e.movz(2, 1);
   e.strb(2, 1, 0);
   e.b(rt.exit_r15);
 
-  // ---- call_pure: x16 = fn, args in x0-x3 ------------------------------------------
+  // ---- call_pure: x16 = fn, args x0-x3 ----
   rt.call_pure = e.cur();
   e.str_x_pre(30, SP, -16);
   emit_save_flags(e, 17, 30);
@@ -209,7 +185,7 @@ void emit_stubs(Runtime& rt) {
   e.ldr_x_post(30, SP, 16);
   e.ret();
 
-  // ---- call_full: x16 = fn, args in x0-x3 ------------------------------------------
+  // ---- call_full: x16 = fn, args x0-x3 ----
   rt.call_full = e.cur();
   e.str_x_pre(30, SP, -16);
   emit_save_flags(e, 17, 30);
@@ -233,7 +209,7 @@ void emit_stubs(Runtime& rt) {
   e.ldr_x_post(30, SP, 16);
   e.ret();
 
-  // ---- poll: `bl poll; .word next_key` ----------------------------------------------
+  // ---- poll: `bl poll; .word next_key` ----
   rt.poll = e.cur();
   {
     std::vector<size_t> leave;
@@ -245,7 +221,7 @@ void emit_stubs(Runtime& rt) {
     e.b(rt.exit_key);
   }
 
-  // ---- slow loads/stores: w1 = address (w2 = value); x1, x7 preserved -------------
+  // ---- slow loads/stores: w1 = address (w2 = value); x1, x7 preserved ----
   {
     const void* lds[3] = {reinterpret_cast<const void*>(&jit_h_ld8), reinterpret_cast<const void*>(&jit_h_ld16), reinterpret_cast<const void*>(&jit_h_ld32)};
     const void* sts[3] = {reinterpret_cast<const void*>(&jit_h_st8), reinterpret_cast<const void*>(&jit_h_st16), reinterpret_cast<const void*>(&jit_h_st32)};
@@ -262,8 +238,7 @@ void emit_stubs(Runtime& rt) {
     }
   }
 
-  // ---- flag merges ---------------------------------------------------------------------
-  // merge_keep_cv: w0 = result. N,Z from the result; C,V unchanged.
+  // ---- merge_keep_cv: N,Z from w0; C,V unchanged ----
   rt.merge_keep_cv = e.cur();
   e.mrs_nzcv(1);
   e.tst_reg(0, 0);
@@ -272,7 +247,7 @@ void emit_stubs(Runtime& rt) {
   e.bfi(2, 3, 28, 2, true);
   e.msr_nzcv(2);
   e.ret();
-  // merge_set_c: w0 = result, w1 = carry (0/1). N,Z from the result, C from w1, V unchanged.
+  // ---- merge_set_c: N,Z from w0, C from w1 (0/1); V unchanged ----
   rt.merge_set_c = e.cur();
   e.mrs_nzcv(2);
   e.tst_reg(0, 0);
@@ -283,17 +258,15 @@ void emit_stubs(Runtime& rt) {
   e.msr_nzcv(3);
   e.ret();
 
-  // ---- per-CPU stubs -----------------------------------------------------------------
+  // ---- per-CPU stubs ----
   for (int c = 0; c < 2; ++c) {
     JitCpu& jc = rt.cpus[c];
 
-    // dispatch: w0 = key. The LUT is at a fixed offset inside the arena and
-    // the arena base is pinned in R_ARENA, so the probe needs no constant
-    // materialisation: seven instructions for CPU0, eight for CPU1.
+    // dispatch: w0 = key. LUT entry = (native offset << 32) | key, at R_ARENA.
     jc.dispatch = e.cur();
     e.ubfx(2, 0, 1, LUT_BITS);
     if (c != 0) {
-      const bool ok = e.orr_imm(2, 2, static_cast<u32>(LUT_STRIDE / 8));   // index into the second LUT
+      const bool ok = e.orr_imm(2, 2, static_cast<u32>(LUT_STRIDE / 8));
       assert(ok && "LUT_STRIDE/8 must be a logical immediate"); (void)ok;
     }
     e.ldr_x_reg(3, R_ARENA, 2, true, true);
@@ -312,15 +285,13 @@ void emit_stubs(Runtime& rt) {
     // link: `bl link; .word key`
     jc.link = e.cur();
     e.ldr_w(1, 30, 0);
-    e.sub_imm(2, 30, 4, true);          // patch site
+    e.sub_imm(2, 30, 4, true);
     e.mov(0, R_CTX, true);
     e.mov_imm64(R_FN, reinterpret_cast<u64>(&jit_h_link));
     e.bl(rt.call_pure);
     e.br(0);
 
-    // fallback: `bl fallback; .word instr; .word key`. Runs the instruction
-    // through the interpreter, polls, then returns to the block when the
-    // instruction did not jump, or dispatches on the new pc.
+    // fallback: `bl fallback; .word instr; .word key`; interprets one instruction.
     jc.fallback = e.cur();
     {
       e.ldp_w(1, 2, 30, 0);
@@ -336,7 +307,7 @@ void emit_stubs(Runtime& rt) {
       e.ret();
       for (size_t f : leave) e.bind(f);
       e.ldp_x_post(30, 2, SP, 16);
-      e.and_imm(3, 2, 1);               // next key = key + 4 - 2T
+      e.and_imm(3, 2, 1);               // key + 4 - 2T
       e.add_imm(0, 2, 4);
       e.sub_reg(0, 0, 3, LSL, 1);
       e.b(rt.exit_key);
@@ -344,7 +315,7 @@ void emit_stubs(Runtime& rt) {
       e.ldp_x_post(30, 2, SP, 16);
       std::vector<size_t> leave2;
       emit_poll(e, leave2);
-      // dispatch from the context: key = (r15 - 8 + 4T) | T
+      // key = (r15 - 8 + 4T) | T
       e.ldr_w(0, R_CTX, off_reg(15));
       e.ldr_w(1, R_CTX, OFF_CPSR);
       e.ubfx(2, 1, 5, 1);
@@ -356,10 +327,9 @@ void emit_stubs(Runtime& rt) {
       e.b(rt.exit_r15);
     }
 
-    // branch_indirect_cdi: w0 = target (bit 0 = new T), w1 = numD, w2 = data
-    // address. Charges the CDI cost of an LDM/POP that loaded pc the way the
-    // interpreter does *after* the jump (new pc, state and code region), then
-    // continues as branch_indirect. Flags are saved in x17 throughout.
+    // branch_indirect_cdi: w0 = target | T, w1 = numD, w2 = data address. Charges
+    // LDM/POP-to-pc CDI cost as the interpreter does, then joins branch_indirect.
+    // Guest flags parked in x17.
     jc.branch_indirect_cdi = e.cur();
     e.mrs_nzcv(17);
     {
@@ -376,7 +346,7 @@ void emit_stubs(Runtime& rt) {
         e.bind(thumb);
         size_t odd = e.tbnz_fwd(3, 1);
         emit_fetch_cost9(e, 3, 4, 6, true);
-        e.movz(4, 0);                       // even a: new r15 = a + 4 has bit 1 set -> numC 0
+        e.movz(4, 0);                       // even a: new r15 has bit 1 set -> numC 0
         size_t done2 = e.b_fwd();
         e.bind(odd);
         e.add_imm(5, 3, 2);
@@ -388,7 +358,7 @@ void emit_stubs(Runtime& rt) {
         e.add_reg(5, 4, 1);
         e.sub_imm(5, 5, 6);
         e.cmp_reg(4, 1);
-        e.csel(6, 4, 1, HI);                // max(numC, numD)
+        e.csel(6, 4, 1, HI);
         e.cmp_reg(5, 6);
         e.csel(5, 5, 6, GT);
       } else {
@@ -415,7 +385,6 @@ void emit_stubs(Runtime& rt) {
         size_t plain = e.cbz_fwd(5);
         e.add_imm(1, 1, 1);
         e.bind(mx);
-        // w5 = max(nC + d - 3, max(nC, d))
         e.add_reg(5, 4, 1); e.sub_imm(5, 5, 3);
         e.cmp_reg(4, 1); e.csel(6, 4, 1, HI);
         e.cmp_reg(5, 6); e.csel(5, 5, 6, GT);
@@ -427,44 +396,37 @@ void emit_stubs(Runtime& rt) {
       }
       e.sub_reg(R_BUDGET, R_BUDGET, 5);
     }
-    // fall into branch_indirect's body (flags already in x17)
     size_t to_body = e.b_fwd();
 
-    // branch_indirect: w0 = target address, bit 0 = new T
+    // branch_indirect: w0 = target | T
     jc.branch_indirect = e.cur();
     e.mrs_nzcv(17);
     e.bind(to_body);
     size_t is_thumb = e.tbnz_fwd(0, 0);
     e.and_imm(0, 0, ~3u);
-    e.bind(is_thumb);                       // Thumb keys keep bit 0; pc = key & ~1
+    e.bind(is_thumb);
     e.ldr_w(1, R_CTX, OFF_CPSR);
     e.bfi(1, 0, 5, 1);
     e.str_w(1, R_CTX, OFF_CPSR);
-    e.and_imm(2, 0, ~1u);                   // a
+    e.and_imm(2, 0, ~1u);
     if (c == 0) {
-      // ARM9 refill: ARM a: cost(a,B)+cost(a+4,S); Thumb: a&2 ? cost(a-2,B)+cost(a+2,S) : cost(a,B).
-      // The per-page refill table (mem::Timing::build_refill9) holds every
-      // shape the formula can take; what is left here is choosing the byte.
-      // With T = bit 0 of w0 and odd = bit 1 of a (clear for ARM):
-      //   first  = a - 2*odd            (its page selects the entry)
-      //   second = a + 4 - 2*T          (dropped when T && !odd -> byte 3)
-      //   index  = second starts a page ? 2 : second starts a line ? 1 : 0
-      // One byte load replaces the two dependent timing-table loads and the
-      // cache-line/0xFF selects the formula needed. Flags are free here (x17).
+      // ARM9 refill: ARM cost(a,B)+cost(a+4,S); Thumb a&2 ? cost(a-2,B)+cost(a+2,S) : cost(a,B).
+      // Byte from Timing's refill9 table: page of first = a - 2*odd; index by second =
+      // a + 4 - 2*T: 3 if dropped (T && !odd), 2 if page start, 1 if line start, else 0.
       e.and_imm(4, 0, 1);                       // T
       e.ubfx(5, 2, 1, 1);                       // odd
-      e.sub_reg(3, 2, 5, LSL, 1);               // first
-      e.lsr_imm(3, 3, 12);                      // its page
+      e.sub_reg(3, 2, 5, LSL, 1);
+      e.lsr_imm(3, 3, 12);
       e.add_imm(7, 2, 4);
-      e.sub_reg(7, 7, 4, LSL, 1);               // second
-      e.bic_reg(4, 4, 5);                       // T && !odd: no second fetch
+      e.sub_reg(7, 7, 4, LSL, 1);
+      e.bic_reg(4, 4, 5);
       e.tst_imm(7, 0xFFF);
-      e.cset(6, EQ);                            // second in the next page
+      e.cset(6, EQ);
       e.tst_imm(7, 0x1F);
-      e.csinc(6, 6, 6, NE);                     // + line-aligned (implied by the above)
+      e.csinc(6, 6, 6, NE);
       e.movz(1, 3);
       e.cmp_imm(4, 0);
-      e.csel(6, 1, 6, NE);                      // first only
+      e.csel(6, 1, 6, NE);
       e.add_reg(3, R_TIM, 3, LSL, 2, true);
       e.add_imm(3, 3, mem::Timing::REFILL9_OFFSET, true);
       e.ldrb_reg(3, 3, 6);
@@ -492,8 +454,7 @@ void emit_stubs(Runtime& rt) {
   sync_icache(rt.arena + LUT_AREA, rt.stubs_end - LUT_AREA);
 }
 
-// Killed block: anything linked to its entry lands in the dispatcher with
-// the key in w0 (movz/movk/b = the 12 bytes of ENTRY_PATCH).
+// Killed block: `movz/movk w0; b dispatch` = the 12 bytes of ENTRY_PATCH.
 void write_entry_redirect(u8* entry, u32 key, const u8* dispatch) {
   Emitter e(entry, ENTRY_PATCH);
   e.movz(0, key & 0xFFFF);
@@ -501,7 +462,6 @@ void write_entry_redirect(u8* entry, u32 key, const u8* dispatch) {
   e.b(dispatch);
 }
 
-// `bl link` at `site` becomes `b target`.
 bool fastmem_capable() { return true; }
 
 void patch_link(u8* site, const u8* target) {
@@ -510,11 +470,10 @@ void patch_link(u8* site, const u8* target) {
   Emitter::patch(site, w);
 }
 
-// 0 = not a pc-relative branch; else a class id equal for two encodings of
-// the same branch kind (B/BL, B.cond).
+// 0 = not a pc-relative branch; else an id equal across encodings of the same kind.
 u32 relative_branch_class(u32 w) {
-  if ((w & 0x7C000000u) == 0x14000000u) return 1 + ((w >> 31) & 1);   // B / BL
-  if ((w & 0xFF000010u) == 0x54000000u) return 3;                      // B.cond
+  if ((w & 0x7C000000u) == 0x14000000u) return 1 + ((w >> 31) & 1);
+  if ((w & 0xFF000010u) == 0x54000000u) return 3;
   return 0;
 }
 

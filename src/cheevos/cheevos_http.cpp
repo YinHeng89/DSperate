@@ -12,16 +12,8 @@
 namespace ds::cheevos {
 namespace {
 
-// libcurl's ABI, declared rather than included. We never build against a curl
-// package -- the point of dlopen is that there is nothing to find at build time
-// -- so the handful of entry points and option numbers we use are written out
-// here.
-//
-// The option numbers are safe to hard-code: curl assigns each one a permanent
-// number (type base + index) and has never renumbered one, because every binary
-// ever linked against it would break. The values below were read out of
-// curl 8.5.0's include/curl/curl.h, and the type bases are in the same file:
-// LONG 0, OBJECTPOINT 10000, FUNCTIONPOINT 20000.
+// libcurl's ABI, declared rather than included (loaded via dlopen). Option
+// numbers are permanent (type base + index) and safe to hard-code.
 using CURL = void;
 constexpr long CURL_GLOBAL_ALL = 3;
 constexpr int  CURLE_OK = 0;
@@ -58,10 +50,7 @@ struct Api {
   void  (*slist_free_all)(curl_slist*);
 };
 
-// Trust stores, for a libcurl whose compiled-in path does not exist here. That
-// is the normal case for one a packager dropped into the emulator's own lib
-// directory: it was built against some other filesystem. Only consulted when
-// the usual system stores are absent, so a CFW that has its own keeps using it.
+// Fallback trust stores, consulted only when curl's own compiled-in store is absent.
 const char* const kCaPaths[] = {
   "/etc/ssl/certs/ca-certificates.crt",
   "/etc/pki/tls/certs/ca-bundle.crt",
@@ -74,11 +63,7 @@ bool exists(const char* path) {
   return stat(path, &st) == 0 && S_ISREG(st.st_mode);
 }
 
-// Growth-bounded sink. A RetroAchievements response is a few KB; a patch (the
-// achievement set for a game) can be a few hundred. The cap is generous and
-// exists so a confused or hostile response cannot grow without limit on a
-// 512 MB handheld.
-constexpr size_t MAX_BODY = 8u << 20;
+constexpr size_t MAX_BODY = 8u << 20;   // caps a runaway response
 
 struct Sink {
   std::string* out;
@@ -88,7 +73,7 @@ struct Sink {
 size_t write_cb(char* data, size_t size, size_t nmemb, void* user) {
   Sink* s = static_cast<Sink*>(user);
   const size_t n = size * nmemb;
-  if (s->out->size() + n > MAX_BODY) { s->overflowed = true; return 0; }   // 0 aborts the transfer
+  if (s->out->size() + n > MAX_BODY) { s->overflowed = true; return 0; }  // 0 aborts the transfer
   s->out->append(data, n);
   return n;
 }
@@ -97,8 +82,6 @@ class CurlBackend final : public Backend {
 public:
   CurlBackend(void* handle, const Api& api, const char* from)
       : handle_(handle), api_(api), name_(std::string("libcurl (") + from + ")") {
-    // Resolved once: where the trust store is is a property of the device, not
-    // of a request.
     if (const char* ca = std::getenv("DS_CHEEVOS_CAINFO")) {
       if (*ca) { ca_ = ca; return; }
     }
@@ -106,13 +89,9 @@ public:
       if (exists(p)) { ca_ = p; break; }
     }
   }
-  ~CurlBackend() override {
-    // The library is deliberately left open. curl_global_cleanup is not called
-    // either: OpenSSL and curl both register process-wide state, and tearing it
-    // down while a worker may still be unwinding is a crash-at-exit waiting to
-    // happen. A leaked handle at process end costs nothing.
-    (void)handle_;
-  }
+  // Handle deliberately leaked, curl_global_cleanup deliberately not called:
+  // tearing down process-wide curl/OpenSSL state at exit risks a crash.
+  ~CurlBackend() override { (void)handle_; }
 
   const char* name() const override { return name_.c_str(); }
 
@@ -127,14 +106,11 @@ public:
     api_.easy_setopt(c, CURLOPT_WRITEDATA, &sink);
     api_.easy_setopt(c, CURLOPT_USERAGENT, user_agent);
     api_.easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
-    api_.easy_setopt(c, CURLOPT_ACCEPT_ENCODING, "");     // whatever this curl supports
-    // No signals: curl's default alarm-based DNS timeout is not thread-safe,
-    // and this runs on a worker. The *_MS timeouts below work without it.
+    api_.easy_setopt(c, CURLOPT_ACCEPT_ENCODING, "");
+    // curl's default DNS timeout is alarm-based and not thread-safe.
     api_.easy_setopt(c, CURLOPT_NOSIGNAL, 1L);
     api_.easy_setopt(c, CURLOPT_CONNECTTIMEOUT_MS, 10000L);
     api_.easy_setopt(c, CURLOPT_TIMEOUT_MS, 30000L);
-    // Set only when a store was actually found; otherwise curl uses the one it
-    // was built against, which is right wherever the CFW built its own.
     if (!ca_.empty()) api_.easy_setopt(c, CURLOPT_CAINFO, ca_.c_str());
 
     curl_slist* headers = nullptr;
@@ -146,9 +122,7 @@ public:
         const std::string h = "Content-Type: " + req.content_type;
         headers = api_.slist_append(headers, h.c_str());
       }
-      // curl would otherwise announce Expect: 100-continue on a large body and
-      // wait a second for a server that never answers it.
-      headers = api_.slist_append(headers, "Expect:");
+      headers = api_.slist_append(headers, "Expect:");  // suppress 100-continue stalls
       if (headers) api_.easy_setopt(c, CURLOPT_HTTPHEADER, headers);
     }
 
@@ -160,7 +134,6 @@ public:
     } else if (sink.overflowed) {
       res.error = "response larger than 8 MB";
     } else {
-      // status stays 0, which is what tells rcheevos to retry this later.
       const char* m = api_.easy_strerror ? api_.easy_strerror(rc) : nullptr;
       res.error = m ? m : ("curl error " + std::to_string(rc));
     }
@@ -181,17 +154,7 @@ private:
 std::unique_ptr<Backend> make_curl_backend(std::string& err) {
   err.clear();
 
-  // The soname, and nothing else. Deliberately no list of places a library
-  // might be hiding: on a CFW the launcher decides what this process can see.
-  // spruce's dsperate_functions.sh exports
-  // LD_LIBRARY_PATH="$EMU_DIR/lib64:$LD_LIBRARY_PATH", so a libcurl.so.4
-  // dropped into the emulator's own lib directory is found by this line with
-  // no help from us. Hunting through other applications' bundles would work
-  // until any of them moved, and would be us borrowing a library nobody
-  // offered.
-  //
-  // DS_CHEEVOS_LIBCURL is the escape hatch for a firmware that keeps it
-  // somewhere the loader cannot see.
+  // DS_CHEEVOS_LIBCURL overrides the soname for a firmware that hides it from the loader.
   const char* explicit_path = std::getenv("DS_CHEEVOS_LIBCURL");
   if (explicit_path && !*explicit_path) explicit_path = nullptr;
   const char* what = explicit_path ? explicit_path : "libcurl.so.4";
@@ -224,8 +187,7 @@ std::unique_ptr<Backend> make_curl_backend(std::string& err) {
     }
   }
 
-  // Once, before any easy handle exists. curl does this lazily and
-  // non-thread-safely if we do not, and the first request is on a worker.
+  // Must run before any easy handle exists: curl's lazy init is not thread-safe.
   if (api.global_init(CURL_GLOBAL_ALL) != CURLE_OK) {
     err = "curl_global_init failed";
     dlclose(h);

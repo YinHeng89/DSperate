@@ -15,34 +15,15 @@
 
 namespace ds::sdl {
 
-// The frame limiter: the emulator's clock.
-//
-// It used to be the audio queue -- a frame produces a fixed 547-odd samples,
-// so holding the queue at a depth held the emulator at the rate the *sound
-// card* consumed them. That paced well and cost nothing, but the clock was
-// the daemon's rather than ours: no speed control, latency pinned at the
-// queue depth, and a device that accepted samples without playing them had
-// to be detected and worked around before it hung the machine. This is the
-// wall clock instead, and the period is a knob.
-//
-// Deadlines accumulate rather than being measured from the end of each
-// frame, so a frame that runs long is paid for by the next one rather than
-// pushing the whole session late. Debt is capped at one frame: a title that
-// alternates heavy and light (Spirit Tracks' intro, Golden Sun's title:
-// 18 ms then 12 ms) is on time over the pair, and dropping the debt after
-// the heavy frame made the light one sleep the difference away -- 57.6 fps
-// out of 15 ms of work.
+// Frame limiter. Deadlines accumulate rather than resetting each frame, so a
+// long frame is paid back by the next one; debt is capped at one frame so an
+// alternating heavy/light pair stays on time on average.
 class Pacer {
 public:
-  // The nominal period, in nanoseconds -- CYCLES_PER_FRAME / ARM9_CLOCK_HZ,
-  // i.e. 59.8261 Hz, unless something asks for another rate.
+  // period_ns: nominal frame period, e.g. CYCLES_PER_FRAME / ARM9_CLOCK_HZ (59.8261 Hz).
   explicit Pacer(double period_ns) {
 #if defined(__linux__)
-    // The kernel rounds a timer up by the thread's slack -- 50 us by default,
-    // which is most of the error a frame wait sees. It costs nothing to ask
-    // for none (an RT thread is already given none, so this is for the
-    // ordinary case). Per-thread, and this runs on the emulation thread.
-    prctl(PR_SET_TIMERSLACK, 1UL, 0, 0, 0);
+    prctl(PR_SET_TIMERSLACK, 1UL, 0, 0, 0);   // remove the kernel's default ~50us timer rounding
 #endif
     set_period_ns(period_ns);
     reset();
@@ -51,39 +32,18 @@ public:
   void set_period_ns(double ns) { period_ = ns * ticks_per_ns(); }
   double period_ns() const { return period_ / ticks_per_ns(); }
 
-  // Hold the core through the wait instead of sleeping it (emu.pacing =
-  // busy). The frame rate is identical either way -- this only changes what
-  // the machine looks like it is doing between frames, which is the whole
-  // of what a polling frequency governor decides on. See cpu_gov.h for why
-  // that is worth a core's idle time: on `ondemand` the sleep reads as idle
-  // and the clock steps down under the emulator, and there is no way for an
-  // unprivileged process to say "I am busy, I am just not busy *now*".
+  // Spin instead of sleeping between frames; keeps the core from reading as
+  // idle to a polling cpufreq governor (see cpu_gov.h). Same frame rate either way.
   void set_busy_wait(bool on) { busy_ = on; }
   bool busy_wait() const { return busy_; }
 
-  // Stay under the kernel's real-time bandwidth cap by choosing when to give
-  // the surplus up, instead of having it taken.
-  //
-  // sched_rt_runtime_us/sched_rt_period_us cap the real-time class at 95 % of
-  // every second on a stock distro, and with NO_RT_RUNTIME_SHARE (ROCKNIX's
-  // setting) each CPU is capped on its own, so one saturated thread is enough
-  // to trigger it. The kernel enforces it in a single lump: when the budget
-  // runs out the thread is stopped dead for the rest of the period, up to
-  // 50 ms. That is invisible on a scene with slack -- the limiter's sleep
-  // keeps us well under -- and brutal on one without, where the limiter never
-  // sleeps and the thread really is 100 % real-time: NSMB's attract mode took
-  // 45-60 ms hitches about every 1.7 s, three lost frames and a gap in the
-  // sound each time.
-  //
-  // The 5 % is going either way. This gives it back ~0.8 ms at a time, at the
-  // frame boundary, and only while the accounting says we are actually near
-  // the cap -- so a scene that is merely occasionally late pays nothing.
-  // `cap` is runtime/period; `period_ns` the kernel's RT period.
+  // Keep this thread under the kernel's RT bandwidth cap (sched_rt_runtime_us)
+  // by sleeping off the surplus near the frame boundary, instead of being
+  // throttled for up to 50ms when the budget runs out mid-frame.
+  // `cap` is runtime/period; `period_ns` the kernel's RT accounting period.
   void set_rt_relief(double cap, double period_ns) {
     if (!(cap > 0.0 && cap < 1.0) || !(period_ns > 0.0)) return;
-    // A little under the kernel's own figure: being throttled costs 50 ms and
-    // being early costs microseconds, so the margin is not symmetric.
-    allowed_ = cap - 0.01;
+    allowed_ = cap - 0.01;   // small margin: throttling costs 50ms, being early costs us
     rt_period_ = period_ns * ticks_per_ns();
     relief_ = allowed_ > 0.0;
     window_ = SDL_GetPerformanceCounter();
@@ -92,8 +52,7 @@ public:
   }
   bool rt_relief() const { return relief_; }
 
-  // What the relief has cost, in microseconds a frame since the last call,
-  // and how many frames it had to act on. For the statistics line.
+  // Relief cost in us/frame since the last call, and frames it acted on.
   double relief_us(unsigned* frames = nullptr) {
     const double v = relief_n_ ? relief_ticks_ / ticks_per_ns() / 1e3 / relief_n_ : 0.0;
     if (frames) *frames = relief_n_;
@@ -101,35 +60,28 @@ public:
     return v;
   }
 
-  // Start again from now: the deadline is one period away. For every place
-  // where wall time and emulated time have just been cut apart -- unpause,
-  // a state load, a speed change -- so the gap is not repaid as a burst.
+  // Reset deadline to one period from now; call after unpause/load/speed change
+  // so the gap isn't repaid as a burst.
   void reset() { next_ = SDL_GetPerformanceCounter(); }
 
-  // This frame's deadline, in SDL performance-counter ticks. Read by the
-  // DS_WIFI_SLICE path, which spreads a frame's emulation across its period.
+  // This frame's deadline, in SDL performance-counter ticks (used by DS_WIFI_SLICE).
   Uint64 next() const { return next_; }
 
-  // Advance to the next deadline and sleep until it. `scale` runs the clock
-  // faster or slower than the period: 2.0 is double speed, 0.5 half.
+  // Advance to the next deadline and sleep until it. `scale`: 2.0 = double speed, 0.5 = half.
   void wait(double scale = 1.0) {
     next_ += static_cast<Uint64>(scale > 0.0 ? period_ / scale : period_);
     Uint64 now = SDL_GetPerformanceCounter();
     if (relief_) now = relieve(now);
     if (now >= next_) {
-      // Behind. Carry at most one frame of debt (see above).
-      const Uint64 budget = static_cast<Uint64>(period_);
+      const Uint64 budget = static_cast<Uint64>(period_);   // cap debt at one frame
       if (now - next_ > budget) next_ = now - budget;
     } else {
       sleep_until(next_, now);
     }
-    // The frame's real-time run starts when this returns, not before: the
-    // wait itself -- slept or spun at ordinary priority -- is not charged.
-    if (relief_) frame_start_ = SDL_GetPerformanceCounter();
+    if (relief_) frame_start_ = SDL_GetPerformanceCounter();   // RT run starts here, not before the wait
   }
 
-  // What the spin is costing, in microseconds a frame, averaged since the
-  // last call. For the statistics line; the margin tunes itself without it.
+  // Spin cost in us/frame, averaged since the last call. Informational only.
   double spin_us() {
     const double v = spin_n_ ? spin_ticks_ / ticks_per_ns() / 1e3 / spin_n_ : 0.0;
     spin_ticks_ = 0; spin_n_ = 0;
@@ -137,22 +89,10 @@ public:
   }
 
 private:
-  // A sleep does not end when it was asked to: the kernel wakes the thread
-  // late, by its timer slack plus whatever else wanted the core. Measured on
-  // an idle desktop, ordinary priority: 60 us late at the median but 430 us
-  // at the 99th percentile, and the two do not move together -- a constant
-  // spin margin is therefore either 30x too large most frames or too small
-  // on the ones that matter.
-  //
-  // So the margin is what this thread has actually been seen to overshoot
-  // by, and it is learned: it jumps straight to any lateness bigger than it
-  // has, and decays slowly (1/512 a frame, ~2 s to halve) when frames come
-  // back on time. The asymmetry is the point -- being early costs a few
-  // microseconds of spin, being late costs a missed frame -- and it means
-  // the number tunes itself per device and per scheduling policy rather
-  // than being one guess for a desktop and an RK3566 alike. An RT thread is
-  // given no timer slack at all, so on a device that runs under SCHED_RR
-  // this settles near zero and the spin all but disappears.
+  // Sleep wakeups run late by a variable amount, so the spin margin is learned
+  // per-thread: jumps to any new lateness seen, decays slowly (1/512/frame,
+  // ~2s to halve) otherwise. Asymmetric because being early costs microseconds
+  // of spin, being late costs a missed frame.
   static constexpr double MARGIN_DECAY = 1.0 - 1.0 / 512.0;
   static constexpr double MARGIN_MAX_NS = 2e6;    // never hand more than 2 ms to the spin
 
@@ -161,13 +101,8 @@ private:
     return v;
   }
 
-  // The whole wait, spun. The spin must not run at the emulator's real-time
-  // priority: the kernel caps an RT thread's share of a CPU
-  // (sched_rt_runtime_us, 95 % of every second on ROCKNIX) and would throttle
-  // the emulation along with the spin, and while it held the core nothing at
-  // ordinary priority -- the sound daemon, the compositor -- would run there
-  // at all. So the wait is taken as an ordinary thread and the real-time
-  // policy is put back for the frame.
+  // Drops RT scheduling for the spin so it doesn't burn the thread's RT
+  // bandwidth budget (sched_rt_runtime_us) and starve other threads on the core.
   void busy_until(Uint64 deadline, Uint64 now) {
 #if defined(__linux__)
     int policy = 0;
@@ -186,25 +121,20 @@ private:
     ++spin_n_;
   }
 
-  // Charge the frame that just ran, then sleep off whatever puts us over the
-  // cap for the window so far. A sleep consumes no real-time budget, so this
-  // needs no change of scheduling policy -- only not running.
+  // Charge the frame just run, then sleep off whatever exceeds the cap for the window.
   Uint64 relieve(Uint64 now) {
     rt_busy_ += static_cast<double>(now - frame_start_);
     const double elapsed = static_cast<double>(now - window_);
-    if (elapsed >= rt_period_) {          // a new accounting window
+    if (elapsed >= rt_period_) {          // new accounting window
       window_ = now; rt_busy_ = 0.0;
       return now;
     }
     const double over = rt_busy_ - allowed_ * elapsed;
     if (over <= 0.0) return now;
-    // Never hand over more than a quarter of a frame in one go: the point is
-    // to spread the cost, and a long nap here would be the very hitch this
-    // exists to remove.
-    const double cap_ticks = period_ * 0.25;
+    const double cap_ticks = period_ * 0.25;   // spread the cost; cap at a quarter frame per nap
     const double nap = over < cap_ticks ? over : cap_ticks;
 #if defined(__linux__)
-    const double nap_ns = nap / ticks_per_ns();   // at most a quarter frame, so well under a second
+    const double nap_ns = nap / ticks_per_ns();
     timespec ts{0, static_cast<long>(nap_ns)};
     while (clock_nanosleep(CLOCK_MONOTONIC, 0, &ts, &ts) == EINTR) {}
 #endif
@@ -222,11 +152,7 @@ private:
       const double nap_ns = (left - margin) / ticks_per_ns();
       const Uint64 asked = deadline - static_cast<Uint64>(margin);
 #if defined(__linux__)
-      // Absolute rather than relative: a signal restarts the wait against
-      // the same instant instead of the remainder, so a stray SIGALRM can
-      // neither shorten nor lengthen the frame. The deadline is built from
-      // the monotonic clock read here, which keeps this independent of
-      // whichever clock SDL's counter is on.
+      // Absolute deadline: a signal restart doesn't shorten/lengthen the frame.
       timespec mono{};
       clock_gettime(CLOCK_MONOTONIC, &mono);
       long long end = mono.tv_sec * 1'000'000'000LL + mono.tv_nsec + static_cast<long long>(nap_ns);
@@ -236,14 +162,11 @@ private:
       const double nap_ms = nap_ns / 1e6;
       if (nap_ms > 1.0) SDL_Delay(static_cast<Uint32>(nap_ms));
 #endif
-      // What the sleep actually cost against what was asked for. Only a
-      // real sleep teaches the margin anything; a frame that spun the whole
-      // way has nothing to say about the kernel's wakeups.
       const Uint64 woke = SDL_GetPerformanceCounter();
       const double late = static_cast<double>(woke) - static_cast<double>(asked);
       const double cap = MARGIN_MAX_NS * ticks_per_ns();
       margin_ticks_ = late > margin_ticks_ ? (late < cap ? late : cap) : margin_ticks_ * MARGIN_DECAY;
-      if (woke >= deadline) return;      // woke past the deadline: nothing left to spin
+      if (woke >= deadline) return;      // already past deadline
       spin_ticks_ += static_cast<double>(deadline - woke);
     }
     ++spin_n_;

@@ -13,29 +13,20 @@
 #include <cstring>
 #include <cstdlib>
 
-// pow() for the gamma LUT below comes from pow_compat.c, which pins its glibc
-// symbol version so the aarch64 binary keeps a low runtime floor; see there.
+// pow() for the gamma LUT below; pins a glibc symbol version for a low aarch64 runtime floor.
 extern "C" double ds_pow_compat(double x, double y);
 
 namespace ds::gpu {
 
-// Render ablation (DS_ABLATE, bit mask) -- a measurement instrument, not a
-// feature. It removes rendering work while leaving the emulated machine's
-// timing untouched, so the frame time that survives is CPU emulation, DMA,
-// the GX front end, the scheduler and the SPU. Frames are garbage while it is
-// set; never quote a hash or a picture from an ablated run.
-//   1  3D rasterisation (and the texture cache it drives)
-//   2  2D line drawing, output and sprites -- the journal replay, window
-//      latches and lazy-2D bookkeeping still run, so what is removed is the
-//      drawing and not the machinery that decides when to draw
+// DS_ABLATE bit mask: removes rendering work but leaves timing untouched, so
+// frames are garbage while set (measurement only, not for output).
+//   1  3D rasterisation (and its texture cache)
+//   2  2D line drawing/output/sprites (journal replay and window latches still run)
 //   4  display capture
-//   8  engine A's 2D drawing only (bit 2 for one engine): the share of the
-//      2D work that runs on the emulation thread rather than the line worker
+//   8  engine A's 2D drawing only
 //  16  engine A's scanline scaler only (emit_scaled)
 //  32  engine B's scanline scaler only
-// Debug knobs read once, in the constructor: function-local statics cost a
-// guard load and test per call, and ablate() runs three or four times per
-// line per engine; begin_frame read three of these with getenv every frame.
+// Knobs read once in the constructor: ablate() runs several times per line per engine.
 namespace {
 unsigned g_ablate = 0;
 bool g_dbg_join = false, g_dbg_gpu = false, g_dbg_vramnz = false, g_dbg_skip = false;
@@ -60,15 +51,11 @@ static void ev_fifo(NDS& nds, u32 x)   { nds.gpu.on_display_fifo(x); }
 
 Gpu::Gpu(NDS& nds) : engine{Engine2D(nds, 0), Engine2D(nds, 1)}, nds_(nds) {
   read_knobs();
-  // DS_2D_THREAD=0 keeps engine B on the emulation thread. The two paths must
-  // produce identical frames; the env var is what makes that checkable.
+  // DS_2D_THREAD=0 keeps engine B on the emulation thread (must produce identical frames).
   if (const char* l = std::getenv("DS_2D_LAZY")) lazy_enabled_ = std::atoi(l) != 0;
   if (const char* l = std::getenv("DS_2D_LAZY_CAPTURE")) lazy_capture_ = std::atoi(l) != 0;
   const char* e = std::getenv("DS_2D_THREAD");
   if (!e || std::atoi(e) != 0) {
-    // The only statics the two engines share are the colour tables, built by
-    // magic statics (thread-safe init) and read-only afterwards; every other
-    // buffer, cache and palette copy is per-engine.
     worker_.start(&Gpu::worker_job, this);
     par_2d_ = worker_.running();
   }
@@ -119,7 +106,7 @@ u32 Gpu::reg_read(u32 addr, u32 width) {
 
 void Gpu::reg_write(u32 addr, u32 width, u32 value) {
   const u32 r = addr - 0x04000000;
-  // MASTER_BRIGHT: guest copy here, render-side copy through the engine's journal.
+  // MASTER_BRIGHT: guest copy here, render side via the journal.
   auto mb = [&](int e, u16 v) { master_bright_g_[e] = v; engine[e].master_bright_write(v); };
   if (r >= 0x64 && r < 0x70) {
     if (width == 32) {
@@ -174,10 +161,7 @@ void Gpu::set_powcnt(u16 value) {
 
 // ---- slow-path stores and the VRAM trap ---------------------------------------
 
-// Palette and OAM: the guest bytes change now, the engine copy through the
-// journal. A store of the value already there changes nothing anywhere and is
-// not journaled (silent-store elimination). Byte stores are applied, as the
-// direct mapping applied them before.
+// Guest bytes change now, engine copy via the journal. A store of the value already there is not journaled.
 void Gpu::palette_store(Cpu cpu, u32 addr, u32 width, u32 value) {
   const u32 off = addr & 0x7FF, n = width / 8;
   u8* host = nds_.bus.palette.get() + off;
@@ -198,33 +182,20 @@ void Gpu::oam_store(Cpu cpu, u32 addr, u32 width, u32 value) {
 void Gpu::vram_store_trap(Cpu cpu, u32 addr) {
   if (!trap_armed_ || cpu != Cpu::ARM9) return;
   if (addr >= 0x06800000 && !trap_lcdc_) return;
-  // Engine A's batch is in flight past the last display line (the deferred
-  // join, see worker_): a store that can reach what it reads -- A's BG/OBJ
-  // windows, or LCDC when A displays or captures from it -- joins it first,
-  // which finishes the frame and lifts the trap. B's windows cannot.
+  // A's deferred batch: a store reaching what it reads joins it, finishing
+  // the frame and lifting the trap. B's windows cannot trigger this.
   if (a_deferred_) {
     if (reach_engines(addr) & 1) { prof::add(prof::C_2D_A_JOIN_STORES, 1); join_worker(JoinSite::Trap); }
     return;
   }
-  // Both engines already per line: nothing to do but the lag-mode join below.
-  // A store is charged to BOTH engines -- see the note on the removed
-  // per-engine split in gpu.h -- so this is the whole frame being per line.
+  // A store is charged to both engines, so both per-line means the whole frame is.
   if (per_line_[0] && per_line_[1]) {
     // Lag mode: the store may land on a line engine B is still drawing.
     prof::add(prof::C_2D_LAG_STORES, 1);
     const u32 reach = reach_engines(addr);
     const bool b_joined = ((reach & 1) && inflight_[0]) || ((reach & 2) && inflight_[1]);
     if (b_joined) { prof::add(prof::C_2D_LAG_STORE_JOINS, 1); join_worker(JoinSite::Trap); }
-    // Past the limit the lag is dropped and the trap lifted -- but the trap is
-    // still the other engine's guard if it is batching, and lifting it there
-    // would let a store into ITS vram land unseen before its batch renders.
-    // (That hazard is why the per-engine split needed 31a7ab6; with the split
-    // gone this branch needs the whole frame per line again, so the guard is
-    // belt and braces rather than load-bearing -- keep it.)
-    // Count the stores that actually cost something -- the ones that joined a
-    // line in flight -- not every store that reached the trap. The limit is
-    // there to drop the lag when joining gets expensive, and on Golden Sun it
-    // was firing every frame on 4096 stores of which NOT ONE joined anything.
+    // Past the limit, drop lag and lift the trap unless the other engine is still batching.
     if (b_joined && ++lag_trap_hits_ >= LAG_TRAP_LIMIT) {
       lag_frame_ = false;
       if (per_line_[0] && per_line_[1]) disarm_trap();
@@ -233,47 +204,32 @@ void Gpu::vram_store_trap(Cpu cpu, u32 addr) {
     return;
   }
   prof::add(prof::C_2D_TRAP_HITS, 1);
-  // The budget stays per engine: one engine streaming tiles must not spend the
-  // other's, even though a store is now charged to both.
+  // Budget stays per engine, even though a store is charged to both.
   u32 burst_mask = 0;
   const u32 limit = lazy_probe_ ? LAZY_PROBE_BURSTS : LAZY_BURST_LIMIT;
   for (int e = 0; e < 2; ++e)
     if (!per_line_[e] && ++lazy_bursts_[e] < limit) burst_mask |= 1u << e;
   if (burst_mask) {
-    // Lines whose HBlank has passed are drawn before the bytes change; the
-    // burst continues per line, and the frame re-batches when it ends.
     catch_up(burst_mask);
     for (int e = 0; e < 2; ++e)
       if (burst_mask & (1u << e)) { per_line_[e] = true; burst_[e] = true; burst_left_[e] = LAZY_BURST_LINES; }
-    // The trap stays armed while an engine is still batching: it is that
-    // engine's guard, and lifting it would let a store into its vram land
-    // unseen before its batch renders.
     if (per_line_[0] && per_line_[1]) disarm_trap();
     return;
   }
-  // Out of bursts: the frame is futile (see begin_frame); a probe frame
-  // gives up on both engines at once.
   lazy_limit_hit_ = true;
-  fall_back_per_line(3);   // both engines: a store is charged to both (see gpu.h)
+  fall_back_per_line(3);
 }
 
-// `moved_2d` is the engines whose read views this remap actually moves (bit 0
-// engine A, bit 1 engine B), computed by the caller from the old and new maps.
-// CENSUS ONLY for now -- the catch-up below is still unconditional. The 3D
-// path beside it in Bus::update_vram already syncs only when ITS views move;
-// SS3.25 measures whether 2D can do the same.
+// `moved_2d`: engines whose read views this remap actually moves. CENSUS
+// ONLY for now -- the catch-up below is still unconditional.
 bool Gpu::vram_remap_begin(u32 moved_2d) {
   if (prof::enabled) {
     prof::add(prof::C_VRAM_REMAP, 1);
     prof::add(moved_2d ? prof::C_VRAM_REMAP_2D_MOVED : prof::C_VRAM_REMAP_2D_STILL, 1);
-    // Before the join below, which is what clears it.
     if (lines_in_flight()) {
       prof::add(prof::C_VRAM_REMAP_INFLIGHT, 1);
-      // capture_on_ is cleared at VBlank, before these remaps land, so it is
-      // trivially false here and says nothing. What matters is whether the JOB
-      // IN FLIGHT is rendering a capture -- capture_render_, latched when the
-      // job was handed over -- because that is the job a snapshot would let
-      // keep running across the remap.
+      // capture_on_ is cleared at VBlank before remaps land, so it says nothing here;
+      // what matters is whether the in-flight job is rendering a capture (capture_render_).
       const bool alt = phase_period_ > 1, cap = capture_render_;
       if (alt) prof::add(prof::C_VRAM_REMAP_INFLIGHT_ALT, 1);
       if (cap) prof::add(prof::C_VRAM_REMAP_INFLIGHT_CAP, 1);
@@ -284,7 +240,7 @@ bool Gpu::vram_remap_begin(u32 moved_2d) {
               (render_next_[1] < f && render_next_[1] < SCREEN_H)))
       prof::add(prof::C_VRAM_REMAP_PENDING, 1);
   }
-  lazy_probe_period_ = LAZY_PROBE_PERIOD;   // a remap is how scenes change: probe soon
+  lazy_probe_period_ = LAZY_PROBE_PERIOD;   // remap = scene change: probe soon
   if (lazy_probe_in_ > LAZY_PROBE_PERIOD) lazy_probe_in_ = LAZY_PROBE_PERIOD;
   catch_up(3);
   join_worker(JoinSite::Remap);
@@ -296,20 +252,11 @@ bool Gpu::vram_remap_begin(u32 moved_2d) {
 void Gpu::vram_remap_end(bool trapped) { if (trapped) arm_trap(); }
 
 void Gpu::arm_trap() {
-  // LCDC banks are trapped when engine A displays one -- or when a capture
-  // writes one, since the batched capture reads its source B and writes its
-  // destination there in line order.
+  // LCDC banks trapped when engine A displays one, or a capture writes one.
   trap_lcdc_ = ((engine[0].dispcnt() >> 16) & 3) == 2 || capture_on_;
-  // Armed for the whole VRAM window, not per engine. Arming only the batching
-  // engine's windows looks obvious -- Golden Sun then skips the trap for its
-  // ~24.7k engine-B stores a frame -- and measured +0.9 % instead of -5.1 %:
-  // a page is 2 KB, so each toggle rewrites 8192 page-table entries, and the
-  // 8-line bursts toggle ~31 times a frame. A quarter of a million page writes
-  // to save early-returns that cost nothing (the DMA census shows the runs
-  // stay on the fast path either way).
-  // Lag frames that are not batching: only engine A's lines are ever in
-  // flight, so only its windows need guarding -- engine B's may stream (Golden
-  // Sun's per-scanline HDMA) without a slow-path store per word.
+  // Armed for the whole VRAM window: arming only the batching engine's
+  // windows costs more in page-table toggling than it saves. Lag frames that
+  // aren't batching only need A's windows guarded (B may stream via per-scanline HDMA).
   trap_a_only_ = lag_frame_ && !lazy_frame_;
   nds_.bus.set_vram_trap(true, trap_lcdc_, trap_a_only_);
   trap_armed_ = true;
@@ -330,15 +277,12 @@ void Gpu::catch_up(u32 mask) {
   if (!a && !b) return;
   render_ranges(a ? render_next_[0] : 1, a ? last : 0,
                 b ? render_next_[1] : 1, b ? last : 0);
-  // A catch-up exists to render lines before the bytes they read change: a
-  // run left in flight by lag mode must land before the caller's store does.
   join_worker(JoinSite::CatchUp);
 }
 void Gpu::fall_back_per_line(u32 mask) {
   catch_up(mask);
   for (int e = 0; e < 2; ++e) if (mask & (1u << e)) { per_line_[e] = true; burst_[e] = false; }
-  // The trap now guards the line in flight instead of the batch -- but only
-  // once no engine is still batching, or the other one loses its guard.
+  // Trap now guards the in-flight line, not the batch.
   if (!(lag_frame_ && par_2d_) && per_line_[0] && per_line_[1]) disarm_trap();
 }
 
@@ -349,11 +293,8 @@ void Gpu::on_hblank() {
   nds_.io.set_hblank(true);
   const bool frame_reset = line_ == 262;
   if (line_ < SCREEN_H) {
-    // Display line: rendered now in per-line mode, or all together at the
-    // last one. The per-line latches (pre/post_draw, the sprites one line
-    // ahead) run inside step_engine, in front of the journal replay.
-    // Each engine is either batching (render everything at the last line) or
-    // per-line, and the two are always in the same mode.
+    // Rendered now per-line, or all together at the last one. Both engines
+    // are always in the same mode.
     u32 f[2], l[2];
     for (int e = 0; e < 2; ++e) {
       const bool batch = lazy_frame_ && !per_line_[e];
@@ -362,16 +303,8 @@ void Gpu::on_hblank() {
       l[e] = batch ? SCREEN_H - 1 : line_;
       if (!batch && render_next_[e] < line_) f[e] = render_next_[e];          // catch up anything skipped
     }
-    // The draws account for themselves; take them out of this hook's time.
-    // (Adding the negated interval to the unsigned accumulator subtracts it
-    // modulo 2^64; the enclosing scope keeps the per-frame sum positive.)
-    //
-    // The WORKER JOIN inside render_ranges does not account for itself, so it
-    // must not be subtracted with the draws: it has no scope of its own to add
-    // it back, and taking it out here charged it to nothing at all. That is
-    // where Golden Sun's `untimed` row came from -- 2.8 ms a typical frame and
-    // 16 ms at p99, invisible in every stage (SS3.19). Only the draw time is
-    // removed now, by adding the join interval back.
+    // Draws account for themselves; subtracted from this hook's time. The
+    // worker join in render_ranges has no scope of its own, so it's added back rather than subtracted.
     const auto t_draw0 = prof::enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const u64 join0 = prof::enabled ? join_wait_ns_ : 0;
     render_ranges(f[0], l[0], f[1], l[1]);
@@ -386,30 +319,19 @@ void Gpu::on_hblank() {
     nds_.dma.check(Cpu::ARM9, dma::MODE9_HBLANK);
   } else {
     hblank_done_ = true;
-    // The VBlank lines' latches: applied at once, or journaled behind the
-    // lines still in flight on the worker (Engine2D::latch).
     engine[0].latch(Engine2D::L_PREDRAW, line_, frame_reset);
     engine[1].latch(Engine2D::L_PREDRAW, line_, frame_reset);
     if (line_ == 215) {
-      // The 3D frame flushed at VBlank is rasterised now, ahead of the next
-      // frame's display lines.
-      // Frameskip: the raster at this line feeds the next frame's display
-      // lines, so the decision is taken here for begin_frame() to latch.
-      // Capture and the display FIFO are read from the current frame -- a
-      // game turning either on across this boundary gets one frame of the
-      // previous 3D picture, which is the only inexactness frameskip adds
-      // beyond the skipped frames themselves.
+      // 3D flushed at VBlank rasterises now, ahead of the next frame's display
+      // lines, so frameskip is decided here for begin_frame to latch.
       skip_next_ = skip_req_ && skippable();
-      // The render accounts for itself (R3D_PREP / GPU_UPLOAD / band dispatch).
       const auto t_r0 = prof::enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
       if (!skip_next_) nds_.gpu3d.render_frame(); else nds_.gpu3d.note_raster_skipped();
       if (prof::enabled) prof::add_ns(prof::GPU_LINE, static_cast<u64>(-(std::chrono::steady_clock::now() - t_r0).count()));
       if (probe_enabled_) async_probe_start();
     } else if (line_ == 262) {
       engine[0].latch(Engine2D::L_SPRITES, 0, false); engine[1].latch(Engine2D::L_SPRITES, 0, false);
-      // Line 0's sprites are drawn whether or not an engine is shown. Engine
-      // A's flag belongs to the thread drawing its lines: reset at the join
-      // while they are in flight (finish_a).
+      // Engine A's skip flag resets at the join while its lines are in flight (finish_a).
       if (!inflight_[0]) skipped_[0] = false;
       skipped_[1] = false;
     }
@@ -420,15 +342,9 @@ void Gpu::on_hblank() {
 }
 
 // ---- async-raster probe (DS_ASYNC_PROBE=1, measurement only) ----------------
-//
-// An asynchronous 3D raster would start at line 215 and have to be joined
-// before its output is read. Two candidate deadlines: line 0 of the next
-// frame (join everything before the first display line) and the next swap at
-// line 192 (the loosest possible, with a per-band lazy join). The probe
-// hashes the texture and texture-palette VRAM at the start and at each
-// deadline: a change means a worker would have been reading bytes the CPU was
-// writing. VRAMCNT rewrites are counted separately in Bus::update_vram --
-// those rebuild the view arrays themselves, which is worse than torn texels.
+// Hashes texture/texture-palette VRAM at line 215 and at two join deadlines
+// (line 0 next frame, line 192 swap): a change means an async raster worker
+// would have read bytes the CPU was writing.
 namespace {
 u64 hash_view(const VramView& v) {
   u64 h = 0xcbf29ce484222325ull;
@@ -459,7 +375,6 @@ void Gpu::async_probe_check(bool at_line0) {
   const bool dirty = hash_tex_vram(nds_.bus.vram_map()) != probe_hash_;
   if (at_line0) {
     if (dirty) prof::add(prof::C_ASYNC_DIRTY_L0, 1);
-    // Snapshot the remap count so far; the rest belongs to the wider window.
     probe_vramcnt_at_l0_ = prof::count(prof::C_ASYNC_VRAMCNT_SWAP);
     if (probe_vramcnt_at_l0_ != probe_vramcnt_base_) prof::add(prof::C_ASYNC_VRAMCNT_L0, 1);
     return;
@@ -476,13 +391,10 @@ void Gpu::on_scanline_start() {
   line_ = static_cast<u16>((line_ + 1) % SCANLINES_PER_FRAME);
   hblank_done_ = false;
 
-  // Display lines evaluate their window edges inside step_engine; the rest
-  // of the frame's go through the latch (direct unless lines are in flight).
+  // Display lines evaluate window edges in step_engine; the rest go through the latch.
   if (line_ >= SCREEN_H) { engine[0].latch(Engine2D::L_WINDOWS, line_, false); engine[1].latch(Engine2D::L_WINDOWS, line_, false); }
   if (line_ == 0) {
-    // The frame's display lines must all be drawn before the frontend reads
-    // them (run_frame returns here) and before begin_frame reads the
-    // engines' render side.
+    // All display lines must be drawn before the frontend reads them and before begin_frame runs.
     { prof::Scope j(prof::JOIN0); join_worker(JoinSite::Line0); }
     if (probe_enabled_) async_probe_check(true);
     { prof::Scope b(prof::BEGIN_FRAME); begin_frame(); }
@@ -504,13 +416,8 @@ void Gpu::on_scanline_start() {
   nds_.sched.schedule(EventId::HBlank, nds_.sched.event_time() + HBLANK_START, ev_hblank);
 }
 
-// The display-phase signature of the frame starting now, and the period of
-// the sequence it belongs to (see display_phase_period). Only structural
-// choices go in: which engine drives which screen, what each engine displays
-// and out of which VRAM bank, and where a capture lands. Things that change
-// every frame on their own -- master brightness during a fade, scroll
-// registers -- are deliberately left out; they would make every frame look
-// like a new phase.
+// Signature of only structural display choices (driving engine, display
+// mode/bank, capture destination); per-frame changes like fades/scroll are excluded.
 void Gpu::update_phase() {
   const u32 a = engine[0].dispcnt(), b = engine[1].dispcnt();
   const u32 sig = ((nds_.io.powcnt1 >> 15) & 1)
@@ -520,9 +427,7 @@ void Gpu::update_phase() {
   for (u32 i = 0; i + 1 < PHASE_HISTORY; ++i) phase_sig_[i] = phase_sig_[i + 1];
   phase_sig_[PHASE_HISTORY - 1] = sig;
   if (phase_seen_ < PHASE_HISTORY) { ++phase_seen_; phase_period_ = 1; return; }
-  // The smallest period that explains the whole window; none means treat it as
-  // 1 and let the frontend skip freely, since anything it does is as wrong as
-  // anything else.
+  // Smallest period that explains the whole window; none found means treat as 1.
   for (u32 p = 1; p <= PHASE_MAX; ++p) {
     bool ok = true;
     for (u32 i = p; i < PHASE_HISTORY && ok; ++i) ok = phase_sig_[i] == phase_sig_[i - p];
@@ -543,36 +448,21 @@ void Gpu::begin_frame() {
     for (int i : {5, 7}) { const u8* b = nds_.bus.vram_bank(i); u32 lo = ~0u, hi = 0; for (u32 k = 0; k < mem::Bus::VRAM_BANK_SIZES[i]; ++k) if (b[k]) { if (k < lo) lo = k; hi = k; } std::fprintf(stderr, " %c[%x..%x]", 'A' + i, lo, hi); }
     std::fputc('\n', stderr);
   }
-  if (const char* f = g_dump_frame) {   // with DS_DEBUG_DUMP_LINE=L: engine state and one rendered line
+  if (const char* f = g_dump_frame) {   // DS_DEBUG_DUMP_LINE=L: engine state and one rendered line
     if (nds_.frame_count == static_cast<u64>(std::atoi(f))) {
       const char* l = std::getenv("DS_DEBUG_DUMP_LINE"); const u32 line = l ? std::atoi(l) : 96;
       engine[0].debug_dump(line); engine[1].debug_dump(line);
     }
   }
   screens_on_ = nds_.io.powcnt1 & 1;
-  // The FIFO only needs clocking when something displays or captures from it,
-  // or a DMA channel is waiting on it.
+  // FIFO only needs clocking when something displays/captures from it, or a DMA channel awaits it.
   run_fifo_ = uses_fifo() || nds_.dma.in_mode(Cpu::ARM9, dma::MODE9_DISPLAY_FIFO);
   if (capcnt_ & (1u << 31)) capture_on_ = true;
   if (capture_on_) capture_recent_ = CAPTURE_STICKY; else if (capture_recent_) --capture_recent_;
-  // The 3D frame this display frame reads, rasterised at line 215 of the
-  // previous one. Latched once, here: the raster moves on to the next frame
-  // at line 215 of this one while the compositor may still be reading it.
-  //
-  // With the GPU raster and video.gpu_defer, this may instead take the frame
-  // BEFORE that one, which the GPU has certainly finished -- removing the
-  // compositor's fence wait, at a frame of visual latency. Never while
-  // anything captures: capture writes the composited result into VRAM that
-  // the guest reads back, so a stale 3D layer there is wrong emulation
-  // rather than lag. `capture_recent_` is the same conservatism frameskip
-  // uses (skippable()), and for the same reason -- the capture bit clears
-  // itself at line 192, so "off right now" is not "off".
-  //
-  // This is after the capture bits are known, which is why it is here and
-  // not at the top of the function.
-  // The frame whose display lines were just output keeps its layer for the
-  // frontend: run_frame returns from line 0 AFTER this, so ref3d_ already
-  // names the coming frame when the frontend asks (frame_hires).
+  // 3D frame this display frame reads, latched here since the raster moves on
+  // at line 215 while the compositor may still be reading it. With
+  // video.gpu_defer, may take the frame before that one instead (removes the
+  // fence wait, at a frame of latency); never while capturing (stale 3D there is wrong emulation).
   shown_hires_ = ref3d_.hires; shown_hires_bytes_ = ref3d_.hires_bytes; shown_scale_ = ref3d_.scale; shown_edge_ = ref3d_.edge;
   ref3d_ = nds_.gpu3d.frame_ref(defer_3d_ && !capture_on_ && !capture_recent_ && !run_fifo_);
   update_phase();
@@ -581,25 +471,21 @@ void Gpu::begin_frame() {
     if (phase_period_ > 1) prof::add(prof::C_FRAMES_PHASE_ALT, 1);
     if (capture_on_) prof::add(prof::C_FRAMES_CAPTURE, 1);
   }
-  // Frameskip, for this frame's display lines: what the raster at line 215
-  // assumed, re-checked now that this frame's capture bit is known.
+  // Frameskip: what line 215 assumed, re-checked now the capture bit is known.
   skip_frame_ = skip_next_ && skippable();
-  if (g_dbg_skip)   // frameskip: the decision, and what refused it
+  if (g_dbg_skip)
     std::fprintf(stderr, "[skip] frame %llu req %d raster %d capture %d/%u fifo %d period %u -> %s\n",
                  static_cast<unsigned long long>(nds_.frame_count), skip_req_ ? 1 : 0, skip_next_ ? 1 : 0,
                  capture_on_ ? 1 : 0, capture_recent_, run_fifo_ ? 1 : 0, phase_period_, skip_frame_ ? "skipped" : "drawn");
-  // The frame's rendering mode. The FIFO is sampled per line and capture
-  // writes VRAM the guest may read back per line: both stay per-line.
   render_next_[0] = render_next_[1] = 0;
   per_line_prev_[0] = per_line_[0]; per_line_prev_[1] = per_line_[1];
   per_line_[0] = per_line_[1] = false; frame_finished_ = false;
-  // Was last frame's trap worth arming? Both engines per line at the end means
-  // no batch survived, so nothing it guarded was ever batched.
+  // Was last frame's trap worth arming? Both per-line at the end means no batch survived.
   if (lazy_tried_) {
     const bool wasted = (per_line_prev_[0] && per_line_prev_[1]) || lazy_limit_hit_;
     if (wasted) {
       ++lazy_futile_;
-      if (lazy_probe_ && lazy_probe_period_ < LAZY_PROBE_MAX) lazy_probe_period_ *= 2;   // a failed probe: wait longer
+      if (lazy_probe_ && lazy_probe_period_ < LAZY_PROBE_MAX) lazy_probe_period_ *= 2;
     } else { lazy_futile_ = 0; lazy_probe_period_ = LAZY_PROBE_PERIOD; }
   }
   lazy_limit_hit_ = false;
@@ -612,9 +498,6 @@ void Gpu::begin_frame() {
   lazy_tried_ = lazy_frame_;
   if (futile) prof::add(prof::C_2D_LAZY_SKIPPED, 1);
   lazy_bursts_[0] = lazy_bursts_[1] = 0; burst_[0] = burst_[1] = false; burst_left_[0] = burst_left_[1] = 0;
-  // Lag mode for the per-line lines of this frame: the trap guards the line
-  // in flight (capture writes only LCDC banks, which no engine reads, so
-  // capture itself never needs a join).
   lag_frame_ = lag_enabled_ && par_2d_ && !run_fifo_;
   lag_trap_hits_ = 0;
   if (lazy_frame_ || lag_frame_) arm_trap();
@@ -634,9 +517,8 @@ void Gpu::sample_fifo(u32 offset, u32 count) {
   for (u32 i = 0; i < count; ++i) { fifo_line_[offset + i] = fifo_[fifo_rd_]; fifo_rd_ = (fifo_rd_ + 1) & 0xF; }
 }
 
-// The FIFO is read out in 8-pixel steps starting ~3 pixels before the visible
-// line, so the sampling is offset from the 8-pixel DMA grid. Each step
-// requests the next DMA transfer (start mode 4).
+// FIFO read out in 8-pixel steps starting ~3 pixels before the visible line
+// (offset from the 8-pixel DMA grid). Each step requests the next DMA transfer (mode 4).
 void Gpu::on_display_fifo(u32 x) {
   if (x > 0) { if (x == 8) sample_fifo(0, 5); else sample_fifo(x - 11, 8); }
   if (x < 256) {
@@ -647,9 +529,7 @@ void Gpu::on_display_fifo(u32 x) {
 
 // ---- rendering and the output stage ------------------------------------------
 
-// One engine's run of display lines on the worker. Nothing here reaches the
-// other engine: the engines' state is disjoint and the output stage writes
-// each engine's own screen and line buffer.
+// One engine's run of display lines on the worker; engine state is disjoint.
 void Gpu::worker_job(void* self) {
   Gpu& g = *static_cast<Gpu*>(self);
   for (int e = 0; e < 2; ++e)
@@ -665,15 +545,6 @@ void Gpu::join_worker(JoinSite site) {
   if (!inflight_[0] && !inflight_[1] && !scale_inflight_) return;
   const bool dbg = g_dbg_join;
   if (dbg) std::fprintf(stderr, "[join] frame %llu line %u hblank %d a %u..%u b %u..%u deferred %d\n", (unsigned long long)nds_.frame_count, line_, hblank_done_ ? 1 : 0, job_first_[0], job_last_[0], job_first_[1], job_last_[1], a_deferred_ ? 1 : 0);
-  // The wait was already being timed into join_wait_ns_; it is now also a
-  // profile stage, so it stops being reported as whoever's scope we are under.
-  // Eight of the nine join_worker() call sites had no scope, and the two in
-  // the VRAM write trap run inside the DMA scope. "Of which" -- see W2D_JOIN
-  // in profile.h.
-  //
-  // Split by call site as well (SS3.19). 99.8 % of the wait turns out to be
-  // render_ranges' PRE-join -- waiting for the previous run before handing off
-  // the next -- and not catch_up, which SS3.18 guessed.
   { const auto t0 = std::chrono::steady_clock::now(); worker_.wait();
     const u64 dt = static_cast<u64>((std::chrono::steady_clock::now() - t0).count());
     join_wait_ns_ += dt; prof::add_ns(prof::W2D_JOIN, dt);
@@ -689,16 +560,10 @@ void Gpu::join_worker(JoinSite site) {
   if (a_deferred_) { a_deferred_ = false; finish_a(); }
 }
 
-// Engine A's deferred batch has been joined: what render_ranges does at the
-// end of a frame drawn on this thread, done now. The read trap first, so a
-// store into the capture bank below (none expected) cannot land on a trapped
-// page; then the journal -- the VBlank period's writes and latches so far,
-// in order -- and the frame's end.
+// Engine A's deferred batch has been joined: what render_ranges does at frame
+// end, done now (read trap, then journal, then frame end).
 void Gpu::finish_a() {
   if (read_trap_bank_ >= 0) { nds_.bus.set_lcdc_read_trap(read_trap_bank_, false); read_trap_bank_ = -1; }
-  // Line 262's HBlank reset of the sprite-skip flag, if it has passed (a
-  // join before it leaves it to the HBlank itself, since nothing is in
-  // flight by then).
   if (line_ == 0 || (line_ == 262 && hblank_done_)) skipped_[0] = false;
   engine[0].apply_pending();
   if (frame_finished_) { engine[0].frame_done(); disarm_trap(); }
@@ -711,22 +576,14 @@ void Gpu::debug_dump(FILE* f) {
   nds_.gpu3d.debug_dump(f);
 }
 
-// Render display lines of both engines: one hand-off to the worker, the
-// other engine's run here. Per-engine ranges; an empty range (first > last)
-// means that engine has nothing due.
+// Render display lines of both engines: one hand-off to the worker, the other
+// engine's run here. An empty range (first > last) means nothing due.
 void Gpu::render_ranges(u32 af, u32 al, u32 bf, u32 bl) {
   const bool a_has = af <= al, b_has = bf <= bl;
   if (!a_has && !b_has) return;
-  // Whatever the worker still holds -- a lagged line, a previous run --
-  // before anything below reads or re-latches what it uses.
   join_worker(JoinSite::RangesPre);
-  // What the lines read of the frame-level capture state, as of now -- the
-  // same for lines drawn here and for lines handed over.
   capcnt_render_ = capcnt_; capture_render_ = capture_on_;
-  // ...and the one field of the VramMap the capture reads (see gpu.h). Latched
-  // here, with the rest of the frame-level capture state, so the job does not
-  // consult the live map while the emulation thread may be rebuilding it.
-  lcdc_mask_render_ = nds_.bus.vram_map().lcdc_mask;
+  lcdc_mask_render_ = nds_.bus.vram_map().lcdc_mask;   // latched so the job doesn't consult a live map that may be rebuilding
   const bool dbg = g_dbg_join;
   auto hand = [&](bool a, bool b) {
     if (dbg) std::fprintf(stderr, "[hand] frame %llu line %u a %u..%u b %u..%u lag %d stash %u\n", (unsigned long long)nds_.frame_count, line_, a ? af : 1, a ? al : 0, b ? bf : 1, b ? bl : 0, lag_frame_ ? 1 : 0, bscale_n_);
@@ -735,8 +592,7 @@ void Gpu::render_ranges(u32 af, u32 al, u32 bf, u32 bl) {
     scale_inflight_ = bscale_n_ > 0;
     worker_.dispatch();
     inflight_[0] = a; inflight_[1] = b;
-    // A capture in flight writes an LCDC bank the guest may read before the
-    // join: trap reads of it until the frame's end.
+    // A capture in flight writes an LCDC bank the guest may read before the join: trap it.
     if (a && capture_render_ && read_trap_bank_ < 0 && !(ablate() & 4)) {
       const int bank = static_cast<int>((capcnt_render_ >> 16) & 3);
       nds_.bus.set_lcdc_read_trap(bank, true);
@@ -746,31 +602,23 @@ void Gpu::render_ranges(u32 af, u32 al, u32 bf, u32 bl) {
   const u32 a_len = a_has ? al - af + 1 : 0, b_len = b_has ? bl - bf + 1 : 0;
   const u32 last = a_has && b_has ? (al > bl ? al : bl) : a_has ? al : bl;
   bool a_handed = false, b_handed = false;
-  // The decision, censused (SS3.29). parked() is read once here rather than
-  // per branch: the branches below read it separately and it can change under
-  // them, which is itself part of what makes this hard to reason about.
+  // Read once: parked() can change under separate branches.
   const bool parked_at_decision = prof::enabled ? worker_.parked() : false;
   if (prof::enabled) {
     prof::add(prof::C_RR_CALLS, 1);
     prof::add(parked_at_decision ? prof::C_RR_PARKED : prof::C_RR_AWAKE, 1);
-    // Would the short-run rule have gone the other way if the worker's parked
-    // state had been the opposite? Those are the decisions an unrelated join
-    // flips.
     if (b_has && par_2d_ && b_len < 24 && !parked_at_decision) prof::add(prof::C_RR_SHORT_HANDED_AWAKE, 1);
     if (b_has && par_2d_ && b_len < 24 && parked_at_decision) prof::add(prof::C_RR_SHORT_INLINE_PARKED, 1);
   }
   if (a_has && par_2d_ && al == SCREEN_H - 1 && (a_len >= 24 || (!worker_.parked() && a_len >= b_len))) {
-    // Engine A's run to the last display line: the deferred join (see
-    // worker_), engine B's run drawn here meanwhile.
+    // Run to the last display line: deferred join, engine B drawn here meanwhile.
     prof::add(prof::C_RR_DEFER_A, 1);
     hand(true, false);
     a_handed = true; a_deferred_ = true;
   } else if (par_2d_ && lag_frame_ && (a_has || (b_has && scaling()))) {
-    // Lag mode: engine A's lines go and stay in flight until the next line's
-    // HBlank (the join at the top) unless this is the last one; engine B's
-    // are drawn here -- the cheap engine, and the one whose window a game
-    // streams into per line, which would join the lag on every store -- but
-    // their scaling is stashed and goes with the job (see bscale_).
+    // Lag: A's lines stay in flight until next HBlank unless this is the
+    // last one. B is drawn here (its window streams per-line, joining lag on
+    // every store), but its scaling is stashed with the job (bscale_).
     if (b_has && scaling()) {
       bscale_defer_ = true;
       for (u32 x = bf; x <= bl; ++x) step_engine(1, x);
@@ -781,10 +629,7 @@ void Gpu::render_ranges(u32 af, u32 al, u32 bf, u32 bl) {
     hand(a_has, false);
     a_handed = a_has;
   } else if (b_has && par_2d_ && (b_len >= 24 || !worker_.parked())) {
-    // A short run against a parked worker is drawn here: the wake-up costs
-    // more than the lines do, and the trap-hit catch-ups of a batched frame
-    // (Golden Sun: ~16 a frame, 8-line bursts between them) would each pay it
-    // -- measured as the whole loss of batching on that title.
+    // Short run against a parked worker drawn here: wake-up costs more than the lines do.
     prof::add(prof::C_RR_HAND_B, 1);
     hand(false, true);
     b_handed = true;
@@ -799,9 +644,8 @@ void Gpu::render_ranges(u32 af, u32 al, u32 bf, u32 bl) {
   }
   if (a_has && !a_handed) for (u32 x = af; x <= al; ++x) step_engine(0, x);
   if (b_has && !b_handed) for (u32 x = bf; x <= bl; ++x) step_engine(1, x);
-  // Engine A's deferred batch stays in flight until line 0. A lagged run
-  // stays in flight until the next line; the last display line always
-  // joins, since writes after it apply directly.
+  // A's deferred batch stays in flight until line 0; a lagged run until the
+  // next line. The last display line always joins.
   if (a_deferred_) { if (!defer_join_) join_worker(JoinSite::RangesPost); }
   else if ((a_handed || b_handed || scale_inflight_) && lag_frame_ && last < SCREEN_H - 1) prof::add(prof::C_2D_LAG_LINES, 1);
   else join_worker(JoinSite::RangesPost);
@@ -809,7 +653,7 @@ void Gpu::render_ranges(u32 af, u32 al, u32 bf, u32 bl) {
   if (b_has) render_next_[1] = bl + 1;
   if (!frame_finished_ && render_next_[0] >= SCREEN_H && render_next_[1] >= SCREEN_H) {
     frame_finished_ = true;
-    if (a_deferred_) engine[1].frame_done();   // engine A's end, and the traps, at the join (finish_a)
+    if (a_deferred_) engine[1].frame_done();   // engine A's end (and traps) happen at the join in finish_a
     else {
       join_worker(JoinSite::RangesPost);
       if (read_trap_bank_ >= 0) { nds_.bus.set_lcdc_read_trap(read_trap_bank_, false); read_trap_bank_ = -1; }
@@ -818,9 +662,8 @@ void Gpu::render_ranges(u32 af, u32 al, u32 bf, u32 bl) {
   }
 }
 
-// One engine's display line, in hardware order: the writes stamped before
-// the scanline start, the window edges, the writes of the line itself, the
-// HBlank latches, the line, its output, the next line's sprites.
+// One engine's display line, in hardware order: pre-scanline writes, window
+// edges, the line's own writes, latches, the line, its output, next line's sprites.
 void Gpu::step_engine(int e, u32 line) {
   Engine2D& en = engine[e];
   {
@@ -831,19 +674,12 @@ void Gpu::step_engine(int e, u32 line) {
     en.pre_draw(line, false);
   }
   const unsigned abl = ablate();
-  // Engine B on a screen the frontend hides (set_screen_visible) draws
-  // nothing; the line it comes back on re-renders its own sprites, which the
-  // skipped line before it would have drawn.
+  // Engine B on a hidden screen draws nothing; the line it comes back on re-renders its sprites.
   const bool draw = !(abl & 2) && !(e == 0 && (abl & 8)) && !skip_frame_ && !(e == 1 && !screen_visible_[en.screen()]);
   if (!draw) skipped_[e] = true; else if (skipped_[e]) { skipped_[e] = false; en.render_sprites(line); }
-  // Reading the 3D line joins the raster bands, so a skipped frame (whose
-  // raster never ran) must not ask for it; capture, which also reads it, is
-  // never on for a skipped frame.
+  // Reading the 3D line joins the raster bands: skip it when the raster never ran.
   if (e == 0 && (draw || capture_render_)) { prof::Scope l3(prof::R3D_LINE); line3d_ = nds_.gpu3d.line(ref3d_, line); en.set_3d_line(line3d_); split3d_ = splits_on() ? nds_.gpu3d.split_line(ref3d_, line) : nullptr; }
   if (draw) { en.render_line(line); output_engine(e, line); }
-  // A skipped frame has nothing to capture: its destination bank keeps the
-  // picture it last captured, and display_phase_period() is what stops an
-  // alternating destination from going unrefreshed.
   if (e == 0 && capture_render_ && !skip_frame_ && !(abl & 4)) { DS_PROF(CAPTURE); capture(line); }
   // Sprites are rendered one line ahead of the backgrounds.
   if (draw && line < SCREEN_H - 1) {
@@ -854,8 +690,6 @@ void Gpu::step_engine(int e, u32 line) {
 }
 
 // A line's identity for the carry: its colours at the 15 bits a capture keeps.
-// Rotate-xor over the line in 64-bit pairs with one multiply-mix to finish: the keys only have
-// to tell apart the few hundred lines of the last frames, and this runs on every shown line.
 static inline u64 key_finish(u64 h) { h ^= h >> 29; h *= 0xFF51AFD7ED558CCDull; return (h ^ (h >> 32)) | 1; }   // 0 = empty slot
 static u64 line_key(const u32* px) {
   u64 h = 0x9E3779B97F4A7C15ull;
@@ -866,7 +700,7 @@ static u64 line_key(const u32* px) {
   return key_finish(h);
 }
 static u64 line_key15(const u16* px) {
-  // The same value line_key gives the line once it is RGB666: 5 bits a channel at bits 1, 9, 17.
+  // Same value line_key gives once RGB666: 5 bits/channel at bits 1, 9, 17.
   auto c = [](u32 v) -> u32 { return ((v & 0x1Fu) << 1) | ((v & 0x3E0u) << 4) | ((v & 0x7C00u) << 7); };
   u64 h = 0x9E3779B97F4A7C15ull;
   for (u32 i = 0; i < SCREEN_W; i += 2) {
@@ -886,8 +720,6 @@ void Gpu::output_engine(int e, u32 line) {
   const bool scaled = scaling();
   u32* dst = scaled ? line_out_[e].data() : fb_[screen].data() + line * SCREEN_W;
   if (screens_on_) {
-    // The common display modes go through one fused kernel (copy, master
-    // brightness, 6->8 bit expansion); the others build the line first.
     if (e == 0) {
       const u32 mode = (en.dispcnt() >> 16) & 3;
       if (layer_.line) {
@@ -912,8 +744,6 @@ void Gpu::output_engine(int e, u32 line) {
     } else {
       emit_scaled(screen, line, dst);
       if (splits_on()) {
-        // Engine A's composed line carries the 3D splits when it is shown (normal display) or
-        // captured; any other shown line may be a remembered one (see carry_store).
         const u32 mode = e == 0 ? (en.dispcnt() >> 16) & 3 : ((en.dispcnt() >> 16) & 1);
         const bool a_3d = e == 0 && split3d_ && (mode == 1 || capture_render_);
         u64 key = 0;
@@ -935,11 +765,8 @@ static inline bool row_kept(const Gpu::ScaleTarget& t, u32 y) { return y >= t.y_
 static inline u32* row_at(const Gpu::ScaleTarget& t, u32 y) { return t.px + (static_cast<size_t>(y) - t.y_lo) * t.pitch; }
 
 // ---- sub-pixel edges ------------------------------------------------------------
-// After a line's rows are out, the cells of its split pixels are patched in
-// place: the part of the cell the polygon does not cover takes the composed
-// colour of the neighbour on that side (what is really there -- another
-// polygon, the 2D layer behind a transparent clear). Write-only: colours come
-// from the source lines, never from the target.
+// After a line's rows are out, split pixels' cells are patched in place: the
+// uncovered part takes the composed colour of the neighbour on that side.
 void Gpu::set_shape(bool on) {
   if (on && sp_gen_.empty()) sp_gen_.resize(kSplitGens);
   shape_ = on;
@@ -969,13 +796,10 @@ constexpr u32 kSplitContrast = 24;   // summed RGB888 distance below which a cut
 constexpr u32 kSplitStep = 60;       // and what a weak record's step must reach (see split_admit)
 constexpr u32 kSplitBold = 120;      // a step this big is a boundary whatever runs along it
 
-// The carry. A game that shows its 3D through a display capture (GSDD: engine
-// A captures its own picture to a bank, shows the bank a frame later, and
-// copies it to the other engine's bitmap by DMA) never shows the split lines
-// themselves. So a captured line's splits are remembered under the line's
-// content, and any line either engine later shows with that content -- VRAM
-// display, a bitmap BG, a guest copy -- gets them back. Generations by frame:
-// the one being written is never read, so the two engines' threads do not meet.
+// The carry: a game showing its 3D via display capture never shows split
+// lines directly, so a captured line's splits are remembered under the
+// line's content and reattached wherever that content is later shown.
+// Generations by frame: the one being written is never read.
 void Gpu::carry_store(u64 key, const SplitRec* recs, u32 n) {
   const u64 frame = nds_.frame_count;
   SplitGen& g = sp_gen_[frame % kSplitGens];
@@ -1007,12 +831,9 @@ u32 Gpu::carry_find(u64 key, const SplitRec** recs) const {
 }
 
 // Whether a cut shows and should. `own` is the cell's line, `other` the line
-// the test may also look at (a vertical cut: the line above, for what runs
-// along the edge; a horizontal cut: the line the uncovered part takes from),
-// `ox` the column of the neighbour it takes. A strong record needs only
-// contrast. A weak one must be a step and not texture: the colour across the
-// cut has to stand well clear of how much either side varies *along* the
-// edge, where a real boundary is steady and a texture is as busy as across.
+// the test may also look at, `ox` the neighbour column. Strong records need
+// only contrast; weak ones must be a step, not texture (colour across the cut
+// must clear how much either side varies along the edge).
 bool Gpu::split_admit(const SplitRec& r, const u32* own, const u32* other, u32 ox, bool horiz) {
   const u32 x = r.x;
   const u32 p = own[x], o = horiz ? other[ox] : own[ox];
@@ -1044,9 +865,7 @@ void Gpu::emit_splits_b(int screen, u32 line, const u32* dst, u64 key) {
   emit_splits(screen, line, dst, nullptr, true, key);   // no composed line: engine A's split map is not read
 }
 
-// `composed`: engine A's composed line when it is what the screen shows (normal
-// display) or what a capture takes; `key`: the shown line's content key when it
-// is not engine A's own 3D (0 = none).
+// `composed`: A's composed line when shown/captured; `key`: shown line's content key when not A's own 3D (0 = none).
 void Gpu::emit_splits(int screen, u32 line, const u32* dst, const Pixel* composed, bool shown, u64 key) {
   const ScaleTarget& t = scale_[screen];
   const bool usable = !t.bilinear && !t.chunky && t.h >= SCREEN_H && t.xrun[SCREEN_W] >= SCREEN_W;
@@ -1058,11 +877,9 @@ void Gpu::emit_splits(int screen, u32 line, const u32* dst, const Pixel* compose
     if (usable && sp_pend_line_[screen] + 1 == line)
       for (u32 i = 0; i < sp_pend_n_[screen]; ++i) {
         const SplitRec& r = sp_pend_[screen][i];
-        // An outline's band reaching down into this line (see the marked case below): this
-        // line's cell, its upper part, the outline's colour from the line above.
+        // An outline's band reaching down into this line: this cell's upper part from the line above.
         if (r.side & 0x10) { patch_cell(t, line, r, sp_prev_[screen][r.x]); continue; }
-        if ((r.side & 0x08) && !own3d(r.x)) continue;   // a grown triangle takes this line's pixel: it must be the front's own
-        // The cell's own line is sp_prev_ by now, the line it takes from is this one.
+        if ((r.side & 0x08) && !own3d(r.x)) continue;   // a grown triangle's pixel must be the front's own
         if (split_admit(r, sp_prev_[screen], dst, r.x, true)) patch_cell(t, line - 1, r, dst[r.x]);
       }
     sp_pend_n_[screen] = 0;
@@ -1076,13 +893,12 @@ void Gpu::emit_splits(int screen, u32 line, const u32* dst, const Pixel* compose
     for (u32 i = 0; i < 2 * SCREEN_W && n < 2 * SCREEN_W; ++i) {   // two slots a pixel: its own cut, then a spill into it
       const u32 v = sm[i], x = i >> 1;
       if (!v) continue;
-      // The 3D layer must be what shows, unblended, at the polygon's pixel: the cell itself,
-      // or for a spill the pixel the colour comes from.
+      // The 3D layer must be what shows, unblended, at the polygon's pixel (or for a spill the source pixel).
       const s32 src = static_cast<s32>(static_cast<s8>(((v >> 16) & 7) << 5) >> 5);
       const bool grow = v & Renderer3D::SPLIT_GROW;
       if (grow) {
-        // Edge shaping: the cell is the BACK's (it may be 2D); what must be the 3D layer's is the front's cell the
-        // colour comes from -- beside it, on the line above (remembered), or on the next line (asked when it comes).
+        // Edge shaping: cell is the back's (may be 2D); the front's cell the colour comes from
+        // must be the 3D layer's -- beside it, on the line above (remembered), or the next line.
         const u32 s3 = v & 7;
         if (s3 <= 2 ? !own3d(x + static_cast<u32>(src)) : (s3 == 3 && !(sp_prev_line_[screen] + 1 == line && sp_prev_own_[screen][x]))) continue;
       } else {
@@ -1107,10 +923,9 @@ void Gpu::emit_splits(int screen, u32 line, const u32* dst, const Pixel* compose
       const u32* const prev = have_prev ? sp_prev_[screen] : nullptr;
       u32 nb; bool ok;
       if (r.side & 0x20) {
-        // An edge-marked pixel. The outline is a pixel wide and stays one: the band starts at
-        // the edge, `pos` in from this pixel's outer boundary (-32..64, see Renderer3D::
-        // note_edge_part), the outside comes up to it, and it reaches as far into the next
-        // pixel in as it left this one. All half-plane patches of whole cells.
+        // An edge-marked pixel. The outline stays a pixel wide: the band starts at the edge,
+        // `pos` in from this pixel's outer boundary (-32..64, see Renderer3D::note_edge_part),
+        // reaching as far into the next pixel in as it left this one. All half-plane patches of whole cells.
         const s32 pos = static_cast<s32>(r.unc) - 32;
         const u32 s3 = r.side & 7;
         const bool low = s3 == 1 || s3 == 3;
@@ -1130,8 +945,7 @@ void Gpu::emit_splits(int screen, u32 line, const u32* dst, const Pixel* compose
           else if (pos <= 32) { half(x, line, outer, pos, O); half(xi, line, outer, pos, C); }
           else { half(x, line, outer, 32, O); half(xi, line, outer, 32, C); half(xi, line, outer, pos - 32, O); half(xii, line, outer, pos - 32, C); }
         } else if (pos > 0 && pos <= 32) {
-          // Horizontal cuts never saturate. The outside part waits for / comes from the other
-          // line as any cut does; the band's reach into the line further in is the extra.
+          // Horizontal cuts never saturate; the band's reach into the line further in is the extra.
           if (s3 == 3) {                     // uncovered above: outside from the line above, band into the line below
             if (prev && split_admit(r, dst, prev, x, true)) {
               patch_cell(t, line, SplitRec{r.x, 3, static_cast<u8>(pos), r.slope, -1}, prev[x]);
@@ -1178,7 +992,7 @@ void Gpu::patch_cell(const ScaleTarget& t, u32 line, const SplitRec& r, u32 nb) 
   const u32 side = r.side & 7;
   const bool low = side == 1 || side == 3, horiz = side >= 3;
   const s32 bound0 = low ? unc : 32 - unc;
-  // The grid's seams (see emit_scaled): the leading column / row of a wide enough cell.
+  // The grid's seams: leading column/row of a wide enough cell.
   const bool grid = t.grid < 256 && !t.blend;
   u32 nbd = nb;
   bool seam_col = false, seam_row = false;
@@ -1190,8 +1004,8 @@ void Gpu::patch_cell(const ScaleTarget& t, u32 line, const SplitRec& r, u32 nb) 
     const u32 f = t.grid;
     nbd = f ? ((nb & 0xFF000000u) | (((nb & 0x00FF00FFu) * f >> 8) & 0x00FF00FFu) | (((nb & 0x0000FF00u) * f >> 8) & 0x0000FF00u)) : 0xFF000000u;
   }
-  // Pixel centres in 1/32 of the cell. Cells are a few pixels each way; anything larger takes
-  // the first kMax (no panel we drive scales a DS pixel past that).
+  // Pixel centres in 1/32 of the cell. Cells are a few pixels each way; anything
+  // larger takes the first kMax (no panel scales a DS pixel past that).
   constexpr s32 kMax = 16;
   const s32 nw = std::min(cw, kMax), nh = std::min(ch, kMax);
   s32 cx[kMax], cy[kMax];
@@ -1225,11 +1039,6 @@ void Gpu::patch_cell(const ScaleTarget& t, u32 line, const SplitRec& r, u32 nb) 
   }
 }
 
-// One source line to the destination rows it covers. Destination row y takes
-// source row y * 192 / h, so source line `line` owns rows
-// [ceil(line*h/192), ceil((line+1)*h/192)) -- usually two or three of them.
-// The first is scaled and the rest copied from it: at that point it is the
-// hottest line in the machine, and a copy beats redoing the run fill.
 // Mean of four 0xAARRGGBB pixels, per channel, alpha forced opaque.
 static inline u32 mean4(u32 a, u32 b, u32 c, u32 d) {
   const u32 rb = (((a & 0xFF00FFu) + (b & 0xFF00FFu) + (c & 0xFF00FFu) + (d & 0xFF00FFu) + 0x020002u) >> 2) & 0xFF00FFu;
@@ -1256,10 +1065,8 @@ static inline u32 max4(u32 a, u32 b, u32 c, u32 d) {
   for (u32 p : {b, c, d}) { const u32 l = luma(p); if (l > bl) { best = p; bl = l; } }
   return best;
 }
-// The darkest or brightest of the four, whichever stands farther from the
-// block's mean luma, when that is by more than `thr` -- keeps a thin stroke
-// whatever its polarity while dithers and gradients (small deviations)
-// average; the mean otherwise, and when both are equally far.
+// Darkest/brightest of the four when it stands farther than `thr` from the
+// block's mean luma (keeps a thin stroke while dithers/gradients average); mean otherwise.
 static inline u32 extreme4(u32 a, u32 b, u32 c, u32 d, u32 thr) {
   const u32 lo = min4(a, b, c, d), hi = max4(a, b, c, d);
   const u32 m = (luma(a) + luma(b) + luma(c) + luma(d)) / 4;
@@ -1268,8 +1075,7 @@ static inline u32 extreme4(u32 a, u32 b, u32 c, u32 d, u32 thr) {
   return dlo > dhi ? lo : dhi > dlo ? hi : mean4(a, b, c, d);
 }
 
-// sRGB <-> linear for the linear-light blend: 8-bit sRGB to 12-bit linear
-// and back, built once.
+// sRGB <-> linear for the linear-light blend: 8-bit sRGB to 12-bit linear and back, built once.
 namespace {
 struct GammaLut {
   u16 to_lin[256];
@@ -1312,8 +1118,7 @@ void Gpu::blend_rows(const ScaleTarget& t, const u32* a, const u32* b, u32 w, u3
 }
 
 // One row with box-filter seams: the last pixel of a run that straddles two
-// source pixels is their area-weighted blend (the previous block in chunky
-// mode is never straddled: its boundaries are integer).
+// source pixels is their area-weighted blend.
 void Gpu::emit_row_straddle(const ScaleTarget& t, const u32* src, u32* dst) {
   alignas(16) u32 next[SCREEN_W], seam[SCREEN_W];
   std::memcpy(next, src + 1, (SCREEN_W - 1) * sizeof(u32));
@@ -1326,9 +1131,7 @@ bool Gpu::build_cell_axis(u32 src_n, u32 cells, u32 cell_px, CellAxis& a) {
   a.cells = cells; a.cell_px = cell_px;
   a.first.assign(cells, 0); a.n.assign(cells, 0); a.w.assign(static_cast<size_t>(cells) * CELL_TAPS, 0);
   for (u32 i = 0; i < cells; ++i) {
-    // Cell i covers source [i*src_n/cells, (i+1)*src_n/cells); tap weights
-    // are the overlap over the cell's width, in 1/256, the last one fixed
-    // so that they sum to 256 exactly.
+    // Cell i covers source [i*src_n/cells, (i+1)*src_n/cells); tap weights are the overlap, 1/256 units.
     const u32 lo = i * src_n, hi = (i + 1) * src_n;         // in 1/cells units
     const u32 s0 = lo / cells, s1 = (hi + cells - 1) / cells; // taps [s0, s1)
     if (s1 - s0 > CELL_TAPS) return false;
@@ -1345,12 +1148,9 @@ bool Gpu::build_cell_axis(u32 src_n, u32 cells, u32 cell_px, CellAxis& a) {
   return true;
 }
 
-// One cell row: every cell's colour from its taps in the held lines, then
-// the row of cells drawn as `cell_px` panel rows (the first the seam row
-// when the grid is on) through the grid kernel with the cells' xrun.
-// A rect row's pixels in the frontend's buffer, valid only for rows the
-// crop window keeps (see ScaleTarget::y_lo).
-
+// One cell row: every cell's colour from its taps in the held lines, then the
+// row of cells drawn as `cell_px` panel rows (the first the seam row when the
+// grid is on) through the grid kernel with the cells' xrun.
 void Gpu::emit_cells(int screen, u32 line, const u32* src) {
   const ScaleTarget& t = scale_[screen];
   const CellMap& m = *t.cells;
@@ -1381,9 +1181,7 @@ void Gpu::emit_cells(int screen, u32 line, const u32* src) {
     }
     u32 out = mean;
     if (t.chunky != 2) {
-      // The other modes work on the pixels that are mostly inside the cell
-      // (at least half covered on both axes); the largest-coverage pixel
-      // stands in for "top-left".
+      // Other modes use pixels >= half covered on both axes; largest-coverage pixel stands in for "top-left".
       u32 cand[CELL_TAPS * CELL_TAPS]; u32 nc = 0;
       u32 best = 0, bestw = 0;
       for (u32 v = 0; v < ln; ++v) for (u32 u = 0; u < sn; ++u) {
@@ -1432,13 +1230,10 @@ void Gpu::scale_image(int screen, const u32* src) {
   for (u32 line = 0; line < SCREEN_H; ++line) emit_scaled(screen, line, src + line * SCREEN_W);
 }
 
-// Bilinear. The sample point of destination row y is v = (y + 0.5) * 192 / h
-// - 0.5 in source lines, so the rows that blend lines L-1 and L are those
-// with v in [L-1, L): they are written when line L arrives, from the two
-// widened rows held here. Rows above line 0's centre and below line 191's
-// are that line alone (clamped), and go out at line 0 and line 191.
-// Source line L owns rows [ystart(L), ystart(L+1)) with ystart(L) the
-// smallest y with (2y+1)*192 >= (2L-1)*h; every row is claimed exactly once.
+// Bilinear. Destination row y samples v = (y+0.5)*192/h - 0.5 in source
+// lines; rows blending L-1 and L are written when L arrives. Rows above line
+// 0's centre / below line 191's are that line alone (clamped). Source line L
+// owns rows [ystart(L), ystart(L+1)); every row claimed exactly once.
 void Gpu::emit_bilinear(int screen, u32 line, const u32* src) {
   const ScaleTarget& t = scale_[screen];
   const u32 w = t.xrun[SCREEN_W];
@@ -1449,7 +1244,7 @@ void Gpu::emit_bilinear(int screen, u32 line, const u32* src) {
     const u32 k = ((2 * l - 1) * h + SCREEN_H - 1) / SCREEN_H;   // ceil((2L-1)h/192)
     return std::min(h, k / 2);
   };
-  // Widen this line; the previous line's row is kept if it is line-1.
+  // Widen this line; previous line's row kept if it is line-1.
   const bool have_prev = line > 0 && lin_prev_line_[screen] + 1 == line;
   const u32 cur = have_prev ? lin_cur_[screen] ^ 1u : 0u;
   u32* const hcur = lin_row_[screen][cur];
@@ -1475,8 +1270,7 @@ void Gpu::emit_bilinear(int screen, u32 line, const u32* src) {
       else kern::active::lerp_rows(hprev, hcur, wy, w, o);
     }
   } else {
-    // A gap in the lines (a hidden span, or the first line after a
-    // reset): this line stands alone over its rows.
+    // A gap in the lines (hidden span, or first line after reset): this line stands alone.
     for (u32 y = ystart(line); y < ystart(line + 1); ++y) if (u32* o = out_row(y)) std::memcpy(o, hcur, bytes);
   }
   if (line + 1 == SCREEN_H)
@@ -1494,11 +1288,8 @@ void Gpu::emit_scaled(int screen, u32 line, const u32* src) {
   u32 first = line, last = line;
   alignas(16) u32 block[SCREEN_W];
   if (t.chunky) {
-    // Each 2x2 block of DS pixels is one cell (the frontend's xrun merges
-    // the pixel pairs; the line pair is merged here). Top-left draws from
-    // the even line as it arrives; mean and mode hold the even line and
-    // resolve the block when the odd one completes it. Only the even
-    // pixels' entries are read (the odd runs are empty).
+    // Each 2x2 block is one cell (xrun merges pixel pairs; line pair merged
+    // here). Top-left draws from the even line; other modes resolve on the odd one.
     if (t.chunky == 1) { if (line & 1) return; last = line + 1; }
     else {
       if (!(line & 1)) { std::memcpy(chunk_even_[screen], src, sizeof block); return; }
@@ -1518,25 +1309,18 @@ void Gpu::emit_scaled(int screen, u32 line, const u32* src) {
   const u32 y1 = ((last + 1) * t.h + SCREEN_H - 1) / SCREEN_H;
   if (y0 >= y1) return;                      // downscale: this line is dropped
   const size_t bytes = static_cast<size_t>(t.xrun[SCREEN_W]) * sizeof(u32);
-  // Rows are built in cached scratch and copied out, never read back from
-  // the target (see row_scratch_). A row wider than the scratch goes direct,
-  // which a cropped view cannot (its first row may be outside the buffer).
+  // Rows built in cached scratch and copied out, never read back from the
+  // target. A row wider than the scratch goes direct, which a cropped view cannot.
   const bool stage = t.xrun[SCREEN_W] <= SCALED_ROW_MAX;
   const bool cropped = t.y_lo != 0 || t.y_hi != t.h;
   if (!stage && cropped) return;
   u32* row = stage ? row_scratch_[screen] : row_at(t, y0);
   const bool blend = t.blend && t.seam_w;   // --seam blend: box-filter seams stand in for the grid
   if (blend && t.h >= SCREEN_H) {
-    // Box-filter seams (sharp-shimmerless): a panel pixel or row that
-    // straddles two source pixels or lines is their area-weighted blend,
-    // every other one is nearest. The straddling row of this span is its
-    // last, and needs the next line, so it is written when that arrives;
-    // the crisp rows go out now.
-    //
-    // Upscales only: a downscaled view (the PiP inset on a small panel)
-    // drops lines, and a dropped line never came back to write the
-    // straddling row the line before it left for it -- a fifth of the
-    // inset's rows were never written at 213x160. Nearest below 1x.
+    // Box-filter seams: a straddling panel pixel/row is an area-weighted
+    // blend, others are nearest. The straddling row of this span is its last
+    // and needs the next line, so it's written when that arrives. Upscales
+    // only: a downscale drops lines and never returns for the row they left.
     const u32 hb = (last + 1) * t.h;                 // this span's lower boundary, in 1/192 rows
     const bool straddle_below = (hb % SCREEN_H) != 0 && last + 1 < SCREEN_H;
     const u32 ycrisp_end = straddle_below ? y1 - 1 : y1;
@@ -1545,9 +1329,8 @@ void Gpu::emit_scaled(int screen, u32 line, const u32* src) {
       for (u32 y = stage ? y0 : y0 + 1; y < ycrisp_end; ++y)
         if (row_kept(t, y)) std::memcpy(row_at(t, y), row, bytes);
     }
-    // The row above this span straddles the previous line and this one: the
-    // boundary falls frac/192 of the way down it, so the previous line owns
-    // that much of the row and this line the rest.
+    // Row above straddles the previous line and this one: boundary falls
+    // frac/192 down it, previous line owns that much, this line the rest.
     if (first > 0 && seam_prev_line_[screen] + 1 == first) {
       const u32 tb = first * t.h;                    // this span's upper boundary
       const u32 frac = tb % SCREEN_H;
@@ -1561,35 +1344,18 @@ void Gpu::emit_scaled(int screen, u32 line, const u32* src) {
     seam_prev_line_[screen] = last;
     return;
   }
-  // Plain nearest: no grid asked for, or seam blend on a view too small for
-  // its seams (the grid is the other seam treatment, not a fallback for it).
+  // Plain nearest: no grid, or seam blend on a view too small for its seams.
   if (t.grid >= 256 || blend) {
     kern::active::scale_row(src, t.xrun, row);
     for (u32 y = stage ? y0 : y0 + 1; y < y1; ++y)
       if (row_kept(t, y)) std::memcpy(row_at(t, y), row, bytes);
     return;
   }
-  // LCD grid: the last output column of every source pixel's run and the last
-  // output row of every source line's span are dimmed, so each DS pixel shows
-  // as a lit cell with a dark seam right and below. Runs are whatever the
-  // fractional scale hands out (2 and 3 wide at 2.5x), so the seams are not
-  // evenly spaced there -- a one-pixel seam per DS pixel is what a panel
-  // that size can honestly show. A run of one pixel is left alone: dimming
-  // it would erase the pixel, not outline it. The seam row is scaled from
-  // the source too, so the corner where the two seams meet is dimmed once.
-  //
-  // Only runs the fractional part of the scale widened carry a seam
-  // (min_run = ceil(scale)): the lit cell keeps the integer size everywhere,
-  // and at 2.5x the seams fall on every other DS pixel rather than every
-  // other DS pixel being half-width. The seam leads its run (see
-  // scale_row_grid), so the seam row is the span's first row and the plain
-  // row is built below it. At an integer scale every run qualifies. Rows
-  // follow the same rule as columns.
-  //
-  // At exactly 2x a seam per DS pixel leaves one lit panel pixel in four,
-  // which reads as a dim wash, not a grid; there the seam goes on every
-  // other DS pixel (a 4-pixel pitch, nine lit in sixteen), still on the
-  // pixel boundaries. Each axis decides for itself.
+  // LCD grid: last output column/row of every source pixel's run/span is
+  // dimmed, so each DS pixel shows a lit cell with a dark seam right/below.
+  // A run of one pixel is left alone. Only runs the fractional scale widened
+  // carry a seam (min_run = ceil(scale)); the seam leads its run. At exactly
+  // 2x a seam per pixel reads as a wash, so it goes on every other pixel instead (4-pixel pitch).
   const u32 w = t.xrun[SCREEN_W];
   const u32 min_run = (w + SCREEN_W - 1) / SCREEN_W, min_rows = (t.h + SCREEN_H - 1) / SCREEN_H;
   const u32 pitch_x = w == 2 * SCREEN_W ? 2 : 1, pitch_y = t.h == 2 * SCREEN_H ? 2 : 1;
@@ -1612,8 +1378,6 @@ void Gpu::output_a(u32 line, u32* dst) {
   case 0: for (u32 i = 0; i < 256; ++i) dst[i] = 0x3F3F3F; return;          // display off: white
   case 1: { const Pixel* src = engine[0].output(); for (u32 i = 0; i < 256; ++i) dst[i] = src[i]; break; }
   case 2: {                                                                 // VRAM display (LCDC bank)
-    // One kernel does the 15 -> 18 bit unpack, master brightness and the
-    // 6 -> 8 expansion; an unmapped bank reads as zero.
     const u32 bank = (dispcnt >> 18) & 3;
     const VramMap& vm = nds_.bus.vram_map();   // bank pointers are remap-invariant
     static constexpr u16 kZeroLine[256] = {};
@@ -1641,8 +1405,7 @@ void Gpu::capture(u32 line) {
   const u32 width = size == 0 ? 128 : 256, height = size == 0 ? 128 : 64 * size;
   if (line >= height) return;
   const u32 dst_bank = (cnt >> 16) & 3;
-  // The bank POINTERS are remap-invariant, so the live map is safe to take
-  // them from; lcdc_mask is not, and is latched at hand-off (see gpu.h).
+  // Bank pointers are remap-invariant so the live map is safe here; lcdc_mask is not (latched at hand-off).
   const VramMap& vm = nds_.bus.vram_map();
   const u32 lcdc = lcdc_mask_render_;
   if (!(lcdc & (1u << dst_bank))) return;
@@ -1719,9 +1482,8 @@ template void Gpu::sync_state<state::Writer>(state::Writer&);
 template void Gpu::sync_state<state::Reader>(state::Reader&);
 
 void Gpu::after_load() {
-  // The state was taken right after line 0's begin_frame(): its decisions
-  // depend only on registers and DMA state, all restored, so retaking them
-  // reproduces the frame's mode and re-arms the trap.
+  // State was taken right after line 0's begin_frame(); its decisions depend
+  // only on restored registers/DMA state, so retaking them re-arms the trap.
   if (frame_begun_ && line_ == 0 && !hblank_done_) begin_frame();
 }
 

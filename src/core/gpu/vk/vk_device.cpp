@@ -62,23 +62,11 @@ struct Device::Impl {
   DeviceInternal internal{};
   VkPhysicalDeviceMemoryProperties memprops{};
 
-  // The memory type for an Access.
-  //
-  // The one requirement is cacheability. CpuRead must be HOST_CACHED, because
-  // the NEON composite reads that buffer directly and on a write-combine
-  // mapping it reads at 0.12 GB/s instead of 4.5 -- a 35x cliff, the same one
-  // the A30's uncached fb0 has. A part with no cached host-visible type is
-  // refused outright rather than run that slowly.
-  //
-  // DEVICE_LOCAL is a PREFERENCE, not a requirement, and the distinction
-  // matters. On the unified parts this targets every host-visible type is
-  // device-local anyway, so the preference costs nothing and is always met.
-  // On a part with a separate device heap -- a desktop iGPU or a discrete
-  // card, which is where this gets developed -- the cached host-visible types
-  // are system memory and are not device-local, and insisting would refuse a
-  // perfectly workable device for a property that is only free on the target.
-  // So: two passes, preferred first, and the fallback is reported rather than
-  // silent (Device::name()).
+  // CpuRead must be HOST_CACHED (NEON composite reads it directly; write-
+  // combine is drastically slower), refused otherwise. DEVICE_LOCAL is only
+  // a preference (costs nothing on unified parts; a discrete dev card's
+  // cached host-visible type may be system memory) so it's tried first, and
+  // falling back is reported via Device::name() rather than silent.
   bool find_mem(u32 bits, Access a, u32* out, bool* was_device_local = nullptr) const {
     const VkMemoryPropertyFlags need =
       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
@@ -142,9 +130,7 @@ std::unique_ptr<Device> Device::create(std::string* why) {
   if (!n) return set("no Vulkan device");
   std::vector<VkPhysicalDevice> devs(n);
   d.api.vkEnumeratePhysicalDevices(d.inst, &n, devs.data());
-  // DS_VK_DEVICE picks the physical device by index or by a substring of its
-  // name (a development box may have an integrated and a discrete GPU, and
-  // each is a different driver to test against); DS_VK_LIST_EXT lists them.
+  // DS_VK_DEVICE: pick physical device by index or name substring; DS_VK_LIST_EXT lists them.
   d.phys = devs[0];
   if (const char* pick = std::getenv("DS_VK_DEVICE")) {
     char* end = nullptr;
@@ -198,9 +184,6 @@ std::unique_ptr<Device> Device::create(std::string* why) {
   }
   self->limits_.dmabuf_import = has_fd && has_dmabuf;
   self->limits_.drm_modifier = self->limits_.dmabuf_import && has_modifier && has_fmtlist;
-  // 64-bit buffer atomics: the extension (or 1.2, where it is core) plus the
-  // feature bits actually being set, and shaderInt64 alongside, since the
-  // key the shader builds is a 64-bit integer before it is an atomic.
   VkPhysicalDeviceShaderAtomicInt64Features at64{};
   at64.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_INT64_FEATURES;
   VkPhysicalDeviceRasterizationOrderAttachmentAccessFeaturesEXT roaa{};
@@ -214,10 +197,7 @@ std::unique_ptr<Device> Device::create(std::string* why) {
     self->limits_.int64_atomics = (has_atomic64_ext || props.apiVersion >= VK_API_VERSION_1_2) && f2.features.shaderInt64 && at64.shaderBufferInt64Atomics;
     self->limits_.ordered_attachments = has_roaa && roaa.rasterizationOrderColorAttachmentAccess;
   }
-  // DS_VK_LIST_EXT=1: what this driver actually offers. Worth having as a
-  // knob rather than a one-off program -- the handhelds have no compiler, so
-  // "does libmali support X" is otherwise a cross-build and a copy every
-  // time it comes up.
+  // DS_VK_LIST_EXT=1: what this driver actually offers.
   if (std::getenv("DS_VK_LIST_EXT")) {
     std::fprintf(stderr, "vk: %s, %u device extensions:\n", props.deviceName, ne);
     for (const auto& e : exts) std::fprintf(stderr, "vk:   %s\n", e.extensionName);
@@ -240,13 +220,10 @@ std::unique_ptr<Device> Device::create(std::string* why) {
   std::vector<const char*> want;
   if (d.has_host_import) want.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
   if (self->limits_.int64_atomics && has_atomic64_ext) want.push_back(VK_KHR_SHADER_ATOMIC_INT64_EXTENSION_NAME);
-  // dma-buf import for the present stage; every one optional.
   if (self->limits_.dmabuf_import) { want.push_back(VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME); want.push_back(VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME); }
   if (self->limits_.drm_modifier) { want.push_back(VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME); want.push_back(VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME); }
   if (self->limits_.dmabuf_import && has_foreign) want.push_back(VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME);
   if (self->limits_.ordered_attachments) want.push_back(VK_EXT_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_EXTENSION_NAME);
-  // Enable exactly the two features the raster uses and nothing else the
-  // query happened to return.
   VkPhysicalDeviceShaderAtomicInt64Features en64{};
   en64.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_INT64_FEATURES;
   en64.shaderBufferInt64Atomics = VK_TRUE;
@@ -255,7 +232,6 @@ std::unique_ptr<Device> Device::create(std::string* why) {
   enroaa.rasterizationOrderColorAttachmentAccess = VK_TRUE;
   VkPhysicalDeviceFeatures2 enf{};
   enf.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
-  // Chain only what is on: shaderInt64 + the 64-bit atomics, and/or ordered attachments.
   if (self->limits_.int64_atomics) { enf.pNext = &en64; enf.features.shaderInt64 = VK_TRUE; }
   if (self->limits_.ordered_attachments) { enroaa.pNext = enf.pNext; enf.pNext = &enroaa; }
 
@@ -275,15 +251,8 @@ std::unique_ptr<Device> Device::create(std::string* why) {
   if (d.api.vkCreateDevice(d.phys, &di, nullptr, &d.dev) != VK_SUCCESS) return set("vkCreateDevice failed");
   d.api.vkGetDeviceQueue(d.dev, d.qfam, 0, &d.queue);
 
-  // The rule the whole design rests on: without a cached host-visible type
-  // the composite would read GPU memory at write-combine speed. Refuse here
-  // rather than run 35x slower than the software path.
   u32 dummy = 0;
   if (!d.find_mem(~0u, Access::CpuRead, &dummy, &d.device_local)) return set("no HOST_CACHED memory type");
-  // Say so when the cached type is not device-local. It is workable -- and on
-  // a development host it is the only thing on offer -- but on the target
-  // parts it should never happen, so a timing measurement taken here is not
-  // one taken there.
   if (!d.device_local) self->name_ += " (host memory, not device-local: a development fallback)";
   if (!self->limits_.int64_atomics) self->name_ += " (no 64-bit atomics: the visibility pass is off)";
 
@@ -302,7 +271,7 @@ Buffer Device::alloc(size_t size, Access access) {
   VkBufferCreateInfo bi{};
   bi.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
   bi.size = size;
-  bi.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT;   // texel buffer: the triangle path fetches texels through the texture cache
+  bi.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT;   // texel buffer: triangle path fetches through it
   bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
   VkBuffer buf = VK_NULL_HANDLE;
   if (d.api.vkCreateBuffer(d.dev, &bi, nullptr, &buf) != VK_SUCCESS) return out;
@@ -423,8 +392,6 @@ Buffer Device::import_host(void* ptr, size_t size) {
 void Device::flush(const Buffer& b, size_t offset, size_t size) {
   if (!b) return;
   Impl& d = *d_;
-  // Only meaningful for a non-coherent mapping; harmless otherwise, and
-  // cheaper to always call than to track which type each buffer landed in.
   const VkDeviceSize atom = d.internal.non_coherent_atom;
   VkDeviceSize off = offset / atom * atom;
   VkDeviceSize len = size ? ((offset + size + atom - 1) / atom * atom) - off : VK_WHOLE_SIZE;

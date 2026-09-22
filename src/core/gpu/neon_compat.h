@@ -1,28 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // DSperate - Nintendo DS emulator. Copyright (C) 2026 DSperate contributors.
 //
-// A shim layer over the handful of NEON intrinsics that exist only in AArch64.
-// Every name here has two bodies: the plain A64 one, and — under
-// DS_A32_SUBSET — one built solely from intrinsics that ARMv7 NEON can also
-// express.  Both are compiled for AArch64; the flag does not produce a 32-bit
-// build, it restricts the *instruction vocabulary* the kernels are allowed to
-// use, so the A32 instruction mix can be measured against the A64 one with the
-// JIT, the register file and everything else held fixed.
-//
-// The A64-only constructs the kernels use, and what replaces them:
-//
-//   vmaxvq_* / vminvq_* / vmaxv_*   across-vector reduction -> pairwise chain
-//   vqtbl1q_u8 / vqtbl2q_u8         Q-table lookup          -> vtbl2 / vtbl4 halves
-//   vqtbl4q_u8                      64-byte table           -> two vtbl4 halves, OR-merged
-//   v*_high_*                       high-half widening      -> vget_high_* + base op
-//   vceqzq_u32                      compare-to-zero         -> vceqq against a zero dup
-//   vdivq_f64 & friends             f64 vector divide       -> scalar double divides
-//
-// The table shims lean on the fact that both vqtblNq_u8 and AArch32's vtblN_u8
-// return 0 for an out-of-range index, so a wider table can be assembled by
-// OR-ing the results of two narrower lookups with the index biased between
-// them.  That is the same rule the reference kernels rely on, so the shims are
-// value-identical, not merely close.
+// Shim over NEON intrinsics that exist only in AArch64. Every name here has
+// two bodies: the plain A64 one, and — under DS_A32_SUBSET — one built solely
+// from intrinsics ARMv7 NEON also has. Both compile for AArch64; the flag
+// restricts the instruction vocabulary, it does not produce a 32-bit build.
 #pragma once
 
 #include "core/types.h"
@@ -37,8 +19,7 @@
 namespace ds::gpu::kern::compat {
 
 // ---- across-vector reductions --------------------------------------------
-// AArch32 has no ADDV/MAXV/MINV; the idiom is log2(lanes) pairwise steps on
-// D registers, which is what the shims below spell out.
+// AArch32 has no ADDV/MAXV/MINV; log2(lanes) pairwise steps on D registers instead.
 
 [[gnu::always_inline]] inline u8 maxv_u8(uint8x16_t v) {
 #if DS_A32_SUBSET
@@ -110,10 +91,6 @@ namespace ds::gpu::kern::compat {
 #endif
 }
 
-// A 16-lane byte plane is uniform.  Spelt out as its own shim because the
-// kernels ask this question far more often than they ask for either extreme,
-// and the A32 form can answer it with one pairwise chain over a difference
-// instead of the two chains a max == min pair would cost.
 [[gnu::always_inline]] inline bool uniform_u8(uint8x16_t v) {
 #if DS_A32_SUBSET
   return maxv_u8(veorq_u8(v, vdupq_n_u8(vgetq_lane_u8(v, 0)))) == 0;
@@ -121,9 +98,7 @@ namespace ds::gpu::kern::compat {
   return vmaxvq_u8(v) == vminvq_u8(v);
 #endif
 }
-// "Are these 16 bytes in memory all the same?" without a vector->scalar
-// readback: two 64-bit loads, replicate the first byte, compare. On an
-// in-order core the umaxv+fmov pair cannot overlap the branch that reads it.
+// Avoids a vector->scalar readback: two 64-bit loads, replicate first byte, compare.
 [[gnu::always_inline]] inline bool uniform_u8_mem(const u8* p) {
   u64 a, b; std::memcpy(&a, p, 8); std::memcpy(&b, p + 8, 8);
   const u64 r = (a & 0xFF) * 0x0101010101010101ull;
@@ -131,8 +106,7 @@ namespace ds::gpu::kern::compat {
 }
 
 // ---- table lookups --------------------------------------------------------
-// vtbl2_u8 covers a 16-byte table, vtbl4_u8 a 32-byte one, both 8 indices at
-// a time and both zeroing out-of-range lanes.
+// vtbl2_u8: 16-byte table; vtbl4_u8: 32-byte table. Both zero out-of-range lanes.
 
 [[gnu::always_inline]] inline uint8x16_t tbl1q_u8(uint8x16_t t, uint8x16_t idx) {
 #if DS_A32_SUBSET
@@ -155,10 +129,8 @@ namespace ds::gpu::kern::compat {
 
 [[gnu::always_inline]] inline uint8x16_t tbl4q_u8(uint8x16x4_t t, uint8x16_t idx) {
 #if DS_A32_SUBSET
-  // 64 bytes is twice what vtbl4 can address: look the index up in both
-  // 32-byte halves, biasing the second by 32.  An index below 32 misses the
-  // high half (it wraps to >= 224) and one at or above 32 misses the low
-  // half, so exactly one lookup contributes and the two can be OR-ed.
+  // 64 bytes is twice what vtbl4 addresses: look up in both 32-byte halves,
+  // biasing the second by 32, so exactly one lookup is in-range and the two OR together.
   const uint8x8x4_t lo = {{vget_low_u8(t.val[0]), vget_high_u8(t.val[0]),
                            vget_low_u8(t.val[1]), vget_high_u8(t.val[1])}};
   const uint8x8x4_t hi = {{vget_low_u8(t.val[2]), vget_high_u8(t.val[2]),
@@ -172,9 +144,7 @@ namespace ds::gpu::kern::compat {
 #endif
 }
 
-// ---- high-half widening ---------------------------------------------------
-// Pure sugar: on AArch32 the high half is extracted first and the base op
-// applied to the D register.  Identical results either way.
+// ---- high-half widening ----------------------------------------------------
 
 [[gnu::always_inline]] inline uint64x2_t mull_high_u32(uint32x4_t a, uint32x4_t b) {
 #if DS_A32_SUBSET
@@ -256,8 +226,7 @@ namespace ds::gpu::kern::compat {
 #endif
 }
 
-// The shift count has to survive as a literal into the intrinsic, so this one
-// is a template rather than a plain parameter.
+// Shift count must be a literal, hence template rather than a parameter.
 template <int N>
 [[gnu::always_inline]] inline uint32x4_t shll_high_n_u16(uint16x8_t a) {
 #if DS_A32_SUBSET
@@ -267,10 +236,8 @@ template <int N>
 #endif
 }
 
-// ---- lane broadcast ------------------------------------------------------
-// AArch32's VDUP.32 can only name a lane of a D register, so a lane in the
-// upper half is reached by extracting that half first.  N is a template
-// parameter for the same reason the shift count above is.
+// ---- lane broadcast ---------------------------------------------------------
+// VDUP.32 can only name a lane of a D register; extract the upper half first to reach it.
 template <int N>
 [[gnu::always_inline]] inline int32x4_t dup_laneq_s32(int32x4_t v) {
 #if DS_A32_SUBSET
@@ -289,20 +256,11 @@ template <int N>
 #endif
 }
 
-// ---- exact unsigned division ----------------------------------------------
-// The one place where the A32 subset cannot match the A64 shape at all:
-// AArch32 NEON has no double-precision vector type and no vector divide of
-// any width, so the f64 quotient the kernels use to reproduce the reference's
-// integer division exactly has to be done a lane at a time on the scalar VFP
-// unit.  Same values (the f64 quotient of two u32 values, truncated, is the
-// exact integer quotient), very different cost — this is the shim to watch in
-// a span-heavy profile.
-//
-// The kernels still compile for AArch64, so the vectoriser will happily fuse a
-// plain loop of four scalar divides straight back into the two f64 vector
-// divides the subset is meant to exclude.  keep_scalar pins each quotient in a
-// scalar register with an empty asm, which is what makes the measurement mean
-// anything.
+// ---- exact unsigned division ------------------------------------------------
+// AArch32 NEON has no f64 vector type or vector divide, so the truncated f64
+// quotient (== exact integer quotient) is done a lane at a time on scalar VFP.
+
+// Pins each quotient in a scalar register so the vectoriser can't fuse the loop back into vdivq_f64.
 [[gnu::always_inline]] inline double keep_scalar(double v) {
   asm("" : "+w"(v));
   return v;

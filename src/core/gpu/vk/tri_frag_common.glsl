@@ -1,9 +1,8 @@
-// Shared by tri_opaque.frag and tri_tail.frag: the per-fragment shading of
-// the triangle path, through ds_shade.glsl's arithmetic.
+// Shared by tri_opaque.frag and tri_tail.frag: per-fragment shading of the
+// triangle path, through ds_shade.glsl's arithmetic.
 layout(std430, binding = 0) readonly buffer Polys  { GpuPoly polys[]; };
-// The texel arena as a uniform texel buffer: on Mali a texelFetch goes
-// through the texture cache where an SSBO load goes through load/store, and
-// the fragment stage was 3.5 ms of a 5.9 ms fence wait at 2x (Golden Sun).
+// Texel arena as a uniform texel buffer: on Mali a texelFetch goes through
+// the texture cache where an SSBO load goes through load/store.
 #define DS_TEXEL_BUFFER 1
 layout(binding = 3) uniform usamplerBuffer texels_tb;
 layout(std430, binding = 5) readonly buffer Post   { GpuPost ps; };
@@ -18,10 +17,8 @@ layout(location = 0) out uint o_col;     // the 3D layer record: RGB666 + alpha5
 layout(location = 1) out uint o_attr;    // the attribute plane the final pass reads
 layout(location = 2) out uint o_z;       // the depth plane (DS z, or w in W-buffer mode)
 layout(std430, binding = 9) readonly buffer RowsC { GpuRow rows_c[]; };
-// This pixel's edge flags (1 left run, 2 right run, 4 top row, 8 bottom row)
-// and coverage from its polygon's span-table row (Renderer3D::resolve_span's
-// rules); `inside` says whether the DS span reaches the pixel at all. At
-// S >= 2 the caller passes the native pixel (x / S, y / S).
+// Edge flags/coverage from the polygon's span-table row; `inside` says
+// whether the DS span reaches the pixel. At S >= 2 caller passes native (x/S, y/S).
 uint row_edge(GpuPoly p, int x, int y, out uint cov, out bool inside, out GpuRow row) {
   cov = 31u; inside = false;
   int y0 = max(p.ytop, 0);
@@ -49,7 +46,7 @@ uint row_edge(GpuPoly p, int x, int y, out uint cov, out bool inside, out GpuRow
   return yedge;
 }
 #ifndef DS_AA_PASS
-layout(location = 4) out uint o_touch;   // the native tail pass (DS_FF_TAIL1X): 1 where the tail wrote the pixel, for expand.comp (no such attachment in the hi-res pass: the write is dropped)
+layout(location = 4) out uint o_touch;   // native tail pass (DS_FF_TAIL1X): 1 where the tail wrote the pixel, for expand.comp
 #endif
 #include "ds_shade.glsl"
 struct Frag { uint src; uint alpha; uint polyattr; uint depth; };
@@ -57,17 +54,12 @@ Frag shade_fragment(GpuPoly p) {
   Frag o;
   uint blendmode = (p.attr >> 4) & 3u;
   uint polyalpha = (p.attr >> 16) & 0x1Fu;
-  bool textured = (p.flags & DS_PF_TEXTURED) != 0u && (pc.f.flags & DS_FF_NOTEX) == 0u;   // DS_FF_NOTEX: attribution
+  bool textured = (p.flags & DS_PF_TEXTURED) != 0u && (pc.f.flags & DS_FF_NOTEX) == 0u;
   o.src = shade_pixel(p, blendmode, polyalpha, textured,
                       int(round(v_rgb.r)), int(round(v_rgb.g)), int(round(v_rgb.b)),
                       int(floor(v_st.x + 0.01)), int(floor(v_st.y + 0.01)));
-  // Colours round (measured closer to the DS's fixed-point interpolation);
-  // texture coordinates TRUNCATE, as the DS's 12.4 >> 4 does -- a quad that
-  // stretches one texel column across a hundred pixels (Etrian's menu panels,
-  // s 22.0 -> 23.0) otherwise flips to the edge texel columns early. The
-  // 0.01 (a hundredth of a 1/16 texel) absorbs float error at exact texel
-  // boundaries: the same panels step t by exactly 16.0 a row, and 15.9999
-  // floored onto the row above -- the one-row shift in the menu text.
+  // Texcoords TRUNCATE as DS 12.4 >> 4 does; +0.01 absorbs float error so an
+  // exact-boundary coordinate doesn't floor down a row/column early.
   o.alpha = o.src >> 24;
   bool front = (p.flags & DS_PF_FRONTFACING) != 0u;
   o.polyattr = (p.attr & 0x3F008000u) | (front ? 0u : (1u << 4));

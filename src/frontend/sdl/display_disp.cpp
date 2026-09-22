@@ -81,12 +81,8 @@ u64 now_ns() { timespec t{}; clock_gettime(CLOCK_MONOTONIC, &t); return static_c
 #endif
 
 // ---- rotation kernels ----------------------------------------------------------
-// src: SCREEN_W x SCREEN_H; dst: the slot's top-left in the composite, stride in
-// pixels. 270: dst[py][px] = src[px][W-1-py] (the DS's top edge becomes the
-// panel's left edge, which on a panel mounted 270 degrees is the user's top).
-// 90: dst[py][px] = src[H-1-px][py]. The panel memory is uncached, so every
-// store is a full 64-byte line: 16 source rows x 4 columns per step, four
-// 4x4 NEON transposes, one 16-pixel column store each.
+// 270: dst[py][px] = src[px][W-1-py]. 90: dst[py][px] = src[H-1-px][py].
+// Panel memory is uncached, so stores go a full line at a time via NEON transposes.
 constexpr int W = static_cast<int>(SCREEN_W), H = static_cast<int>(SCREEN_H);
 
 #if DS_DISP_NEON
@@ -137,7 +133,7 @@ void rot90(const u32* src, u32* dst, int stride) {
   for (int py = 0; py < W; ++py) for (int px = 0; px < H; ++px) dst[py * stride + px] = src[(H - 1 - px) * W + py];
 }
 #endif
-// 0 and 180 keep the DS orientation: whole rows, 64-byte stores either way.
+// 0 and 180 keep the DS orientation: whole-row copies.
 void rot0(const u32* src, u32* dst, int stride) {
   for (int y = 0; y < H; ++y) std::memcpy(dst + y * stride, src + y * W, W * sizeof(u32));
 }
@@ -192,15 +188,13 @@ bool DispOut::open(int rot, bool vsync) {
   map_ = static_cast<u8*>(m);
   phys_ = static_cast<u32>(fix.smem_start);
 
-  // The UI's layer (the one fb0 drives) goes off while the panel is ours; a
-  // free layer carries the composite. Both come back on close().
+  // The UI's layer (the one fb0 drives) goes off while ours carries the
+  // composite; both come back on close().
   unsigned long hdl = 0;
   if (ioctl(fb_, FBIOGET_LAYER_HDL_0, &hdl) == 0) ui_layer_ = static_cast<int>(hdl);
   for (int l = 0; l < 4; ++l) if (l != ui_layer_) { layer_ = l; break; }
   grid_layer_ = -1; grid_enabled_ = false; grid_dirty_ = false; grid_dims_ = Dims{};
   ov_active_ = false; ov_taken_ = false; ov_stage_.clear(); ov_sent_.clear();
-  // One image serves the grid and the frontend's overlay: see the header on
-  // why there is no second layer to be had.
   if (grid_alpha_ || overlay_wanted_) {
     grid_off_ = buf_bytes_ * BUFS;
     const size_t need = static_cast<size_t>(panel_w_) * panel_h_ * sizeof(u32);
@@ -269,9 +263,8 @@ void DispOut::set_canvas(int w, int h) {
 void DispOut::set_view(int i, int x, int y, int w, int h, bool shown) {
   if (i < 0 || i >= VIEWS) return;
   const ViewRect& o = views_[i];
-  // A moved, resized or hidden view leaves its old pixels behind in every
-  // buffer: pip to single, a screen swap or a corner change keep the canvas
-  // size, so set_canvas() alone would not black them out.
+  // A moved/resized/hidden view leaves old pixels behind in every buffer
+  // (set_canvas() alone wouldn't black them out on a same-size layout change).
   if (o.x != x || o.y != y || o.w != w || o.h != h || o.shown != shown) { dirty_ = (1u << BUFS) - 1; grid_dirty_ = true; }
   views_[i] = ViewRect{x, y, w, h, shown, o.cell};
 }
@@ -302,9 +295,8 @@ double DispOut::fit_scale() const {
   return snap(std::min(static_cast<double>(panel_w_) / d.w, static_cast<double>(panel_h_) / d.h));
 }
 
-// Whole panel pixels per DS pixel when asked for (see Display::IntScale).
-// `s` is a DS-pixel factor: the composite's own factor is s times the
-// divisor, and the snap is on the DS pixel, not the cell.
+// Snaps to whole panel pixels per DS pixel (Display::IntScale). `s` is a
+// DS-pixel factor; the composite's own factor is s times the divisor.
 double DispOut::snap(double s) const {
   if (int_scale_ == 0 || s <= 0.0) return s;
   const double f = std::floor(s + 1e-9);
@@ -313,17 +305,12 @@ double DispOut::snap(double s) const {
 }
 
 DispOut::Fit DispOut::fit(Dims d) const {
-  // Fit the composite to the panel, aspect kept, centred: the DE does the scale.
-  // `d` is in composite pixels (DS pixels over the divisor), so the snap is
-  // taken on the DS factor and put back.
+  // `d` is in composite pixels; the snap is taken on the DS factor and put back.
   Fit f;
   const double s = snap(std::min(static_cast<double>(panel_w_) / d.w, static_cast<double>(panel_h_) / d.h) / div_) * div_;
   f.sx = 0; f.sy = 0; f.sw = static_cast<unsigned>(d.w); f.sh = static_cast<unsigned>(d.h);
   f.w = static_cast<unsigned>(d.w * s); f.h = static_cast<unsigned>(d.h * s);
-  // Overscale: the composite is larger than the panel, so the layer shows a
-  // centred window of it -- whole composite pixels, so the window's edge is
-  // a pixel edge and the scale stays exactly s -- and the outer edges are
-  // what is lost, keeping the edge between a stacked pair's screens.
+  // Overscale: layer shows a centred window of whole composite pixels (keeps scale exactly s).
   if (f.w > static_cast<unsigned>(panel_w_)) { f.sw = static_cast<unsigned>(panel_w_ / s); f.w = static_cast<unsigned>(f.sw * s); f.sx = static_cast<int>((d.w - static_cast<int>(f.sw)) / 2); }
   if (f.h > static_cast<unsigned>(panel_h_)) { f.sh = static_cast<unsigned>(panel_h_ / s); f.h = static_cast<unsigned>(f.sh * s); f.sy = static_cast<int>((d.h - static_cast<int>(f.sh)) / 2); }
   f.x = static_cast<int>((panel_w_ - static_cast<int>(f.w)) / 2); f.y = static_cast<int>((panel_h_ - static_cast<int>(f.h)) / 2);
@@ -332,7 +319,6 @@ DispOut::Fit DispOut::fit(Dims d) const {
 
 void DispOut::comp_rect(const ViewRect& r0, int& cx, int& cy, int& cw, int& ch) const {
   const bool turned = rot_ == 90 || rot_ == 270;
-  // In composite pixels: the canvas over the divisor.
   const ViewRect r{r0.x / div_, r0.y / div_, r0.w / div_, r0.h / div_, r0.shown, r0.cell};
   const int cw_ = canvas_w_ / div_, ch_ = canvas_h_ / div_;
   switch (rot_) {
@@ -344,18 +330,14 @@ void DispOut::comp_rect(const ViewRect& r0, int& cx, int& cy, int& cw, int& ch) 
   cw = turned ? r.h : r.w; ch = turned ? r.w : r.h;
 }
 
-// The grid image for a composite of size d. Each shown view's composite
-// rect lands on a panel rect through the same fit set_layer gives the DE;
-// within it composite pixel c (or chunky cell) covers panel run [ceil(c*pw/n),
-// ceil((c+1)*pw/n)), and the run's first pixel is a seam when the run is at
-// least ceil(pw/n) long -- kern::scale_row_grid's rule, so the seams sit
-// where the scanline tiers put them. Seam rows the same way. Composed in
-// cached memory and copied to fb0 in bulk (uncached; small stores are slow).
+// Composite pixel c covers panel run [ceil(c*pw/n), ceil((c+1)*pw/n)); the
+// run's first pixel is a seam when the run is >= ceil(pw/n) long
+// (kern::scale_row_grid's rule), matching the scanline tiers. Composed in
+// cached memory and copied to fb0 in bulk (uncached stores are slow).
 void DispOut::draw_grid(Dims d) {
   if (grid_layer_ < 0 || d.w <= 0 || d.h <= 0) return;
   const size_t n = static_cast<size_t>(panel_w_) * panel_h_;
   grid_stage_.assign(n, 0u);
-  // The layer may be carrying only the frontend's overlay.
   if (!grid_alpha_) { grid_dims_ = d; grid_dirty_ = false; return; }
   const Fit f = fit(d);
   const u32 seam = static_cast<u32>(grid_alpha_) << 24;
@@ -365,8 +347,7 @@ void DispOut::draw_grid(Dims d) {
     const int pw = p1 - p0;
     if (pw <= 0 || cells <= 0) return;
     const int min_run = (pw + cells - 1) / cells;
-    // At exactly 2x a seam per cell leaves one lit pixel in four; every
-    // other cell gets one instead (Gpu::scale_screen_line does the same).
+    // At exactly 2x, every other cell gets a seam (Gpu::scale_screen_line matches).
     const int pitch = pw == 2 * cells ? 2 : 1;
     for (int c = 0; c < cells; c += pitch) {
       const int a = (c * pw + cells - 1) / cells, b = ((c + 1) * pw + cells - 1) / cells;
@@ -377,24 +358,14 @@ void DispOut::draw_grid(Dims d) {
     if (!r.shown || r.w <= 0 || r.h <= 0) continue;
     int cx, cy, cw, ch;
     comp_rect(r, cx, cy, cw, ch);
-    // Composite x lands on the panel at f.x + (x - f.sx) * f.w / f.sw: the
-    // shown window's own mapping, so a cropped composite's views can start
-    // before the panel's edge (clamped below, as before).
+    // Composite x lands on the panel at f.x + (x - f.sx) * f.w / f.sw.
     auto pxof = [&](int x) { return f.x + static_cast<int>(static_cast<s64>(x - f.sx) * static_cast<s64>(f.w) / static_cast<s64>(f.sw)); };
     auto pyof = [&](int y) { return f.y + static_cast<int>(static_cast<s64>(y - f.sy) * static_cast<s64>(f.h) / static_cast<s64>(f.sh)); };
     const int px0 = pxof(cx), px1 = pxof(cx + cw);
     const int py0 = pyof(cy), py1 = pyof(cy + ch);
     const int cell = (W % r.cell == 0 && H % r.cell == 0) ? r.cell : 1;
-    // A later view (the PiP inset) covers the seams of the one under it, as
-    // its pixels do in the composite; and a view shown smaller than its
-    // source has no run to lead (every panel pixel would be a seam), so it
-    // gets none -- the scanline tiers' downscaled insets are plain too.
     for (int y = std::max(0, py0); y < std::min(panel_h_, py1); ++y)
       std::fill(grid_stage_.data() + static_cast<size_t>(y) * panel_w_ + std::max(0, px0), grid_stage_.data() + static_cast<size_t>(y) * panel_w_ + std::min(panel_w_, px1), 0u);
-    // The cells along each composite axis: composite pixels over the
-    // source-side cell (under a divisor a composite pixel is a cell, and
-    // Display passes cell 1). A view shown smaller than the screen itself
-    // gets no grid, whatever the cell.
     const bool turned = rot_ == 90 || rot_ == 270;
     if (px1 - px0 < (turned ? H : W) || py1 - py0 < (turned ? W : H)) continue;
     const int nx = cw / cell, ny = ch / cell;
@@ -411,8 +382,6 @@ void DispOut::draw_grid(Dims d) {
   grid_dirty_ = false;
 }
 
-// The surface the frontend draws into. Display orientation, so a menu laid
-// out for a 640x480 screen is upright on a panel mounted portrait.
 bool DispOut::overlay(u32*& px, int& pitch, int& w, int& h) {
   if (!overlay_available() || ov_w_ <= 0 || ov_h_ <= 0) return false;
   const size_t n = static_cast<size_t>(ov_w_) * ov_h_;
@@ -432,10 +401,7 @@ void DispOut::overlay_changed(bool any) {
   grid_dirty_ = true;   // recompose before the next flip
 }
 
-// Grid seams first, then the frontend's surface rotated over them, and the
-// result into fb0 -- but only when it differs from the image already there.
-// fb0 is uncached, so a needless 1.2 MB copy is the one cost worth avoiding;
-// the compare is against a cached copy.
+// Skips the copy to fb0 (uncached) when unchanged, checked against a cached copy.
 void DispOut::compose_overlay() {
 #if defined(__linux__)
   if (grid_layer_ < 0) return;
@@ -527,36 +493,14 @@ bool DispOut::open_frontend() {
 }
 
 
-// Nearest neighbour as a polyphase table: the whole weight (64) on the
-// centre sample in every phase, so panel pixel k shows source pixel
-// floor(k * n / pw) -- the same runs the scanline tiers' kern::scale_row
-// draws, and the runs the LCD grid layer (draw_grid) puts its seams on;
-// rounding to the nearer sample from phase 16 was tried and put the
-// scaler's cell edges two panel pixels past the seams. Where the taps
-// live was probed on the A30 with the emulator frozen (the RAM is
-// write-only): horizontally the centre is tap 4 -- the low byte of the
-// second coefficient register -- with tap 5 the next sample; vertically
-// the centre is byte 1 of the one register, byte 2 the next (bytes 0 and 3
-// two samples out). The first horizontal register's bytes carry no weight
-// on this chip, whatever the sun4i tables suggest.
-//
-// The RAM is behind an access control (frm_ctrl bit 23; status bit 11
-// grants it, within a few us): raised, the CPU owns it and the scaler is
-// locked out -- stores with it down are dropped, and while it is up the
-// picture keeps whatever the scaler last read (so a table left raised
-// never shows). So: raise, write, lower, as the driver does. The scaler
-// reads the RAM live, so the lines scanned during a lockout (the driver's
-// on every layer set, then ours) lose their table; presenter() puts the
-// swap right after the vsync return to keep that near the frame's top.
-// The ready bit is a sun4i thing the A33 does not have.
-//
-// An LCD grid in this table (the last panel pixel of each source pixel at
-// reduced weight) was tried: it works, and the swap's lockout band -- a
-// few lines without the filter, invisible with plain nearest -- shows
-// through it as a bright strip every few seconds, and timing the swap into
-// the blank from userspace (DSI line counter + real-time waits) still
-// missed under load because the layer ioctl itself stalls. The grid stays
-// on its layer.
+// Nearest neighbour as a polyphase table: full weight (64) on the centre
+// sample in every phase. Tap positions probed on the A30 (RAM is
+// write-only): horizontally the centre is tap 4, vertically byte 1 of the
+// one register. RAM is behind an access control (frm_ctrl bit 23, status
+// bit 11 grants it) that locks the scaler out while raised, so raise/write/
+// lower as the driver does; presenter() times the swap right after the
+// vsync return to keep the lockout confined near the frame's top. The
+// ready bit is a sun4i thing the A33 lacks.
 void DispOut::write_coefs() {
 #if defined(__linux__)
   fe_[FE_FRM_CTRL] = fe_[FE_FRM_CTRL] | FE_COEF_ACCESS;
@@ -571,10 +515,6 @@ void DispOut::write_coefs() {
 #endif
 }
 
-// One view into the composite. A 1:1 view takes the NEON rotate; any other
-// size is a box downscale (area average over the source block each output
-// pixel covers) into a cached temporary, rotated there, and copied in by
-// rows so the uncached panel memory sees whole lines.
 void DispOut::canvas_point(int compx, int compy, int& x, int& y) const {
   switch (rot_) {
     case 270: x = canvas_w_ - 1 - compy; y = compx; break;
@@ -596,12 +536,10 @@ const u32* DispOut::under_pixel(int x, int y, int index, const u32* const fbs[VI
 
 void DispOut::draw_view(u32* comp, int comp_w, const ViewRect& r0, const u32* fb, int index, const u32* const fbs[VIEWS]) {
   const bool turned = rot_ == 90 || rot_ == 270;
-  // The view's top-left in the composite: the same rotation the pixels get.
   int cx, cy, cw, ch;
   comp_rect(r0, cx, cy, cw, ch);
   u32* dst = comp + static_cast<size_t>(cy) * comp_w + cx;
-  // The view in composite pixels: under a divisor a 1:1 view takes the
-  // downscale below -- the box average over each cell is the chunky mean.
+  // Under a divisor a 1:1 view takes the downscale below (box average = chunky mean).
   const ViewRect r{r0.x / div_, r0.y / div_, r0.w / div_, r0.h / div_, r0.shown, r0.cell};
   if (r.w == W && r.h == H) {
     switch (rot_) {
@@ -613,11 +551,8 @@ void DispOut::draw_view(u32* comp, int comp_w, const ViewRect& r0, const u32* fb
     return;
   }
   if (r.w <= 0 || r.h <= 0 || r.w > W || r.h > H) return;
-  // Downscale, unrotated, into tmp_ (r.w x r.h). A power-of-two factor (the
-  // chunky divisors 2 and 4, the dominant layouts' 128x96) is the common
-  // case and gets a NEON path: rounding halving adds over the pixel pairs of
-  // two rows, one pass per halving (a second pass reads the first's
-  // output from tmp4_).
+  // Downscale, unrotated, into tmp_ (r.w x r.h). Power-of-two factors get a
+  // NEON path: rounding halving adds per pass (a later pass reads tmp4_).
   tmp_.resize(static_cast<size_t>(r.w) * r.h);
 #if DS_DISP_NEON
   int halvings = 0;
@@ -634,12 +569,12 @@ void DispOut::draw_view(u32* comp, int comp_w, const ViewRect& r0, const u32* fb
         u32* o = out + static_cast<size_t>(dy) * ow;
         int dx = 0;
         for (; dx + 4 <= ow; dx += 4) {
-          const uint32x4x2_t a = vld2q_u32(s0 + dx * 2), b = vld2q_u32(s1 + dx * 2);   // even / odd pixels
+          const uint32x4x2_t a = vld2q_u32(s0 + dx * 2), b = vld2q_u32(s1 + dx * 2);
           const uint8x16_t ha = vrhaddq_u8(vreinterpretq_u8_u32(a.val[0]), vreinterpretq_u8_u32(a.val[1]));
           const uint8x16_t hb = vrhaddq_u8(vreinterpretq_u8_u32(b.val[0]), vreinterpretq_u8_u32(b.val[1]));
           vst1q_u32(o + dx, vorrq_u32(vreinterpretq_u32_u8(vrhaddq_u8(ha, hb)), vdupq_n_u32(0xFF000000u)));
         }
-        for (; dx < ow; ++dx) {   // a width not a multiple of 8 source pixels
+        for (; dx < ow; ++dx) {
           const u32 p00 = s0[dx * 2], p01 = s0[dx * 2 + 1], p10 = s1[dx * 2], p11 = s1[dx * 2 + 1];
           u32 v = 0xFF000000u;
           for (int sh8 = 0; sh8 < 24; sh8 += 8) v |= ((((p00 >> sh8) & 0xFF) + ((p01 >> sh8) & 0xFF) + ((p10 >> sh8) & 0xFF) + ((p11 >> sh8) & 0xFF) + 2) / 4) << sh8;
@@ -662,7 +597,6 @@ void DispOut::draw_view(u32* comp, int comp_w, const ViewRect& r0, const u32* fb
       tmp_[static_cast<size_t>(dy) * r.w + dx] = 0xFF000000u | ((rs / n) << 16) | ((gs / n) << 8) | (bs / n);
     }
   }
-  // Rotate into tmp2_ (tw x th) with the same mapping the 1:1 kernels use.
   const int tw = turned ? r.h : r.w, th = turned ? r.w : r.h;
   tmp2_.resize(static_cast<size_t>(tw) * th);
   for (int py = 0; py < th; ++py) for (int px = 0; px < tw; ++px) {
@@ -675,27 +609,20 @@ void DispOut::draw_view(u32* comp, int comp_w, const ViewRect& r0, const u32* fb
     }
     tmp2_[static_cast<size_t>(py) * tw + px] = tmp_[static_cast<size_t>(vy) * r.w + vx];
   }
-  // Into the composite by rows: copied, or blended over the view under it
-  // (drawn first: views go in order) when the inset is translucent. The
-  // pixels under it come from that view's own framebuffer, not the
-  // composite: the panel memory is uncached, and reading a small inset
-  // back through it cost 0.6 ms a frame on the A30. Where no 1:1 view lies
-  // under a pixel (nothing does in the layouts we have) the composite is
-  // read after all.
+  // Blended over the view under it (drawn earlier) when the inset is
+  // translucent, reading that view's own framebuffer rather than the
+  // (uncached) composite; falls back to the composite where nothing is under.
   if (inset_alpha_ == 255 || div_ > 1) {
     for (int py = 0; py < th; ++py) std::memcpy(dst + static_cast<size_t>(py) * comp_w, tmp2_.data() + static_cast<size_t>(py) * tw, static_cast<size_t>(tw) * sizeof(u32));
     return;
   }
   tmp3_.resize(static_cast<size_t>(tw));
-  // A composite row is a straight line on the canvas: its step per pixel.
   const int sx = rot_ == 0 ? 1 : rot_ == 180 ? -1 : 0, sy = rot_ == 270 ? 1 : rot_ == 90 ? -1 : 0;
   for (int py = 0; py < th; ++py) {
     u32* row = dst + static_cast<size_t>(py) * comp_w;
     int x0, y0;
     canvas_point(cx, cy + py, x0, y0);
-    // Usual case: the whole row lies in one 1:1 view -- a strided gather from
-    // its (cached) framebuffer. Otherwise pixel by pixel, the composite
-    // read back where nothing is under it.
+    // Usual case: whole row in one 1:1 view, a strided gather. Else pixel by pixel.
     const u32* u0 = under_pixel(x0, y0, index, fbs);
     const u32* u1 = under_pixel(x0 + sx * (tw - 1), y0 + sy * (tw - 1), index, fbs);
     if (u0 && u1 && (u1 - u0) == static_cast<std::ptrdiff_t>(sx + sy * static_cast<int>(W)) * (tw - 1)) {
@@ -730,8 +657,7 @@ void DispOut::present(const u32* const fb[VIEWS]) {
   }
   for (int v = 0; v < VIEWS; ++v) if (fb[v] && views_[v].shown) draw_view(comp, d.w, views_[v], fb[v], v, fb);
   dims_[buf] = d;
-  // The grid follows the layout: redrawn in place (it is scanned out live,
-  // so a layout change may show one torn refresh of it).
+  // Redrawn in place; scanned out live, so a layout change may show one torn refresh.
   if (grid_layer_ >= 0 && (grid_dirty_ || d.w != grid_dims_.w || d.h != grid_dims_.h)) {
     draw_grid(d);
     compose_overlay();
@@ -748,16 +674,10 @@ void DispOut::present(const u32* const fb[VIEWS]) {
 
 void DispOut::presenter() {
 #if defined(__linux__)
-  // One flip per refresh: take the newest posted frame, wait for the
-  // refresh, and flip to it right then. The layer registers take effect at
-  // the next frame start whenever they are set, but the scaler reads its
-  // coefficient RAM live and the driver's own table goes in, behind a
-  // lockout, inside every layer set before write_coefs() puts ours back --
-  // so the swap goes right after the vsync return, which on the A30 is a
-  // few lines into the frame: what it shows is a handful of lines at the
-  // top with the driver's filter, not a band mid-screen. The ioctls run
-  // outside the lock so a post never waits on them; the buffer taken for
-  // the flip is `queued_` meanwhile, so a post cannot draw into it.
+  // One flip per refresh, timed right after the vsync return so the
+  // driver's own coefficient table (reasserted on every layer set) is
+  // confined to a few lines rather than a mid-screen band before
+  // write_coefs() puts ours back. Ioctls run outside the lock.
   raise_presenter_priority("disp: presenter priority");
   std::unique_lock<std::mutex> lk(mu_);
   for (;;) {
@@ -766,10 +686,10 @@ void DispOut::presenter() {
     queued_ = pending_; pending_ = -1;
     lk.unlock();
     const u64 tw = now_ns();
-    wait_vsync();               // the previously flipped buffer is on the panel now
+    wait_vsync();
     const u64 t0 = now_ns();
     flip(queued_);
-    if (diag_) {                // DS_DISP_DIAG: a refresh wait or a flip that ran long, and the presented frame rate
+    if (diag_) {                // DS_DISP_DIAG: log stalls and frame rate
       const u64 t1 = now_ns();
       ++diag_flips_;
       if (t0 - tw > 40000000ull || t1 - t0 > 8000000ull)
@@ -780,7 +700,7 @@ void DispOut::presenter() {
         diag_mark_ = t1; diag_flips_ = diag_posts_ = 0;
       }
     }
-    if (timing_) {              // DS_DISP_TIMING: how long the swap ran past the vsync return
+    if (timing_) {              // DS_DISP_TIMING: swap time past the vsync return
       const u64 dt = now_ns() - t0;
       flip_ns_sum_ += dt; if (dt > flip_ns_max_) flip_ns_max_ = dt; ++flip_n_;
       if ((flip_n_ & 255) == 0) std::fprintf(stderr, "disp: flip after vsync mean %.0f us, max %.0f us (%llu)\n", flip_ns_sum_ / 1000.0 / flip_n_, flip_ns_max_ / 1000.0, static_cast<unsigned long long>(flip_n_));
@@ -794,9 +714,8 @@ void DispOut::presenter() {
 
 void DispOut::wait_vsync() {
 #if defined(__linux__)
-  // FBIOPAN_DISPLAY on fb0 blocks until the next refresh on this driver (its
-  // FBIO_WAITFORVSYNC returns at once), even with the UI layer off -- checked
-  // the first time through; if it ever returns early, pace by the clock.
+  // FBIOPAN_DISPLAY on fb0 blocks for the next refresh on this driver, even
+  // with the UI layer off; checked once, else pace by the clock.
   if (pan_blocks_) {
     fb_var_screeninfo var{};
     if (ioctl(fb_, FBIOGET_VSCREENINFO, &var) == 0) {

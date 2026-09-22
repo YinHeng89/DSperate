@@ -32,27 +32,11 @@ bool verbose() {
 
 const char* token_name = "/cheevos.token";
 
-// RetroAchievements' "warning" achievements -- the one every set carries to say
-// "Hardcore unlocks cannot be earned using this emulator" is the one we meet.
-// They are a real class, not a naming convention: rcheevos gives them ids from
-// 101000001 up, leaves them out of its own summary counts and never submits
-// them to the server (rc_client.c:25, :954, :4818).
-//
-// They are noise here. This build is Casual-only by design, so a notice that
-// hardcore will not count says nothing the player can act on, and popping a
-// toast (and a screenshot) for it on every launch is worse than saying nothing.
-// It stays in the log.
-//
-// The constant is rcheevos' but lives in its .c file rather than a header, so
-// this copy has to track it across an update; the vendored README says to
-// re-run the tests, and this is one of the things they would not catch.
+// "Warning" achievement ids; rcheevos excludes them from summaries. Casual-only
+// build, so suppress the toast but keep it in the log.
 constexpr u32 WARNING_ACHIEVEMENT_ID = 101000001;
 bool is_warning(u32 id) { return id >= WARNING_ACHIEVEMENT_ID; }
 
-// The callbacks rcheevos is handed, with exactly its signatures, each one
-// finding the session through rc_client_get_userdata and forwarding. Written
-// out rather than casting Client's members to these types: a cast between
-// function pointer types is not something to rely on, and these cost nothing.
 Client* session_of(const rc_client_t* c) {
   return static_cast<Client*>(rc_client_get_userdata(c));
 }
@@ -94,7 +78,7 @@ bool load_credentials(const std::string& dir, Credentials& out, std::string& err
   err.clear();
   const std::string path = dir + token_name;
   std::FILE* f = std::fopen(path.c_str(), "r");
-  if (!f) return true;   // not signed in yet; not a failure
+  if (!f) return true;
 
   char line[512];
   std::string fields[2];
@@ -117,16 +101,12 @@ bool load_credentials(const std::string& dir, Credentials& out, std::string& err
 bool save_credentials(const std::string& dir, const Credentials& in, std::string& err) {
   err.clear();
   if (in.empty()) { err = "nothing to save"; return false; }
-  // A newline in either field would corrupt the file, and neither can legally
-  // contain one.
   if (in.username.find('\n') != std::string::npos || in.token.find('\n') != std::string::npos) {
     err = "credentials contain a newline";
     return false;
   }
 
-  // Written 0600 from the start, not chmod'ed afterwards: a token readable by
-  // another user, even briefly, is a token to treat as compromised. O_EXCL on a
-  // temporary then rename keeps the live file whole if we are interrupted.
+  // 0600 from creation; write to temp file and rename to avoid a half-written file.
   const std::string path = dir + token_name;
   const std::string tmp = path + ".tmp";
   ::unlink(tmp.c_str());
@@ -155,9 +135,7 @@ bool read_token_file(const std::string& path, Credentials& out, std::string& err
   std::FILE* f = std::fopen(path.c_str(), "r");
   if (!f) { err = path + ": " + std::strerror(errno); return false; }
 
-  // Whitespace-delimited words, at most the two we can use. PPSSPP writes the
-  // token with no trailing newline; ours writes "username\ntoken\n". Anything
-  // beyond the second word is ignored rather than guessed at.
+  // At most two words: token-only file, or "username\ntoken".
   std::vector<std::string> words;
   char line[512];
   while (words.size() < 3 && std::fgets(line, sizeof line, f)) {
@@ -185,9 +163,7 @@ bool read_cfw_credentials(const std::string& path, Credentials& out) {
   std::FILE* f = std::fopen(path.c_str(), "r");
   if (!f) return false;
 
-  // The two shapes these files come in, and the only two keys we look for.
-  // Note what is deliberately absent: the password. Both formats keep it in
-  // clear text next to the token and we never read it (see the header).
+  // Only these keys are read; the cleartext password in these files is never touched.
   struct Want { const char* key; std::string* into; };
   const Want wants[] = {
     {"global.retroachievements.username", &out.username},
@@ -226,14 +202,10 @@ bool import_cfw_credentials(Credentials& out, std::string& source) {
   out = Credentials{};
   source.clear();
   std::vector<std::string> paths;
-  // An explicit override first, for a CFW that keeps it somewhere else.
   if (const char* e = std::getenv("DS_CHEEVOS_CFW_CONFIG")) {
     if (*e) paths.push_back(e);
   }
-  // ROCKNIX / batocera-style: what EmulationStation's own sign-in writes.
   paths.push_back("/storage/.config/system/configs/system.cfg");
-  // RetroArch, which most CFWs also ship. Checked second because on ROCKNIX it
-  // is present but empty unless RetroArch itself signed in.
   paths.push_back("/storage/.config/retroarch/retroarch.cfg");
   if (const char* home = std::getenv("HOME")) {
     if (*home) paths.push_back(std::string(home) + "/.config/retroarch/retroarch.cfg");
@@ -282,8 +254,6 @@ bool Client::start(std::string& err) {
 
   http_ = make_curl_backend(err);
   if (!http_) {
-    // Expected on a device whose CFW ships no libcurl, and on the -static
-    // tiers, which cannot dlopen at all. Report once, carry on without.
     unavailable_ = "no HTTP support on this device (" + err + ")";
     state_ = State::Off;
     return false;
@@ -299,18 +269,13 @@ bool Client::start(std::string& err) {
   client_ = c;
   rc_client_set_userdata(c, this);
 
-  // CASUAL MODE. rc_client defaults hardcore ON (rc_client.c:173), so this is
-  // the line that makes this emulator's unlocks honest: DSperate permits save
-  // states and cheats, so it must never claim a hardcore unlock. Submitting one
-  // would put bad data on another person's account, which is the only failure
-  // here with consequences outside our own build. Nothing sets it back.
+  // rc_client defaults hardcore ON; force off since save states/cheats would
+  // corrupt a hardcore unlock claim on the server.
   rc_client_set_hardcore_enabled(c, 0);
 
-  // Memory is read only from inside do_frame/idle, which is how we can promise
-  // that guest memory is touched on the emulation thread and nowhere else.
+  // Restricts guest memory reads to the emulation thread (do_frame/idle).
   rc_client_set_allow_background_memory_reads(c, 0);
 
-  // Whatever set_encore() was told before there was a client to tell.
   rc_client_set_encore_mode_enabled(c, encore_ ? 1 : 0);
 
   if (verbose()) rc_client_enable_logging(c, RC_CLIENT_LOG_LEVEL_VERBOSE, &rc_log);
@@ -332,9 +297,7 @@ void Client::shutdown() {
     worker_.join();
   }
   if (client_) {
-    // Anything still queued is dropped rather than completed: rc_client is
-    // about to go away, and calling back into it mid-teardown is how you get a
-    // crash at exit. rc_client_destroy releases its own pending state.
+    // Queued work is dropped; calling back into rc_client mid-teardown would crash.
     rc_client_destroy(static_cast<rc_client_t*>(client_));
     client_ = nullptr;
   }
@@ -351,18 +314,13 @@ void Client::shutdown() {
 // The worker
 
 void Client::worker_loop() {
-  // main.cpp may have put the whole process under SCHED_RR (emu.realtime), and
-  // this thread inherits it. That is wrong for this thread in a way the project
-  // has already been bitten by: rt-scheduling-closes-the-tail found the frame
-  // tail was preemption by unrelated threads, so a thread that blocks on a
-  // socket for 270 ms must not hold a real-time priority. Drop to SCHED_OTHER
-  // and then below everything else.
+  // May inherit SCHED_RR from the process; a thread blocking on a socket must not
+  // hold real-time priority.
 #if defined(__linux__)
   sched_param sp{};
   sp.sched_priority = 0;
   if (pthread_setschedparam(pthread_self(), SCHED_OTHER, &sp) != 0 && verbose())
     std::perror("cheevos: worker SCHED_OTHER");
-  // Thread-level nice on Linux; ignored if the kernel disallows it.
   if (nice(10) == -1 && errno != 0 && verbose()) std::perror("cheevos: worker nice");
 #endif
 
@@ -409,14 +367,10 @@ void Client::drain_completions() {
       done = std::move(done_.front());
       done_.pop_front();
     }
-    // On the emulation thread, which is the whole point: every rcheevos
-    // callback, and therefore everything that touches rc_client, runs here.
     rc_api_server_response_t res{};
     res.body = done.res.body.c_str();
     res.body_length = done.res.body.size();
-    // 0 when the request never reached a server. rcheevos reads that as a
-    // retryable transport failure and requeues the unlock, which is what a
-    // handheld that left Wi-Fi range needs.
+    // Status 0 (never reached server) is treated by rcheevos as retryable.
     res.http_status_code = done.res.status;
     auto cb = reinterpret_cast<rc_client_server_callback_t>(done.callback);
     if (cb) cb(&res, done.callback_data);
@@ -467,15 +421,10 @@ void load_done(int result, const char* error_message, rc_client_t* c, void* user
     const rc_client_game_t* g = rc_client_get_game_info(c);
     const std::string title = g && g->title ? g->title : "";
     const u32 id = g ? g->id : 0;
-    // A known dump whose game has no published set yet loads with RC_OK and
-    // zero core achievements. That is not "achievements active", and a toast
-    // saying so sends the player looking for a list that is not there.
+    // Zero achievements on RC_OK means a known dump with no published set.
     if (self->achievements().empty()) self->on_empty_set(title, id);
     else self->on_game_loaded(title, id);
   } else if (result == RC_NO_GAME_LOADED) {
-    // The ROM hashed fine, RetroAchievements simply has no set for this dump.
-    // An ordinary outcome, and one the player has to be able to see -- it is
-    // otherwise indistinguishable from the feature being broken.
     self->on_no_set();
   } else {
     self->on_game_failed(error_message ? error_message : "could not load achievements");
@@ -574,8 +523,7 @@ void Client::on_game_loaded(const std::string& title, u32 id) {
   CLOG("game %u loaded: %s\n", id, title.c_str());
 }
 
-// Quiet on purpose: nothing has gone wrong and there is nothing to do, so no
-// popup. The account page says what happened instead.
+// No popup: nothing has gone wrong, nothing to do.
 void Client::on_empty_set(const std::string& title, u32 id) {
   state_ = State::EmptySet;
   CLOG("game %u known (%s) but has no published achievements\n", id, title.c_str());
@@ -583,13 +531,7 @@ void Client::on_empty_set(const std::string& title, u32 id) {
 
 void Client::on_no_set() {
   state_ = State::NoSet;
-  // The hash goes in the message on purpose. RetroAchievements identifies a
-  // *dump*, not a game, and its database holds only the dumps somebody has
-  // registered -- so a ROM dumped from your own cart very often does not match
-  // even when the game certainly has a set. Without the hash there is nothing
-  // the player can do with this message; with it they can check the game's
-  // supported-files list on the site and ask for their dump to be added, which
-  // is the route that exists for exactly this.
+  // Hash identifies a dump, not a game; a legit ROM can still fail to match.
   post(Message::Kind::Problem, "No achievements for this ROM",
        hash_.empty() ? "RetroAchievements does not recognise this dump"
                      : "RetroAchievements does not recognise this dump (hash " + hash_ + ")");
@@ -607,7 +549,7 @@ std::vector<Client::Achievement> Client::achievements() const {
   std::vector<Achievement> out;
   if (!client_) return out;
   rc_client_t* c = static_cast<rc_client_t*>(client_);
-  // Core only: unofficial achievements are a separate opt-in and do not count.
+  // Core category only; unofficial achievements are opt-in separately.
   rc_client_achievement_list_t* list =
       rc_client_create_achievement_list(c, RC_CLIENT_ACHIEVEMENT_CATEGORY_CORE,
                                         RC_CLIENT_ACHIEVEMENT_LIST_GROUPING_LOCK_STATE);
@@ -616,19 +558,14 @@ std::vector<Client::Achievement> Client::achievements() const {
     const rc_client_achievement_bucket_t& bucket = list->buckets[b];
     for (u32 i = 0; i < bucket.num_achievements; ++i) {
       const rc_client_achievement_t* a = bucket.achievements[i];
-      if (!a || is_warning(a->id)) continue;   // and out of the count, as rcheevos does
+      if (!a || is_warning(a->id)) continue;
       Achievement info;
       info.title = a->title ? a->title : "";
       info.description = a->description ? a->description : "";
       info.progress = a->measured_progress;
       info.id = a->id;
       info.points = a->points;
-      // In Casual the unlock we care about is the softcore one; `unlocked` is a
-      // bitmask, and state is what rcheevos derived from it.
-      // Two different questions, and encore is where they come apart: `unlocked`
-      // is whether the account holds it, `active` whether it can trigger now.
-      // Outside encore an earned achievement is not active; inside it, it is
-      // both, which is the whole point of the mode.
+      // unlocked = account holds it; active = can trigger now (both true in encore).
       info.unlocked = a->state == RC_CLIENT_ACHIEVEMENT_STATE_UNLOCKED ||
                       (a->unlocked & RC_CLIENT_ACHIEVEMENT_UNLOCKED_SOFTCORE) != 0;
       info.active = a->state == RC_CLIENT_ACHIEVEMENT_STATE_ACTIVE;
@@ -660,7 +597,6 @@ bool Client::serialize_progress(std::vector<u8>& out) const {
   out.clear();
   if (!client_) return false;
   rc_client_t* c = static_cast<rc_client_t*>(client_);
-  // Nothing to carry unless a set is actually loaded and being evaluated.
   if (!rc_client_get_game_info(c)) return false;
   const size_t n = rc_client_progress_size(c);
   if (n == 0) return false;
@@ -676,9 +612,7 @@ bool Client::deserialize_progress(const u8* data, size_t size) {
   if (!client_ || !data || size == 0) return false;
   rc_client_t* c = static_cast<rc_client_t*>(client_);
   if (!rc_client_get_game_info(c)) return false;
-  // rcheevos validates the blob against the set it currently holds and says so
-  // rather than half-applying it, which is what makes the "reset instead"
-  // fallback safe.
+  // rcheevos validates against the loaded set, so callers can reset() on failure.
   return rc_client_deserialize_progress_sized(c, data, size) == RC_OK;
 }
 
@@ -697,8 +631,6 @@ void Client::handle_event(const void* event_ptr) {
   switch (e->type) {
     case RC_CLIENT_EVENT_ACHIEVEMENT_TRIGGERED:
       if (e->achievement && is_warning(e->achievement->id)) {
-        // No toast, and therefore no screenshot either -- the frontend hangs
-        // both off an Unlock message.
         CLOG("ignoring warning achievement %u: %s\n", e->achievement->id,
              e->achievement->title ? e->achievement->title : "");
       } else if (e->achievement) {
@@ -719,19 +651,16 @@ void Client::handle_event(const void* event_ptr) {
                  e->server_error && e->server_error->error_message ? e->server_error->error_message : "");
       break;
     case RC_CLIENT_EVENT_DISCONNECTED:
-      // Unlocks are being held, not lost. Saying so is the difference between
-      // a player trusting the feature and not.
       self->post(Message::Kind::Problem, "RetroAchievements offline", "unlocks will be sent when the connection returns");
       break;
     case RC_CLIENT_EVENT_RECONNECTED:
       self->post(Message::Kind::Info, "RetroAchievements reconnected", "pending unlocks sent");
       break;
     case RC_CLIENT_EVENT_RESET:
-      // Only raised by enabling hardcore, which this build never does.
       CLOG("ignoring a reset event; hardcore is not supported\n");
       break;
     default:
-      break;   // indicators and leaderboards are phase 4 and later
+      break;
   }
 }
 

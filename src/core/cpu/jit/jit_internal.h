@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // DSperate - Nintendo DS emulator. Copyright (C) 2026 DSperate contributors.
 //
-// Recompiler internals shared by the runtime (stubs, cache) and the
-// translator. Nothing here is visible outside cpu/jit.
+// Recompiler internals shared by the runtime and translator; private to cpu/jit.
 #pragma once
 #include "core/cpu/jit/jit.h"
 #include "core/cpu/cpu.h"
@@ -31,93 +30,66 @@ constexpr u32 OFF_JC_TIM   = sizeof(void*);        // JitCpuHot::timing
 constexpr u32 OFF_JC_ARENA = 2 * sizeof(void*);    // JitCpuHot::arena
 constexpr u32 OFF_JC_TABLE = 3 * sizeof(void*);    // JitCpuHot::table
 inline constexpr u32 off_reg(u32 r) { return OFF_REGS + 4 * r; }
-// The USR/SYS bank slots of r13/r14, for the inline `LDM ^` / `STM ^` (bank 0
-// of CpuContext::bank_r13 / bank_r14). Outside `hot`, so far enough from the
-// context base to be worth checking the scaled-immediate reach.
+// USR r13/r14 bank slots for inline `LDM ^` / `STM ^`; must stay in ldr_w reach.
 constexpr u32 OFF_BANK_R13 = offsetof(CpuContext, bank_r13);
 constexpr u32 OFF_BANK_R14 = offsetof(CpuContext, bank_r14);
 static_assert(OFF_BANK_R13 < 16380 && OFF_BANK_R14 < 16380, "user bank slots out of ldr_w/str_w immediate range");
 
-// Alert bits (JitHot::alerts): set by the runtime while translated code is
-// inside a helper; the post-helper poll leaves the block when any is set.
-constexpr u32 ALERT_INVALIDATED = 1;   // a block was invalidated (possibly this one)
-constexpr u32 ALERT_HALTED      = 2;   // the CPU halted inside a helper
+// Alert bits (JitHot::alerts): post-helper poll leaves the block when set.
+constexpr u32 ALERT_INVALIDATED = 1;   // possibly this block
+constexpr u32 ALERT_HALTED      = 2;
 
 // ---- blocks -----------------------------------------------------------------------
-// Key = guest address with bit 0 = Thumb. ARM keys are word aligned, Thumb
-// keys halfword aligned, so the key is unique per (pc, state).
+// Key = guest pc | Thumb in bit 0.
 inline constexpr u32 make_key(u32 pc, bool thumb) { return thumb ? (pc & ~1u) | 1u : (pc & ~3u); }
 inline constexpr u32 key_pc(u32 key) { return key & ~1u; }
 inline constexpr bool key_thumb(u32 key) { return key & 1; }
 inline constexpr u32 key_r15(u32 key) { return key_pc(key) + (key_thumb(key) ? 4 : 8); }
 inline constexpr u32 key_next(u32 key) { return key + (key_thumb(key) ? 2 : 4); }
 
-// DS_JIT_DENSITY: one slot per *translation*, so a block that is retranslated
-// after an invalidation is a fresh slot and its executions are not merged with
-// the old one's. `execs` is bumped by the block's own entry code; the other two
-// are static properties of that translation. Weighting them by `execs` turns
-// the emitted-bytes-per-guest-instruction figure into an executed one -- the
-// static figure counts a block translated once and run a million times exactly
-// as it counts one translated once and run once.
+// DS_JIT_DENSITY: one slot per translation (not per key).
 struct DensitySlot {
-  u64 execs = 0;          // block entries (bumped from translated code)
-  u32 hot_bytes = 0;      // hot section, the instrumentation itself excluded
-  u32 guest_instrs = 0;   // guest instructions translated inline into this block
-  // DS_JIT_CENSUS (implies density): the static facts about this translation
-  // that, weighted by `execs`, size the A32 backend's design choices
-  // (docs/arm32-jit-scoping.md §6): which guest registers carry the traffic
-  // and cross block boundaries live, how often NZCV are live where a
-  // flag-clobbering host sequence would sit, and how much is fallback.
-  u16 reg_reads[16] = {};   // per-instruction reads of each guest register
-  u16 reg_writes[16] = {};  // per-instruction writes
-  u16 live_in = 0;          // registers read before written in the block
-  u16 written = 0;          // registers written in the block (live-out candidates)
-  u8  n_instrs = 0;         // guest instructions decoded (inline + fallback)
-  u8  n_fallback = 0;       // of which interpreter fallbacks
-  u8  n_mem = 0;            // memory instructions (single, multiple, swap)
-  u8  n_mem_flags_live = 0; // of which with any of NZCV live after them (flags assumed live at block end)
-  u8  n_mem_flags_intra = 0;// of which read by a later instruction of the same block (the certain part)
-  u8  n_flags_live = 0;     // instructions with NZCV live after them
-  bool entry_flags_live = false;   // the block reads NZCV before writing them
+  u64 execs = 0;          // bumped from translated code
+  u32 hot_bytes = 0;      // instrumentation excluded
+  u32 guest_instrs = 0;   // translated inline
+  // DS_JIT_CENSUS (implies density): static facts, weighted by `execs`.
+  u16 reg_reads[16] = {};
+  u16 reg_writes[16] = {};
+  u16 live_in = 0;          // read before written
+  u16 written = 0;
+  u8  n_instrs = 0;         // inline + fallback
+  u8  n_fallback = 0;
+  u8  n_mem = 0;
+  u8  n_mem_flags_live = 0; // NZCV live after
+  u8  n_mem_flags_intra = 0;// NZCV read later in the block
+  u8  n_flags_live = 0;
+  bool entry_flags_live = false;
 };
 
-constexpr u32 GUEST_COPY_MAX = 64 * 4;   // a block is at most 64 ARM instructions
+constexpr u32 GUEST_COPY_MAX = 64 * 4;   // max 64 ARM instructions per block
 
 struct Block {
   u32  key;
   u8*  entry;
-  u32  size;         // bytes of native code
-  u32  hot_size;     // of which the hot section (the cold section follows it)
-  u32  guest_len;    // bytes of guest code covered
-  const u8* host_pages[2];   // 2 KB host pages the guest code lives in (0-2 used)
+  u32  size;         // native bytes
+  u32  hot_size;     // cold section follows
+  u32  guest_len;
+  const u8* host_pages[2];   // 2 KB host pages (0-2 used)
   u32  npages;
-  const u8* host_lo;         // first and last host byte of the guest code: a store that
-  const u8* host_hi;         // touches neither page's part of [lo, hi] leaves the block alone
+  const u8* host_lo;         // guest code host byte range, inclusive
+  const u8* host_hi;
   u8   owner;        // index into Runtime::cpus
   bool dead;
-  bool pooled;       // lives in Runtime::block_pool (freed by the arena reset), not the heap
-  // Static branch targets (emit_branch_static keys): what the pre-translation
-  // worker chases ahead of execution. Best-effort -- targets past `nsucc` 4
-  // are simply not chased.
-  u32  succ[4];
+  bool pooled;       // in Runtime::block_pool (freed by arena reset), not heap
+  u32  succ[4];      // static targets for the pre-translation worker (best-effort)
   u8   nsucc;
-  // Park-and-revive (see kill_block / revive in runtime.cpp): a block killed
-  // by a store into its range keeps its translation, the guest bytes it was
-  // built from, the entry bytes the kill overwrites (backend::ENTRY_PATCH), and the timing
-  // stamp it was built under. When the same key is looked up again and the
-  // guest bytes match one parked version, that version comes back instead of
-  // a retranslation. Exact: the translation is a pure function of (key, guest
-  // bytes, timing stamp, CPU), and everything the kill undid is redone.
+  // Park-and-revive: a killed block keeps code, guest bytes, overwritten entry
+  // bytes and timing stamp; matching guest bytes later revive it.
   u32  entry_words[3];
   u64  stamp;
   u32  guest_copy_len;
   u8   guest_copy[GUEST_COPY_MAX];
-  // Timing-table dependencies (ARM9): the 4 KB pages whose entry this
-  // translation baked a byte from, with which byte (mem::Timing::RETIME_*).
-  // Code pages (the prefetch address of every instruction: up to two), the
-  // static branch target's refill pages (up to two) and the literal pages of
-  // pc-relative loads. A translation that needs more than fit sets
-  // `dep_overflow` and dies on every retime, as every block used to.
+  // ARM9 timing pages baked into this block; on overflow it dies on every retime.
   static constexpr u32 DEP_MAX = 8;
   u32  dep_page[DEP_MAX];
   u8   dep_kind[DEP_MAX];
@@ -125,62 +97,42 @@ struct Block {
   bool dep_overflow;
 };
 
-// Direct-mapped branch-target cache, one per CPU, indexed by `(key >> 1)`.
-// Each entry is one u64, `(native offset << 32) | key`, so a probe is a single
-// load and a tag compare.
-//
-// Size: 64 K entries, 512 KB per CPU. This is *not* the technique's sizing and
-// the difference was measured, not assumed: on the RK3566, 1024 entries costs
-// 1.6-2.7 % of frame time against 64 K, and 8 K entries is the break-even.
-// Bigger than 64 K gains nothing. See README.md, "The branch LUT", for the
-// numbers and why the technique's footprint argument does not transfer here.
-// To re-measure, change LUT_BITS and time the device; the arena reserves room
-// for LUT_BITS_MAX either way. Miss rate needs a temporary counter in
-// `jit_h_lookup`, which is the dispatch stub's only miss path.
+// Per-CPU direct-mapped LUT indexed by key >> 1; entry = (native offset << 32) | key.
 constexpr u32 LUT_BITS = 16;
 constexpr u32 LUT_BITS_MAX = 16;
 constexpr u32 LUT_SIZE = 1u << LUT_BITS;
 constexpr u32 LUT_EMPTY_KEY = 0xFFFFFFFFu;
-// Arena layout: [CPU0 LUT][CPU1 LUT][stubs][blocks...]. The reservation is
-// fixed at the maximum so the per-CPU offsets are constants in the stubs;
-// only the first LUT_SIZE entries of each are ever touched.
+// Arena: [CPU0 LUT][CPU1 LUT][stubs][blocks...]; LUTs reserved at max size so stub offsets are constant.
 constexpr size_t LUT_STRIDE = (size_t{1} << LUT_BITS_MAX) * 8;   // 512 KB
 constexpr size_t LUT_AREA   = 2 * LUT_STRIDE;
 static_assert(LUT_BITS <= LUT_BITS_MAX, "the arena only reserves room for LUT_BITS_MAX");
 
-// Standard-layout head of JitCpu: translated code reaches these through
-// CpuContext::jit with fixed offsets.
+// Standard-layout head of JitCpu; translated code uses fixed offsets (OFF_JC_*).
 struct JitCpuHot {
-  // Page-table entries (pointer-sized) -- or, when this CPU runs on fastmem
-  // (JitCpu::fastmem), the host view's base: translated code then indexes
-  // guest addresses straight off R_PT, and walks load `table` instead.
-  mem::Entry* pt;
-  const u8* timing;    // timing9 (per 4 KB, 8 bytes per entry) or timing7 (per 32 KB, 4 bytes per entry)
-  u8*       arena;     // Runtime::arena: LUT base and block-pointer base (R_ARENA)
-  mem::Entry* table;   // the page table itself, always
+  mem::Entry* pt;      // page table, or (fastmem) host view base; walks then use `table`
+  const u8* timing;    // timing9 (4 KB pages, 8 B/entry) or timing7 (32 KB, 4 B/entry)
+  u8*       arena;     // R_ARENA
+  mem::Entry* table;   // always the page table
 };
 
 struct JitCpu {
   JitCpuHot hot{};
-  bool  fastmem = false;                     // hot.pt is the host view (mem::GuestView), see Runtime::fm_blocks
-  // 32-bit hosts: hot.pt points here instead of at the view. One entry per
-  // 64 MB guest region: region 0 (0x00000000-0x03FFFFFF, where every direct
-  // access of the measured scenes lands) holds the view base, the others
-  // Runtime::fm_guard minus the region's start, so any address outside
-  // region 0 lands in the guard and faults. host = region[a >> 26] + a.
+  bool  fastmem = false;                     // hot.pt is the host view
+  // 32-bit hosts: hot.pt points here; host = region[a >> 26] + a. Region 0 is
+  // the view, others point into fm_guard so they fault.
   u32   fm_region[64] = {};
   CpuContext* ctx = nullptr;
   NDS*  nds = nullptr;
   bool  arm9 = false;
-  u64*  lut = nullptr;                       // into the arena: LUT_SIZE entries, (native offset << 32) | key
+  u64*  lut = nullptr;                       // into the arena
   std::unordered_map<u32, Block*> blocks;
-  std::vector<Block*> all_blocks;            // for flushes
-  std::unordered_map<u32, std::vector<Block*>> parked;   // key -> killed translations kept for revival (newest last)
-  u8*   dispatch = nullptr;                  // w0 = key -> jumps to the block
+  std::vector<Block*> all_blocks;
+  std::unordered_map<u32, std::vector<Block*>> parked;   // killed translations, newest last
+  u8*   dispatch = nullptr;                  // w0 = key
   u8*   link = nullptr;                      // `bl link; .word key`: patches the bl into `b block`
-  u8*   fallback = nullptr;                  // `bl fallback; .word instr; .word key`: interpreter for one instruction, poll, dispatch if it jumped
+  u8*   fallback = nullptr;                  // `bl fallback; .word instr; .word key`: interpret one instr, poll, dispatch
   u8*   branch_indirect = nullptr;           // w0 = target (bit 0 = T): updates T, charges refill, dispatches
-  u8*   branch_indirect_cdi = nullptr;       // same, plus the post-jump CDI charge of LDM/POP pc: w1 = numD, w2 = data address
+  u8*   branch_indirect_cdi = nullptr;       // same, plus LDM/POP pc's CDI charge: w1 = numD, w2 = data address
 };
 
 struct Runtime {
@@ -188,15 +140,11 @@ struct Runtime {
   size_t cap = 0;
   size_t pos = 0;
   size_t stubs_end = 0;        // arena below this is permanent
-  bool   need_reset = false;   // arena full: reset at the next safe point
+  bool   need_reset = false;   // reset at the next safe point
 
-  // C-callable: void enter(CpuContext*, const void* native)
   void (*enter)(CpuContext*, const void*) = nullptr;
-  // Same without the callee-saved frame: for callers that saved x19-x28
-  // themselves and keep nothing in them (the native slice loop).
-  u8* enter_light = nullptr;
-  // void run_loop(Scheduler*): the native slice loop (runtime.cpp, jit::run_loop)
-  void (*run_loop)(void*) = nullptr;
+  u8* enter_light = nullptr;   // enter without saving x19-x28; caller must have
+  void (*run_loop)(void*) = nullptr;   // arg: Scheduler*
   u8* exit_key = nullptr;      // w0 = key of the next instruction; stores r15, leaves
   u8* exit_key_lit = nullptr;  // `bl exit_key_lit; .word key`
   u8* exit_r15 = nullptr;      // ctx.r15 already correct; leaves
@@ -212,54 +160,29 @@ struct Runtime {
 
   JitCpu cpus[2];
 
-  // DS_FASTMEM (core/mem/fastmem.h). A translated load or store on a fastmem
-  // CPU reads its host base straight from the view (`mov x3, R_PT`, the patch
-  // site) and accesses through it; an access the view refuses faults. The
-  // fault handler finds the faulting instruction here, turns its patch site
-  // into a branch to the site's cold walk -- today's page-table path -- and
-  // resumes there, so the access completes exactly as it always did and every
-  // later execution takes the walk. The guest instruction is remembered
-  // (fm_slow) so a retranslation emits the walk from the start.
-  // Registered sites, appended as blocks are installed: blocks sit at rising
-  // addresses within one arena lifetime, so the handler binary-searches
-  // fm_blocks by pc and scans that block's few entries in fm_rels. Cleared
-  // with the arena. (A hash map insert per site was a visible share of
-  // translation.)
+  // DS_FASTMEM: a faulting access site is patched to branch to its cold
+  // page-table walk; fm_slow makes retranslations emit the walk directly.
+  // fm_blocks is sorted by entry for the fault handler. Cleared with the arena.
   struct FmRel { u32 fault, patch, resume; u64 guest; };
   struct FmBlock { const u8* entry; u32 size; u32 first; u32 count; };
   std::vector<FmBlock> fm_blocks;
   std::vector<FmRel> fm_rels;
-  std::unordered_set<u64> fm_slow;                  // fm_key(cpu, pc, thumb) of every site that faulted
-  u64 fm_slow_bits[1024] = {};                      // hash filter over fm_slow: most accesses never faulted
+  std::unordered_set<u64> fm_slow;                  // fm_key()s
+  u64 fm_slow_bits[1024] = {};                      // hash prefilter for fm_slow
   static u32 fm_bit(u64 key) { return static_cast<u32>((key * 0x9E3779B97F4A7C15ull) >> 48); }
   bool fm_is_slow(u64 key) const {
     const u32 b = fm_bit(key);
     return (fm_slow_bits[b >> 6] >> (b & 63) & 1) && fm_slow.count(key);
   }
-  // Faults from the handler, drained into fm_slow on the emulation thread (the
-  // handler does not allocate).
-  u8* fm_guard = nullptr;                           // 32-bit: a 64 MB PROT_NONE range every non-view region maps into
+  u8* fm_guard = nullptr;                           // 32-bit: 64 MB PROT_NONE
+  // Faults, drained into fm_slow on the emulation thread (handler can't allocate).
   u64 fm_ring[512] = {};
   u32 fm_ring_n = 0;
   u64 fm_faults = 0;
-  // Filled by the translator, block-relative: moved to fm_rels when the block is installed.
-  std::vector<FmRel> fm_new;
-  // Blocks translated on the emulation thread; same lifetime as the arena
-  // (deque: stable addresses). One malloc per block was a measurable slice
-  // of an overlay burst's translate stall.
-  std::deque<Block> block_pool;
-  // Blocks installed since the last arena reset (translated, pooled or
-  // adopted). What a translation costs outside the arena -- the Block, its
-  // map/LUT/page-list entries -- is only freed by the reset, and a guest that
-  // runs off into zeroed memory translates a new ~4-instruction block at every
-  // address: tiny code, so the arena takes hundreds of MB of metadata to fill.
-  // translate() asks for the reset at MAX_BLOCKS (runtime.cpp) instead.
-  size_t blocks_live = 0;
-  // host page -> blocks with code on it. The byte range each block covers
-  // on the page is kept in a parallel array (offsets within the page,
-  // lo | hi << 16), so a store's range test scans a few cache lines instead
-  // of dereferencing every Block: Golden Sun keeps a hundred-odd hot blocks
-  // on one ITCM page it also writes data to, ~80 stores a frame.
+  std::vector<FmRel> fm_new;    // moved to fm_rels on block install
+  std::deque<Block> block_pool;   // emulation-thread blocks; deque: stable addresses
+  size_t blocks_live = 0;         // since last reset; translate() resets at MAX_BLOCKS
+  // host page -> blocks; span = lo | hi << 16 (page offsets) for store range tests.
   struct PageBlocks {
     std::vector<Block*> blocks;
     std::vector<u32> span;
@@ -270,48 +193,23 @@ struct Runtime {
   };
   std::unordered_map<const u8*, PageBlocks> code_pages;
   bool trace = false;
-  bool strict = false;    // check the budget after every instruction (exact lockstep with the interpreter)
+  bool strict = false;    // budget check after every instruction (interpreter lockstep)
   bool debug = false;     // DS_JIT_DEBUG: log fallbacks
   bool cyclog = false;    // DS_DEBUG_CYCLES: log the budget after every instruction (needs strict)
-  bool density = false;   // DS_JIT_DENSITY: count block entries so bytes-per-guest-instruction
-                          // can be weighted by execution instead of by translation.
-  bool census = false;    // DS_JIT_CENSUS: the phase-0 census for the A32 backend (implies density)
-  // deque: the entry code holds the absolute address of a slot's `execs`, so
-  // slots must never move. Only the emulation thread appends (DS_JIT_PRETX is
-  // refused in density mode).
+  bool density = false;   // DS_JIT_DENSITY: exec-weighted native bytes per guest instruction
+  bool census = false;    // DS_JIT_CENSUS (implies density)
+  // Entry code embeds &slot.execs: slots must never move. Emulation thread only.
   std::deque<DensitySlot> density_slots;
   bool hist = false;      // DS_JIT_HIST: histogram of fallback executions by pc
-  bool fastcost = false;  // DS_JIT_FASTCOST: measurement knob (inexact data-cost arithmetic)
-  // --cpu-oc (jit::set_cpu_oc): INEXACT opt-in tier. No per-access timing
-  // lookup at all: every data access is priced at translate time at one
-  // constant (ARM9: main RAM's cached load cost, for stores too; ARM7: its
-  // WRAM cost -- see Translator::oc_data_cost), and the whole CD/CDI charge
-  // folds into the block's static cycles.
-  CpuOc cpu_oc = CpuOc::Off;   // see jit::set_cpu_oc; `rt().cpu_oc != CpuOc::Off` is the tier test
-  // DS_JIT_RETIME_ALL: a timing-table rebuild kills every ARM9 block (the old
-  // rule) instead of only the blocks that baked a changed byte. A/B knob.
-  bool retime_all = false;
-  // DS_JIT_COSTPROBE_PART: which half of the per-access cost model the probe
-  // duplicates -- 1 = the timing-table lookup, 2 = the combine arithmetic,
-  // 3 (default) = both. Splits §A's price between the load and the maths.
+  bool fastcost = false;  // DS_JIT_FASTCOST: inexact data-cost arithmetic
+  CpuOc cpu_oc = CpuOc::Off;   // --cpu-oc: inexact, no per-access timing lookup
+  bool retime_all = false;   // DS_JIT_RETIME_ALL: timing rebuild kills all ARM9 blocks
+  // DS_JIT_COSTPROBE_PART: 1 = timing-table lookup, 2 = combine arithmetic, 3 (default) = both.
   int  costprobe_part = 3;
-  bool nocsel = false;    // DS_JIT_NOCSEL: branch around conditional data-processing instead
-                          // of selecting, so the csel form can be A/B'd inside one binary.
-  bool nocost7 = false;   // DS_JIT_NOCOST7: keep the inline ARM7 cost model, so the
-                          // precomputed table can be A/B'd inside one binary.
-  int  costprobe = 0;     // DS_JIT_COSTPROBE: 1 = both CPUs, 9 or 7 = that CPU only.
-  // DS_JIT_MEMPROBE: emit the page-table walk (lsr / ldr / lsl) a second time
-  // ahead of the real one, into the same scratch registers, so the real
-  // sequence overwrites it and emulation is unchanged. The frame-time delta is
-  // what the inline walk costs in instructions -- an upper bound on what
-  // mapping guest memory into host address space could remove. It does NOT
-  // price cache misses: the duplicate load always hits the line the real one
-  // is about to touch, so a miss-dominated walk reads as cheaper than it is.
-  int  memprobe = 0;      // 1 = both CPUs, 9 or 7 = that CPU only.
-                          // Emit the data-cost sequence twice, the first copy's
-                          // result discarded into a dead scratch. Semantics and frame output are
-                          // unchanged (the budget is still charged exactly once), so the A/B runs
-                          // the identical workload; the delta prices the per-access cost accounting.
+  bool nocsel = false;    // DS_JIT_NOCSEL: branch instead of csel for conditional ALU ops
+  bool nocost7 = false;   // DS_JIT_NOCOST7: inline ARM7 cost model instead of the table
+  int  costprobe = 0;     // DS_JIT_COSTPROBE: 1 = both CPUs, 9 or 7 = that CPU
+  int  memprobe = 0;      // DS_JIT_MEMPROBE: extra page-table walk (always hits); 1/9/7 as above
   std::unordered_map<u64, u64> fallback_hist;
   Stats stats;
 };
@@ -327,41 +225,26 @@ void   lut_insert(JitCpu& jc, Block* b);
 DensitySlot* density_new_slot();                 // null unless DS_JIT_DENSITY
 Block* translate(JitCpu& jc, u32 key);          // null when the arena is full
 const u8* find_native(JitCpu& jc, u32 key);      // translates on miss; null when arena is full
-// ---- backend -----------------------------------------------------------------------
-// What the host-specific half provides (a64/, a32/): the stubs, the
-// translator, and the two code patches the runtime applies itself. Every
-// backend agrees on the Runtime/JitCpu stub slots, the LUT entry format
-// `(native offset << 32) | key`, and the literal-argument stub convention.
+// ---- backend (a64/, a32/) ----
 namespace backend {
-// Bytes the killed-block redirect overwrites at a block's entry; a block is
-// always at least this long, and revive restores exactly these.
+// Bytes the killed-block redirect overwrites; every block is at least this long.
 constexpr u32 ENTRY_PATCH = 12;
-// Emit every stub into rt.arena after the LUTs, fill the Runtime/JitCpu stub
-// pointers, set rt.stubs_end and rt.pos.
 void emit_stubs(Runtime& rt);
-// Emit one block for `key` into buf[0..cap). Returns false when it ran out
-// of room (the caller resets the arena); `size` is the bytes emitted.
+// False when out of room (caller resets the arena).
 bool translate_block(JitCpu& jc, u32 key, u8* buf, size_t cap, Block& b, u32& size);
-// Overwrite a killed block's first ENTRY_PATCH bytes with a jump into the
-// dispatcher carrying `key`.
 void write_entry_redirect(u8* entry, u32 key, const u8* dispatch);
-// Whether this backend emits fastmem accesses (Runtime::fm_sites).
 bool fastmem_capable();
-// Turn the `bl link` at `site` into a direct branch to `target`.
 void patch_link(u8* site, const u8* target);
-// 0 when `word` is not a pc-relative branch, else a class id equal for two
-// encodings of the same branch kind (DS_JIT_PRETX_VERIFY tolerates those).
+// 0 if not a pc-relative branch, else an id equal across encodings of the same kind.
 u32  relative_branch_class(u32 word);
 }
 
 // Helpers called from translated code (through the stubs).
 extern "C" {
 u32         jit_h_fallback(CpuContext* cpu, u32 instr, u32 key);   // returns cpu->jumped
-// The DSi ARM9 BIOS SHA-1 loop (bios_sha1.cpp). The translator asks at a
-// block start; the block then begins with a fallback call carrying
-// BIOS_SHA1_MARKER, which runs iterations natively (returns true, pc set) or
-// declines and lets the translated instructions run.
-constexpr u32 BIOS_SHA1_MARKER = 0xE7F5A1F0;   // an undefined instruction: never a real fallback
+// DSi ARM9 BIOS SHA-1 loop: such blocks begin with a fallback carrying this
+// marker (an undefined instruction), which runs it natively or declines.
+constexpr u32 BIOS_SHA1_MARKER = 0xE7F5A1F0;
 bool bios_sha1_hook_wanted(CpuContext& cpu, u32 pc, bool thumb);
 bool bios_sha1_run(CpuContext& cpu);
 const void* jit_h_lookup(CpuContext* cpu, u32 key);
@@ -378,7 +261,6 @@ void        jit_h_st16(CpuContext* cpu, u32 addr, u32 v);
 void        jit_h_st32(CpuContext* cpu, u32 addr, u32 v);
 }
 
-// Flush the instruction cache for freshly written code.
 inline void sync_icache(u8* start, size_t len) { __builtin___clear_cache(reinterpret_cast<char*>(start), reinterpret_cast<char*>(start + len)); }
 
 } // namespace ds::jit

@@ -1,16 +1,13 @@
 #version 450
-// The native-resolution planes from the hi-res ones (P3 at S >= 2): one
-// invocation per native pixel taking the top-left subpixel -- no filter,
-// because this plane goes where the DS's own layer went (the CPU composite
-// on capturing frames, display capture into VRAM, save states), and a
-// filtered colour there would be an invented one. With DS_FF_SHRINK3 the
-// attribute and depth records shrink too: the native-resolution translucent
-// tail draws on all three (vk_raster.cpp, "native tail").
+// Native-resolution planes from the hi-res ones (S >= 2): one invocation per
+// native pixel, top-left subpixel, no filter (a filtered colour would be
+// invented where the DS's own layer is expected). DS_FF_SHRINK3 also shrinks
+// attribute and depth for the native-resolution translucent tail.
 #extension GL_GOOGLE_include_directive : require
 #define DS_GLSL 1
 #include "vk_layout.h"
 layout(local_size_x = 64) in;
-layout(std430, binding = 4) readonly buffer Out { uint fb[]; };        // the hi-res layer, 256S x 192S
+layout(std430, binding = 4) readonly buffer Out { uint fb[]; };        // hi-res layer, 256S x 192S
 layout(std430, binding = 6) readonly buffer Depth { uint zbuf[]; };
 layout(std430, binding = 7) readonly buffer Attr { uint abuf[]; };
 layout(std430, binding = 12) writeonly buffer Nat { uint nat[]; };    // 256 x 192

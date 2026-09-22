@@ -23,13 +23,12 @@ u16 crc16(const u8* data, u32 len, u16 start) {
 namespace {
 void w16(u8* p, u16 v) { p[0] = static_cast<u8>(v); p[1] = static_cast<u8>(v >> 8); }
 
-// Field offsets follow GBATEK "DS Firmware Header" / "User Settings" and the
-// values melonDS's generated firmware uses (SPI_Firmware.cpp).
+// Field offsets follow GBATEK "DS Firmware Header" / "User Settings".
 void fill_header(u8* h, u32 size, u8 console_type) {
   std::memset(h, 0, 0x200);
-  std::memcpy(h + 0x08, "DSPR", 4);            // identifier: not "MACP", so nothing mistakes it for a dump
+  std::memcpy(h + 0x08, "DSPR", 4);            // not "MACP", so it's not mistaken for a dump
   h[0x1D] = console_type;                      // 0x20 DS Lite, 0x57 DSi
-  w16(h + 0x20, static_cast<u16>((size - 0x200) >> 3));   // user settings offset (/8): the last two pages
+  w16(h + 0x20, static_cast<u16>((size - 0x200) >> 3));   // user settings offset (/8)
   w16(h + 0x2C, 0x138);                        // wifi config length
   h[0x2F] = 6;                                 // wifi version W006
   static const u8 unused3[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00};
@@ -62,8 +61,7 @@ void fill_user(u8* u, const UserSettings& s) {
   u16 len;
   put_utf16(u + 0x06, s.nickname, 10, &len); std::memcpy(u + 0x1A, &len, 2);
   put_utf16(u + 0x1C, s.message, 26, &len);  std::memcpy(u + 0x50, &len, 2);
-  // Touch calibration: identity in ADC<<4 form (normalise_touch_calibration
-  // writes the same values over a dump).
+  // Identity touch calibration, ADC<<4 form.
   w16(u + 0x58, 0); w16(u + 0x5A, 0); u[0x5C] = 0; u[0x5D] = 0;
   w16(u + 0x5E, 255 << 4); w16(u + 0x60, 191 << 4); u[0x62] = 255; u[0x63] = 191;
   w16(u + 0x64, static_cast<u16>((s.language & 7) | (7 << 3)));   // language, backlight max
@@ -74,8 +72,7 @@ void fill_user(u8* u, const UserSettings& s) {
 std::vector<u8> build(const UserSettings& user, u32 size, u8 console_type) {
   std::vector<u8> fw(size, 0xFF);
   fill_header(fw.data(), size, console_type);
-  fw[0x2FF] = 0x80;                            // boot0: NAND as stage-2 medium (as melonDS)
-  // Wifi access points sit just below the user settings.
+  fw[0x2FF] = 0x80;                            // boot0: NAND as stage-2 medium
   fill_access_point(fw.data() + size - 0x600, true, console_type == 0x57);
   fill_access_point(fw.data() + size - 0x500, false, false);
   fill_access_point(fw.data() + size - 0x400, false, false);
@@ -121,15 +118,10 @@ std::vector<u8> generate_firmware(const UserSettings& user) { return build(user,
 
 std::vector<u8> generate_firmware_dsi(const UserSettings& user, u8 language, u16 language_mask) {
   std::vector<u8> fw = build(user, 0x20000, 0x57);
-  // The Wi-Fi board and flash type as a retail DSi's (read from a dump: board
-  // 2, which NDS::setup_direct_boot_dsi keys the board words at 0x020005E0 on).
+  // Wi-Fi board/flash type of a retail DSi (board 2).
   fw[0x1FD] = 0x02;
   fw[0x1FE] = 0x20;
-  // Both user-settings copies as a DSi keeps them: the settings word with its
-  // "set" flags (bits 10-15) and the extended block at 0x74 -- version 1, the
-  // language (which may be Chinese or Korean, past the 3-bit field) and the
-  // region's supported-language mask, under its own CRC. DSi titles take
-  // their language from it: without it Shantae finds no localisation.
+  // Extended user-settings block at 0x74: version, language, region mask, own CRC.
   for (u32 blk = 0; blk < 2; ++blk) {
     u8* u = fw.data() + 0x20000 - 0x200 + blk * 0x100;
     w16(u + 0x64, static_cast<u16>((language & 7) | 0xFC00));

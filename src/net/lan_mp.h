@@ -1,18 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // DSperate - Nintendo DS emulator. Copyright (C) 2026 DSperate contributors.
 //
-// Local wireless over the LAN: the MpTransport that carries DS frames between
-// emulator instances on a network, in melonDS's wire format (net/LAN.cpp,
-// protocol version 1) so a DSperate is a peer of a melonDS. One host and up
-// to fifteen clients; the host is found by a UDP broadcast on port 7063 or
-// named by address; game traffic is ENet on port 7064, two channels (control
-// commands, MP frames).
+// Local wireless over the LAN: MpTransport carrying DS frames between
+// instances, in melonDS's wire format (interoperable with real melonDS). One
+// host, up to fifteen clients; discovery is UDP broadcast on port 7063, game
+// traffic is ENet on port 7064.
 //
-// Everything here runs on the emulation thread, as melonDS does it:
-// process() once per frame drives ENet and the discovery socket, the send
-// calls are immediate, the recv calls poll, and recv_replies (the MP host
-// waiting for its clients' time slots) waits up to recv_timeout_ms. That
-// wait is the one place a session can stall a frame (docs/wifi-scoping.md).
+// Runs on the emulation thread: process() drives ENet/discovery once a
+// frame, sends are immediate, recvs poll; recv_replies blocks up to
+// recv_timeout_ms -- the one place a session can stall a frame.
 #pragma once
 
 #include "core/io/wifi_transport.h"
@@ -35,7 +31,7 @@ public:
   LanMp& operator=(const LanMp&) = delete;
 
   enum class PlayerStatus : u32 { None = 0, Client, Host, Connecting, Disconnected };
-  // melonDS's Player, byte for byte (it travels in the player-list command).
+  // melonDS's Player, byte for byte (travels in the player-list command).
   struct Player {
     s32  id = 0;
     char name[32] = {};
@@ -60,13 +56,8 @@ public:
   bool start_discovery();
   void end_discovery();
   bool start_host(const std::string& player_name, int max_players);
-  // Listen for hosts' discovery beacons for scan_ms (melonDS hosts send one
-  // a second); join the first heard, else host. What --netplay does.
-  //
-  // host_fallback false makes it join-only: heard nobody, or the join failed,
-  // and it gives up rather than becoming the host. That is the difference
-  // between the menu's AUTO and its GUEST -- a second console told to be a
-  // guest must not quietly become the session everyone else then joins.
+  // Listen for beacons up to scan_ms; join the first heard, else host unless
+  // host_fallback is false (menu GUEST: never silently becomes the host).
   enum class Role { None, Host, Guest };
   Role start_auto(const std::string& player_name, int scan_ms = 2500, int max_players = 16,
                   bool host_fallback = true);
@@ -80,21 +71,11 @@ public:
   int my_id() const { return me_.id; }
 
   void process();                          // once per frame
-  // One step of a discovery-only scan: no session, just listening for hosts'
-  // beacons, to be called once a frame between start_discovery() and
-  // end_discovery(). process() does this too, but only inside a session;
-  // this is the scan a guest runs while it has none.
-  void scan_step();
-  // The end of such a scan: take the first session heard that has room and
-  // join it, and end the discovery either way. This is start_auto's second
-  // half without its blocking loop -- a frontend that cannot afford to stop
-  // for two and a half seconds drives start_discovery() / scan_step() itself
-  // across that many frames and then calls this. Guest only: there is no
-  // host fallback here, and error() says why when it returns false.
+  void scan_step();                        // discovery-only scan; call between start_discovery()/end_discovery()
+  // Ends a scan_step() scan: joins the first session with room if any, ends
+  // discovery either way. Non-blocking counterpart to start_auto; guest only, no host fallback.
   bool scan_join(const std::string& player_name);
-  // How long the emulation thread has blocked in the MP host's reply wait
-  // (and the client's host-packet wait): the cost local wireless puts on a
-  // frame. docs/wifi-scoping.md, pacing.
+  // Time the emulation thread has blocked in the MP reply/host-packet waits.
   unsigned wait_count() const { return wait_count_; }
   double wait_total_ms() const { return wait_total_ms_; }
   double wait_max_ms() const { return wait_max_ms_; }
@@ -140,7 +121,7 @@ private:
   u32 host_address_ = 0;
   u16 connected_mask_ = 0;
   int recv_timeout_ms_ = 25;
-  u32 stale_ms_ = 64;               // queued frames older than this are dropped (melonDS: 16); DS_LAN_STALE_MS
+  u32 stale_ms_ = 64;               // DS_LAN_STALE_MS; melonDS uses 16
   int last_host_id_ = -1;
   _ENetPeer* last_host_peer_ = nullptr;
   std::queue<_ENetPacket*> rx_;

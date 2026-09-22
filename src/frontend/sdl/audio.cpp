@@ -15,14 +15,12 @@ bool Audio::open(bool native_rate) {
   SDL_AudioSpec want{}, got{};
   want.freq = static_cast<int>(spu::Spu::SAMPLE_RATE);
   if (native_rate) {
-    // The device's own rate, asked for explicitly: a daemon-backed device
-    // accepts any rate and converts, so "allow a change" alone never
-    // changes anything. SDL 2.24 can ask the default device; before that
-    // 48 kHz is what every such daemon runs at.
+    // Ask for the device's own rate explicitly: a daemon-backed device
+    // accepts and converts any rate, so "allow a change" alone changes
+    // nothing. 48 kHz is the daemon default before SDL 2.24's query exists.
     int freq = 48000;
 #if SDL_VERSION_ATLEAST(2, 24, 0)
-    // Only the daemon backends implement the query; SDL 2.30's ALSA backend
-    // crashes inside it (RG DS, 2026-09-04) rather than failing.
+    // Only daemon backends implement the query; some ALSA backends crash in it.
     const char* drv = SDL_GetCurrentAudioDriver();
     if (drv && (std::strcmp(drv, "pipewire") == 0 || std::strcmp(drv, "pulseaudio") == 0)) {
       SDL_AudioSpec def{};
@@ -39,18 +37,10 @@ bool Audio::open(bool native_rate) {
   if (!dev_) { std::fprintf(stderr, "audio: %s (continuing without sound)\n", SDL_GetError()); return false; }
   rate_ = got.freq > 0 ? static_cast<u32>(got.freq) : spu::Spu::SAMPLE_RATE;
   dev_samples_ = got.samples;
-  // A DS frame, not 1/60 s: the console runs at 59.8261 Hz, and this number
-  // is what a frame of queue depth means to the controller.
   frame_bytes_ = static_cast<u32>(static_cast<u64>(rate_) * 4 * CYCLES_PER_FRAME / ARM9_CLOCK_HZ);
   prev_l_ = prev_r_ = 0; phase_ = 0;
   stats_ = Stats{};
   SDL_PauseAudioDevice(dev_, 0);
-  // The buffer is reported in frames of audio as well as samples: it is the
-  // floor under any queue target, and "2048 samples" does not say that "2.55
-  // DS frames" does. The input rate is not named here -- everything goes
-  // through the resampler now, and a DSi title can move the SPU to 47605 Hz
-  // mid-session, so the rate the sound is coming *from* is a live number and
-  // belongs in the statistics line rather than in a message printed once.
   std::fprintf(stderr, "audio: %s driver, %d Hz, %d channels, %u-sample buffer (%.2f frames)\n",
                SDL_GetCurrentAudioDriver() ? SDL_GetCurrentAudioDriver() : "?",
                got.freq, got.channels, got.samples, device_buffer_frames());
@@ -81,7 +71,7 @@ const std::vector<s16>& Audio::capture() {
   if (!cap_) return mic_;
   const u32 per_frame = spu::Spu::SAMPLE_RATE / 60 + 1;
   u32 avail = SDL_GetQueuedAudioSize(cap_) / 2;
-  if (avail > per_frame * 4) {                   // stale backlog (a stalled frame): keep the newest
+  if (avail > per_frame * 4) {                   // stale backlog: keep the newest
     std::vector<s16> junk(avail - per_frame * 2);
     SDL_DequeueAudio(cap_, junk.data(), static_cast<u32>(junk.size() * 2));
     avail = per_frame * 2;
@@ -93,14 +83,9 @@ const std::vector<s16>& Audio::capture() {
 }
 
 void Audio::push(NDS& nds, bool drop) {
-  // The SPU's rate is not a constant: a DSi title can select 47.6 kHz
-  // through SNDEXCNT mid-session. Re-reading it here costs nothing and
-  // keeps the resampler honest when it changes. The exact rate, not the
-  // nominal 32768 -- see Spu::output_rate_hz().
-  in_rate_ = nds.spu.output_rate_hz();
+  in_rate_ = nds.spu.output_rate_hz();   // live: a DSi title can move it to 47.6 kHz via SNDEXCNT
 
-  // Measure before queueing, so the depth is what the device has left to
-  // play rather than what it has plus this frame.
+  // Measure before queueing: depth is what's left to play, not plus this frame.
   if (dev_) {
     const u32 queued = SDL_GetQueuedAudioSize(dev_);
     const double now = static_cast<double>(queued) / frame_bytes_;
@@ -115,10 +100,7 @@ void Audio::push(NDS& nds, bool drop) {
     if (now > stats_.max_depth) stats_.max_depth = now;
   }
 
-  // Fast forward outruns the speakers whatever the rate is, and a queue that
-  // is not being consumed cannot be steered: both drop whole frames. Neither
-  // teaches the controller anything, so its state is left where it is.
-  if (over_ || (drop && (!dev_ || SDL_GetQueuedAudioSize(dev_) > frame_bytes_ * target_frames_))) {   // target_frames_ is fractional; the comparison promotes
+  if (over_ || (drop && (!dev_ || SDL_GetQueuedAudioSize(dev_) > frame_bytes_ * target_frames_))) {
     ++stats_.dropped;
     nds.spu.drain();
     return;
@@ -137,11 +119,8 @@ void Audio::push(NDS& nds, bool drop) {
   size_t n;
   while ((n = nds.spu.take(buf, 2048)) != 0) {
     if (!dev_) continue;
-    // Always through the resampler, even when the rates match: the trim is
-    // applied here, so a bypass would be a path with no rate control on it.
-    // The step is input frames per output frame, 16.16 -- a larger step
-    // emits fewer output frames from the same input, which is what draining
-    // a deep queue means.
+    // Always resampled, even at matching rates, since the trim is applied
+    // here. Step is input frames per output frame, 16.16.
     const double ratio = in_rate_ / rate_ * speed_ * (1.0 + trim_);
     const u32 step = static_cast<u32>(ratio * 65536.0 + 0.5);
     out_.resize((static_cast<size_t>(n / ratio) + 2) * 2);
@@ -162,7 +141,6 @@ void Audio::push(NDS& nds, bool drop) {
     s16* out = out_.data();
     if (muted_) std::memset(out, 0, m * 4);
     else if (volume_ != 100) {
-      // Linear in amplitude; the SPU's own master volume is the game's.
       const int g = volume_ * 256 / 100;
       for (size_t i = 0; i < m * 2; ++i) out[i] = static_cast<s16>((out[i] * g) >> 8);
     }
@@ -176,7 +154,7 @@ void Audio::set_speed(double factor) {
 
 void Audio::apply_target_ms(double ms) {
   target_frames_ = std::clamp(ms, MIN_MS, MAX_MS) / FRAME_MS;
-  depth_ = -1.0;      // the target moved: measure again rather than chase the old error
+  depth_ = -1.0;      // target moved: measure again rather than chase the old error
   trim_ = 0.0;
 }
 
@@ -204,9 +182,8 @@ void Audio::queue_silence(double ms) {
 
 void Audio::auto_tick(bool on_time) {
   if (!auto_ || !dev_) return;
-  // After a step -- and after startup, where the queue fills from empty and
-  // would otherwise read as a run of underruns and grow the target on a
-  // fault that is over before anything could answer it.
+  // Ignore right after a step, and at startup (queue filling from empty
+  // would otherwise read as underruns and grow the target needlessly).
   if (auto_settle_ > 0) { --auto_settle_; auto_dry_mark_ = stats_.dry; return; }
 
   ++auto_frames_;
@@ -222,7 +199,6 @@ void Audio::auto_tick(bool on_time) {
                  static_cast<unsigned long long>(dry), auto_on_time_, auto_frames_,
                  !keeping_up ? "behind, leaving it" : dry ? "grow" : "clean");
   if (!keeping_up) {
-    // Behind on its own account. Depth cannot answer that, so leave it.
     auto_calm_ = 0;
   } else if (dry) {
     if (now < AUTO_MAX_MS) {
@@ -233,7 +209,6 @@ void Audio::auto_tick(bool on_time) {
     }
     auto_calm_ = 0;
   } else if (++auto_calm_ >= AUTO_CALM_WINDOWS) {
-    // Clean for long enough to believe it: give the latency back.
     if (now > AUTO_MIN_MS) { apply_target_ms(now - AUTO_STEP_MS); auto_settle_ = AUTO_SETTLE; }
     auto_calm_ = 0;
   }
@@ -248,7 +223,6 @@ void Audio::set_volume(int percent) {
 void Audio::pause(bool p) {
   if (!dev_) return;
   SDL_PauseAudioDevice(dev_, p ? 1 : 0);
-  // The queue is gone, so what the controller had learned about it is too.
   if (p) { SDL_ClearQueuedAudio(dev_); over_ = false; depth_ = -1.0; trim_ = 0.0; }
 }
 

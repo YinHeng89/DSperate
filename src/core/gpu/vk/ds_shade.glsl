@@ -2,17 +2,12 @@
 // DSperate - Nintendo DS emulator. Copyright (C) 2026 DSperate contributors.
 #ifndef DS_SHADE_GLSL
 #define DS_SHADE_GLSL
-// The pixel: texture sampling, the colour combine and the alpha blend, shared
-// by the resolve pass (which shades each pixel's order-free winner once) and
-// the raster's ordered loop (which shades the tail). Included after the
-// includer has declared the Texels and Post buffers and the `pc` push
-// constant. Everything here is Renderer3D's arithmetic in Renderer3D's order.
+// Texture sampling, colour combine, alpha blend, shared by the resolve pass
+// and raster's ordered tail. Includer must declare Texels/Post and `pc` first.
 
 // ---- texture ---------------------------------------------------------------
 
-// texcache decodes to one 32-bit word per texel: the 16-bit RGB555 colour in
-// the low half, the 5-bit alpha above. One load, no palette chain -- which is
-// why the GPU can sample it without knowing any of the six texel formats.
+// Texel: 16-bit RGB555 in low half, 5-bit alpha above.
 uint sample_tex(GpuPoly p, int s, int t) {
   int w = int(p.tex_w), h = int(p.tex_h);
   s >>= 4; t >>= 4;
@@ -23,14 +18,14 @@ uint sample_tex(GpuPoly p, int s, int t) {
   if (rep_t) { if (flp_t && (t & h) != 0) t = (h - 1) - (t & (h - 1)); else t &= h - 1; }
   else       t = clamp(t, 0, h - 1);
 #ifdef DS_TEXEL_BUFFER
-  if ((pc.f.flags & DS_FF_TEX0) != 0u) return texelFetch(texels_tb, int(p.tex_offset)).r;   // attribution
-  return texelFetch(texels_tb, int(p.tex_offset + uint(t * w + s))).r;   // the texture cache's path, not load/store (the triangle path)
+  if ((pc.f.flags & DS_FF_TEX0) != 0u) return texelFetch(texels_tb, int(p.tex_offset)).r;
+  return texelFetch(texels_tb, int(p.tex_offset + uint(t * w + s))).r;
 #else
   return texels[p.tex_offset + uint(t * w + s)];
 #endif
 }
 
-// 15-bit colour channel -> 6 bits: bits 1-5 of the field, +1 when non-zero.
+// 15-bit channel -> 6 bits: bits 1-5 of the field, +1 when non-zero.
 uint c15_to_18(uint c, uint shift) {
   uint v = ((shift == 0u ? (c << 1) : (c >> shift)) & 0x3Eu);
   return v != 0u ? v + 1u : v;
@@ -38,17 +33,13 @@ uint c15_to_18(uint c, uint shift) {
 
 // ---- the pixel -------------------------------------------------------------
 
-// Renderer3D::shade_pixel.
 uint shade_pixel(GpuPoly p, uint blendmode, uint polyalpha, bool textured,
                  int vr9, int vg9, int vb9, int s, int t) {
   uint vr = uint(vr9 >> 3) & 0x3Fu, vg = uint(vg9 >> 3) & 0x3Fu, vb = uint(vb9 >> 3) & 0x3Fu;
   uint r, g, b, a;
-  // Blend mode 2 is toon or highlight, chosen by DISP3DCNT bit 1. Toon
-  // replaces the vertex colour outright from a 32-entry table indexed by the
-  // red channel; highlight instead greys the vertex colour to its own red and
-  // ADDS the table entry after the texture combine, which is why the second
-  // half of this sits below. `vr` survives the highlight branch untouched, so
-  // both lookups index the same original red -- as on the CPU.
+  // Mode 2 = toon or highlight (DISP3DCNT bit 1). Toon replaces vertex colour
+  // via the 32-entry table; highlight greys to its own red and ADDS the table
+  // entry after texture combine (below); `vr` stays untouched for both lookups.
   bool highlight = (pc.f.dispcnt & 2u) != 0u;
   if (blendmode == 2u) {
     if (highlight) { vg = vr; vb = vr; }
@@ -88,7 +79,6 @@ uint shade_pixel(GpuPoly p, uint blendmode, uint polyalpha, bool textured,
   return r | (g << 8) | (b << 16) | (a << 24);
 }
 
-// Renderer3D::alpha_blend.
 uint alpha_blend(uint dispcnt, uint src, uint dst, uint alpha) {
   uint dsta = dst >> 24;
   if (dsta == 0u) return src;

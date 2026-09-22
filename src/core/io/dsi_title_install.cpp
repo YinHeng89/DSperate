@@ -53,9 +53,6 @@ bool read_dsiware(const std::string& path, std::vector<u8>& srl, std::string* er
   std::vector<u8> b(std::istreambuf_iterator<char>(f), {});
   std::string why;
 
-  // A zipped title: the archive holds the .cia (or the bare SRL) and the rest
-  // of this reads the entry's bytes, so a zipped and a loose copy of the same
-  // title behave identically from here on.
   if (cart::is_zip(b.data(), b.size())) {
     std::vector<u8> inner;
     std::string zerr, chosen;
@@ -66,8 +63,8 @@ bool read_dsiware(const std::string& path, std::vector<u8>& srl, std::string* er
     b = std::move(inner);
   }
 
-  // A CIA: header, certificates, ticket, TMD, then the content, each padded to
-  // 64 bytes. A DSiWare CIA's only content is the SRL itself.
+  // CIA layout: header, certs, ticket, TMD, then content, each padded to 64
+  // bytes. A DSiWare CIA's only content is the SRL itself.
   const bool cia = b.size() >= 0x20 && rd32le(&b[0]) == 0x2020;
   if (cia) {
     auto al = [](u64 x) { return (x + 0x3F) & ~u64{0x3F}; };
@@ -75,10 +72,9 @@ bool read_dsiware(const std::string& path, std::vector<u8>& srl, std::string* er
     if (tmd + 4 > b.size()) { if (err) *err = path + ": truncated CIA"; return false; }
     const u64 content = al(tmd + rd32le(&b[16]));
     const u64 size = rd64le(&b[24]);
-    // The content chunk record: in a 3DS TMD (RSA-2048/SHA-256) after the
-    // signature block (0x140), the header (0xC4) and 64 content info records
-    // (0x900); in a DSi TMD, which some tools put in a CIA and which is the
-    // one the launcher accepts, straight after the header at 0x1E4.
+    // Content chunk record: in a 3DS TMD, after signature block (0x140),
+    // header (0xC4) and 64 content info records (0x900); in a DSi TMD (the
+    // one the launcher accepts), straight after the header at 0x1E4.
     const u32 sig = rd32be(&b[tmd]);
     const u64 rec = sig == 0x00010001 ? tmd + 0x1E4 : tmd + 0x204 + 0x900;
     if ((sig != 0x00010004 && sig != 0x00010001) || rec + 0x10 > b.size() || content + size > b.size()) {
@@ -148,7 +144,7 @@ std::vector<u8> make_dsi_save(u32 len) {
 
 namespace {
 
-// "4b533345" -> "KS3E" (the hex kept when it is not printable).
+// "4b533345" -> "KS3E" (hex kept when not printable).
 std::string code_of(const std::string& id) {
   std::string c;
   for (size_t i = 0; i + 1 < id.size(); i += 2) {
@@ -227,7 +223,6 @@ std::vector<DsiWareUsage> dsiware_usage(const FatVolume& vol) {
     DsiWareUsage u;
     for (char ch : t.name) u.id += static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
     u.code = code_of(u.id);
-    // Every file below the title directory, however deep.
     std::vector<FatVolume::Entry> stack{t};
     while (!stack.empty()) {
       const FatVolume::Entry d = stack.back();
@@ -278,12 +273,7 @@ TitleInstall nand_install_title(NandImage& nand, const u8* bios7i, const std::ve
   const u32 need = clusters(srl.size()) + clusters(kTmdSize) + clusters(kTicketSize) + clusters(pub) + clusters(prv) +
                    (banner ? clusters(0x4000) : 0) + 5;   // five directories at most
 
-  // The DSiWare quota. The launcher stops with "An error has occurred" at
-  // boot when the titles under /title/00030004 add up to more than 1024
-  // blocks of 128 KB -- measured on a dump at 1001.5 blocks: one more 3.8 MB
-  // title failed, the same title with a 6 MB one removed booted. When the new
-  // title would cross it, the dump's own titles are hidden for this session,
-  // largest first, until it fits (docs/dsiware-scoping.md 2.3).
+  // If adding it would exceed kDsiWareQuota, hide the dump's own titles, largest first, to fit.
   const std::vector<DsiWareUsage> installed = dsiware_usage(vol);
   u64 used = 0;
   for (const DsiWareUsage& t : installed) used += t.bytes;
@@ -300,15 +290,13 @@ TitleInstall nand_install_title(NandImage& nand, const u8* bios7i, const std::ve
     if (used + adding > kDsiWareQuota) { r.message = "the title alone is larger than the DSi's DSiWare quota"; return r; }
   }
 
-  // Room for all of it before any of it: a half-installed title in the
-  // session is worse than a clear refusal.
+  // Check space for all of it up front: no half-installed title.
   if (vol.free_clusters() < need) {
     r.message = "not enough free space on the NAND (" + std::to_string(need * (cs >> 10)) + " KB needed, " +
                 std::to_string(vol.free_clusters() * (cs >> 10)) + " KB free)";
     return r;
   }
 
-  // The ticket, as melonDS's CreateTicket makes it.
   u8 tik[kTicketSize] = {};
   wr32be(&tik[0x000], 0x00010001);
   std::memcpy(&tik[0x140], "Root-CA00000001-XS00000006", 26);
@@ -371,8 +359,6 @@ bool file_is_dsiware(const std::string& path) {
   return is_dsiware(head, nullptr);
 }
 
-// The archive is mapped rather than read, and nothing is inflated but the
-// entry's header: both of these are asked of every archive in a game list.
 namespace {
 std::unique_ptr<cart::RomSource> zip_entry_of(const std::string& path, cart::ZipEntry& e) {
   std::string err;
@@ -386,8 +372,6 @@ bool zip_is_dsiware(const std::string& path) {
   cart::ZipEntry e;
   std::unique_ptr<cart::RomSource> src = zip_entry_of(path, e);
   if (!src) return false;
-  // A .cia is DSiWare by its name alone, as a loose one is; a bare entry is
-  // peeked for its DSi unit code and title ID.
   if (e.cia) return true;
   std::vector<u8> head(0x1000);
   if (cart::peek_entry(src->page(0), src->size(), e, head.data(), head.size()) != head.size()) return false;

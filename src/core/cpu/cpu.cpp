@@ -107,9 +107,8 @@ void CpuContext::jump(u32 addr, bool interwork) {
   if (thumb()) hot.regs[15] = (addr & ~1u) + 4;
   else         hot.regs[15] = (addr & ~3u) + 8;
 
-  // Pipeline refill cost (the recompiler emits the same arithmetic). On the
-  // ARM9 the refill leaves the cost of its last fetch in code_cycles; on the
-  // ARM7 the code region follows the target.
+  // Pipeline refill cost; ARM9 leaves its last fetch's cost in code_cycles,
+  // ARM7's code region follows the target.
   u32 code_after = 0;
   hot.cycle_budget -= static_cast<s32>(refill_cycles(*this, addr & ~1u, thumb(), &code_after));
   if (which == Cpu::ARM9) {
@@ -131,11 +130,9 @@ void CpuContext::raise_exception(Exception e) {
   case Exception::Irq:           vector = 0x18; mode = 0x12; lr_adj = was_thumb ? 0 : 4; break;
   case Exception::Fiq:           vector = 0x1C; mode = 0x11; lr_adj = was_thumb ? 0 : 4; break;
   }
-  // LR per exception, in terms of r15 at the moment the exception is raised:
-  //  - SWI/UND/aborts are raised *during* execution, when r15 = addr + 8 (ARM)
-  //    or addr + 4 (Thumb);
-  //  - IRQ/FIQ are raised *between* instructions, when r15 = next + 8 / next + 4,
-  //    and the architectural LR is next + 4 in both states.
+  // LR per exception, in terms of r15 when raised: SWI/UND/aborts are raised
+  // during execution (r15 = addr+8 ARM / addr+4 Thumb); IRQ/FIQ between
+  // instructions (r15 = next+8/next+4, LR = next+4 in both states).
   const u32 pc = hot.regs[15];
   const u32 old_cpsr = hot.cpsr;
   switch_mode(mode);
@@ -143,32 +140,21 @@ void CpuContext::raise_exception(Exception e) {
   hot.regs[14] = static_cast<u32>(static_cast<s32>(pc) - lr_adj);
   hot.cpsr &= ~0x20u;                       // ARM state
   hot.cpsr |= 0x80;                         // mask IRQ
-  // The architecture leaves F alone on IRQ entry; melonDS (our trace oracle)
-  // sets it, and FIQ is unused on the DS, so follow melonDS for lockstep.
+  // Architecture leaves F alone on IRQ entry; matches melonDS, FIQ unused on DS.
   if (e == Exception::Fiq || e == Exception::Reset || e == Exception::Irq) hot.cpsr |= 0x40;
-  jump(exception_base() + vector, false);   // charges the pipeline refill like any branch
+  jump(exception_base() + vector, false);
 }
 
 void CpuContext::check_irq() {
-  // The off-slice deferral covers exactly the first check of the phase (the
-  // one the run loop makes before its first instruction), whether or not the
-  // IRQ is maskable right now: melonDS checks after every instruction, so an
-  // IRQ that was masked when it landed is taken the instant an MSR unmasks it.
+  // melonDS checks after every instruction, so an IRQ masked when it landed
+  // is taken the instant an MSR unmasks it.
   if (irq_skip_once) { irq_skip_once = false; return; }   // see irq_offline
   if (hot.irq_pending && !(hot.cpsr & 0x80)) {
     halted = false;
     raise_exception(Exception::Irq);
-    // Action Replay codes run from the ARM7's VBlank handler, which is what
-    // the cartridge patches itself into on real hardware. Doing it here --
-    // every path that takes an IRQ comes through check_irq, the JIT's
-    // included -- puts their writes at the one moment a frame when the game
-    // has finished with its own state and has not started on the next.
-    //
-    // The test is the same as melonDS's: VBlank pending *and* enabled, which
-    // can also be true while some other IRQ is being taken, so a code may run
-    // more than once in a frame. AR codes write fixed values and are written
-    // to be re-run, so that is harmless, and matching the reference matters
-    // more than being clever about it.
+    // AR codes run from the ARM7's VBlank handler, matching real hardware.
+    // VBlank pending&&enabled can fire more than once a frame; harmless, AR
+    // codes write fixed values.
     if (which == Cpu::ARM7 && !nds->cheats.codes.empty()) {
       const io::CpuIo& io7 = nds->io.cpu_io[static_cast<int>(Cpu::ARM7)];
       if ((io7.if_ & io7.ie) & (1u << io::IRQ_VBLANK)) nds->cheats.run(*nds);
@@ -179,15 +165,15 @@ void CpuContext::check_irq() {
 
 template <class S> void CpuContext::sync_state(S& s) {
   s.begin(which == Cpu::ARM9 ? "CPU9" : "CPU7");
-  // hot.alerts is the recompiler's host-side "leave native code" word (a
-  // flush sets it); it means nothing at a slice boundary and is not restored.
+  // hot.alerts (recompiler's "leave native code" word) means nothing at a
+  // slice boundary and is not restored.
   u32 no_alerts = 0;
   s.fields(halted, preempt_residual, yielded, jumped,
            hot.regs, hot.cpsr, hot.spsr, hot.cycle_budget, hot.irq_pending, no_alerts,
            bank_r8_r12, bank_r13, bank_r14, bank_spsr,
            cp15_control, cp15_dtcm, cp15_itcm, pu_region, pu_code_cacheable, pu_data_cacheable, pu_data_bufferable, pu_code_perm, pu_data_perm,
            code_cycles, data_cycles, code_region, data_region, branch_fetch, budget_at_halt);
-  s.fields(boot_stall, code_latch, irq_offline, irq_skip_once, defer_cost);   // appended (DSi; zero on a DS)
+  s.fields(boot_stall, code_latch, irq_offline, irq_skip_once, defer_cost);   // DSi; zero on a DS
   s.end();
 }
 template void CpuContext::sync_state<state::Writer>(state::Writer&);

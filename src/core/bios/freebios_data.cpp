@@ -2,8 +2,7 @@
 // FreeBIOS: a clean-room NDS ARM7/ARM9 BIOS replacement.
 // Copyright (c) 2013, Gilead Kutnick. All rights reserved. See LICENSE.freebios.
 //
-// Generated from the melonDS FreeBIOS_Data.h build of freebios/src/bios_common.s
-// (NTR targets only). Do not edit; regenerate with tools/freebios_import.py.
+// Generated (NTR targets only). Do not edit by hand.
 #include "core/bios/freebios.h"
 
 namespace ds::bios {

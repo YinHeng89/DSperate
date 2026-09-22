@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // DSperate - Nintendo DS emulator. Copyright (C) 2026 DSperate contributors.
 //
-// DSperate's own DSi system fonts (io/dsi_font/README.md), linked in whole.
+// DSperate's own DSi system fonts, linked in whole.
 #include "core/io/dsi_nand_synth.h"
 
 #include <cstring>

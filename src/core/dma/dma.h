@@ -26,18 +26,16 @@ struct Channel {
   u32 running = 0;          // 0 idle, 1 running, 2 running (first access of a burst)
   bool in_progress = false;
   const u8* burst_table = nullptr; u32 burst_pos = 0;
-  // Unit-timing cache: the bus tables are per 16 KB (ARM9) / 32 KB (ARM7)
-  // block, so the four lookups unit_cycles() makes are constant until cur_src
-  // or cur_dst leaves its block. Keyed on the block indices.
+  // Unit-timing cache: constant until cur_src/cur_dst leaves its 16 KB (ARM9)
+  // / 32 KB (ARM7) block. Keyed on the block indices.
   u32 tim_key_src = ~0u, tim_key_dst = ~0u;
   u32 src_rgn = 0, dst_rgn = 0;
   u32 src_n = 0, src_s = 0, dst_n = 0, dst_s = 0;
 };
 
 // Eight DMA channels (4 per CPU). A running channel stalls its CPU; the
-// scheduler runs `run()` in the CPU's place until the transfer (or its current
-// iteration) completes. Unit timings follow the main-RAM burst model of the
-// hardware as documented by melonDS.
+// scheduler runs `run()` in its place until the transfer (or current
+// iteration) completes.
 class Dma {
 public:
   explicit Dma(NDS& nds);
@@ -58,17 +56,15 @@ public:
   bool any_running(Cpu cpu) const { return running_mask_[cpu == Cpu::ARM9 ? 0 : 1] != 0; }
   bool in_mode(Cpu cpu, u32 mode) const;
   // NDMA glue: its running state occupies bit 4 of the per-CPU mask so the
-  // scheduler's test stays one load; its armed modes fold into the cached
-  // cart/GX answers. melonDS's NDMAModes table translates old modes.
+  // scheduler's test stays one load.
   void set_ndma_running(Cpu cpu, bool on) { u8& m = running_mask_[cpu == Cpu::ARM9 ? 0 : 1]; if (on) m |= 0x10; else m &= static_cast<u8>(~0x10); }
   void update_armed() { update_cart_armed(); }
   static u32 ndma_mode(u32 mode);
   void set_clock9_shift(u32 s) { shift9_ = s; track_progress_ = s > 1; }   // DSi: report progress to Scheduler::now() (see dma_progress)
   u32  run_base_ = 0;                 // budget used by earlier channels in this Dma::run (progress base)
   bool track_progress_ = false;
-  // Cached `in_mode(cart)` for either CPU. The cart transfer path asks once
-  // per word and once per catch-up, and the eight-channel scan cost more than
-  // the events it was there to avoid (178k instructions a frame, measured).
+  // Cached `in_mode(cart)` for either CPU: the cart transfer path asks per
+  // word and per catch-up, and an eight-channel scan there was too costly.
   bool cart_armed() const { return cart_armed_; }
   // An enabled ARM9 channel in GXFIFO start mode exists: the geometry engine
   // asks after every command it retires, so the answer is kept, not searched.

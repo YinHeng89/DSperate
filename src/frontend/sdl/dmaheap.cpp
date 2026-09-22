@@ -18,8 +18,7 @@
 namespace ds::sdl::dmaheap {
 namespace {
 
-// linux/dma-buf.h, which the handhelds' images do not ship; the layout is
-// kernel UAPI and fixed, as with drm_uapi.h.
+// linux/dma-buf.h, not shipped in the handhelds' sysroots; kernel UAPI, fixed.
 struct dma_buf_sync { unsigned long long flags; };
 constexpr unsigned long long kSyncWrite = 2ull;      // DMA_BUF_SYNC_WRITE
 constexpr unsigned long long kSyncStart = 0ull << 2; // DMA_BUF_SYNC_START
@@ -28,17 +27,14 @@ constexpr unsigned long long kSyncEnd   = 1ull << 2; // DMA_BUF_SYNC_END
 #define DMA_BUF_IOCTL_SYNC _IOW('b', 0, struct ds::sdl::dmaheap::dma_buf_sync)
 #endif
 
-// Set once the kernel says it has no such ioctl, so a legacy allocator does
-// not pay for a failing call on every frame.
-bool g_no_sync = false;
+bool g_no_sync = false;  // set once the ioctl is known unsupported
 
 void sync(int fd, unsigned long long flags) {
   if (fd < 0 || g_no_sync) return;
   dma_buf_sync s{flags};
   while (ioctl(fd, DMA_BUF_IOCTL_SYNC, &s) != 0) {
     if (errno == EINTR || errno == EAGAIN) continue;
-    // ENOTTY: this allocator has no sync ioctl (legacy ION), and its buffers
-    // are uncached. Anything else is worth knowing about, once.
+    // ENOTTY: no sync ioctl (legacy ION, uncached anyway); anything else is logged.
     if (errno != ENOTTY) std::fprintf(stderr, "dmabuf: sync failed (%s); frames may tear\n", std::strerror(errno));
     g_no_sync = true;
     return;
@@ -63,10 +59,9 @@ struct dma_heap_allocation_data {
 };
 #define DMA_HEAP_IOCTL_ALLOC _IOWR('H', 0x0, struct dma_heap_allocation_data)
 
-// From <linux/ion.h>, both generations. The new ABI (4.12 .. 5.10) answers
-// ION_IOC_HEAP_QUERY and returns an fd from ION_IOC_ALLOC; the legacy one
-// (Android 3.x/4.4 BSPs) returns a handle that ION_IOC_SHARE turns into an fd.
-// The ioctl numbers collide by design -- the struct sizes tell them apart.
+// From <linux/ion.h>, both generations: new ABI returns an fd from
+// ION_IOC_ALLOC, legacy returns a handle ION_IOC_SHARE turns into an fd.
+// The ioctl numbers collide by design; struct sizes tell them apart.
 struct ion_allocation_data_new {
   uint64_t len;
   uint32_t heap_id_mask;
@@ -88,7 +83,7 @@ struct ion_heap_query {
   uint32_t reserved2;
 };
 struct ion_allocation_data_legacy {
-  size_t len;                       // the target's size_t: this is the 32-bit ABI on arm32
+  size_t len;                       // target's size_t: 32-bit ABI on arm32
   size_t align;
   unsigned int heap_id_mask;
   unsigned int flags;
@@ -104,11 +99,11 @@ struct ion_fd_data { int handle; int fd; };
 enum { ION_HEAP_TYPE_SYSTEM = 0, ION_HEAP_TYPE_SYSTEM_CONTIG = 1, ION_HEAP_TYPE_CARVEOUT = 2,
        ION_HEAP_TYPE_CHUNK = 3, ION_HEAP_TYPE_DMA = 4 };
 
-// A place to allocate from. `ion_mask` == 0 means a dma-heap at `path`.
+// `ion_mask` == 0 means a dma-heap at `path`.
 struct Source {
-  std::string path;                 // dma-heap device, or "ion:<name>" for the log
+  std::string path;               // dma-heap device, or "ion:<name>" for the log
   uint32_t ion_mask = 0;
-  bool swept = false;             // one of the blind id-bit candidates: quiet on failure
+  bool swept = false;             // blind id-bit candidate: quiet on failure
 };
 
 std::string g_chosen;
@@ -126,12 +121,9 @@ int alloc_dmaheap(const std::string& path, size_t len) {
   return r < 0 ? -1 : static_cast<int>(a.fd);
 }
 
-// flags 0: uncached where the heap has the choice, which is what a buffer
-// the CPU only writes and the display only reads wants. Which ABI the kernel
-// speaks is found here, not from the query: android-4.9 kernels answer
-// ION_IOC_HEAP_QUERY yet still allocate by handle, and each ABI's ALLOC
-// number encodes its struct size, so the wrong one is ENOTTY, never a
-// misread.
+// flags 0: uncached where the heap has the choice (write-once, display-read
+// buffer). ABI is detected by trying new-style alloc first: each ABI's ALLOC
+// number encodes its struct size, so the wrong one is ENOTTY, never a misread.
 int alloc_ion(const Source& s, size_t len) {
   int ion = ::open("/dev/ion", O_RDWR | O_CLOEXEC);
   if (ion < 0) return -1;
@@ -151,7 +143,7 @@ int alloc_ion(const Source& s, size_t len) {
       f.handle = l.handle;
       if (ioctl(ion, ION_IOC_SHARE, &f) == 0) fd = f.fd;
       ion_handle_data h = {l.handle};
-      ioctl(ion, ION_IOC_FREE, &h);   // the fd keeps the buffer alive
+      ioctl(ion, ION_IOC_FREE, &h);   // fd keeps the buffer alive
     }
   }
   const int err = errno;
@@ -164,11 +156,10 @@ int alloc_from(const Source& s, size_t len) {
   return s.ion_mask ? alloc_ion(s, len) : alloc_dmaheap(s.path, len);
 }
 
-// Rank a dma-heap by name: what scanout needs is physically contiguous
-// memory, and uncached beats cached for a write-once buffer nobody syncs.
+// Rank a dma-heap by name: contiguous memory preferred, uncached over cached.
 int heap_rank(const std::string& n) {
   const bool uncached = n.find("uncached") != std::string::npos;
-  if (n == "linux,cma") return 0;                                  // mainline; the one measured
+  if (n == "linux,cma") return 0;                                  // mainline
   if (n.find("cma") != std::string::npos || n.find("contig") != std::string::npos) return uncached ? 1 : 2;
   if (n.find("reserved") != std::string::npos || n.find("carveout") != std::string::npos) return 3;
   if (n.find("system") != std::string::npos) return uncached ? 4 : 5;   // contiguous only behind an IOMMU
@@ -221,12 +212,9 @@ void ion_heaps(std::vector<Source>& out) {
   }
   ::close(ion);
   if (out.size() > before) return;
-  // No usable query (legacy ION, or one that reports a count and then
-  // refuses to fill: seen on an Allwinner 4.9). Heap ids are per vendor,
-  // but the common BSPs (Allwinner, Rockchip) number a heap by its type:
-  // DMA (cma) 4, carveout 2, system-contig 1, chunk 3, system 0. Those
-  // first, then the rest of the bits; the caller's import test is what tells
-  // a usable one.
+  // No usable query (legacy ION). Heap ids are per vendor, but common BSPs
+  // number by type (DMA 4, carveout 2, system-contig 1, chunk 3, system 0);
+  // try those first, then the rest of the bits; caller's import test decides.
   static const unsigned order[] = {4, 2, 1, 3, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
                                    17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 0};
   for (unsigned b : order) out.push_back({"ion:id" + std::to_string(b), 1u << b, true});
@@ -269,7 +257,7 @@ int alloc(size_t len, const std::function<bool(int fd)>& usable, const char* tag
   for (const Source& s : cands) {
     const int fd = alloc_from(s, len);
     if (fd < 0) {
-      // Silence the legacy-ION sweep: most of its 32 bits are not heaps.
+      // legacy-ION sweep: most of its 32 bits are not heaps, so stay quiet
       if (!s.swept || std::getenv("DS_DMA_HEAP_VERBOSE")) std::fprintf(stderr, "%s: %s: %s\n", tag, s.path.c_str(), std::strerror(errno));
       continue;
     }

@@ -25,15 +25,14 @@ using gpu::vk::DeviceInternal;
 
 namespace {
 
-// The SPIR-V, tracked beside the .comp (tools/gen_shaders.sh), linked in the
-// way the core links its passes (vk_shaders.cpp).
+// SPIR-V linked in like the core links its passes (vk_shaders.cpp).
 __asm__(".section .rodata\n.balign 4\n.globl ds_present_spv_data\nds_present_spv_data:\n"
         ".incbin \"" DSPERATE_PRESENT_SHADER_DIR "/present.spv\"\n"
         ".globl ds_present_spv_end\nds_present_spv_end:\n.previous\n");
 extern "C" const unsigned char ds_present_spv_data[], ds_present_spv_end[];
 
-// One Vulkan context for the process (vk::Device::shared): the 3D raster in
-// the core and this stage share it, so the raster's layer can be bound here.
+// One Vulkan context for the process: shared with the core's 3D raster so
+// its layer can be bound here.
 std::shared_ptr<Device> shared_device(std::string* why) { return Device::shared(why); }
 
 constexpr u32 kFrameWords = 256 * 192;     // one screen
@@ -57,8 +56,8 @@ __asm__(".section .rodata\n.balign 4\n.globl ds_composite_spv_data\nds_composite
         ".globl ds_composite_spv_end\nds_composite_spv_end:\n.previous\n");
 extern "C" const unsigned char ds_composite_spv_data[], ds_composite_spv_end[];
 
-// The planes, once per process: both windows of a dual-window layout read
-// the same engine A. Freed with the last stage.
+// One set of planes per process: both windows of a dual-window layout read
+// the same engine A.
 struct Planes {
   std::shared_ptr<Device> dev;
   Buffer buf;
@@ -76,11 +75,9 @@ std::shared_ptr<Planes> shared_planes(const std::shared_ptr<Device>& dev) {
   return p;
 }
 
-// Whether a DS screen is the same picture as another within display
-// capture's rounding: the capture keeps 5 bits a channel of the 6 the
-// composite had, so a screen showing last frame's capture of the other
-// differs from it by up to 2 of 63 (8 of 255) a channel. Every other row,
-// every third pixel: 8 K pixels, enough to tell a copy from a new frame.
+// Same picture within display capture's rounding (5 of 6 bits/channel kept,
+// so up to 8/255 per channel differs). Sparse sample: every other row, every
+// third pixel.
 bool near_same(const u32* a, const u32* b) {
   for (u32 y = 0; y < 192; y += 2)
     for (u32 x = (y >> 1) % 3; x < 256; x += 3) {
@@ -100,19 +97,14 @@ struct GpuPresent::Impl {
   VkPhysicalDeviceMemoryProperties memprops{};
 
   struct Imported { VkImage img = VK_NULL_HANDLE; VkDeviceMemory mem = VK_NULL_HANDLE; VkImageView view = VK_NULL_HANDLE; VkDescriptorSet set[kSlots] = {VK_NULL_HANDLE, VK_NULL_HANDLE}; int fd = -1; u32 stride = 0; };
-  // The composite: the shared planes, a composited screen (engine A's) per slot, and a
-  // descriptor set per slot rewritten each frame with that frame's layer.
   std::shared_ptr<Planes> planes;
   Buffer comp[kSlots];
-  Buffer over[kSlots];                 // the frontend's overlay per slot (logical frame, pitch = lw)
+  Buffer over[kSlots];                 // frontend's overlay per slot (logical frame, pitch = lw)
   Buffer tab[kSlots];
-  // Per slot: which screen its composite holds (-1 none) and whether it
-  // carries the smooth filter's records; and a cached copy of the frame's
-  // two DS screens, for the capture pass-through (present() below).
-  int comp_screen[kSlots] = {-1, -1};
-  bool comp_smooth[kSlots] = {false, false};
-  std::vector<u32> fbcopy[kSlots];                  // the LCD grid's seam bitmasks per slot: view v at word v * 64, columns then rows, 32 words each (1024 bits)
-  SDL_Rect over_dirty[kSlots] = {};    // what was drawn into each, to clear before its next use
+  int comp_screen[kSlots] = {-1, -1};  // which screen each slot's composite holds (-1 none)
+  bool comp_smooth[kSlots] = {false, false};   // carries the smooth filter's records
+  std::vector<u32> fbcopy[kSlots];     // LCD grid seam bitmasks per slot: view v at word v*64
+  SDL_Rect over_dirty[kSlots] = {};    // drawn region per slot, cleared before next use
   int over_lw = 0, over_lh = 0;
   VkShaderModule cmod = VK_NULL_HANDLE;
   VkDescriptorSetLayout cdsl = VK_NULL_HANDLE;
@@ -136,12 +128,11 @@ struct GpuPresent::Impl {
   VkCommandBuffer cmd[kSlots]{};
   VkFence fence[kSlots]{};
   bool fence_live[kSlots] = {false, false};    // a submit is outstanding on this slot
-  int pending_buf = -1;                        // the tier buffer of the frame in flight, not yet end_frame()'d
+  int pending_buf = -1;                        // tier buffer of the frame in flight, not yet end_frame()'d
   int pending_slot = -1;
   u64 frame = 0;
-  // Statistics for the exit line: how long the previous frame's fence made us wait.
-  u64 wait_ns = 0, waits = 0, frames = 0, late = 0;
-  u64 t_begin = 0, t_upload = 0, t_submit = 0, t_retire = 0;   // where present() spends its time, per frame
+  u64 wait_ns = 0, waits = 0, frames = 0, late = 0;   // exit-line stats: fence wait time
+  u64 t_begin = 0, t_upload = 0, t_submit = 0, t_retire = 0;   // present() time breakdown, per frame
 
   bool ok() const { return pipe != VK_NULL_HANDLE; }
 
@@ -159,9 +150,8 @@ struct GpuPresent::Impl {
     b.view = VK_NULL_HANDLE; b.img = VK_NULL_HANDLE; b.mem = VK_NULL_HANDLE;
   }
 
-  // Import one of the tier's dma-bufs as a LINEAR B8G8R8A8 image (P0.1: the
-  // explicit modifier layout with size 0, or plain LINEAR tiling without
-  // the extension) and point a descriptor set at it.
+  // Import a tier dma-buf as a LINEAR B8G8R8A8 image and point a descriptor
+  // set at it.
   bool import(const ScanoutOut::DmabufPlane& p, Imported& b, std::string* why) {
     const VkFormat fmt = VK_FORMAT_B8G8R8A8_UNORM;
     const bool mod = dev->limits().drm_modifier;
@@ -189,8 +179,8 @@ struct GpuPresent::Impl {
     ii.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     if (a->vkCreateImage(vk->dev, &ii, nullptr, &b.img) != VK_SUCCESS) { if (why) *why = "vkCreateImage (imported) failed"; return false; }
     if (!mod) {
-      // Without the modifier extension the driver picks the pitch; it has to
-      // be the tier's or the picture is sheared.
+      // Without the modifier extension the driver picks the pitch; must match
+      // the tier's or the picture shears.
       VkImageSubresource sr{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0}; VkSubresourceLayout got{};
       a->vkGetImageSubresourceLayout(vk->dev, b.img, &sr, &got);
       if (got.rowPitch != p.stride_bytes) { if (why) *why = "LINEAR image pitch differs from the scanout pitch"; drop_import(b); return false; }
@@ -241,9 +231,7 @@ struct GpuPresent::Impl {
     nbufs = 0;
     const int n = out.bufs();
     if (n <= 0 || n > kMaxBufs) { if (why) *why = "tier buffer count out of range"; return false; }
-    // The overlays follow the tier's size (the window is small at open and
-    // reopens at the panel's size; the logical frame under a rotation has
-    // the same pixel count). Before the descriptor writes below, which bind them.
+    // Overlays follow the tier's size; must precede the descriptor writes below.
     {
       ScanoutOut::DmabufPlane p0;
       if (!out.dmabuf_plane(0, p0)) { if (why) *why = "tier has no dma-buf"; return false; }
@@ -256,7 +244,7 @@ struct GpuPresent::Impl {
         std::memset(over[s].ptr, 0, need);
         dev->flush(over[s], 0, need);
       }
-      over_lw = over_lh = 0;   // overlay() starts every slot clean at the new geometry
+      over_lw = over_lh = 0;   // overlay() starts each slot clean at new geometry
     }
     for (int i = 0; i < n; ++i) {
       ScanoutOut::DmabufPlane p;
@@ -269,17 +257,15 @@ struct GpuPresent::Impl {
     return true;
   }
 
-  // DS_GPU_COMP_DUMP=<file>: after presented frames 400-403's fences, write
-  // the composited screen of that slot as a PPM (when this frame composited)
-  // and the panel, per display (debugging the composite's inputs).
+  // DS_GPU_COMP_DUMP=<file>: writes the composited screen and panel as PPMs
+  // for debugging, over a window of presented frames.
   u32 dump_scale = 0; const u32* dump_l3d = nullptr; size_t dump_l3d_words = 0;
   void maybe_dump(int slot) {
     static const char* env = std::getenv("DS_GPU_COMP_DUMP");
-    static const u64 from = std::getenv("DS_GPU_COMP_DUMP_FROM") ? std::strtoull(std::getenv("DS_GPU_COMP_DUMP_FROM"), nullptr, 10) : 400;   // first presented frame to dump
+    static const u64 from = std::getenv("DS_GPU_COMP_DUMP_FROM") ? std::strtoull(std::getenv("DS_GPU_COMP_DUMP_FROM"), nullptr, 10) : 400;
     static const u64 count = std::getenv("DS_GPU_COMP_DUMP_COUNT") ? std::strtoull(std::getenv("DS_GPU_COMP_DUMP_COUNT"), nullptr, 10) : 4;
-    // DS_GPU_COMP_DUMP_ON_STALL=1: instead of a fixed window, the frames
-    // presented after each GPU stall report (the frame that stalled is the
-    // one being presented now).
+    // DS_GPU_COMP_DUMP_ON_STALL=1: dump frames presented after each GPU stall
+    // instead of a fixed window.
     static const bool on_stall = std::getenv("DS_GPU_COMP_DUMP_ON_STALL") != nullptr;
     static unsigned seen_stalls = 0; static u64 dump_until = 0;
     if (on_stall) {
@@ -296,7 +282,7 @@ struct GpuPresent::Impl {
       for (u32 i = 0; i < W * H; ++i) { const u32 c = px[i]; const unsigned char rgb[3] = {static_cast<unsigned char>(c >> 16), static_cast<unsigned char>(c >> 8), static_cast<unsigned char>(c)}; std::fwrite(rgb, 1, 3, f); }
       std::fclose(f);
     }
-    // And the panel buffer the tier is about to show, through its own mapping.
+    // Panel buffer the tier is about to show, through its own mapping.
     if (pending_buf >= 0 && bufs[pending_buf].fd >= 0) {
       const size_t bytes = static_cast<size_t>(bufs[pending_buf].stride) * h;
       void* m = mmap(nullptr, bytes, PROT_READ, MAP_SHARED, bufs[pending_buf].fd, 0);
@@ -320,7 +306,6 @@ struct GpuPresent::Impl {
                    static_cast<const u32*>(planes->buf.ptr)[4 * kFrameWords + 192], static_cast<const u32*>(planes->buf.ptr)[4 * kFrameWords + 193], static_cast<const u32*>(planes->buf.ptr)[4 * kFrameWords + 194], static_cast<const u32*>(planes->buf.ptr)[4 * kFrameWords + 195], static_cast<const u32*>(planes->buf.ptr)[0]);
     }
   }
-  // Block on the frame in flight and give its buffer to the tier.
   void retire(ScanoutOut& out) {
     if (pending_slot < 0) return;
     const auto t0 = std::chrono::steady_clock::now();
@@ -406,7 +391,6 @@ std::unique_ptr<GpuPresent> GpuPresent::open(ScanoutOut& out, std::string* why) 
   cp.stage.module = d.mod; cp.stage.pName = "main"; cp.layout = d.layout;
   if (d.a->vkCreateComputePipelines(d.vk->dev, VK_NULL_HANDLE, 1, &cp, nullptr, &d.pipe) != VK_SUCCESS) return fail("present pipeline failed to compile");
 
-  // The composite: its planes, output buffers, pipeline and per-slot sets.
   d.planes = shared_planes(d.dev);
   if (!d.planes) return fail("plane buffer allocation failed");
   for (int s = 0; s < kSlots; ++s) { d.comp[s] = d.dev->alloc(sizeof(u32) * kCompWords, Access::CpuWrite); if (!d.comp[s]) return fail("composite buffer allocation failed"); }
@@ -458,7 +442,7 @@ u32* GpuPresent::overlay(int lw, int lh) {
   if (!d.over[slot]) return nullptr;
   u32* px = static_cast<u32*>(d.over[slot].ptr);
   if (lw != d.over_lw || lh != d.over_lh) {
-    // A new geometry: every slot starts clean.
+    // New geometry: every slot starts clean.
     for (int s = 0; s < kSlots; ++s) { std::memset(d.over[s].ptr, 0, d.over[s].size); d.over_dirty[s] = SDL_Rect{0, 0, 0, 0}; }
     d.over_lw = lw; d.over_lh = lh;
   } else {
@@ -516,17 +500,14 @@ bool GpuPresent::present(ScanoutOut& out, const u32* const fb[2], const View* vi
   const int slot = static_cast<int>(d.frame % kSlots);
   if (d.fence_live[slot]) { a.vkWaitForFences(d.vk->dev, 1, &d.fence[slot], VK_TRUE, ~0ull); d.fence_live[slot] = false; }
 
-  // The two DS frames, into this slot's half of the source buffer.
   u32* dst = static_cast<u32*>(d.src.ptr) + static_cast<size_t>(slot) * kSlotWords;
   for (int s = 0; s < 2; ++s) std::memcpy(dst + static_cast<size_t>(s) * kFrameWords, fb[s], sizeof(u32) * kFrameWords);
   d.dev->flush(d.src, static_cast<size_t>(slot) * kSlotWords * sizeof(u32), kSlotWords * sizeof(u32));
   u64 t3 = now(); d.t_upload += t3 - t2;
 
-  // Composite engine A's screen on the GPU when this display shows it and the frame
-  // has a GPU-drawn 3D layer; the planes are the core's, flushed here.
-  // The 3D layer belongs to whichever screen engine A drew this frame
-  // (hires_screen): a game that swaps the screens every frame, Spirit
-  // Tracks, flickered when it was always screen 0.
+  // Composite engine A's screen on the GPU when shown and the frame has a
+  // GPU-drawn 3D layer; hires_screen names whichever screen engine A drew it
+  // to this frame (games that swap screens per frame need this per-frame).
   bool shows = false;
   for (int v = 0; v < nviews; ++v) if (views[v].screen == hires_screen && views[v].shown) shows = true;
   const bool do_comp = shows && hires != 0 && scale >= 1 && scale <= kMaxScale;
@@ -537,22 +518,18 @@ bool GpuPresent::present(ScanoutOut& out, const u32* const fb[2], const View* vi
     ci[1].buffer = gpu::vk::vk_buf(d.planes->buf); ci[1].range = VK_WHOLE_SIZE;
     ci[2].buffer = reinterpret_cast<VkBuffer>(hires); ci[2].range = hires_bytes;
     ci[3].buffer = gpu::vk::vk_buf(d.comp[slot]); ci[3].range = VK_WHOLE_SIZE;
-    // The raster's edge plane, when this frame has one; else the output plane stands in (never read).
+    // Edge plane when this frame has one; else output plane stands in (never read).
     ci[4].buffer = edge ? reinterpret_cast<VkBuffer>(edge) : gpu::vk::vk_buf(d.comp[slot]); ci[4].range = VK_WHOLE_SIZE;
     VkWriteDescriptorSet cw[5]{};
     for (u32 i = 0; i < 5; ++i) { cw[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; cw[i].dstSet = d.cset[slot]; cw[i].dstBinding = i + 1; cw[i].descriptorCount = 1; cw[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; cw[i].pBufferInfo = &ci[i]; }
     a.vkUpdateDescriptorSets(d.vk->dev, 5, cw, 0, nullptr);
   }
   d.dump_scale = do_comp ? scale : 0;
-  const bool smooth = do_comp && edge != 0 && scale == 1;   // the raster only writes the plane at 1x (vk_raster.cpp)
-  // The capture pass-through. A game that shows the previous frame's display
-  // capture on a screen (Spirit Tracks: the 3D swaps screens every frame and
-  // the other one shows the capture of it) hands the present a DS-resolution
-  // copy of a picture this stage composited a frame ago -- at panel
-  // resolution, with the smooth filter's edges, or at S x. When a screen's
-  // new frame is that picture within the capture's rounding, the previous
-  // composite is shown again for it. Only where it would show: the filter
-  // or a hi-res layer; at 1x without the filter the copy is the same picture.
+  const bool smooth = do_comp && edge != 0 && scale == 1;   // raster only writes the plane at 1x
+  // Capture pass-through: if a screen shows the previous frame's display
+  // capture (matches within near_same()'s rounding), show the previous
+  // composite again for it instead of the DS-res copy, where that composite
+  // would actually differ (the filter or a hi-res layer; at 1x it wouldn't).
   const int ps = (slot + 1) % kSlots;
   bool prev_use[2] = {false, false};
   static const bool no_pt = std::getenv("DS_GPU_NO_PT") != nullptr;   // bisecting
@@ -583,12 +560,9 @@ bool GpuPresent::present(ScanoutOut& out, const u32* const fb[2], const View* vi
   d.comp_screen[slot] = do_comp ? hires_screen : -1;
   d.comp_smooth[slot] = smooth;
 
-  // The LCD grid's seam columns and rows per view, as kern::scale_row_grid
-  // and Gpu::emit_scaled choose them: the first panel pixel of a source
-  // pixel's run, for runs at least ceil(scale) wide (at a fractional scale
-  // only the widened runs carry a seam, so the lit cells keep the integer
-  // size), on every other DS pixel at exactly 2x (nine lit in sixteen rather
-  // than one in four). Each axis decides for itself.
+  // LCD grid seam columns/rows per view, matching kern::scale_row_grid and
+  // Gpu::emit_scaled: first panel pixel of a source run, for runs at least
+  // ceil(scale) wide. Each axis decides independently.
   if (grid < 256) {
     u32* t = static_cast<u32*>(d.tab[slot].ptr);
     std::memset(t, 0, sizeof(u32) * 128);
@@ -621,7 +595,7 @@ bool GpuPresent::present(ScanoutOut& out, const u32* const fb[2], const View* vi
     std::fprintf(stderr, "gpu present: overlay at frame %llu -- drawn %d,%d %dx%d, has_over %d, geometry %dx%d (recorded %dx%d), buffer %zu bytes, tier %ux%u, %llu pixels with alpha\n", static_cast<unsigned long long>(d.composited), drawn.x, drawn.y, drawn.w, drawn.h, has_over ? 1 : 0, lw, lh, d.over_lw, d.over_lh, d.over[slot].size, d.w, d.h, static_cast<unsigned long long>(nz));
   }
   pc.b[0] = static_cast<u32>(rot); pc.b[1] = static_cast<u32>(nviews > 2 ? 2 : nviews); pc.b[2] = inset_alpha | (has_over ? 0x100u : 0u) | (std::min<u32>(grid, 256) << 16);
-  // The scale goes with every frame: a pass-through view reads the previous composite at it.
+  // Scale goes with every frame: a pass-through view reads the previous composite at it.
   pc.b[3] = static_cast<u32>(slot) * kSlotWords | (std::max<u32>(scale, 1) << 24) | (do_comp ? 0x80000000u : 0u);
   for (int v = 0; v < static_cast<int>(pc.b[1]); ++v) {
     pc.rect[v][0] = views[v].rect.x; pc.rect[v][1] = views[v].rect.y; pc.rect[v][2] = views[v].rect.w; pc.rect[v][3] = views[v].rect.h;
@@ -635,18 +609,15 @@ bool GpuPresent::present(ScanoutOut& out, const u32* const fb[2], const View* vi
   a.vkResetCommandBuffer(cb, 0);
   VkCommandBufferBeginInfo bi{}; bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO; bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
   if (a.vkBeginCommandBuffer(cb, &bi) != VK_SUCCESS) { out.end_frame(); return false; }
-  // The imported image's contents are the display's business between
-  // frames; every pixel is rewritten here, so UNDEFINED is the honest
-  // starting layout and costs no load.
+  // Every pixel is rewritten here, so UNDEFINED costs no load.
   VkImageMemoryBarrier ib{}; ib.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
   ib.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT; ib.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; ib.newLayout = VK_IMAGE_LAYOUT_GENERAL;
   ib.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED; ib.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
   ib.image = d.bufs[buf].img; ib.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
   a.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &ib);
   if (do_comp) {
-    // The 3D layer was written by the core's raster on this same queue: order
-    // its writes (compute or transfer) before this read, then the composite's
-    // own writes before the present reads them.
+    // Raster wrote the 3D layer on this same queue: order those writes
+    // before this read, then this pass's writes before present reads them.
     VkMemoryBarrier mb0{}; mb0.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER; mb0.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT; mb0.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
     a.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb0, 0, nullptr, 0, nullptr);
     CompPush cp{scale, static_cast<u32>(slot) * kSlotWords + static_cast<u32>(hires_screen) * kFrameWords, 0, smooth ? 1u : 0u};
@@ -662,7 +633,7 @@ bool GpuPresent::present(ScanoutOut& out, const u32* const fb[2], const View* vi
   a.vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, d.layout, 0, 1, &d.bufs[buf].set[slot], 0, nullptr);
   a.vkCmdPushConstants(cb, d.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
   a.vkCmdDispatch(cb, (d.w + 15) / 16, (d.h + 7) / 8, 1);
-  // Hand the writes to whoever reads the dma-buf next (the compositor or the CRTC).
+  // Hand the writes to whoever reads the dma-buf next.
   VkMemoryBarrier mb{}; mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER; mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT; mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
   a.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
   if (a.vkEndCommandBuffer(cb) != VK_SUCCESS) { out.end_frame(); return false; }

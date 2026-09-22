@@ -17,8 +17,7 @@ namespace ds::prof {
 bool enabled = false;
 bool async_window = false;
 bool census_same_list = false;
-// Nested scopes: each sits inside another stage's scope, so it is reported as
-// an "of which" column and excluded from the sum. See profile.h.
+// "Of which" stages nest inside another scope; excluded from the sum. See profile.h.
 inline bool of_which(Stage s) { return s == JIT_TX || s == GX_RUN || s == W2D_JOIN || s == R3D_STEAL; }
 
 const char* const names[COUNT] = {
@@ -31,10 +30,7 @@ const char* const names[COUNT] = {
   "2d journal/latches", "3d line wait", "3d prep (texcache)", "gpu upload", "3d bins stolen (of which)",
 };
 
-// Stable machine keys for the same stages (DS_PROFILE_LINE). Display names
-// above are prose and change; these are a diff key across the whole rework
-// and must not, so a stage that is renamed keeps its key and a stage that is
-// removed leaves a hole rather than shifting its neighbours.
+// Stable machine keys for DS_PROFILE_LINE; unlike `names`, must not change on rename.
 const char* const stage_keys[COUNT] = {
   "cpu9", "cpu7", "dma", "gx_geom",
   "bg_draw", "obj_draw", "window", "select", "effects", "output", "capture",
@@ -111,9 +107,8 @@ thread_local Accum* acc = nullptr;
 std::mutex& accs_mutex() { static std::mutex m; return m; }
 std::vector<Accum*>& accs() { static std::vector<Accum*> v; return v; }
 
-// One accumulator per thread, owned by the registry and never freed: a band
-// worker may outlive or predecease `report`, and the totals must survive it
-// either way (there are only ever a handful of threads).
+// One accumulator per thread, owned by the registry and never freed, so
+// totals survive a band worker outliving or predeceasing `report`.
 Accum* make_acc() {
   Accum* a = new Accum();
   { std::lock_guard<std::mutex> lk(accs_mutex()); a->tid = static_cast<u32>(accs().size()); accs().push_back(a); }
@@ -123,21 +118,11 @@ Accum* make_acc() {
 } // namespace detail
 
 // Per-frame stage series. Only the emulation thread's stages are kept per
-// frame: it waits for the slowest band (R3D_WAIT), so its stages sum to the
-// frame's critical path and can be compared against the frontend's wall-clock
-// frame_ms. The band workers' time is folded into one "band workers" column
-// for context -- it overlaps the wait, it does not add to the wall time.
-// Reading the workers' counters here is a census, not a synchronisation:
-// a torn read costs one misattributed nanosecond slice, not a wrong answer.
+// frame (it waits for the slowest band, so they sum to the critical path);
+// band worker time is folded into one "band workers" column for context.
 namespace {
-// Per frame: the stages, the worker total, and the two counters that separate
-// a STALLED frame from a CATCH-UP one. A DS frame is a fixed number of
-// emulated cycles, so a long frame that ran the usual cycle count lost its
-// time to something outside the emulation, while one that ran several frames'
-// worth was working off a backlog. `slices` says how finely that was
-// interleaved. (SS3.38: the gsdd tail is periodic, deadline-driven and
-// carried by a different stage each time, which is what a backlog flush looks
-// like -- this is the instrument that tells the two apart.)
+// cyc/slices distinguish a STALLED frame (lost time outside emulation) from
+// a CATCH-UP one (ran several frames' worth of cycles).
 struct FrameNs { u64 ns[COUNT]; u64 workers; u64 cyc; u64 slices; };
 std::vector<FrameNs> frame_series;
 u64 frame_last_ns[COUNT];
@@ -170,8 +155,7 @@ void frame_mark() {
 }
 
 void frame_breakdown(const std::vector<double>& frame_ms) {
-  // frame_mark runs every frame; the statistics may leave the first N out
-  // (--stats-from), so the series is aligned to its tail.
+  // frame_mark runs every frame; frame_ms may start later (--stats-from), so align to the tail.
   if (!enabled || frame_series.empty() || frame_series.size() < frame_ms.size()) return;
   if (frame_series.size() > frame_ms.size())
     frame_series.erase(frame_series.begin(), frame_series.begin() + static_cast<long>(frame_series.size() - frame_ms.size()));
@@ -179,9 +163,7 @@ void frame_breakdown(const std::vector<double>& frame_ms) {
   std::vector<size_t> order(n);
   for (size_t i = 0; i < n; ++i) order[i] = i;
   std::sort(order.begin(), order.end(), [&](size_t a, size_t b) { return frame_ms[a] < frame_ms[b]; });
-  // p99 group: the slowest 1% (at least one frame). typical group: the middle
-  // fifth, so both boot transients and the spikes themselves stay out of the
-  // baseline.
+  // p99: slowest 1%. typical: middle fifth, keeping boot transients and spikes out of the baseline.
   const size_t n99 = std::max<size_t>(1, n / 100);
   const std::vector<size_t> tail(order.end() - static_cast<long>(n99), order.end());
   const std::vector<size_t> mid(order.begin() + static_cast<long>(n * 2 / 5),
@@ -191,9 +173,7 @@ void frame_breakdown(const std::vector<double>& frame_ms) {
     Group g;
     for (size_t i : idx) {
       double timed = 0;
-      // The "of which" stages nest inside others, so they are reported as rows
-      // but must not be subtracted again here -- counting them would push
-      // `untimed` negative, which is how this was read before 2026-09-21.
+      // "of which" stages are reported as rows but excluded here (else `untimed` goes negative).
       for (u32 s = 0; s < COUNT; ++s) { const double v = frame_series[i].ns[s] / 1e6; g.stage[s] += v; if (!of_which(static_cast<Stage>(s))) timed += v; }
       g.workers += frame_series[i].workers / 1e6;
       g.ms += frame_ms[i];
@@ -204,10 +184,8 @@ void frame_breakdown(const std::vector<double>& frame_ms) {
     for (u32 s = 0; s < COUNT; ++s) g.stage[s] *= k;
     return g;
   };
-  // The fastest fifth as well: titles that alternate a heavy and a light
-  // frame (Spirit Tracks, Golden Sun's title) put the light one here and the
-  // heavy one in the middle, and the difference between the two columns is
-  // what the heavy frame does that the light one does not.
+  // Fastest fifth too: for titles alternating heavy/light frames, the delta
+  // between this and the middle column is what the heavy frame adds.
   const std::vector<size_t> low(order.begin(), order.begin() + static_cast<long>(n / 5));
   const Group m = mean(mid), t = mean(tail), l = mean(low);
   std::fprintf(stderr, "[frames] stage breakdown, mean of fastest fifth (%zu frames), typical (middle 20%%, %zu frames) and p99 tail (%zu frames), sorted by what the tail adds:\n",
@@ -224,14 +202,9 @@ void frame_breakdown(const std::vector<double>& frame_ms) {
   std::fprintf(stderr, "[frames] %-16s %9.3f %9.3f %9.3f %+9.3f   (overlaps the band wait; not part of the wall time)\n",
                "band workers", l.workers, m.workers, t.workers, t.workers - m.workers);
   std::fprintf(stderr, "[frames] %-16s %9.3f %9.3f %9.3f %+9.3f\n", "frame total", l.ms, m.ms, t.ms, t.ms - m.ms);
-  // The worst individual frames, each with its heaviest stages: clusters with
-  // one cause look alike here, mixed causes do not.
   const size_t worst_n = std::min<size_t>(6, n);
   {
-    // The median frame, as the calibration line: a worst-frame cyc figure is
-    // meaningless without knowing what a normal frame reads. 1.00x is one
-    // frame of emulated time (1,120,380 cycles); a spike at 1.00x did the
-    // usual work slowly, one above 1.00x was working off a backlog.
+    // Median frame as calibration: 1.00x = one frame of emulated cycles (1,120,380); a spike above 1.00x was catching up.
     const size_t md = order[n / 2];
     std::fprintf(stderr, "[frames] median frame #%-5zu %7.3f ms  [cyc %.2fx slices %llu]\n",
                  md, frame_ms[md], static_cast<double>(frame_series[md].cyc) / 1120380.0,
@@ -248,19 +221,13 @@ void frame_breakdown(const std::vector<double>& frame_ms) {
     for (size_t s = 0; s < 3 && frame_series[i].ns[top[s]]; ++s)
       std::fprintf(stderr, " %s %.3f", names[top[s]], frame_series[i].ns[top[s]] / 1e6);
     std::fprintf(stderr, " untimed %.3f", frame_ms[i] - timed);
-    // cyc/frame against the console's own ~560 k: at 1.0 the frame emulated
-    // exactly its own time and the wall time went elsewhere; above 1.0 it was
-    // catching up, and by how much.
     std::fprintf(stderr, "  [cyc %.2fx slices %llu]\n",
                  static_cast<double>(frame_series[i].cyc) / 1120380.0,
                  static_cast<unsigned long long>(frame_series[i].slices));
   }
 
-  // DS_PROFILE_LINE: the same run as one line of JSON, so a phase's claim is
-  // a diff of two lines rather than an eyeball over two tables
-  // (docs/speed-first-rework-scoping.md Phase 0). "-" or "1" goes to stderr;
-  // anything else is a path, appended to, so a sweep accumulates one line per
-  // run. DS_PROFILE_LABEL names the run.
+  // DS_PROFILE_LINE: this run as one JSON line. "-"/"1" -> stderr; else a
+  // path, appended to. DS_PROFILE_LABEL names the run.
   const char* line_to = std::getenv("DS_PROFILE_LINE");
   if (!line_to || !*line_to) return;
   std::FILE* out = stderr;
@@ -283,11 +250,8 @@ void frame_breakdown(const std::vector<double>& frame_ms) {
   const char* label = std::getenv("DS_PROFILE_LABEL");
   if (close_out) std::fprintf(out, "%s", "");
   std::fprintf(out, "{\"label\":\"%s\",\"frames\":%zu", label ? label : "", n);
-  // p95 is the bar's single-number tier (scoping doc SS3.33); p99 and max are
-  // kept because a driver stall shows there, and nowhere else.
   std::fprintf(out, ",\"ms\":{\"mean\":%.4f,\"median\":%.4f,\"p90\":%.4f,\"p95\":%.4f,\"p99\":%.4f,\"max\":%.4f}",
                m.ms, pct(0.50), pct(0.90), pct(0.95), pct(0.99), frame_ms[order[n - 1]]);
-  // Typical group (the middle fifth): the emulation thread's critical path.
   std::fprintf(out, ",\"typ\":{");
   bool first = true;
   for (u32 i = 0; i < COUNT; ++i) {
@@ -296,8 +260,6 @@ void frame_breakdown(const std::vector<double>& frame_ms) {
     first = false;
   }
   std::fprintf(out, "},\"typ_untimed\":%.4f,\"typ_workers\":%.4f", m.untimed, m.workers);
-  // The p99 group too: the tail is what a player feels, and a change that
-  // improves the median while worsening this one is not an improvement.
   std::fprintf(out, ",\"p99\":{");
   first = true;
   for (u32 i = 0; i < COUNT; ++i) {
@@ -306,11 +268,7 @@ void frame_breakdown(const std::vector<double>& frame_ms) {
     first = false;
   }
   std::fprintf(out, "},\"p99_untimed\":%.4f,\"p99_workers\":%.4f", t.untimed, t.workers);
-  // A fixed, small set of workload counters. Fixed because the point is to
-  // diff two runs: a counter that appears only sometimes cannot be diffed,
-  // and one that says how much work the guest asked for is what tells a real
-  // saving apart from the game simply drawing less (the swap-count trap in
-  // docs/frame-profile-2026-09-16.md).
+  // Fixed set of workload counters so two runs can be diffed.
   struct { const char* k; Counter c; } kCounts[] = {
     {"slices", C_SLICES}, {"gx_swap", C_GX_SWAP}, {"gx_read_gxstat", C_GX_READ_GXSTAT},
     {"poly_lines", C_POLY_LINES}, {"span_px", C_SPAN_PIXELS}, {"resolved_px", C_RESOLVED_PIXELS},
@@ -326,8 +284,7 @@ void frame_breakdown(const std::vector<double>& frame_ms) {
   else std::fflush(out);
 }
 
-// Sum every thread's accumulator. Called from the emulation thread after the
-// band workers are idle, so a plain lock is enough.
+// Called from the emulation thread after band workers are idle; a plain lock is enough.
 void report() {
   Accum t;
   {
@@ -339,10 +296,6 @@ void report() {
   }
   const u64* ns = t.ns;
   const u64* count = t.count;
-  // The "of which" stages nest inside other scopes and must not be added
-  // against wall time -- profile.h says so for each of them. JIT_TX was in
-  // this sum anyway until 2026-09-21, so the row has always been slightly
-  // over; GX_RUN and W2D_JOIN would have made it three.
   u64 total = 0;
   for (u32 i = 0; i < COUNT; ++i) if (!of_which(static_cast<Stage>(i))) total += ns[i];
   if (!total) return;
@@ -358,9 +311,7 @@ void report() {
                      ds::cpu::idle_reject_name(static_cast<ds::cpu::IdleReject>(r)),
                      (unsigned long long)il.by_reason[r]);
   }
-  // DS_PROFILE_THREADS=1: the same stages per thread. The emulation thread
-  // waits for the slowest band, so its own column is the frame's critical
-  // path and the workers' columns are only what they contribute to it.
+  // DS_PROFILE_THREADS=1: the same stages, per thread.
   if (std::getenv("DS_PROFILE_THREADS")) {
     std::lock_guard<std::mutex> lk(detail::accs_mutex());
     for (const Accum* a : detail::accs()) {

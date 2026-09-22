@@ -33,11 +33,9 @@ const char* const kPadHotDefaults[static_cast<int>(Action::Count)] = {
   "mod+start+back", "mod+start", "mod++righttrigger", "none", "mod+rightshoulder", "mod+leftshoulder", "mod+dpright", "mod+dpleft",
   "none", "none", "none", "mod+back", "mod+x", "mod+y", "none", "none", "none", "none", "leftstick", "none"};
 
-// The controls that are not a DS button and not a hotkey: the hotkey modifier
-// and the pad-driven pen. The Controls page shows them as rows of their own,
-// so their defaults have to be readable from there as well as from
-// configure() -- one copy, or the page will offer to reset a control to
-// something the emulator does not actually start with.
+// Controls that are neither a DS button nor a hotkey: hotkey modifier and
+// the pad-driven pen. Kept as one copy readable from both configure() and
+// the Controls page.
 const char* const kModDefaultKey = "none";       // hotkeys.modifier
 const char* const kModDefaultPad = "guide";      // padhotkeys.modifier: the pad's mode/home button
 const char* const kStylusButtonDefault = "rightstick";
@@ -49,16 +47,10 @@ const char* const kStickDpadDefault = "left";
 // Held actions: an edge on both press and release.
 bool is_hold(Action a) { return a == Action::FastForward || a == Action::Mic; }
 
-// How a controller control is spelled in the config file, and how the menu
-// says it. One table for both directions: the aliases a player may write and
-// the label the page draws are the same set of names, so they cannot drift.
-//
-// SDL names the face buttons by their Xbox letters, which are in different
-// places on the pads this runs on -- so the letter is not shown at all. The
-// menu draws the position pip and names the position, and the file accepts
-// those same compass names as the unambiguous spelling. `sdl` is what is
-// always written back, so a captured binding and a hand-written one land on
-// the same line in the file.
+// Spelling in the config file and label the menu shows, one table for both.
+// SDL names face buttons by Xbox letters, meaningless on these pads, so the
+// menu draws the position pip and compass name instead; `sdl` is always
+// written back.
 struct PadName {
   const char* sdl;      // canonical, as SDL spells it (what we store)
   const char* label;    // what the menu draws
@@ -85,8 +77,8 @@ const PadName kPadNames[] = {
   {"dpright",       "RIGHT",      nullptr, nullptr},
 };
 
-// One token of a binding -- no "mod+", no chord, but the axis sign is part of
-// the name ("+lefttrigger" is L2, "-lefttrigger" is not a thing any pad has).
+// One token of a binding (no "mod+", no chord); axis sign is part of the
+// name ("+lefttrigger" is L2, "-lefttrigger" is not a thing any pad has).
 std::string canon_pad_token(const std::string& s) {
   for (const PadName& p : kPadNames) {
     if (s == p.sdl) return s;
@@ -121,15 +113,14 @@ Input::Bind Input::parse_pad(const std::string& s0) {
   std::string s = s0;
   if (s.compare(0, 4, "mod+") == 0) { b.mod = true; s = s.substr(4); }
   if (s.empty() || s == "none" || s == "null") return b;
-  // A chord: "start+select" is start with select held (either order works
-  // for the player; the last pressed completes it).
+  // Chord: "start+select" is start with select held.
   if (const size_t plus = s.find('+', 1); plus != std::string::npos && s[0] != '+' && s[0] != '-') {
     const SDL_GameControllerButton w = SDL_GameControllerGetButtonFromString(canon_pad_token(s.substr(plus + 1)).c_str());
     if (w == SDL_CONTROLLER_BUTTON_INVALID) { std::fprintf(stderr, "config: unknown controller button in \"%s\"\n", s0.c_str()); return b; }
     b.with = w;
     s = s.substr(0, plus);
   }
-  // After the split, so an alias that expands to an axis ("l2" -> "+lefttrigger")
+  // After the split, so an alias expanding to an axis ("l2" -> "+lefttrigger")
   // still meets the sign test below.
   s = canon_pad_token(s);
   if (s[0] == '+' || s[0] == '-') {
@@ -173,26 +164,24 @@ void Input::configure(const Config& cfg) {
   for (int i = 0; i < static_cast<int>(Action::Count); ++i) {
     key_hot_[i][0] = parse_key(cfg.str(std::string("hotkeys.") + kActionNames[i], kKeyHotDefaults[i]));
     pad_hot_[i][0] = parse_pad(cfg.str(std::string("padhotkeys.") + kActionNames[i], kPadHotDefaults[i]));
-    // The second binding, if the player set one. No default: unset means the
-    // action has the one control its column's layout gives it.
+    // Second binding, if set; no default.
     key_hot_[i][1] = parse_key(cfg.str(std::string("hotkeys.") + kActionNames[i] + ".alt", "none"));
     pad_hot_[i][1] = parse_pad(cfg.str(std::string("padhotkeys.") + kActionNames[i] + ".alt", "none"));
   }
   key_mod_ = parse_key(cfg.str("hotkeys.modifier", kModDefaultKey));
   pad_mod_ = parse_pad(cfg.str("padhotkeys.modifier", kModDefaultPad));   // BTN_MODE
   stylus_button_[0] = parse_pad(cfg.str("pad.stylus_button", kStylusButtonDefault));
-  stylus_button_[1] = parse_pad(cfg.str("pad.stylus_button.alt", "none"));   // no default, like a hotkey's .alt
+  stylus_button_[1] = parse_pad(cfg.str("pad.stylus_button.alt", "none"));
   stylus_speed_ = cfg.real("pad.stylus_speed", 4.0);
   stylus_size_ = cfg.num("pad.stylus_size", 2);
   stylus_hide_ = cfg.num("pad.stylus_hide", 90);
-  // Which DS button the pad modifier doubles as, so it can be delivered as a
-  // tap when released alone.
+  // Which DS button the pad modifier doubles as, delivered as a tap on release alone.
   pad_mod_button_ = -1;
   if (pad_mod_.kind == Bind::PadButton)
     for (int i = 0; i < static_cast<int>(B::BTN_COUNT); ++i)
       if (pad_map_[i].kind == Bind::PadButton && pad_map_[i].code == pad_mod_.code) pad_mod_button_ = i;
   {
-    // stylus_axis: right (default) | left | none; stylus_stick = false is the old spelling of none.
+    // stylus_axis: right (default) | left | none; stylus_stick = false is old spelling of none.
     const std::string ax = cfg.str("pad.stylus_axis", stylus_axis_default(cfg));
     if (ax == "right") stylus_axis_ = StylusAxis::Right;
     else if (ax == "left") stylus_axis_ = StylusAxis::Left;
@@ -201,9 +190,8 @@ void Input::configure(const Config& cfg) {
   }
   stylus_chord_ = parse_pad(cfg.str("pad.stylus_dpad", kStylusDpadDefault));
   {
-    // stick_dpad: left (default) | right | none, a stick that also works the
-    // d-pad; stick_face: none (default) | left | right, one whose directions
-    // are X (up), B (down), Y (left) and A (right), the DS's own layout.
+    // stick_dpad: left (default)|right|none, also works d-pad. stick_face:
+    // none (default)|left|right, directions X(up)/B(down)/Y(left)/A(right).
     const std::string sd = cfg.str("pad.stick_dpad", kStickDpadDefault), sf = cfg.str("pad.stick_face", kStickFaceDefault);
     if (!parse_stick(sd, stick_dpad_)) { std::fprintf(stderr, "config: stick_dpad \"%s\" is not none | left | right\n", sd.c_str()); stick_dpad_ = StylusAxis::Left; }
     if (!parse_stick(sf, stick_face_)) { std::fprintf(stderr, "config: stick_face \"%s\" is not none | left | right\n", sf.c_str()); stick_face_ = StylusAxis::None; }
@@ -215,9 +203,9 @@ void Input::configure(const Config& cfg) {
       std::fprintf(stderr, "config: pad.stick_dpad and pad.stick_face are both the %s stick; it will work both the d-pad and X/B/Y/A\n", sf.c_str());
   }
   deadzone_ = cfg.num("pad.stick_deadzone", 12000);
-  stick_ = stick_prev_ = face_stick_ = 0;   // a stick held across a reconfigure re-asserts itself on its next motion
+  stick_ = stick_prev_ = face_stick_ = 0;   // a held stick re-asserts on its next motion
   dstick_x_ = dstick_y_ = 0;
-  stylus_x_ = stylus_y_ = 0;   // and the pen's tilt is not kept by a stick that is no longer the pen's
+  stylus_x_ = stylus_y_ = 0;
   warn_collisions();
 }
 
@@ -251,9 +239,8 @@ void Input::warn_collisions() const {
     if (same(key_mod_, key_map_[i]))
       std::fprintf(stderr, "config: hotkeys.modifier = %s shadows keys.%s\n", key_name(key_mod_).c_str(), kButtonNames[i]);
   }
-  // Every binding against every earlier one, the two slots included: the
-  // first match in key_down()'s order wins, and that order is action then
-  // slot.
+  // Every binding against every earlier one; key_down()'s match order is
+  // action then slot.
   for (int a = 0; a < na * HOT_SLOTS; ++a)
     for (int b = 0; b < a; ++b)
       if (exact(key_hot_[a / HOT_SLOTS][a % HOT_SLOTS], key_hot_[b / HOT_SLOTS][b % HOT_SLOTS]))
@@ -261,8 +248,8 @@ void Input::warn_collisions() const {
                      kActionNames[a / HOT_SLOTS], hot_suffix(a % HOT_SLOTS), key_name(key_hot_[a / HOT_SLOTS][a % HOT_SLOTS]).c_str(),
                      kActionNames[b / HOT_SLOTS], hot_suffix(b % HOT_SLOTS), kActionNames[b / HOT_SLOTS]);
 
-  // Controller. The modifier doubling as a DS button is by design (a lone
-  // release delivers it as a tap), so that pair is not a collision.
+  // The modifier doubling as a DS button (lone release = tap) is by design,
+  // not a collision.
   for (int i = 0; i < nb; ++i) {
     for (int j = 0; j < i; ++j)
       if (exact(pad_map_[i], pad_map_[j]))
@@ -285,8 +272,7 @@ void Input::warn_collisions() const {
         std::fprintf(stderr, "config: padhotkeys.%s%s = %s is already padhotkeys.%s%s; only %s will fire\n",
                      kActionNames[a], hot_suffix(sl), pad_name(h).c_str(),
                      kActionNames[b / HOT_SLOTS], hot_suffix(b % HOT_SLOTS), kActionNames[b / HOT_SLOTS]);
-    // The pen claims its button unless the modifier is held, so only an
-    // unmodified hotkey on it is dead.
+    // The pen claims its button unless the modifier is held.
     if (!h.mod) {
       for (int tb = 0; tb < HOT_SLOTS; ++tb)
         if (stylus_visible_binding() && same(h, stylus_button_[tb]))
@@ -318,7 +304,7 @@ void Input::close() {
 
 void Input::fake_mic_frame(std::vector<s16>& out) {
   out.resize(spu::Spu::SAMPLE_RATE / 60 + 1);
-  for (s16& v : out) {                          // xorshift white noise, +/-80 % of full scale
+  for (s16& v : out) {                          // xorshift white noise, +/-80% full scale
     noise_ ^= noise_ << 13; noise_ ^= noise_ >> 17; noise_ ^= noise_ << 5;
     v = static_cast<s16>((static_cast<int>(noise_ & 0xFFFF) - 0x8000) * 4 / 5);
   }
@@ -353,14 +339,9 @@ bool Input::key_down(SDL_Keycode k, bool down) {
   return false;
 }
 
-// The menu's fallback controls (input.h). Both tables are consulted only for a
-// control nothing is bound to, so they add menu actions and never duplicate
-// one.
-//
-// The pad table follows the console rather than SDL's letters: on a DS the A
-// button is the one on the right, which is what the shipped default puts DS A
-// on (pad.a = b), so east confirms and south cancels. A player who has swapped
-// them has both bound and sees none of this.
+// Menu fallback controls (input.h). Pad table follows the console layout,
+// not SDL's letters: DS A is on the right (pad.a = b default), so east
+// confirms and south cancels.
 void Input::menu_fallback_pad(const Bind& b, bool down) {
   if (b.kind != Bind::PadButton) return;   // buttons only: an axis is nobody's idea of a menu key
   switch (b.code) {
@@ -378,9 +359,7 @@ void Input::menu_fallback_pad(const Bind& b, bool down) {
 void Input::menu_fallback_key(SDL_Keycode k, bool down) {
   switch (k) {
   case SDLK_RETURN: case SDLK_KP_ENTER: menu_fallback(B::BTN_A, down); break;
-  // Escape is the quit hotkey by default, so it is bound and never arrives
-  // here; it only becomes the menu's cancel for a player who took quit off it.
-  case SDLK_ESCAPE:    menu_fallback(B::BTN_B, down); break;
+  case SDLK_ESCAPE:    menu_fallback(B::BTN_B, down); break;   // only reached if quit was rebound off it
   case SDLK_UP:        menu_fallback(B::BTN_UP, down); break;
   case SDLK_DOWN:      menu_fallback(B::BTN_DOWN, down); break;
   case SDLK_LEFT:      menu_fallback(B::BTN_LEFT, down); break;
@@ -393,10 +372,8 @@ void Input::menu_fallback_key(SDL_Keycode k, bool down) {
 bool Input::pad_down(const Bind& b, bool down) {
   auto same = [&](const Bind& x) { return x.kind == b.kind && x.code == b.code && (x.kind != Bind::PadAxis || x.neg == b.neg); };
   if (b.kind == Bind::PadButton) { if (down) held_ |= 1u << b.code; else held_ &= ~(1u << b.code); }
-  // The pen's tap button and d-pad chord come first, but yield to the pad
-  // modifier: mod+<tap button> is free to be a hotkey, and plain presses
-  // still tap. A release always ends a tap or chord that is in progress,
-  // even if the modifier was pressed in between.
+  // Tap button and d-pad chord yield to the pad modifier: mod+<tap button>
+  // can be a hotkey. A release always ends an in-progress tap or chord.
   for (int sl = 0; sl < HOT_SLOTS; ++sl) {
     const u8 bit = static_cast<u8>(1u << sl);
     if (stylus_visible_binding() && same(stylus_button_[sl]) && ((stylus_down_ & bit) || (down && !pad_mod_down_))) {
@@ -404,13 +381,13 @@ bool Input::pad_down(const Bind& b, bool down) {
       return true;
     }
   }
-  // The d-pad chord: the chord button itself is withheld from the game, and
-  // while it is held the four directions move the pen instead.
+  // Chord button is withheld from the game; while held, the four directions
+  // move the pen instead.
   if (same(stylus_chord_) && (stylus_chord_down_ || (down && !pad_mod_down_))) {
     stylus_chord_down_ = down;
     if (!down) stylus_dpad_ = 0;
-    // The d-pad stick follows the d-pad: under the chord it is the pen's
-    // (update_stylus), so the game lets go of it, and gets it back on release.
+    // D-pad stick is the pen's under the chord (update_stylus); back to the
+    // game on release.
     stick_ = 0;
     if (!down && stick_dpad_ != StylusAxis::None && stick_dpad_ != stylus_axis_) {
       stick_as_buttons(stick_, static_cast<Sint16>(dstick_x_), B::BTN_LEFT, B::BTN_RIGHT);
@@ -431,14 +408,12 @@ bool Input::pad_down(const Bind& b, bool down) {
     if (down) { pad_mod_down_ = true; pad_mod_used_ = false; }
     else {
       pad_mod_down_ = false;
-      // Released alone: the game gets the button it doubles as, for one frame.
+      // Released alone: doubles as its button for one frame.
       if (!pad_mod_used_ && pad_mod_button_ >= 0) pressed_ |= 1u << pad_mod_button_;
     }
     return true;
   }
-  // Hotkeys: a chord's partner may be pressed in either order, so a button
-  // matches both as the binding's own button (partner held) and as the
-  // partner (own button held). The most specific binding wins.
+  // A chord's partner may be pressed in either order; most specific binding wins.
   int best = -1, best_score = -1;
   for (int i = 0; i < static_cast<int>(Action::Count) * HOT_SLOTS; ++i) {
     const Bind& h = pad_hot_[i / HOT_SLOTS][i % HOT_SLOTS];
@@ -470,12 +445,9 @@ bool Input::pad_down(const Bind& b, bool down) {
 }
 
 void Input::axis(Uint8 which, Sint16 value) {
-  // Axis directions bound as buttons: edge detection with a threshold.
-  // A trigger is 0 at rest and 32767 pressed -- unless the pad's mapping
-  // binds it to a centred axis (the Miyoo A30's "Xbox 360" pad: L2/R2 are
-  // -256..256 evdev axes, idle 0), which SDL rescales to rest at 16384. A
-  // stick deadzone would then see the release as still pressed, and the
-  // hotkey fires exactly once. Triggers need three quarters of the travel.
+  // Axis directions bound as buttons: edge detection with a threshold. Some
+  // pads map triggers to a centred axis (SDL rescales rest to 16384), so a
+  // stick deadzone would see release as still pressed; triggers need 3/4 travel.
   const bool trigger = which == SDL_CONTROLLER_AXIS_TRIGGERLEFT || which == SDL_CONTROLLER_AXIS_TRIGGERRIGHT;
   const int threshold = trigger ? std::max(deadzone_, 24576) : deadzone_;
   for (int dir = 0; dir < 2; ++dir) {
@@ -490,12 +462,10 @@ void Input::axis(Uint8 which, Sint16 value) {
   const bool left_x = which == SDL_CONTROLLER_AXIS_LEFTX, left_y = which == SDL_CONTROLLER_AXIS_LEFTY;
   const bool right_x = which == SDL_CONTROLLER_AXIS_RIGHTX, right_y = which == SDL_CONTROLLER_AXIS_RIGHTY;
   const bool x_axis = left_x || right_x;
-  // Is this axis on the stick a setting names, and is that stick not the pen's?
+  // Is this axis on the named stick, and is that stick not the pen's?
   const auto on_stick = [&](StylusAxis s) {
     return s != stylus_axis_ && (s == StylusAxis::Left ? (left_x || left_y) : s == StylusAxis::Right ? (right_x || right_y) : false);
   };
-  // A stick as the d-pad, and a stick as the face buttons laid out as the DS
-  // has them: X up, B down, Y left, A right. The pen's stick stays the pen's.
   if (on_stick(stick_dpad_)) { if (x_axis) dstick_x_ = value; else dstick_y_ = value; }
   if (on_stick(stick_dpad_) && !stylus_chord_down_) stick_as_buttons(stick_, value, x_axis ? B::BTN_LEFT : B::BTN_UP, x_axis ? B::BTN_RIGHT : B::BTN_DOWN);
   if (on_stick(stick_face_)) stick_as_buttons(face_stick_, value, x_axis ? B::BTN_Y : B::BTN_X, x_axis ? B::BTN_A : B::BTN_B);
@@ -505,8 +475,8 @@ void Input::axis(Uint8 which, Sint16 value) {
   }
 }
 
-// A physical axis may feed any number of remapped ones (normally exactly its
-// own). Inverting -32768 would overflow, so the negation is clamped.
+// A physical axis may feed any number of remapped ones. Negation is clamped
+// (inverting -32768 would overflow).
 void Input::physical_axis(Uint8 which, Sint16 value) {
   for (int l = 0; l < SDL_CONTROLLER_AXIS_MAX; ++l)
     if (axis_src_[l] == which)
@@ -548,9 +518,8 @@ void Input::update_stylus() {
   if (stylus_down_) { touch_x_ = stylus_x(); touch_y_ = stylus_y(); }
 }
 
-// A whole binding as the menu should draw it: "mod+leftshoulder" is "MOD+L1",
-// "mod+start+back" is "MOD+START+SELECT". Anything with no entry falls back to
-// upper case, which is what the page did for every name before.
+// "mod+leftshoulder" -> "MOD+L1", "mod+start+back" -> "MOD+START+SELECT".
+// Falls back to upper case for anything with no table entry.
 std::string Input::pad_label(const std::string& s0) {
   std::string s = s0, out;
   if (s.compare(0, 4, "mod+") == 0) { out = "MOD+"; s = s.substr(4); }
@@ -584,16 +553,14 @@ bool Input::parse_stick(const std::string& s, StylusAxis& out) {
   else return false;
   return true;
 }
-// "pad.stylus_stick = false" is the old spelling of "none", and a config file
-// written before the axis key existed still says it, so the default the page
-// shows has to come through the same fallback configure() uses.
+// "pad.stylus_stick = false" is the old spelling of "none"; the page's
+// default must go through the same fallback configure() uses.
 const char* Input::stylus_axis_default(const Config& cfg) {
   return cfg.flag("pad.stylus_stick", true) ? kStylusAxisDefault : "none";
 }
 
-// Which stick a captured axis belongs to, as the generic name the config file
-// wants: the pen follows a stick, not one of its two axes, so whichever way
-// the player pushed it is the same answer.
+// Which stick a captured axis belongs to: the pen follows a stick, not one
+// of its two axes, so either direction gives the same answer.
 const char* Input::stylus_axis_of(const std::string& captured) {
   const std::string a = captured.size() > 1 && (captured[0] == '+' || captured[0] == '-') ? captured.substr(1) : captured;
   if (a == "leftx" || a == "lefty") return "left";
@@ -626,9 +593,7 @@ std::string Input::take_capture() {
   return out;
 }
 
-// A stick at rest still reports small motion, and a trigger may rest at its
-// minimum or centred (see axis()), so "the player moved this" needs the same
-// raised bar in the capture as it does in play.
+// Same raised bar as in play (see axis()): rest reports small motion.
 bool Input::axis_moved(int axis, int value) const {
   const bool trigger = axis == SDL_CONTROLLER_AXIS_TRIGGERLEFT || axis == SDL_CONTROLLER_AXIS_TRIGGERRIGHT;
   return std::abs(value) >= (trigger ? std::max(deadzone_, 24576) : std::max(deadzone_, 16384));
@@ -639,15 +604,10 @@ bool Input::is_pad_mod_button(int sdl_button) const {
 }
 bool Input::is_key_mod(SDL_Keycode k) const { return key_mod_.kind == Bind::Key && key_mod_.code == k; }
 
-// True when the event was swallowed. Only the device being listened to is
-// taken, so pressing a key while the pad column is open does nothing rather
-// than writing a key name into [pad].
+// True when the event was swallowed. Only the device being listened to is taken.
 bool Input::capture_event(const SDL_Event& e) {
-  // The modifier is the one control that is not taken when it goes down: held,
-  // it is the first half of a chord ("mod+start"), which is how most of the
-  // pad hotkeys are spelled and which there was otherwise no way to enter
-  // here. So it is read on the way up instead -- released with nothing pressed
-  // after it, it was not a chord and it binds itself.
+  // The modifier is not taken on press (it's the first half of a chord like
+  // "mod+start"); read on release instead -- if nothing followed, it binds itself.
   if (e.type == SDL_CONTROLLERBUTTONUP && capture_pad_ && capture_mod_ && is_pad_mod_button(e.cbutton.button)) {
     capture_mod_ = false;
     if (captured_.empty()) if (const char* n = SDL_GameControllerGetStringForButton(static_cast<SDL_GameControllerButton>(e.cbutton.button))) captured_ = n;
@@ -658,25 +618,18 @@ bool Input::capture_event(const SDL_Event& e) {
     if (captured_.empty()) if (const char* n = SDL_GetKeyName(e.key.keysym.sym)) captured_ = n;
     return true;
   }
-  // The release of whatever was just captured, and the release of the button
-  // that opened the capture, are swallowed rather than acted on.
   if (e.type == SDL_KEYUP || e.type == SDL_CONTROLLERBUTTONUP) return true;
   if (!captured_.empty()) return true;   // waiting to be collected
   if (!capture_pad_) {
-    // Nothing on a controller can be written into [keys], and a handheld has
-    // no keyboard to satisfy this column with -- so a player who opens it
-    // there has nothing that will do. Anything but a key backs out of the
-    // bind, and is swallowed on the way so that the button which cancelled
-    // does not also act on the row it just left (A would reopen the capture
-    // it had closed).
+    // A controller button can't be written into [keys]; back out of the bind
+    // and swallow the event so it doesn't also act on the row just left.
     if (e.type == SDL_CONTROLLERBUTTONDOWN) { capturing_ = false; return true; }
     if (e.type == SDL_CONTROLLERAXISMOTION) {
       if (axis_moved(e.caxis.axis, e.caxis.value)) capturing_ = false;
       return true;   // resting-stick noise is eaten either way
     }
     if (e.type != SDL_KEYDOWN || e.key.repeat) return e.type == SDL_KEYDOWN;
-    // Escape cancels rather than binding itself: a page that can only be left
-    // by binding something is a trap, and Escape is the quit hotkey's default.
+    // Escape cancels rather than binding itself (would otherwise be a trap).
     if (e.key.keysym.sym == SDLK_ESCAPE) { capturing_ = false; return true; }
     if (is_key_mod(e.key.keysym.sym)) { capture_mod_ = true; return true; }
     const char* n = SDL_GetKeyName(e.key.keysym.sym);
@@ -704,14 +657,10 @@ bool Input::capture_event(const SDL_Event& e) {
     const char* rn = SDL_GameControllerGetStringForAxis(static_cast<SDL_GameControllerAxis>(raw));
     if (!rn) return true;
     captured_raw_axis_ = (e.caxis.value < 0 ? "-" : "+") + std::string(rn);
-    // A binding names the axis as play sees it, after the remap: the control
-    // the player pushed is whichever remapped axis it feeds. One that feeds
-    // none is named as it is, and will not fire until something maps it.
+    // A binding names the axis as play sees it, after the remap.
     Sint16 v = e.caxis.value;
     const int l = logical_of(raw, v);
     const char* n = l >= 0 ? SDL_GameControllerGetStringForAxis(static_cast<SDL_GameControllerAxis>(l)) : rn;
-    // "mod++righttrigger" is a real spelling and a shipped default, so the
-    // modifier prefixes an axis as readily as a button.
     captured_ = std::string(capture_mod_ ? "mod+" : "") + ((l >= 0 ? v : e.caxis.value) < 0 ? "-" : "+") + n;
     return true;
   }
@@ -720,19 +669,9 @@ bool Input::capture_event(const SDL_Event& e) {
   return false;
 }
 
-// Every binding that shadows another, as one line each. warn_collisions()
-// prints the same at startup; this is for the player who is making one.
-// Can this DS button still be pressed at all? The menu is driven by these
-// bindings, so a DS A bound to nothing -- or to a control this pad does not
-// physically have -- takes the Controls page itself out of reach, and with it
-// the reset that would undo the mistake.
-//
-// A pad is judged against the pad in hand: SDL knows which buttons and axes
-// the mapping actually names, so "rightstick" on a pad with no stick click is
-// caught as well as "none". With no pad open the keyboard is all there is.
-// Is any binding at all sitting on this pad button? A chord partner is not:
-// pad_down() only consumes a partner while the chord's own button is held, so
-// a lone press of it still falls through to the menu fallback.
+// Is any binding sitting on this pad button? A chord partner is not: it is
+// only consumed while the chord's own button is held, so a lone press still
+// falls through to the menu fallback.
 bool Input::pad_control_free(int sdl_button) const {
   const auto on = [&](const Bind& b) { return b.kind == Bind::PadButton && b.code == sdl_button; };
   if (on(pad_mod_) || on(stylus_button_[0]) || on(stylus_button_[1]) || on(stylus_chord_)) return false;
@@ -751,9 +690,8 @@ bool Input::key_control_free(SDL_Keycode k) const {
   return true;
 }
 
-// Has this DS button a binding on a control the hardware in hand actually has?
-// With a pad open the pad column is what the player is using: a keyboard
-// binding on a handheld with no keyboard is not a way out.
+// Has this DS button a binding on a control the hardware in hand actually
+// has? With a pad open, a keyboard-only binding is not a way out.
 bool Input::bound_and_present(int ds_button) const {
   const Bind& b = pad_ ? pad_map_[ds_button] : key_map_[ds_button];
   if (!pad_) return b.kind == Bind::Key;
@@ -770,15 +708,11 @@ bool Input::bound_and_present(int ds_button) const {
 
 bool Input::reachable(int ds_button) const {
   if (bound_and_present(ds_button)) return true;
-  // The menu's own fallback counts as a way to press it: it is what rescues
-  // the usual mistakes, and a warning that fires when nothing is actually
-  // broken is a warning players learn to read past.
+  // The menu's own fallback also counts as a way to press it.
   if (ds_button == B::BTN_A && (pad_ ? pad_control_free(SDL_CONTROLLER_BUTTON_B) : key_control_free(SDLK_RETURN))) return true;
   if (ds_button == B::BTN_B && (pad_ ? pad_control_free(SDL_CONTROLLER_BUTTON_A) : key_control_free(SDLK_ESCAPE))) return true;
-  // START confirms on every page but this one, so a working START is still a
-  // way in to the page that resets the lot. It is not offered for B: START
-  // backs out of nothing, and the way out of the menu with no B is the pause
-  // hotkey, which lives in its own namespace and cannot be broken from here.
+  // START confirms on every page but this one, so it's still a way in to the
+  // reset page; not offered for B, whose way out is the pause hotkey.
   if (ds_button == B::BTN_A)
     return bound_and_present(B::BTN_START) || (pad_ && pad_control_free(SDL_CONTROLLER_BUTTON_START));
   return false;
@@ -786,9 +720,7 @@ bool Input::reachable(int ds_button) const {
 
 std::vector<std::string> Input::collisions() const {
   std::vector<std::string> out;
-  // First, because the page shows one line and this is the one that cannot be
-  // recovered from without a text editor. A and B are what the menu needs: A
-  // to go in and act, B to come back out.
+  // First: this one cannot be recovered from without a text editor.
   for (const int i : {static_cast<int>(B::BTN_A), static_cast<int>(B::BTN_B)})
     if (!reachable(i))
       out.push_back(std::string(kButtonNames[i]) + " IS UNREACHABLE; X RESETS");
@@ -802,8 +734,7 @@ std::vector<std::string> Input::collisions() const {
       if (same(key_map_[i], key_map_[j])) out.push_back(std::string(kButtonNames[i]) + " AND " + kButtonNames[j] + " SHARE A KEY");
       if (same(pad_map_[i], pad_map_[j])) out.push_back(std::string(kButtonNames[i]) + " AND " + kButtonNames[j] + " SHARE A BUTTON");
     }
-  // A hotkey on the same control as a DS button: the hotkey is tried first,
-  // so the button is dead.
+  // A hotkey on the same control as a DS button: hotkey tried first, button dead.
   for (int a = 0; a < static_cast<int>(Action::Count); ++a)
     for (int i = 0; i < static_cast<int>(B::BTN_COUNT); ++i) {
       for (int sl = 0; sl < HOT_SLOTS; ++sl) {
@@ -820,9 +751,8 @@ void Input::handle(const SDL_Event& e, Display& display, Display* second) {
   auto owner = [&](u32 wid) -> Display& {
     return (second && wid == second->window_id()) ? *second : display;
   };
-  // Rebinding: the next thing pressed is a name to write down, not a control
-  // to act on. It has to be taken before anything else looks at it, or
-  // rebinding the quit hotkey would quit and rebinding A would press A.
+  // Rebinding: taken before anything else looks at it, or rebinding quit
+  // would quit and rebinding A would press A.
   if (capturing_ && capture_event(e)) return;
   switch (e.type) {
   case SDL_QUIT: quit_ = true; break;
@@ -864,8 +794,7 @@ void Input::handle(const SDL_Event& e, Display& display, Display* second) {
     if (e.button.button == SDL_BUTTON_LEFT) touching_ = false;
     break;
 
-  // The handhelds have a real touchscreen; SDL reports it in normalised
-  // window coordinates.
+  // SDL reports touch in normalised window coordinates.
   case SDL_FINGERDOWN:
   case SDL_FINGERMOTION: {
     Display& d = owner(e.tfinger.windowID);

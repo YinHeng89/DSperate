@@ -63,8 +63,7 @@ FatVolume::Stamp fat_stamp(s64 t) {
   return s;
 }
 
-// melonDS FATStorage::Load: the content plus 128 MB of room, rounded up to a
-// power of two (a size that already is one doubles).
+// Content plus 128 MB, rounded up to a power of two (a size that already is one doubles).
 u64 card_size_for(u64 content) {
   u64 size = content + 0x8000000ull;
   size |= size >> 1; size |= size >> 2; size |= size >> 4; size |= size >> 8; size |= size >> 16; size |= size >> 32;
@@ -113,8 +112,7 @@ bool SdCard::open(const std::string& dir, Report* report, std::string* err) {
   dir_ = fs::path(dir).lexically_normal().string();
   while (dir_.size() > 1 && (dir_.back() == '/' || dir_.back() == '\\')) dir_.pop_back();
 
-  // The folder's tree. Directory links are not followed (they can loop);
-  // file links are, as a PC copying the folder to a card would.
+  // Directory links are not followed (they can loop); file links are.
   struct Item { std::string rel; bool dir; u64 size; s64 mtime, mtime_ns; };
   std::vector<Item> items;
   u64 content = 0;
@@ -140,8 +138,7 @@ bool SdCard::open(const std::string& dir, Report* report, std::string* err) {
   fat_bits_ = length_ >= (1ull << 30) ? 32 : 16;
   const u64 sectors = length_ / 512;
   const u64 part_sectors = sectors - kPartitionStart;
-  // FAT16: about 32 000 clusters. FAT32: 4 KB clusters up to 2 GB, 32 KB
-  // above, as the SD Association's formatter makes SDHC cards.
+  // FAT16: ~32000 clusters. FAT32: 4 KB clusters up to 2 GB, 32 KB above (SDHC formatter shape).
   const u32 spc = fat_bits_ == 16 ? static_cast<u32>(sectors / 32768) : length_ <= (2ull << 30) ? 8 : 64;
 
   u8 mbr[512] = {};
@@ -169,8 +166,7 @@ bool SdCard::open(const std::string& dir, Report* report, std::string* err) {
   v.set_preserve_case(true);
   v.set_fresh(true);
 
-  // Directory by directory, from the top: each one's entries in one pass.
-  std::map<std::string, std::vector<size_t>> by_parent;
+  std::map<std::string, std::vector<size_t>> by_parent;   // directory -> its entries, one pass each
   for (size_t i = 0; i < items.size(); ++i) {
     const size_t slash = items[i].rel.rfind('/');
     by_parent[slash == std::string::npos ? std::string() : items[i].rel.substr(0, slash)].push_back(i);
@@ -217,8 +213,7 @@ bool SdCard::open(const std::string& dir, Report* report, std::string* err) {
 }
 
 bool SdCard::mount(FatVolume& v, std::string* why) {
-  // The partition the MBR names (the guest may have repartitioned), else a
-  // volume from sector 0.
+  // The partition the MBR names (guest may have repartitioned), else a volume from sector 0.
   u8 mbr[512];
   peek(0, 512, mbr);
   part_base_ = 0;
@@ -336,8 +331,7 @@ SdCard::Report SdCard::sync() {
   }
   auto cluster_of = [&](u64 volume_off) { return static_cast<u32>((part_base_ + volume_off - data) / cs) + 2; };
 
-  // The card's tree as the guest left it, parents before children.
-  struct Node { std::string path, key; FatVolume::Entry e; };
+  struct Node { std::string path, key; FatVolume::Entry e; };   // card's tree, parents before children
   std::vector<Node> nodes;
   {
     std::vector<Node> stack{{std::string(), std::string(), v.root()}};
@@ -358,8 +352,7 @@ SdCard::Report SdCard::sync() {
     std::sort(nodes.begin(), nodes.end(), [](const Node& a, const Node& b) { return a.path < b.path; });
   }
 
-  // A file the card keeps in memory from here on: its sectors copied out of
-  // whatever backs them before the backing is rebuilt.
+  // Copies a file's sectors out of whatever backs them; the card then keeps it in memory.
   auto keep_in_memory = [&](const FatVolume::Entry& e) {
     for (u64 o : v.extents(e))
       for (u32 s = 0; s < cs; s += 512) {
@@ -407,8 +400,7 @@ SdCard::Report SdCard::sync() {
       for (u64 o : v.extents(n.e))
         if (dirty.count(cluster_of(o))) { changed = true; break; }
     if (!changed) {
-      // Unchanged: it stays where it is read from now, the host or (after an
-      // earlier conflict) the card's memory.
+      // Stays where it is read from now: the host, or the card's memory after an earlier conflict.
       const std::vector<u64> ex = v.extents(n.e);
       if (ex.empty() || is_backed(part_base_ + ex.front())) backed.emplace_back(host_rel, n.e);
       continue;
@@ -420,8 +412,7 @@ SdCard::Report SdCard::sync() {
       keep_in_memory(n.e);
       continue;
     }
-    // Written beside the file and renamed over it, so a failed write leaves
-    // the host's copy whole (and the card can still read from it meanwhile).
+    // Written beside the file and renamed over it, so a failed write leaves the host's copy whole.
     const std::string tmp = host + ".dsperate-sync";
     bool ok = false;
     {
@@ -460,8 +451,7 @@ SdCard::Report SdCard::sync() {
     r.files++;
   }
 
-  // What the guest removed: files, then directories, children before parents.
-  std::vector<std::string> gone;
+  std::vector<std::string> gone;   // guest-removed: files then directories, children before parents
   for (const auto& [key, k] : known_) if (!present.count(key)) gone.push_back(key);
   std::sort(gone.rbegin(), gone.rend());
   for (const std::string& key : gone) {
@@ -480,8 +470,7 @@ SdCard::Report SdCard::sync() {
     ec.clear();
   }
 
-  // The card now reads its files from the host again: the backing is rebuilt
-  // from the tree, and the written sectors the host files now hold are let go.
+  // Rebuild the backing from the tree; the now-written sectors are let go.
   host_in_.reset();
   open_index_ = ~0u;
   extents_.clear();

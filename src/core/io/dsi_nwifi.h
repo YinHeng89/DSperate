@@ -1,16 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // DSperate - Nintendo DS emulator. Copyright (C) 2026 DSperate contributors.
 //
-// The DSi's Atheros Wi-Fi module on the SDIO host's port 0, after melonDS
-// DSi_NWifi: SDIO function 0 (CCCR + CIS) and function 1 (the mailboxes,
-// the IRQ registers and the diagnostic window), and the firmware protocols
-// the ARM7 driver speaks through mailbox 0 -- BMI while it "uploads" the
-// firmware (accepted and discarded), then HTC service setup, then WMI.
-// Everything is answered instantly, as melonDS does. A scan reports
-// melonDS's built-in AP (named bios::kAccessPointSsid here); once the guest connects to it, data frames
-// go out as Ethernet frames through the NetDriver (the same slirp backend the
-// DS Wi-Fi's access point uses) and come back from it on the 1 ms timer.
-// Without a driver they are dropped (melonDS's trace harness has none either).
+// Port of melonDS's DSi_NWifi.cpp (GPL-3.0-or-later, melonDS team).
+//
+// The DSi's Atheros Wi-Fi module on the SDIO host's port 0: function 0 (CCCR + CIS), function 1
+// (mailboxes, IRQ registers, diagnostic window), and the firmware protocol the ARM7 driver
+// speaks through mailbox 0 -- BMI, then HTC service setup, then WMI. Everything answers
+// instantly. A scan reports one built-in AP; connected, data frames go out as Ethernet frames
+// through the NetDriver and come back on the 1 ms timer.
 #pragma once
 #include "core/io/dsi_sd.h"
 #include "core/io/wifi_transport.h"
@@ -27,15 +24,15 @@ class NWifi : public SdDevice {
   void send_acmd(MmcAcmd cmd, u32 param) override;
   void continue_transfer() override;
 
-  static void ms_timer_event(NDS& nds, u32 param);   // EventId::NWifi
+  static void ms_timer_event(NDS& nds, u32 param);
   void set_net_driver(NetDriver* net) { net_ = net; }
   template <class S> void sync_state(S& s);
 
  private:
-  // melonDS's DynamicFIFO<u8>: a read of an empty FIFO returns the stale
-  // entry at the read position; Clear() zeroes only that entry.
+  // A read of an empty FIFO returns the stale entry at the read position;
+  // clear() zeroes only that entry.
   struct Fifo {
-    std::vector<u8> e;   // on the heap: the NDS lives on the stack in the unit tests
+    std::vector<u8> e;   // heap-allocated: NDS lives on the stack in unit tests
     u32 occupied = 0, rd = 0, wr = 0;
     u32  size() const { return static_cast<u32>(e.size()); }
     void clear() { occupied = rd = wr = 0; e[0] = 0; }
@@ -97,12 +94,12 @@ class NWifi : public SdDevice {
   u32 window_data_ = 0, window_read_addr_ = 0, window_write_addr_ = 0;
   u32 rom_id_ = 0, chip_id_ = 0, host_int_addr_ = 0;
   u8  eeprom_[0x400] = {};
-  u32 eeprom_ready_ = 0;   // melonDS sets it at BMI_DONE and never clears it on reset
+  u32 eeprom_ready_ = 0;   // set at BMI_DONE, never cleared on reset
   u32 boot_phase_ = 0, error_mask_ = 0, scan_timer_ = 0;
   u64 beacon_timer_ = 0;
   u32 connection_status_ = 0;
-  bool send_bss_info_ = true;   // melonDS's filter; always true here (a probe gets an answer under its own name)
-  char probed_ssid_[33] = {};   // the network a directed scan asks for; empty: any
+  bool send_bss_info_ = true;   // a probe always gets an answer under its own name
+  char probed_ssid_[33] = {};   // network a directed scan asks for; empty: any
   u8  cis0_[256] = {}, cis1_[256] = {};
 };
 

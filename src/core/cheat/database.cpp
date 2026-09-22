@@ -13,10 +13,7 @@ constexpr size_t NAME_LEN   = 0x3C;      // the database description, after the 
 constexpr u32 MAX_CODE_WORDS = 0x100000; // melonDS's sanity bound, and far above any real code
 constexpr u32 MAX_CATEGORY   = 0x10000;
 
-// A bounds-checked cursor over the file. Every read either succeeds or sets
-// `bad`, so the parsers can run to their end and be checked once rather than
-// testing each field -- the file is untrusted, and a truncated one must not
-// walk off the buffer.
+// Bounds-checked cursor: every read either succeeds or sets `bad`.
 struct Reader {
   const u8* p;
   size_t n, at = 0;
@@ -31,8 +28,6 @@ struct Reader {
     at += 4;
     return v;
   }
-  // A NUL-terminated string. A missing terminator means the file is
-  // truncated, not that the string runs to the end.
   std::string ntstring() {
     const size_t start = at;
     while (at < n && p[at]) ++at;
@@ -89,15 +84,13 @@ bool Database::open(const std::string& path, std::string& err) {
   const char* desc = reinterpret_cast<const char*>(file_.data() + 16);
   name_.assign(desc, strnlen(desc, NAME_LEN));
 
-  // The entry list: 16 bytes each, ended by a zero game code or the file.
+  // Entry list: 16 bytes each, ended by a zero game code or the file.
   Reader r{file_.data(), file_.size()};
   r.seek(ENTRY_LIST);
   while (r.left() >= 16) {
     const u32 code = r.u32le(), checksum = r.u32le(), offset = r.u32le();
-    r.u32le();                       // reserved, always zero
+    r.u32le();                       // reserved
     if (code == 0) break;
-    // An offset inside the header, or past the end, means a corrupt file
-    // rather than a corrupt entry: skip it and keep the rest.
     if (offset < ENTRY_LIST || offset >= file_.size()) continue;
     index_.push_back({code, checksum, offset});
   }
@@ -156,9 +149,7 @@ bool Database::best_entry(u32 game_code, u32 checksum, GameCheats& out, std::str
   for (GameCheats& g : all) {
     if (g.checksum == checksum) { out = std::move(g); return true; }
   }
-  // No revision matched. The database files generic entries under checksum 0
-  // or 1, and a mismatch usually means a different dump of the same game
-  // rather than a different game, so the first entry is the useful answer.
+  // No revision matched; the first entry is the useful fallback.
   out = std::move(all.front());
   return true;
 }
@@ -173,12 +164,11 @@ bool Database::parse_entry(const Entry& e, GameCheats& out, std::string& err) co
   r.align4();
 
   const u32 flags = r.u32le();
-  for (int i = 0; i < 8; ++i) r.u32le();   // master codes; their use is not documented
+  for (int i = 0; i < 8; ++i) r.u32le();   // master codes; undocumented
   if (r.bad) { err = "entry header runs past the end of the file"; return false; }
   const u32 items = flags & 0xFFFFFF;
 
-  // Codes belong to the most recent category until its count is used up,
-  // then fall back outside any category.
+  // Codes belong to the most recent category until its count is used up.
   int group = -1;
   u32 group_left = 0;
   for (u32 i = 0; i < items; ++i) {
@@ -190,8 +180,6 @@ bool Database::parse_entry(const Entry& e, GameCheats& out, std::string& err) co
     if (r.bad) { err = "item " + std::to_string(i) + " runs past the end of the file"; return false; }
 
     if (item & (1u << 28)) {
-      // A category of zero items is a heading the database uses for a note
-      // or a credit line; melonDS rejects the whole game over one.
       if (total >= MAX_CATEGORY) { err = "category \"" + item_name + "\" has an unreasonable length"; return false; }
       out.groups.push_back({item_name, item_desc, (item & (1u << 24)) != 0});
       group = static_cast<int>(out.groups.size()) - 1;
@@ -201,22 +189,11 @@ bool Database::parse_entry(const Entry& e, GameCheats& out, std::string& err) co
 
     const u32 words = r.u32le();
     if (r.bad) { err = "code \"" + item_name + "\" has no length"; return false; }
-    // The item's own length must account for its strings, the word count and
-    // the code; a mismatch means the file is being read at the wrong offset,
-    // so stop rather than carry on misaligned.
+    // Declared length must account for strings, word count and code.
     const u32 expect = ((static_cast<u32>(item_name.size()) + 1 + static_cast<u32>(item_desc.size()) + 1 + 3) >> 2) + 1 + words;
     if (expect != total) { err = "code \"" + item_name + "\" has a length of " + std::to_string(total) + ", expected " + std::to_string(expect); return false; }
-    // A code of zero words is not a cheat but a note: the database is full of
-    // "(M)", "NOTE: read the description" and credit lines, carried as items
-    // with a name and no code. They are kept, so the menu can show them where
-    // their author put them, and are inert if enabled. Rejecting them costs
-    // the whole game's cheat list, which is what melonDS does here.
+    // Zero words: a note (credit line, heading), not a cheat; kept for the menu.
     if (words >= MAX_CODE_WORDS) { err = "code \"" + item_name + "\" has an unreasonable word count (" + std::to_string(words) + ")"; return false; }
-    // An odd word count is a truncated last instruction, not a misparse --
-    // the length check above has already confirmed where this item ends -- so
-    // the code is kept and the interpreter ignores the dangling word. Eight
-    // games in the published database are like this, and melonDS drops all
-    // of their cheats over it.
     if (r.left() < static_cast<size_t>(words) * 4) { err = "code \"" + item_name + "\" runs past the end of the file"; return false; }
 
     Code c;
@@ -230,8 +207,7 @@ bool Database::parse_entry(const Entry& e, GameCheats& out, std::string& err) co
     if (group_left > 0 && --group_left == 0) group = -1;
   }
 
-  // A category that allows only one of its codes may still arrive with
-  // several marked enabled; the first wins.
+  // An exclusive category may arrive with several codes marked enabled; first wins.
   for (size_t g = 0; g < out.groups.size(); ++g) {
     if (!out.groups[g].exclusive) continue;
     bool seen = false;

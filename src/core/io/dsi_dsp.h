@@ -1,17 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // DSperate - Nintendo DS emulator. Copyright (C) 2026 DSperate contributors.
 //
-// The DSi's DSP host interface at 0x04004300 (ARM9), after melonDS DSi_DSP
-// with no DSP core attached: PDATA/PADR/PCFG/PSTS/PSEM/PMASK/PCLEAR, the
-// three CMD/REP port pairs, and the 16-word PDATA read FIFO fed by the
-// PCFG-started "DMA". With no core every DSP-side read is 0 and the write
-// FIFO is always empty (PSTS bit 8), which is what system software sees while
-// it holds the DSP in reset -- the NAND launcher probes exactly that.
+// DSi's DSP host interface at 0x04004300 (ARM9), no DSP core attached: PDATA/PADR/PCFG/PSTS/
+// PSEM/PMASK/PCLEAR, three CMD/REP port pairs, 16-word PDATA read FIFO fed by the PCFG-started
+// "DMA". With no core, every DSP-side read is 0 and the write FIFO is always empty (PSTS bit 8),
+// matching what system software sees while it holds the DSP in reset.
 //
-// Not modelled: the core itself (melonDS runs HLE ucodes or Teakra) and the
-// 4096-cycle catch-up event melonDS schedules while the core is enabled
-// (SCFG_CLK9 bit 1, SCFG_RST released, PCFG bit 0 clear). Both are logged
-// once when a title reaches them, since from then on the interleave differs.
+// Not modelled: the core and its catch-up scheduling while enabled. Logged once if reached.
 #pragma once
 #include "core/types.h"
 
@@ -23,7 +18,7 @@ class DsiDsp {
 public:
   explicit DsiDsp(NDS& nds) : nds_(nds) {}
   void reset();
-  void set_rst_line(bool release);   // SCFG_RST bit 0 (melonDS SetRstLine: also resets the registers)
+  void set_rst_line(bool release);   // SCFG_RST bit 0; also resets the registers
   template <class S> void sync_state(S& s);
 
   // Offsets from 0x04004300 (the page mirrors every 0x40 bytes).

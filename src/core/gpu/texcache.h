@@ -9,30 +9,14 @@
 
 namespace ds::gpu {
 
-// Decoded-texture cache for the 3D rasteriser.
+// Decoded-texture cache: each (format, address, size, palette) decodes once
+// into one 32-bit word per texel (colour16 | alpha5<<16), so span kernels do
+// a single load per texel.
 //
-// Sampling a DS texture from VRAM costs a texel load, a palette load and for
-// the compressed format a palette-info load and a four-colour decode — a
-// chain of dependent loads per pixel that the in-order core cannot hide.
-// DS textures are small (a few KB) and most of them are reused every frame,
-// so the cache decodes each (format, address, size, palette) once into one
-// 32-bit word per texel — the 16-bit colour the sampler would return in
-// the low half, the 5-bit alpha above it — and the span kernels sample
-// with a single load per texel.
-//
-// Validity is checked by content, not by write tracking: the first time a
-// texture is used in a frame, its source bytes (texels, the compressed
-// format's palette-info slot, the palette range it touches) are compared
-// with the copy taken at decode time and the texture is re-decoded on any
-// difference. VRAM bank remaps, DMA, display capture and palette animation
-// all fall out of that. The comparison itself is gated by the VRAM map's
-// remap generation (VramMap::generation): texture VRAM has no CPU mapping,
-// so with no VRAMCNT change since the entry was last validated -- or none
-// that made a bank behind it writable or moved the banks behind it -- the
-// bytes cannot have moved and the entry is a hit without a read. Entries
-// unused for a frame are dropped when the cache exceeds its budget.
-// DS_TEXCACHE_VERIFY=1 runs the comparison anyway and aborts if the gate
-// was wrong (a check of the no-CPU-mapping claim, not a feature).
+// Validity is by content, not write tracking, but gated by VramMap::generation
+// (texture VRAM isn't CPU-mapped, so no VRAMCNT remap of its banks means the
+// bytes can't have moved) to skip the compare on a hit.
+// DS_TEXCACHE_VERIFY=1 compares anyway and aborts if the gate was wrong.
 class TextureCache {
 public:
   static constexpr size_t BUDGET_BYTES = 24u << 20;
@@ -40,14 +24,11 @@ public:
   ~TextureCache();
 
   void begin_frame(u64 frame);
-  // Decoded texels (width*height words) for a polygon's texture, decoding or
-  // revalidating as needed; nullptr when the cache is disabled.
+  // Decoded texels (width*height words); nullptr when the cache is disabled.
   const u32* lookup(const VramMap& vm, u32 fmt, u32 base, u32 width, u32 height, u32 texpal, u32 alpha0);
-  // The same, with the entry's identity: `id` names the entry for as long as
-  // it lives and `version` counts its decodes, so a consumer keeping its own
-  // copy (the GPU raster's texel arena) can tell whether the copy it holds is
-  // still this texture. texels is null when the cache is disabled.
-  struct Ref { const u32* texels = nullptr; u32 words = 0; u32 id = 0; u32 version = 0; bool transparent = false; };   // transparent: some texel has alpha 0 (scanned once per decode)
+  // Same, plus identity: `id` is stable for the entry's life, `version` counts
+  // decodes, so a caller keeping its own copy can tell if it's stale.
+  struct Ref { const u32* texels = nullptr; u32 words = 0; u32 id = 0; u32 version = 0; bool transparent = false; };   // transparent: any texel has alpha 0
   Ref lookup_ref(const VramMap& vm, u32 fmt, u32 base, u32 width, u32 height, u32 texpal, u32 alpha0);
   void clear();
   bool enabled() const { return enabled_; }
@@ -63,15 +44,15 @@ private:
     std::vector<u32> texels;
     u64 validated = 0, used = 0; // frames
     u32 id = 0, version = 0;     // identity and decode count, for Ref
-    bool transparent = false;    // any texel with alpha 0: the exact alpha-test gate (the GPU raster's DS_PF_TEX_ALPHA)
-    u32 gen = 0, banks = 0;      // VramMap generation the copy was last known current at, and the banks behind the ranges then
-    u64 sig = 0;                 // VramMap::block_signature of the ranges then
+    bool transparent = false;
+    u32 gen = 0, banks = 0;      // generation and banks last validated at
+    u64 sig = 0;                 // block_signature of the ranges then
   };
   static u64 key(u32 fmt, u32 base, u32 width, u32 height, u32 texpal, u32 alpha0);
   void decode(const VramMap& vm, Entry& e);
   void snapshot(const VramMap& vm, Entry& e);
   bool unchanged(const VramMap& vm, Entry& e);
-  void stamp(const VramMap& vm, Entry& e) const;   // record the generation, banks and signature of the ranges now
+  void stamp(const VramMap& vm, Entry& e) const;
   bool verify_ = false;   // DS_TEXCACHE_VERIFY
 
   Entry& find_or_decode(const VramMap& vm, u32 fmt, u32 base, u32 width, u32 height, u32 texpal, u32 alpha0);
@@ -79,7 +60,7 @@ private:
   u32 next_id_ = 1;
   size_t bytes_ = 0;
   u64 frame_ = 0;
-  u32 gate_hits_ = 0;   // validations settled by the generation gate alone (DS_TEXCACHE_VERIFY report)
+  u32 gate_hits_ = 0;   // DS_TEXCACHE_VERIFY report: gate-only hits
   u32 decodes_ = 0;
   bool enabled_ = true;
 };

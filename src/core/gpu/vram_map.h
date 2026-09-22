@@ -8,15 +8,9 @@
 
 namespace ds::gpu {
 
-// Engine-side views of VRAM.
-//
-// The nine VRAM banks are switched between the CPUs, the two 2D engines and
-// the 3D unit by VRAMCNT. Each consumer sees a linear address space made of
-// 16 KB blocks; a block may be backed by zero, one or several banks (the
-// hardware ORs overlapping banks on read and writes to all of them). The maps
-// below record, per block, the set of banks (bit i = bank A+i) and a direct
-// pointer when exactly one bank backs it, which is the common case and the
-// only one the renderers' fast paths take.
+// Engine-side views of VRAM: nine banks switched between CPUs/2D/3D by VRAMCNT. Each consumer
+// sees 16 KB blocks; a block may be backed by 0-several banks (hardware ORs on read, writes go
+// to all). Per block: bank set (bit i = bank A+i) and a direct pointer when exactly one backs it.
 struct VramView {
   static constexpr u32 BLOCK = 0x4000;
   u32 size = 0;                       // bytes covered (power of two)
@@ -26,8 +20,7 @@ struct VramView {
   u32 blocks() const { return size / BLOCK; }
   u32 addr_mask() const { return size - 1; }
 
-  // Direct pointer for `len` bytes at `addr` when the block is unique and the
-  // range does not cross a block; nullptr otherwise (caller uses read8/16).
+  // Direct pointer for `len` bytes at `addr` if the block is unique and not crossed; else nullptr.
   const u8* direct(u32 addr, u32 len) const {
     addr &= addr_mask();
     if (((addr & (BLOCK - 1)) + len) > BLOCK) return nullptr;
@@ -58,17 +51,10 @@ public:
   u8* bank(int i) const { return banks_[i]; }
   static constexpr u32 BANK_MASK[9] = {0x1FFFF, 0x1FFFF, 0x1FFFF, 0x1FFFF, 0xFFFF, 0x3FFF, 0x3FFF, 0x7FFF, 0x3FFF};
 
-  // Change tracking for the views no CPU can write: a bank in texture,
-  // texture-palette or extended-palette mode has no mapping in either CPU's
-  // address space (Bus::update_vram maps the BG/OBJ/LCDC/ARM7 views only,
-  // and DMA goes through the same page table), so its bytes can only change
-  // after a remap has put it in a CPU-writable mode. `generation` counts
-  // rebuilds; `bank_writable_gen(b)` is the last generation at which bank b
-  // was reachable by a CPU (disabled banks are not). Bytes read through the
-  // texture view at generation g are still the same if the banks now behind
-  // them are the ones that were then and none has a writable generation
-  // above g. `block_signature` identifies which banks back a range, block
-  // by block, so a swap of two banks between slots reads as a change.
+  // Change tracking for CPU-unmapped views: `generation` counts rebuilds; `bank_writable_gen(b)`
+  // is the last generation bank b was CPU-reachable. Bytes read at generation g are unchanged if
+  // the same banks back them and none has a writable generation above g. `block_signature`
+  // identifies which banks back a range block by block, so a bank swap between slots counts.
   u32 generation() const { return gen_; }
   u32 bank_writable_gen(int bank) const { return writable_gen_[bank]; }
   u64 block_signature(const VramView& v, u32 addr, u32 len, u32& banks) const;
@@ -80,10 +66,7 @@ private:
   void finish(VramView& v);
 };
 
-// Per-pixel fetches for the renderers' scalar paths (rotscale backgrounds
-// sample the map and the tiles at arbitrary addresses, so there is no row
-// to gather): the unique-bank case is one array lookup, overlapping banks
-// fall back to the OR-read accessor.
+// Per-pixel fetch for scalar renderer paths: unique-bank case is one lookup, else OR-read.
 inline u8 vram_fetch8(const VramMap& vm, const VramView& v, u32 a) {
   a &= v.addr_mask();
   const u8* p = v.ptr[a / VramView::BLOCK];

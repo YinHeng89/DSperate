@@ -17,9 +17,8 @@ static_assert(sizeof(AES_ctx) == 192 && offsetof(AES_ctx, Iv) == 176, "DsiAes::c
 
 namespace {
 
-// The engine works on byte-reversed 128-bit blocks: every value crosses the
-// register interface little-endian word by word and the cipher sees it
-// mirrored.
+// The engine works on byte-reversed 128-bit blocks: register words are little-endian, the
+// cipher sees them mirrored.
 void bswap128(u8* dst, const u8* src) { for (int i = 0; i < 16; ++i) dst[i] = src[15 - i]; }
 u32 get32(const u8* p) { u32 v; std::memcpy(&v, p, 4); return v; }
 void put32(u8* p, u32 v) { std::memcpy(p, &v, 4); }
@@ -56,8 +55,7 @@ void DsiAes::reset() {
   output_mac_due_ = false;
   static const u8 zero[16] = {};
   AES_init_ctx_iv(CTX, zero, zero);
-  // The fixed key material (melonDS DSi_AES::Reset): slot 0 "Nintendo",
-  // slots 1 and 3 mix the console ID, slot 2's KeyX lives in the ARM9i BIOS.
+  // Slot 0 "Nintendo", slots 1/3 mix the console ID, slot 2's KeyX lives in the ARM9i BIOS.
   const u64 cid = nds_.io.dsi.console_id;
   put32(&key_x_[0][0], 0x746E694E); put32(&key_x_[0][4], 0x6F646E65);
   put32(&key_x_[1][0], 0x4E00004A); put32(&key_x_[1][4], 0x4A00004E);
@@ -108,8 +106,7 @@ void DsiAes::process_ccm_encrypt() {
   for (int k = 0; k < 4; ++k) out_.write(get32(&data[k * 4]));
 }
 
-// The block goes in byte-reversed and comes out reversed back, so the
-// keystream is XORed in reversed instead: the same bytes, without the copies.
+// Block goes in/out byte-reversed; XOR the keystream in reversed too, to skip the copies.
 void DsiAes::process_ctr() {
   u8 ks[16], ksr[16];
   AES_CTR_next_keystream(CTX, ks);
@@ -135,7 +132,7 @@ void DsiAes::write_cnt(u32 value) {
   mode_ = (value >> 28) & 3;
   if (value & (1u << 24)) std::memcpy(cur_key_, key_normal_[(value >> 26) & 3], 16);
   if ((old & (1u << 31)) || !(value & (1u << 31))) return;
-  // Start: CCM modes count associated blocks in the low half of BLKCNT.
+  // CCM modes count associated blocks in the low half of BLKCNT.
   rem_extra_ = (mode_ < 2) ? (blkcnt_ & 0xFFFF) : 0;
   rem_blocks_ = blkcnt_ >> 16;
   output_mac_due_ = false;
@@ -144,8 +141,8 @@ void DsiAes::write_cnt(u32 value) {
   bswap128(key, cur_key_);
   bswap128(iv, iv_);
   if (mode_ < 2) {
-    // CCM: the counter block is flags | nonce(12) | 0 0 1, the MAC's B0
-    // carries the MAC length, the adata bit and the payload block count.
+    // CCM: counter block is flags | nonce(12) | 0 0 1; MAC's B0 carries MAC length, adata bit,
+    // and payload block count.
     u32 maclen = (value >> 16) & 7;
     if (maclen < 1) maclen = 1;
     iv[0] = 0x02;
@@ -208,8 +205,8 @@ void DsiAes::update() {
   }
   check_output_dma();
   if (rem_blocks_ != 0 || rem_extra_ != 0) return;
-  // Done: CCM finalises the MAC with counter 0 -- verified against MAC on
-  // decrypt (CNT bit 21), appended to the output on encrypt.
+  // CCM finalises the MAC with counter 0 -- verified against MAC on decrypt (CNT bit 21),
+  // appended to the output on encrypt.
   AES_ctx* ctx = CTX;
   if (mode_ == 0) {
     ctx->Iv[13] = ctx->Iv[14] = ctx->Iv[15] = 0;

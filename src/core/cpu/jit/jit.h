@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // DSperate - Nintendo DS emulator. Copyright (C) 2026 DSperate contributors.
 //
-// ARM -> AArch64 recompiler: public interface. See README.md in this
-// directory for the design.
+// ARM -> AArch64 recompiler: public interface.
 #pragma once
 #include "core/cpu/cpu.h"
 
@@ -14,39 +13,34 @@ namespace ds::jit {
 
 struct Stats {
   u64 blocks_translated = 0;
-  u64 instrs_translated = 0;   // guest instructions emitted inline
-  u64 instrs_fallback = 0;     // guest instructions routed to the interpreter helper
+  u64 instrs_translated = 0;   // emitted inline
+  u64 instrs_fallback = 0;     // routed to the interpreter helper
   u64 blocks_invalidated = 0;
   u64 flushes = 0;
   u64 entries = 0;             // native entries (one per scheduler slice at most)
-  u64 code_bytes = 0;          // native bytes emitted for blocks (cold sections included)
-  u64 hot_bytes = 0;           // of which the hot sections (what runs on the fast paths)
+  u64 code_bytes = 0;          // native bytes emitted (cold sections included)
+  u64 hot_bytes = 0;           // of which hot-section (fast path) bytes
   u64 slow_accesses = 0;       // loads/stores that left the inline page-table path
-  u64 blocks_revived = 0;      // killed blocks brought back because the guest bytes matched again
-  u64 bios_sha1_blocks = 0;    // DSi BIOS SHA-1 blocks run natively (bios_sha1.cpp)
+  u64 blocks_revived = 0;      // killed blocks whose guest bytes matched again
+  u64 bios_sha1_blocks = 0;    // DSi BIOS SHA-1 blocks run natively
 };
 
-// Create the runtime (code arena, stubs) and route the selected CPUs through
-// translated code. Safe to call once per NDS; `trace` mirrors NDS::trace at
-// attach time (toggling tracing later requires `set_trace`).
+// Safe to call once per NDS; `trace` mirrors NDS::trace at attach time
+// (toggling tracing later requires `set_trace`).
 bool attach(NDS& nds, bool arm9, bool arm7);
 void detach(NDS& nds);
 
 // RunFn entry: runs `cpu` until its budget is exhausted or it halts.
 void run(CpuContext& cpu);
 
-// Native slice loop: the scheduler's slice state machine
-// (Scheduler::slice_next) is driven from a loop in the code arena
-// that saves the callee-saved registers once and enters translated code
-// without the per-entry frame. `lookup` is the block lookup that
-// run() does before each entry (translating or resetting the arena as
-// needed); `run_loop` returns when slice_next reports the end.
+// Native slice loop: drives Scheduler::slice_next from a loop in the code
+// arena, saving callee-saved regs once and skipping the per-entry frame.
+// `lookup` is the block lookup run() does before each entry.
 const void* lookup(CpuContext& cpu);
 bool has_runtime();
 void run_loop(void* scheduler);
 
-// Drop every translated block of `cpu` (timing tables changed, tracing
-// toggled, debugger). Cheap to call; translation is lazy.
+// Drop every translated block of `cpu`. Cheap to call; translation is lazy.
 void flush(CpuContext& cpu);
 void flush_all();
 
@@ -54,24 +48,16 @@ void flush_all();
 // NDS::trace before executing, exactly as the interpreter does.
 void set_trace(bool on);
 
-// --cpu-oc: price every data access at a translate-time main-RAM constant
-// instead of looking the page's cost up at run time. INEXACT (frame hashes
-// move on every scene); opt-in only. Flushes both CPUs when it changes.
-//   Overclock:  main RAM's cached load cost for the ARM9 (stores too), its
-//               WRAM cost for the ARM7 -- cheaper than the regions replaced.
-//   Underclock: the first pricing -- ARM9 stores and every ARM7 access at
-//               main RAM's bus cost (8-9 cycles), ARM9 loads as Overclock.
-//               The guest runs slower than hardware and the host does less
-//               work per frame: better on the weakest devices, but a title
-//               that waits on its own clock can miss a VBlank.
+// --cpu-oc: price data accesses at a translate-time constant instead of the
+// per-page run-time cost. INEXACT; opt-in only; flushes both CPUs on change.
+//   Overclock:  main RAM cached-load cost for ARM9 (and stores), WRAM for ARM7.
+//   Underclock: ARM9 stores/all ARM7 at main-RAM bus cost, ARM9 loads as
+//               Overclock -- runs slower than hardware, may miss a VBlank.
 enum class CpuOc : u8 { Off, Overclock, Underclock };
 void set_cpu_oc(CpuOc mode);
 
-// Per-instruction budget checks, the same lockstep with the interpreter that
-// DS_JIT_STRICT asks for. Slower, and exact: the frontend turns it on for a
-// firmware boot, where the console is idle enough for the cost not to show
-// and where block-granularity overshoot has been seen to wedge the boot.
-// Flushes both CPUs when it changes, because it changes what is emitted.
+// DS_JIT_STRICT: per-instruction budget checks, lockstep with the
+// interpreter. Slower, exact. Flushes both CPUs on change.
 void set_strict(bool on);
 
 // DS_JIT_DENSITY: zero the executed-density counters (not the translations

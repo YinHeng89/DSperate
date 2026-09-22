@@ -1,20 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // DSperate - Nintendo DS emulator. Copyright (C) 2026 DSperate contributors.
 //
-// The interface the scanline path presents through when it is not writing
-// into SDL's window surface.
-//
-// Both implementations do the same thing by different means: allocate CMA
-// dma-heap buffers, hand one out per frame for the core to scale into, and
-// then get it in front of the user without a copy -- DmabufOut (display_wl.h)
-// by attaching it to SDL's Wayland surface, DrmOut (display_drm.h) by
-// page-flipping it onto the CRTC SDL's KMSDRM backend already drives. What
-// Display needs from either is a buffer, its size, and a present.
-//
-// The waiting is deliberately asymmetric: begin_frame() blocks (for a buffer
-// release, or for the previous flip) and end_frame() does not. The display's
-// pacing is then felt before the frame's emulation rather than after its
-// present, which is where the frame loop already has slack to absorb it.
+// Interface the scanline path presents through when not writing into SDL's
+// window surface (DmabufOut/display_wl.h, DrmOut/display_drm.h): both hand
+// out a CMA dma-heap buffer per frame and present it without a copy.
+// begin_frame() blocks (buffer release / previous flip); end_frame() does not
+// -- so display pacing is felt before emulation, where the loop has slack.
 #pragma once
 
 #include "core/types.h"
@@ -27,46 +18,33 @@ class ScanoutOut {
 public:
   virtual ~ScanoutOut() = default;
 
-  // Re-establish at a new size after a configure/mode change. False leaves
-  // the object closed and the caller drops the tier.
+  // Re-establish at a new size after a configure/mode change. False: object
+  // stays closed and the caller drops the tier.
   virtual bool reopen(SDL_Window* win, int w, int h) = 0;
   virtual void close() = 0;
 
   virtual int width() const = 0;
   virtual int height() const = 0;
-  // Row pitch in pixels; the width unless the buffer is padded (fbdev).
-  virtual int stride() const { return width(); }
-  // How many buffers rotate, and which one begin_frame() last handed out
-  // (0..bufs()-1; -1 outside a frame). No tier rotates round-robin -- each
-  // takes the lowest free buffer -- so a caller that must touch every
-  // buffer once (the letterbox clear after a layout change) keys off the
-  // index, never off a count of frames.
+  virtual int stride() const { return width(); }   // pixels; > width if padded (fbdev)
+  // Buffer count, and index begin_frame() last handed out (0..bufs()-1, -1
+  // outside a frame). Buffers are not round-robin -- lowest free is taken --
+  // so a caller touching every buffer once keys off the index, not a frame count.
   virtual int bufs() const = 0;
   virtual int current() const = 0;
 
-  // Pixels of a free buffer to render the next frame into, or null on a
-  // protocol/driver error, after which the caller falls back.
-  virtual u32* begin_frame() = 0;
+  virtual u32* begin_frame() = 0;   // free buffer's pixels, or null on protocol/driver error (caller falls back)
   virtual void end_frame() = 0;
-  // Block until the last end_frame() is actually on its way to the panel.
-  // A tier that defers work from end_frame() to the next begin_frame()
-  // (DrmOut queues a flip behind a pending one) needs this from a caller
-  // that presents once and then stops -- the pause menu -- or the frame
-  // sits queued until the next present. A no-op elsewhere.
+  // Block until the last end_frame() is on its way to the panel. Needed by a
+  // caller that presents once and stops (pause menu), since a tier may defer
+  // its work to the next begin_frame() (DrmOut queues a flip). No-op elsewhere.
   virtual void flush() {}
 
-  // The dma-buf behind buffer `buf` (0..bufs()-1), for a GPU present stage
-  // that imports the tier's buffers and writes them itself (docs/
-  // gpu-path-scoping.md P0.1: libmali imports a CMA fd as a LINEAR image and
-  // the display sees the GPU's writes with no sync ioctl). The fd stays
-  // owned by the tier; the importer dup()s it. False on a tier with no
-  // dma-buf (fbdev), and the caller keeps scaling on the CPU.
+  // dma-buf behind buffer `buf`, for a GPU present stage that imports and
+  // writes the tier's buffers directly (no sync ioctl needed on read). Fd
+  // stays owned by the tier; importer dup()s it. False if the tier has no dma-buf (fbdev).
   struct DmabufPlane { int fd = -1; u32 offset = 0, stride_bytes = 0, width = 0, height = 0; u32 fourcc = 0; };
   virtual bool dmabuf_plane(int buf, DmabufPlane& out) const { (void)buf; (void)out; return false; }
-  // The GPU writes the buffers from here on (through dmabuf_plane()): the
-  // CPU-write cache bracket (DMA_BUF_IOCTL_SYNC, a clean of the whole
-  // buffer -- ~0.5 ms for 3 MB) is then pointless and skipped.
-  virtual void set_gpu_writes(bool on) { (void)on; }
+  virtual void set_gpu_writes(bool on) { (void)on; }   // skip the CPU-write cache sync once the GPU owns writes
 };
 
 } // namespace ds::sdl

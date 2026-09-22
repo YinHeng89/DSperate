@@ -21,9 +21,9 @@ enum class Action : u8 {
 };
 const char* action_name(Action a);
 
-// Keyboard, game controller and touch (real finger or mouse) folded into the
-// DS's button mask and pen position, which are handed to the core once a frame.
-// Bindings come from the config ([keys], [pad], [hotkeys], [padhotkeys]).
+// Keyboard, game controller and touch folded into the DS's button mask and
+// pen position, handed to the core once a frame. Bindings come from the
+// config ([keys], [pad], [hotkeys], [padhotkeys]).
 class Input {
 public:
   void configure(const Config& cfg);
@@ -31,55 +31,41 @@ public:
   void close();
 
   // Feeds one SDL event; `display` maps window points onto the screens. In
-  // dual-window mode `second` is the other window: pointer, touch and window
-  // events are routed to whichever owns the event's windowID.
+  // dual-window mode `second` is the other window, routed by windowID.
   void handle(const SDL_Event& e, Display& display, Display* second = nullptr);
-  // The state for the coming frame. A press and release that both arrived
-  // since the last frame (a quick tap between two polls, common when frames
-  // take 30 ms) still count as held for this frame: the release lands on
-  // the next one, so the game sees every tap.
+  // State for the coming frame. A press+release both arrived since the last
+  // frame still counts as held this frame; the release lands on the next one.
   input::Frame frame() {
     const input::Frame f{static_cast<u16>(buttons_ | pressed_ | stick_ | face_stick_), static_cast<u8>(touch_x_), static_cast<u8>(touch_y_), touching_ || touched_ || stylus_down_ != 0};
     pressed_ = 0; stick_pressed_ = 0; touched_ = false;
-    // The menu's fallback presses (menu_fallback) never reach the guest, and
-    // they die with the frame they happened on: an unbound Escape pressed
-    // during play must not still be waiting to cancel the next menu opened.
-    menu_fb_pressed_ = 0;
+    menu_fb_pressed_ = 0;   // menu fallback presses die with their frame
     return f;
   }
 
   // Hotkey actions since the last call, in order.
   std::vector<Action> take_actions() { std::vector<Action> a; a.swap(actions_); return a; }
 
-  // Pause menu: the presses since the last call, as a DS button mask, for a
-  // frontend that is driving a menu instead of the game. The player's own
-  // bindings navigate it -- up/down/A/B are whatever they mapped -- and the
-  // guest never sees them, because the menu is only up while paused and
-  // frame() is not being called. Edge-triggered: a held direction moves one
-  // row, the same as the taps frame() is built to catch.
+  // Pause menu: presses since the last call, as a DS button mask, using the
+  // player's own bindings (never seen by the guest). Edge-triggered.
   u32 take_menu_presses() {
     const u32 p = pressed_ | stick_pressed_ | menu_fb_pressed_;
     pressed_ = 0; stick_pressed_ = 0; menu_fb_pressed_ = 0;
     return p;
   }
-  // What is held right now, for the menu's key repeat. Not the same as the
-  // edges above: a direction held down produces one press and then nothing.
+  // What is held right now, for the menu's key repeat (unlike the edges above).
   u32 menu_held() const { return buttons_ | stick_ | menu_fb_held_; }
   bool fast_forward_held() const { return ff_key_ || ff_pad_; }
 
-  // Hinge: a real lid switch (lid.h) drives set_lid() directly; the `lid`
-  // hotkey toggles it. Closing sends the game to sleep, opening wakes it.
+  // A real lid switch (lid.h) drives set_lid() directly; the `lid` hotkey
+  // toggles it. Closing sleeps the game, opening wakes it.
   void set_lid(bool closed) { lid_ = closed; }
   bool lid() const { return lid_; }
-  // Fake microphone for devices without one: `mic` held = noise at ~80 % of
-  // full scale, otherwise silence. Fills `out` for one frame when active.
+  // Fake mic for devices without one: `mic` held = noise at ~80% full scale.
   bool fake_mic() const { return mic_key_ || mic_pad_; }
   void fake_mic_frame(std::vector<s16>& out);
 
-  // Pad-driven pen: moved once a frame by a stick's deflection (pad.stylus_axis,
-  // pad.stylus_speed pixels per frame at full tilt) and by the d-pad while the
-  // pad.stylus_dpad chord button is held; the frontend draws a crosshair
-  // there while a controller is open.
+  // Pad-driven pen: moved by a stick's deflection (pad.stylus_axis) and by
+  // the d-pad while the pad.stylus_dpad chord is held.
   void update_stylus();
   bool stylus_visible_binding() const;   // some pad control drives the pen
   bool stylus_visible() const { return (stylus_axis_ != StylusAxis::None || stylus_chord_.kind != Bind::None) && pad_ != nullptr && stylus_idle_ < stylus_hide_; }   // hidden after stylus_hide idle frames
@@ -93,81 +79,60 @@ public:
   // Rebinding, for the Controls page.
   bool has_pad() const { return pad_ != nullptr; }
   // While capturing, the next physical key or pad control is taken as a name
-  // instead of being fed to the game or matched against a hotkey -- otherwise
-  // rebinding Quit would quit. `pad` picks which device is listened to, so
-  // pressing a key does not land in the pad column.
+  // instead of fed to the game or matched against a hotkey. `pad` picks
+  // which device is listened to.
   void begin_capture(bool pad);
   void cancel_capture() { capturing_ = false; }
   bool capturing() const { return capturing_; }
-  // The name of what was pressed, once. Empty until then; taking it ends the
-  // capture, so a caller polls this and stops when it gets something.
+  // Name of what was pressed, once; taking it ends the capture.
   std::string take_capture();
-  // Every binding that would shadow another, as one line per clash, for the
-  // page to show. Empty when there are none. The same rules warn_collisions()
-  // prints at startup -- the player who is doing the rebinding is the one who
-  // needs to be told.
+  // Every binding that would shadow another, one line per clash. Empty when none.
   std::vector<std::string> collisions() const;
-  // What the config calls each DS button and each hotkey action, and what it
-  // falls back to when unset. The Controls page shows the config string
-  // itself -- it is already the name of the control, and showing it means the
-  // page and the file can never disagree about what a button is bound to.
+  // Config string for each DS button/hotkey action, and its default.
   static const char* button_name(int i);
   static int button_count();
   static const char* key_default(int i);
   static const char* pad_default(int i);
-  // A pad binding as the menu draws it (L1/SELECT/position pips), against the
-  // SDL spelling the config file stores. Display only: nothing is written back
-  // in this form.
+  // A pad binding as the menu draws it (L1/SELECT/position pips). Display
+  // only; nothing is written back in this form.
   static std::string pad_label(const std::string& value);
-  // The controls that are neither a DS button nor a hotkey, for the rows the
-  // Controls page gives them: the modifier a pad chord is built on, and the
-  // pen's tap button and stick.
+  // Controls that are neither a DS button nor a hotkey: the pad-chord
+  // modifier, and the pen's tap button and stick.
   static const char* mod_default(bool pad);
   static const char* stylus_button_default();
   static const char* stylus_dpad_default();
   static const char* stick_face_default();
   static const char* stick_dpad_default();
   static const char* stylus_axis_default(const Config& cfg);
-  // A captured stick axis as the stick it belongs to ("left"/"right"), or
-  // nullptr when what was captured is not a stick at all.
+  // Captured stick axis as the stick it belongs to ("left"/"right"), or
+  // nullptr if not a stick.
   static const char* stylus_axis_of(const std::string& captured);
-  // Axis remapping (pad.axis_<name>): each of SDL's six controller axes is
-  // fed by one physical axis, optionally inverted, for pads whose mapping
-  // reports a stick rotated, mirrored or on the wrong axis. `i` indexes
-  // SDL_GameControllerAxis. The value is "[-]<sdl axis>" or "none"; the
-  // default is the axis itself. Everything downstream -- bindings, the
-  // stick-as-buttons rows, the pen -- sees the remapped axes.
+  // Axis remapping (pad.axis_<name>): each SDL controller axis fed by one
+  // physical axis, optionally inverted, for pads reporting a stick rotated,
+  // mirrored or wrong. `i` indexes SDL_GameControllerAxis; value is
+  // "[-]<sdl axis>" or "none".
   static int axis_remap_count() { return SDL_CONTROLLER_AXIS_MAX; }
   static std::string axis_remap_key(int i);
   static std::string axis_remap_default(int i);
-  // The last axis a capture took, as the physical control pushed ("-righty"),
-  // before the remap: what an axis_<name> row stores. Empty when the capture
-  // was not an axis.
+  // Last axis a capture took, as the physical control pushed ("-righty"),
+  // before the remap. Empty if the capture was not an axis.
   const std::string& captured_raw_axis() const { return captured_raw_axis_; }
   static int action_count();
   static const char* key_hot_default(int i);
   static const char* pad_hot_default(int i);
-  // A hotkey can carry a second binding in the same column, spelled
-  // "<action>.alt" in the config (hotkeys.pause.alt, padhotkeys.pause.alt).
-  // It has no built-in default -- the first binding is the layout the device
-  // was designed around -- so it starts unset and only exists if the player
-  // sets it. DS buttons have no second binding; the pen's tap button takes
-  // one too (pad.stylus_button.alt), since a handheld often has two controls
-  // that are comfortable to tap with.
+  // A hotkey's second binding, "<action>.alt" in the config. No built-in
+  // default; starts unset. DS buttons have none; the pen tap button does too
+  // (pad.stylus_button.alt).
   static constexpr int HOT_SLOTS = 2;
   static const char* hot_suffix(int slot) { return slot == 1 ? ".alt" : ""; }
 
-  // The event-level paths below are what the menu's rescue behaviour lives in
-  // (the fallback layer, the capture's escape), and they are reached from
-  // handle(), which needs a Display and a window. tests/input_test.cpp drives
-  // them directly instead.
+  // Event-level paths for the menu fallback/capture-escape, reached from handle().
   friend struct InputTestAccess;
 
 private:
   // One binding: a keyboard key, a pad button or a pad axis direction, with
-  // or without the modifier.
-  // `with` is a second pad button that must be held (a chord such as
-  // mod+start+select); the most specific matching binding wins.
+  // or without the modifier. `with` is a second pad button that must be held
+  // (a chord); the most specific matching binding wins.
   struct Bind { enum Kind : u8 { None, Key, PadButton, PadAxis } kind = None; int code = 0; bool neg = false; bool mod = false; int with = -1; };
   static Bind parse_key(const std::string& s);
   static Bind parse_pad(const std::string& s);
@@ -194,14 +159,9 @@ private:
   bool axis_moved(int axis, int value) const;    // past the deadzone this axis needs
   bool is_pad_mod_button(int sdl_button) const;   // the pad's hotkey modifier
   bool is_key_mod(SDL_Keycode k) const;
-  // The menu is navigated by the player's own bindings, so a player who binds
-  // DS A to nothing reachable can no longer reach the page that would put it
-  // back. These are the controls the menu falls back on, and they are consulted
-  // only when key_down()/pad_down() report that nothing at all is bound to the
-  // control: a control the player has given a job keeps that job, and cannot
-  // fire two menu actions at once. Under the shipped defaults every entry
-  // below is bound, so the fallback contributes nothing until something is
-  // orphaned.
+  // Menu fallback controls, consulted only when key_down()/pad_down() report
+  // nothing at all is bound: rescues a player who orphaned the menu's own
+  // navigation. Bound controls keep their job; shipped defaults never trigger this.
   void menu_fallback_key(SDL_Keycode k, bool down);
   void menu_fallback_pad(const Bind& b, bool down);
   void menu_fallback(int ds_button, bool down) {
@@ -211,10 +171,8 @@ private:
 
   u32  buttons_ = 0, pressed_ = 0, stick_ = 0;   // held now; pressed since the last frame; stick as d-pad
   u32  stick_prev_ = 0, stick_pressed_ = 0;      // stick-as-d-pad edges, for the pause menu
-  // The face-button stick is the game's only: on the Controls page X resets
-  // the column and B leaves it, and a stick that fired those while the
-  // player was lining up a binding would undo it. The d-pad stick still
-  // navigates the menu, as it always has.
+  // Face-button stick is game-only: on the Controls page X/B are reserved
+  // for reset/leave, so this stick must not fire them mid-rebind.
   u32  face_stick_ = 0;
   u32  menu_fb_held_ = 0, menu_fb_pressed_ = 0;  // menu-only fallback, for orphaned bindings
   bool touching_ = false, touched_ = false;
@@ -235,8 +193,8 @@ private:
   int  axis_src_[SDL_CONTROLLER_AXIS_MAX] = {0, 1, 2, 3, 4, 5};   // pad.axis_<name>: the physical axis feeding it, -1 none
   bool axis_inv_[SDL_CONTROLLER_AXIS_MAX] = {};
   enum class StylusAxis : u8 { None, Right, Left };
-  // A stick's name as the config spells it: none | left | right. The old
-  // stick_dpad = true/false still parse as left/none.
+  // Config spelling: none | left | right. Old stick_dpad = true/false still
+  // parse as left/none.
   static bool parse_stick(const std::string& s, StylusAxis& out);
   StylusAxis stylus_axis_ = StylusAxis::Right;
   StylusAxis stick_dpad_ = StylusAxis::Left;   // pad.stick_dpad: a stick that also works the d-pad
@@ -258,9 +216,7 @@ private:
   bool capturing_ = false, capture_pad_ = false;
   std::string captured_;
   std::string captured_raw_axis_;
-  // Swallows the release of whatever was captured, so letting go of the key
-  // does not immediately register as the next thing the page asked for.
-  bool capture_swallow_ = false;
+  bool capture_swallow_ = false;   // swallows release of whatever was captured
   bool capture_mod_ = false;      // the modifier is held: what follows is a chord
 };
 

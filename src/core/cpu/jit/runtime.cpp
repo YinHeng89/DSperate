@@ -1,11 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // DSperate - Nintendo DS emulator. Copyright (C) 2026 DSperate contributors.
 //
-// Recompiler runtime, host-agnostic: code arena, the block cache, block
-// linking, park-and-revive, the pre-translation worker, and self-modifying
-// code tracking by host page. Everything that emits or patches host code is
-// behind the `backend` interface in jit_internal.h (a64/, a32/): the stubs,
-// the translator, the killed-block entry redirect and the link patch.
+// Host-agnostic recompiler runtime: arena, block cache, linking, park-and-revive,
+// pre-translation worker, SMC tracking by host page. Host code emission is in backend::.
 #include "core/cpu/jit/jit_internal.h"
 #include "core/host_cores.h"
 #include "core/mem/fastmem_census.h"
@@ -42,14 +39,10 @@
 namespace ds::jit {
 
 namespace {
-// 32-bit hosts: the A32 backend reaches the stubs with `b`/`bl`, +-32 MB.
+// 32-bit: A32 reaches the stubs with `b`/`bl` (+-32 MB).
 constexpr size_t ARENA_BYTES = sizeof(void*) >= 8 ? (64u << 20) : (32u << 20);
-constexpr size_t BLOCK_MARGIN = 64u << 10;    // a block may emit up to this much
-// The block-metadata budget: an arena's worth of translations at most this
-// many blocks (3/4 of the arena's size in Block structs: 48 MB of metadata on
-// a 64-bit host, 24 MB on a 32-bit one). The six recorded scenes peak at
-// ~16 K blocks over 1800 frames; a crashed guest sliding through RAM reached
-// 13 M in 200 frames and was OOM-killed on a 1 GB handheld.
+constexpr size_t BLOCK_MARGIN = 64u << 10;    // max bytes one block may emit
+// Bounds Block metadata growth (reset forced when reached).
 constexpr size_t MAX_BLOCKS = ARENA_BYTES / 4 * 3 / sizeof(Block);
 
 Runtime g_rt;
@@ -60,18 +53,15 @@ namespace {
 // DS_JIT_CHURN=1: who invalidates what, and what gets retranslated. Printed at exit.
 namespace churn {
 struct Key { u32 pc; u8 dma, cpu; bool operator<(const Key& o) const { return pc != o.pc ? pc < o.pc : dma != o.dma ? dma < o.dma : cpu < o.cpu; } };
-static std::map<Key, u64> writers;             // writer pc -> invalidations
-static std::map<u32, u64> victims_by_page;     // guest page of a killed block -> kills
+static std::map<Key, u64> writers;
+static std::map<u32, u64> victims_by_page;
 static std::map<u32, u64> retrans;             // guest pc -> translations
-static std::map<u64, u64> trans_by_frame;      // frame -> translations (first-time + re)
-static std::map<u64, u64> retrans_by_frame;    // frame -> retranslations only
+static std::map<u64, u64> trans_by_frame;
+static std::map<u64, u64> retrans_by_frame;
 static u64 inval = 0, killed = 0, trans = 0, frames_seen = 0, range_miss = 0, resets = 0;
-static u64 retime_calls = 0, retime_killed = 0;   // ARM9 timing-table rebuilds and the blocks they killed
-// Lead-time census: for each retranslation, guest time between the page's
-// last invalidating write and the translate -- the window a pre-translator
-// seeded at write time would have had. Buckets in ARM9 cycles
-// (~1.12 M / frame): <0.1 ms, 0.1-1, 1-4, 4-16 (about a frame), 16-64, >64.
-static std::map<u32, u64> page_last_write;   // guest 2 KB page -> sched.now() of last invalidation
+static u64 retime_calls = 0, retime_killed = 0;
+// Lead time: page's last invalidation -> retranslation, in ARM9 cycles.
+static std::map<u32, u64> page_last_write;   // guest page -> sched.now()
 static u64 lead_hist[6];
 static u64 lead_n = 0, lead_sum = 0;
 static bool on() { static const bool e = std::getenv("DS_JIT_CHURN") != nullptr; return e; }
@@ -94,8 +84,6 @@ static void report() {
   top(writers, "writers (pc of the store / DMA start)", 15, pk);
   top(victims_by_page, "invalidated guest pages (2 KB)", 15, pa);
   top(retrans, "retranslated block pcs", 20, pa);
-  // Which frames the translation work lands in: a flat row is warm-up, a
-  // spike is an overlay reload -- the frames to hold against the p99 table.
   auto pf = [](u64 n, u64 f) { std::fprintf(stderr, "   %10llu  frame %llu (%llu re)\n",
       (unsigned long long)n, (unsigned long long)f, (unsigned long long)retrans_by_frame[f]); };
   top(trans_by_frame, "translation frames", 20, pf);
@@ -108,66 +96,37 @@ static void report() {
 }
 }  // namespace churn
 
-// ---- pre-translation worker (DS_JIT_PRETX=1) ---------------------------------------------
-//
-// Overlay loads hand the JIT ~1000 never-seen blocks in one frame (the mlbis
-// p99 tail); translating them on the emulation thread is a 6-10 ms stall. The
-// worker translates *statically reachable* code ahead of execution: every
-// translated block's direct branch targets (Block::succ) are queued, the
-// worker compiles them into the shared arena, and the emulation thread adopts
-// the finished blocks on its next lookup miss. No guest state is speculated,
-// so the guest cannot observe when a block was translated: exact by
-// construction (gate: DS_FRAME_HASH).
-//
-// Concurrency model: ONE mutex (mu) covers the arena frontier (r.pos), the
-// queues and the generation counter; the worker holds it for a whole
-// translation (~10 us), the emulation thread only takes it on a lookup miss,
-// to seed successors, or in reset/invalidate. The hot dispatch paths never
-// touch it. Guest memory is written by the emulation thread only, so a block
-// the worker built from bytes that then changed is caught at adoption by
-// comparing the code bytes it read against what the guest holds now; timing-
-// table rebuilds and arena resets bump `gen`, which orphans everything the
-// worker built before them.
+// ---- pre-translation worker (DS_JIT_PRETX=1) ----
+// Translates Block::succ targets ahead of time; the emulation thread adopts
+// them on a lookup miss, so timing stays unobservable. `mu` guards the arena
+// frontier, queues and `gen`. Adoption re-checks guest bytes and timing stamp;
+// resets and timing rebuilds bump `gen` to orphan older work.
 namespace pretx {
 static bool on() { static const bool e = std::getenv("DS_JIT_PRETX") != nullptr && std::getenv("DS_JIT_DENSITY") == nullptr; return e; }
 struct Job  { JitCpu* jc; u32 key; };
 struct Done { JitCpu* jc; Block* b; u64 gen; u64 stamp; std::vector<u8> guest; };
-// Deliberately leaked: the worker is detached and may be blocked on cv/mu when
-// the process exits; running these destructors then hangs pthread_cond_destroy
-// (measured: both threads futex-waiting inside pretx::cv after "ran N frames").
+// Leaked on purpose: destroying cv/mu under the detached worker hangs at exit.
 static std::mutex& mu = *new std::mutex;
 static std::condition_variable& cv = *new std::condition_variable;
 static std::deque<Job>& jobs = *new std::deque<Job>;
 static std::vector<Done>& done = *new std::vector<Done>;
-// Finished blocks wait here, INVISIBLE to the runtime, until the emulation
-// thread actually misses on their key. Publishing them any earlier would tag
-// their guest pages as code pages ahead of the baseline schedule, and the
-// invalidation alerts from stores into those pages end slices at points the
-// baseline would have run through -- a guest-visible interleave change
-// (measured: mlbis frame 889 r12/r15 wobble, invalidations 6453 -> 6946).
-// Installing exactly at the miss reproduces the baseline timeline.
-static std::map<u64, Done>& staged = *new std::map<u64, Done>;         // (cpu << 32) | key -> finished block
-static std::unordered_set<u64>& seen = *new std::unordered_set<u64>;   // (cpu << 32) | key: ever queued or translated by the main thread
+// Kept unpublished until an actual miss: tagging pages as code early would
+// change slice interleaving.
+static std::map<u64, Done>& staged = *new std::map<u64, Done>;         // (cpu << 32) | key
+static std::unordered_set<u64>& seen = *new std::unordered_set<u64>;   // (cpu << 32) | key, ever queued
 static u64 gen = 0;
-// True while the worker is emitting into its chunk without mu held. purge()
-// waits it out after bumping gen: an arena reset reclaims the chunk's space,
-// and the frontier must not be reused while the worker still writes there.
+// Worker is emitting without mu; purge() waits for it so a reset can't reclaim the chunk.
 static std::atomic<bool> in_flight{false};
-static u64 st_built = 0, st_adopted = 0, st_dropped = 0, st_skipped = 0;   // worker built / main adopted / stale-or-changed / not attempted
+static u64 st_built = 0, st_adopted = 0, st_dropped = 0, st_skipped = 0;
 static void start();
 static void seed(JitCpu& jc, const Block& b);
 static Block* adopt(JitCpu& jc, u32 key);
-// Takes mu when the worker exists, so the arena frontier and emitted-but-
-// unpublished code cannot race it. A no-op (and no atomics) when off.
 struct ArenaLock {
   bool locked;
   ArenaLock() : locked(on()) { if (locked) mu.lock(); }
   ~ArenaLock() { if (locked) mu.unlock(); }
 };
-// Everything the worker built or was about to build is orphaned. Call with
-// mu NOT held (takes it). Used by arena resets and whole-CPU invalidations;
-// per-block invalidations don't need it -- the byte compare at adoption
-// rejects those.
+// Orphans all worker output. Call without mu held.
 static void purge() {
   if (!on()) return;
   std::lock_guard<std::mutex> lk(mu);
@@ -182,15 +141,12 @@ static void purge() {
 }
 } // namespace pretx
 
-// ---- code page tracking ----------------------------------------------------------------
+// ---- code page tracking ----
 
 const u8* host_page_of(const u8* p) { return reinterpret_cast<const u8*>(reinterpret_cast<u64>(p) & ~u64{mem::PAGE_SIZE - 1}); }
 
-// The bytes of `b` that lie on `page`, as offsets within it. A block spans at
-// most two pages, which need not be adjacent in host memory: on its first
-// page the code runs from host_lo to the page end (or host_hi if that is the
-// only page), on its second from the page start to host_hi. An unmapped end
-// (null) counts as the whole page.
+// Offsets of `b`'s bytes within `page` (of at most two, possibly non-adjacent);
+// an unmapped end counts as the whole page.
 static void page_span(const Block* b, const u8* page, u32& lo, u32& hi) {
   if (!b->host_lo || !b->host_hi) { lo = 0; hi = mem::PAGE_SIZE - 1; return; }
   const u8* seg_lo; const u8* seg_hi;
@@ -219,13 +175,11 @@ constexpr size_t PARKED_PER_KEY = 4;
 void kill_block(JitCpu& jc, Block* b) {
   if (b->dead) return;
   b->dead = true;
-  // Redirect the entry: anything linked to it lands in the dispatcher, which
-  // misses (the LUT/map entries go below) and either revives a parked
-  // translation whose guest bytes still match or retranslates.
+  // Linked callers now land in the dispatcher, which revives or retranslates.
   std::memcpy(b->entry_words, b->entry, backend::ENTRY_PATCH);
   {
     std::vector<Block*>& v = jc.parked[b->key];
-    if (v.size() >= PARKED_PER_KEY) v.erase(v.begin());   // oldest out; it stays dead in the arena until the reset
+    if (v.size() >= PARKED_PER_KEY) v.erase(v.begin());
     v.push_back(b);
   }
   backend::write_entry_redirect(b->entry, b->key, jc.dispatch);
@@ -248,11 +202,11 @@ void remove_from_page_lists(Block* b) {
 JitCpu& jc_of(Block* b) { return g_rt.cpus[b->owner]; }
 
 void reset_arena() {
-  pretx::purge();   // the worker is idle and empty after this; the frontier below is ours
+  pretx::purge();   // worker idle after this; frontier is ours
   if (churn::on()) ++churn::resets;
   Runtime& r = g_rt;
   for (JitCpu& jc : r.cpus) {
-    for (Block* b : jc.all_blocks) if (!b->pooled) delete b;   // pooled ones go with block_pool below
+    for (Block* b : jc.all_blocks) if (!b->pooled) delete b;
     jc.all_blocks.clear();
     jc.blocks.clear();
     jc.parked.clear();
@@ -260,7 +214,7 @@ void reset_arena() {
   }
   for (auto& kv : r.code_pages) set_code_tag(kv.first, false);
   r.code_pages.clear();
-  r.fm_blocks.clear();   // the code they patch is gone; fm_slow (guest sites) stays
+  r.fm_blocks.clear();   // fm_slow (guest sites) survives
   r.fm_rels.clear();
   r.block_pool.clear();
   r.blocks_live = 0;
@@ -269,22 +223,15 @@ void reset_arena() {
   r.stats.flushes++;
 }
 
-// The ARM9 timing table was rebuilt (PU / TCM / EXMEMCNT write). A block bakes
-// only the code-fetch byte of its own pages and its static branch target's,
-// and the N32 byte of its pc-relative literals' pages (Block::dep_*); every
-// other cost is read from the live table. So only the blocks whose recorded
-// pages had that byte change are killed -- the rest are still the translation
-// the new table would produce. Parked translations and the pre-translation
-// worker's output keep the old rule: dropped whole (they carry no
-// dependency check on revival beyond the region stamp, which a PU write does
-// not bump).
+// ARM9 timing table rebuilt (PU/TCM/EXMEMCNT write): kill only blocks whose
+// Block::dep_* bytes changed; parked/pre-translated blocks are all dropped.
 void on_timing_changed(CpuContext& cpu) {
   if (!cpu.jit) return;
   JitCpu& jc = *static_cast<JitCpu*>(cpu.jit);
   mem::Timing& t = cpu.nds->bus.timing();
   if (churn::on()) { static bool reg = (std::atexit(churn::report), true); (void)reg; }
   u64 killed = 0;
-  if (g_rt.retime_all) {   // DS_JIT_RETIME_ALL: the old rule, for the census
+  if (g_rt.retime_all) {
     for (Block* b : jc.all_blocks) if (!b->dead) ++killed;
     t.retime_clear();
     invalidate_cpu(jc);
@@ -314,18 +261,14 @@ void on_timing_changed(CpuContext& cpu) {
 
 Runtime& rt() { return g_rt; }
 
-// ---- cache -----------------------------------------------------------------------------
+// ---- cache ----
 
 void lut_insert(JitCpu& jc, Block* b) {
   const u32 idx = (b->key >> 1) & (LUT_SIZE - 1);
   jc.lut[idx] = (static_cast<u64>(b->entry - g_rt.arena) << 32) | b->key;
 }
 
-// DS_PERF_MAP=1: name each translated block for `perf` in /tmp/perf-<pid>.map,
-// so profiles attribute samples to the guest address a block came from
-// instead of one anonymous mapping. Blocks are named jit9_<pc>/jit7_<pc>
-// (with a `t` suffix for Thumb); the arena is reused after a flush, so the
-// same address can appear more than once and perf takes the last entry.
+// DS_PERF_MAP=1: /tmp/perf-<pid>.map symbols jit9_<pc>/jit7_<pc>[t].
 static FILE* perf_map_file() {
   static FILE* map = [] () -> FILE* {
     if (!std::getenv("DS_PERF_MAP")) return nullptr;
@@ -345,8 +288,6 @@ static void perf_map_add(const Block* b, bool arm9) {
                b->size, arm9 ? '9' : '7', key_pc(b->key), key_thumb(b->key) ? "t" : "");
 }
 
-// The permanent stubs, named jit_stub_<name> (per-CPU ones jit_stub9_/jit_stub7_);
-// each runs to the next stub's start.
 static void perf_map_stubs(const Runtime& r) {
   FILE* map = perf_map_file();
   if (!map) return;
@@ -374,11 +315,7 @@ static void perf_map_stubs(const Runtime& r) {
   }
 }
 
-// Publish a finished block: page registration, maps, LUT, stats. Emulation
-// thread only -- these structures are unsynchronised, which is why the
-// pre-translation worker hands its blocks here instead of doing this itself.
-// Guest bytes [pc, pc + len) through the current mapping; an unmapped word
-// reads as zero (a block never spans unmapped space: translation stops there).
+// Unmapped reads as zero. Emulation thread only.
 static void copy_guest_bytes(JitCpu& jc, u32 pc, u8* dst, u32 len) {
   u32 done = 0;
   while (done < len) {
@@ -395,8 +332,6 @@ static bool guest_bytes_match(JitCpu& jc, const Block* b) {
   return std::memcmp(cur, b->guest_copy, b->guest_copy_len) == 0;
 }
 
-// Make `b` live: register the host pages its guest code sits on (through the
-// current mapping), and enter it in the map and the LUT.
 static void register_block(JitCpu& jc, Block* b) {
   Runtime& r = g_rt;
   const u32 pc = key_pc(b->key);
@@ -417,14 +352,7 @@ static void register_block(JitCpu& jc, Block* b) {
   lut_insert(jc, b);
 }
 
-// A killed translation of `key` whose guest bytes match again (a game that
-// toggles a word between two values, the usual "patch the first instruction
-// to enable a routine" idiom) is brought back: entry words restored, pages,
-// map and LUT re-registered. Nothing about the translation itself changes,
-// and nobody can be inside it -- a kill redirects its entry and raises the
-// alert that leaves every running block at its next poll, and lookups happen
-// between blocks. Only a same-stamp block may come back: translation bakes
-// the timing tables in.
+// Revive a parked translation whose guest bytes match again; same timing stamp only.
 static Block* revive(JitCpu& jc, u32 key) {
   auto it = jc.parked.find(key);
   if (it == jc.parked.end()) return nullptr;
@@ -447,14 +375,13 @@ static Block* revive(JitCpu& jc, u32 key) {
 
 static void install(JitCpu& jc, Block* b) {
   Runtime& r = g_rt;
-  if (r.debug) {   // DS_JIT_DEBUG: dump the block for `objdump -D -b binary (-m aarch64 / -m arm)`
+  if (r.debug) {
     std::fprintf(stderr, "[jit] block %08x (%u bytes):", b->key, b->size);
     for (u32 i = 0; i < b->size; i += 4) { u32 w; std::memcpy(&w, b->entry + i, 4); std::fprintf(stderr, " %08x", w); }
     std::fputc('\n', stderr);
   }
   perf_map_add(b, jc.arm9);
-  // What a revival will be checked against: the guest bytes as they are now
-  // (page-aware, the block may straddle two host pages) and the timing stamp.
+  // Revival checks against these.
   b->stamp = jc.nds->bus.timing().stamp.load(std::memory_order_acquire);
   b->guest_copy_len = std::min<u32>(b->guest_len, GUEST_COPY_MAX);
   copy_guest_bytes(jc, key_pc(b->key), b->guest_copy, b->guest_copy_len);
@@ -466,8 +393,6 @@ static void install(JitCpu& jc, Block* b) {
   r.stats.hot_bytes += b->hot_size;
 }
 
-// Faults the handler queued (it cannot allocate): into fm_slow, before a
-// translation consults it.
 static void fm_drain(Runtime& r) {
   const u32 n = r.fm_ring_n;
   for (u32 i = 0; i < n && i < std::size(r.fm_ring); ++i) {
@@ -479,7 +404,7 @@ static void fm_drain(Runtime& r) {
 }
 
 Block* translate(JitCpu& jc, u32 key) {
-  DS_PROF(JIT_TX);   // nested inside the CPU9/CPU7 slice: an "of which" column
+  DS_PROF(JIT_TX);   // nested in the CPU9/CPU7 slice
   Runtime& r = g_rt;
   if (r.fm_ring_n) fm_drain(r);
   if (churn::on()) {
@@ -487,8 +412,6 @@ Block* translate(JitCpu& jc, u32 key) {
     const u64 f = jc.ctx->nds->frame_count;
     churn::trans_by_frame[f]++;
     if (churn::retrans[key_pc(key)]++ > 0) churn::retrans_by_frame[f]++;
-    // Upper bound on pre-translation lead time: writes after the page's last
-    // block died are invisible, so the true window is at most this.
     const auto pw = churn::page_last_write.find(key_pc(key) & ~(mem::PAGE_SIZE - 1));
     if (pw != churn::page_last_write.end()) {
       const u64 dt = jc.ctx->nds->sched.now() - pw->second;
@@ -501,7 +424,7 @@ Block* translate(JitCpu& jc, u32 key) {
   Block* b;
   {
     pretx::ArenaLock lk;
-    if (r.pos + BLOCK_MARGIN > r.cap || r.blocks_live >= MAX_BLOCKS) return nullptr;   // full (code or metadata): the caller resets the arena
+    if (r.pos + BLOCK_MARGIN > r.cap || r.blocks_live >= MAX_BLOCKS) return nullptr;   // caller resets the arena
     b = &r.block_pool.emplace_back(Block{});
     b->key = key;
     b->owner = jc.arm9 ? 0 : 1;
@@ -533,7 +456,7 @@ const u8* find_native(JitCpu& jc, u32 key) {
   return b ? b->entry : nullptr;
 }
 
-// ---- pre-translation worker body (state and contract above, by churn) ------------------------
+// ---- pre-translation worker body ----
 namespace {
 namespace pretx {
 
@@ -543,7 +466,7 @@ static void seed(JitCpu& jc, const Block& b) {
   bool queued = false;
   for (u8 i = 0; i < b.nsucc; ++i) {
     const u32 k = b.succ[i];
-    if (jc.blocks.count(k)) continue;                       // emulation thread owns this map
+    if (jc.blocks.count(k)) continue;
     const u64 tag = (static_cast<u64>(jc.arm9 ? 0 : 1) << 32) | k;
     if (!seen.insert(tag).second) continue;
     jobs.push_back(Job{&jc, k});
@@ -555,11 +478,7 @@ static void seed(JitCpu& jc, const Block& b) {
 static void worker() {
   name_current_thread("jit-pretx");
   Runtime& r = g_rt;
-  // The worker emits into its own arena chunk, reserved in one bump of r.pos,
-  // so translate_block runs without mu held: the emulation thread's own
-  // translations only ever contend with the (rare, microsecond) chunk
-  // reserve, not with every worker block. A purge orphans the chunk; the
-  // space comes back with the next arena reset.
+  // Private arena chunk so translate_block runs without mu; purge orphans it until the next reset.
   constexpr size_t CHUNK = 1u << 20;
   u8* chunk = nullptr;
   size_t used = 0, cap = 0;
@@ -573,9 +492,9 @@ static void worker() {
       j = jobs.front();
       jobs.pop_front();
       g = gen;
-      ts = j.jc->nds->bus.timing().stamp.load(std::memory_order_acquire);   // before the table reads; see Timing::stamp
+      ts = j.jc->nds->bus.timing().stamp.load(std::memory_order_acquire);   // must precede the table reads
       if (g != chunk_gen || cap - used < BLOCK_MARGIN) {
-        if (r.pos + CHUNK > r.cap) { ++st_skipped; continue; }   // full: the main thread will reset
+        if (r.pos + CHUNK > r.cap) { ++st_skipped; continue; }
         chunk = r.arena + r.pos;
         r.pos += CHUNK;
         used = 0; cap = CHUNK; chunk_gen = g;
@@ -583,11 +502,7 @@ static void worker() {
       in_flight.store(true, std::memory_order_release);
     }
     JitCpu& jc = *j.jc;
-    // Copy the guest bytes BEFORE translating: the emulation thread may write
-    // them at any point, and adoption compares the guest against this copy --
-    // a block whose source moved under it never gets adopted. The copy stops
-    // at the 2 KB page edge (one read_ptr mapping); a block that would cross
-    // it is not pre-translated (rare -- blocks average a few instructions).
+    // Snapshot before translating (adoption compares against it); page-crossing blocks are skipped.
     const u32 pc = key_pc(j.key);
     const u8* src = jc.ctx->page_table.read_ptr(pc);
     if (!src) { in_flight.store(false, std::memory_order_release); ++st_skipped; continue; }
@@ -598,23 +513,20 @@ static void worker() {
     b->key = j.key;
     b->owner = jc.arm9 ? 0 : 1;
     u32 size = 0;
-    if (!backend::translate_block(jc, j.key, chunk + used, BLOCK_MARGIN, *b, size) || b->guest_len > avail) {   // (pretx is refused on fastmem CPUs)
+    if (!backend::translate_block(jc, j.key, chunk + used, BLOCK_MARGIN, *b, size) || b->guest_len > avail) {   // pretx excludes fastmem
       in_flight.store(false, std::memory_order_release);
       delete b; ++st_skipped; continue;
     }
     b->entry = chunk + used;
     b->size = size;
     used += (b->size + 15) & ~size_t{15};
-    sync_icache(b->entry, b->size);     // dc cvau + ic ivau + dsb ish; the adopter issues the isb
-    in_flight.store(false, std::memory_order_release);   // chunk writes done; cleared before mu (purge spins on it holding mu)
+    sync_icache(b->entry, b->size);     // the adopter issues the isb
+    in_flight.store(false, std::memory_order_release);
     {
       std::lock_guard<std::mutex> lk(mu);
       if (gen == g) {
         done.push_back(Done{&jc, b, g, ts, std::vector<u8>(copy, copy + b->guest_len)});
         ++st_built;
-        // Chase this block's own successors so the frontier can run ahead of
-        // execution instead of waiting for an adoption to seed it. `seen`
-        // bounds the waste; a purge clears both.
         for (u8 i = 0; i < b->nsucc; ++i) {
           const u64 tag = (static_cast<u64>(jc.arm9 ? 0 : 1) << 32) | b->succ[i];
           if (seen.insert(tag).second) jobs.push_back(Job{&jc, b->succ[i]});
@@ -624,9 +536,6 @@ static void worker() {
   }
 }
 
-// Emulation thread, on a lookup miss: hand over the worker's finished block
-// for exactly this key, if it has one and it is still current. Everything
-// else stays staged and invisible -- see the note at `staged`.
 static Block* adopt(JitCpu& jc, u32 key) {
   if (!on()) return nullptr;
   Done d{};
@@ -647,10 +556,7 @@ static Block* adopt(JitCpu& jc, u32 key) {
     delete d.b; ++st_dropped;
     return nullptr;
   }
-  // DS_JIT_PRETX_VERIFY=1: re-translate the key fresh right now and diff it
-  // against the staged block. Any mismatch means translation read state that
-  // changed between build and adoption without failing the byte compare --
-  // the exactness bug hunter.
+  // DS_JIT_PRETX_VERIFY=1: diff against a fresh translation to catch state the byte check misses.
   static const bool verify = std::getenv("DS_JIT_PRETX_VERIFY") != nullptr;
   if (verify) {
     Runtime& r = g_rt;
@@ -658,7 +564,7 @@ static Block* adopt(JitCpu& jc, u32 key) {
     if (r.pos + BLOCK_MARGIN <= r.cap) {
       Block tmp{};
       tmp.key = key; tmp.owner = jc.arm9 ? 0 : 1;
-      u32 fsize = 0;   // frontier scratch; pos not advanced
+      u32 fsize = 0;   // scratch at the frontier; pos not advanced
       if (backend::translate_block(jc, key, r.arena + r.pos, BLOCK_MARGIN, tmp, fsize)) {
         if (tmp.guest_len != d.b->guest_len || fsize != d.b->size || tmp.hot_size != d.b->hot_size)
           std::fprintf(stderr, "[pretx] VERIFY shape mismatch key %08x: staged len/size/hot %u/%u/%u fresh %u/%u/%u frame %llu\n",
@@ -672,15 +578,13 @@ static Block* adopt(JitCpu& jc, u32 key) {
             std::memcpy(&a, d.b->entry + i, 4);
             std::memcpy(&f, fresh + i, 4);
             if (a == f) continue;
-            // Relative branches to the fixed stubs legitimately differ with
-            // the emission base; anything else is baked state that drifted.
             const u32 rel = backend::relative_branch_class(a);
             if (rel && rel == backend::relative_branch_class(f)) continue;
             if (++diffs <= 4)
               std::fprintf(stderr, "[pretx] VERIFY word mismatch key %08x +%u: staged %08x fresh %08x frame %llu\n",
                            key, i, a, f, (unsigned long long)jc.ctx->nds->frame_count);
           }
-          if (diffs) {   // both blocks, for objdump -D -b binary (-m aarch64 / -m arm)
+          if (diffs) {
             std::fprintf(stderr, "[pretx] staged:");
             for (u32 i = 0; i < d.b->size && i < 256; i += 4) { u32 w; std::memcpy(&w, d.b->entry + i, 4); std::fprintf(stderr, " %08x", w); }
             std::fprintf(stderr, "\n[pretx] fresh: ");
@@ -692,7 +596,7 @@ static Block* adopt(JitCpu& jc, u32 key) {
     }
   }
   install(jc, d.b);
-  asm volatile("isb" ::: "memory");   // this PE may fetch the adopted code next
+  asm volatile("isb" ::: "memory");
   ++st_adopted;
   seed(jc, *d.b);
   return d.b;
@@ -708,9 +612,6 @@ static void start() {
 } // namespace
 
 
-// A store changed bytes [lo, hi] on `host_page` (both on that page): kill the
-// blocks whose code they belong to, and only those -- data sharing a 2 KB page
-// with code is the common case, not the exception (DraStic's third filter).
 void invalidate_host_range(const u8* host_page, const u8* lo, const u8* hi) {
   auto it = g_rt.code_pages.find(host_page);
   if (it == g_rt.code_pages.end()) return;
@@ -736,8 +637,7 @@ void invalidate_host_page(const u8* host_page) {
   invalidate_blocks(host_page, std::move(victims));
 }
 
-// Kill `victims`, all of which lived on `host_page` and have already been
-// unlinked from that page's list.
+// Victims are already unlinked from host_page's list.
 static void invalidate_blocks(const u8* host_page, std::vector<Block*> victims) {
   if (churn::on()) {
     static bool reg = (std::atexit(churn::report), true); (void)reg;
@@ -756,7 +656,6 @@ static void invalidate_blocks(const u8* host_page, std::vector<Block*> victims) 
   for (Block* b : victims) {
     JitCpu& jc = jc_of(b);
     kill_block(jc, b);
-    // The block may also be listed under its second page.
     for (u32 i = 0; i < b->npages; ++i) if (b->host_pages[i] != host_page) {
       auto jt = g_rt.code_pages.find(b->host_pages[i]);
       if (jt == g_rt.code_pages.end()) continue;
@@ -768,19 +667,17 @@ static void invalidate_blocks(const u8* host_page, std::vector<Block*> victims) 
 }
 
 void invalidate_cpu(JitCpu& jc) {
-  pretx::purge();   // timing/config changed: the worker's pending output is built on the old tables
+  pretx::purge();
   for (Block* b : jc.all_blocks) if (!b->dead) { remove_from_page_lists(b); kill_block(jc, b); }
   jc.blocks.clear();
-  jc.parked.clear();   // built under the old tables: never revivable (the stamp check would refuse them anyway)
+  jc.parked.clear();
   if (jc.ctx) jc.ctx->hot.alerts |= ALERT_INVALIDATED;
 }
 
-// ---- helpers called from translated code -----------------------------------------------------
+// ---- helpers called from translated code ----
 
 extern "C" u32 jit_h_fallback(CpuContext* cpu, u32 instr, u32 key) {
-  if (instr == BIOS_SHA1_MARKER) return bios_sha1_run(*cpu) ? 1 : 0;   // the key is LOOP-4, so a poll that leaves resumes at LOOP
-  // Execute one instruction through the interpreter with the interpreter's own
-  // cycle accounting. r15 is set from the key (pipeline-adjusted).
+  if (instr == BIOS_SHA1_MARKER) return bios_sha1_run(*cpu) ? 1 : 0;   // key is LOOP-4, so a poll resumes at LOOP
   cpu->hot.regs[15] = key_r15(key);
   cpu->data_cycles = 0;
   cpu->jumped = false;
@@ -793,7 +690,7 @@ extern "C" u32 jit_h_fallback(CpuContext* cpu, u32 instr, u32 key) {
     interp::exec_arm(*cpu, instr);
     if (!cpu->jumped) cpu->hot.regs[15] += 4;
   }
-  if (cpu->halted) cpu->hot.alerts |= ALERT_HALTED;   // the poll leaves; run() ends the slice
+  if (cpu->halted) cpu->hot.alerts |= ALERT_HALTED;
   g_rt.stats.instrs_fallback++;
   if (g_rt.hist) g_rt.fallback_hist[(static_cast<u64>(cpu->which) << 32) | key_pc(key)]++;
   if (g_rt.debug) std::fprintf(stderr, "[jit] fallback %08x %08x -> r15 %08x cpsr %08x budget %d halted %d jumped %d\n", key_pc(key), instr, cpu->hot.regs[15], cpu->hot.cpsr, cpu->hot.cycle_budget, cpu->halted, cpu->jumped);
@@ -806,7 +703,7 @@ extern "C" const void* jit_h_lookup(CpuContext* cpu, u32 key) {
   if (g_rt.debug) std::fprintf(stderr, "[jit] lookup %08x -> %p (budget %d)\n", key, static_cast<const void*>(native), cpu->hot.cycle_budget);
   if (native) return native;
   cpu->hot.regs[15] = key_r15(key);
-  return g_rt.flush_exit;   // arena full: leave; run() resets the arena
+  return g_rt.flush_exit;   // arena full
 }
 
 extern "C" const void* jit_h_link(CpuContext* cpu, u32 key, u8* patch_site) {
@@ -814,7 +711,7 @@ extern "C" const void* jit_h_link(CpuContext* cpu, u32 key, u8* patch_site) {
   const u8* native = find_native(jc, key);
   if (g_rt.debug) std::fprintf(stderr, "[jit] link %08x -> %p at %p (budget %d)\n", key, static_cast<const void*>(native), static_cast<void*>(patch_site), cpu->hot.cycle_budget);
   if (!native) { cpu->hot.regs[15] = key_r15(key); return g_rt.flush_exit; }
-  backend::patch_link(patch_site, native);   // `bl link` -> `b native`
+  backend::patch_link(patch_site, native);
   sync_icache(patch_site, 4);
   return native;
 }
@@ -829,32 +726,20 @@ extern "C" void jit_h_trace(CpuContext* cpu, u32 instr, u32 key) {
   if (cpu->nds->trace) cpu->nds->trace(*cpu, instr, cpu->nds->trace_user);
 }
 
-// Loads and stores that left the inline page-table path: MMIO, unmapped
-// space, read-only and code pages. Nearly all of them are MMIO (measured:
-// 99 % across SM64DS, Mario & Luigi and Meteos, four in five of them loads),
-// so those go straight to Io rather than through Bus, whose two frames only
-// re-test the region this path has already established. Otherwise the same
-// paths the interpreter's mem_read*/mem_write* take (cpu_mem.h), minus the
-// cost, which the block charges from the timing table like every other access.
-// MSR CPSR whose mode changes, or that runs in user mode: the interpreter's
-// msr() CPSR arm without the decode. call_pure has already put the host flags
-// into hot.cpsr and carried r8-r12; the caller carries r13/r14. set_cpsr swaps
-// the banks and the caller reloads what it spilled.
+// call_pure has already stored host flags into hot.cpsr.
 extern "C" void jit_h_msr_cpsr(CpuContext* cpu, u32 value, u32 mask) {
   if ((cpu->hot.cpsr & 0x1F) == 0x10) mask &= 0xFF000000;   // user mode: flags only
-  mask &= ~0x00000020u;                                     // T is not writable through MSR
+  mask &= ~0x00000020u;                                     // T not writable via MSR
   cpu->set_cpsr((cpu->hot.cpsr & ~mask) | (value & mask));
 }
 
-// The exception return -- SUBS/ADDS/MOVS pc, rn, #imm. Restores CPSR from
-// SPSR (mode switch and all) and hands back the branch target with the
-// RESTORED T in bit 0, so the caller can take the ordinary interworking
-// branch: the new state comes from SPSR, not from the address.
+// SUBS/MOVS pc etc.: returns target with the restored T in bit 0.
 extern "C" u32 jit_h_exc_return(CpuContext* cpu, u32 target) {
   cpu->restore_cpsr();
   return (target & ~1u) | ((cpu->hot.cpsr >> 5) & 1u);
 }
 
+// Slow path (MMIO, unmapped, read-only, code pages); the block charges cost itself.
 extern "C" u32 jit_h_ld8(CpuContext* cpu, u32 addr) {
   g_rt.stats.slow_accesses++;
   if (u8* p = cpu->page_table.read_ptr(addr)) return *p;
@@ -898,20 +783,15 @@ extern "C" void jit_h_st32(CpuContext* cpu, u32 addr, u32 v) {
   addr &= ~3u;
   bool code = false;
   if (u8* p = cpu->page_table.write_ptr(addr, &code)) { if (code) mem::store_code(p, &v, 4); else std::memcpy(p, &v, 4); }
-  // Through the bus, not Io::write directly: Bus::io_write has the ARM9
-  // GXFIFO / command-port fast path (straight to the geometry engine), which
-  // this helper used to skip -- Spirit Tracks makes 3.8 k such stores a frame.
+  // Bus::io_write, not Io::write: it has the ARM9 GXFIFO fast path.
   else if ((addr & 0xFF000000) == 0x04000000) cpu->nds->bus.io_write(cpu->which, addr, 32, v);
   else cpu->nds->bus.write32(cpu->which, addr, v);
   if (cpu->halted) cpu->hot.alerts |= ALERT_HALTED;
 }
 
-// ---- public API ---------------------------------------------------------------------------------
-
-// ---- fastmem faults -----------------------------------------------------------------
-// SIGSEGV / SIGBUS from a registered access site (Runtime::fm_sites): patch the
-// site to its cold walk and resume there. Anything else is not ours and gets
-// the previous disposition -- the default one re-faults and dies as before.
+// ---- fastmem faults ----
+// Fault at a registered site: patch it to its cold walk and resume there.
+// Anything else goes to the previous handler.
 static struct sigaction g_old_segv, g_old_bus;
 
 static void fm_fault(int sig, siginfo_t* si, void* uctx) {
@@ -949,11 +829,10 @@ static void fm_fault(int sig, siginfo_t* si, void* uctx) {
     const struct sigaction& old = sig == SIGBUS ? g_old_bus : g_old_segv;
     if (old.sa_flags & SA_SIGINFO) { if (old.sa_sigaction) { old.sa_sigaction(sig, si, uctx); return; } }
     else if (old.sa_handler != SIG_DFL && old.sa_handler != SIG_IGN) { old.sa_handler(sig); return; }
-    signal(sig, SIG_DFL);   // return re-executes the instruction, which now kills the process as usual
+    signal(sig, SIG_DFL);   // re-executes and dies
     return;
   }
-  // First the view: if the table allows the access and the view had just not
-  // laid the page yet (views are laid on demand), lay it and retry in place.
+  // View pages are mapped on demand; if that was all, retry in place.
   for (int c = 0; c < 2; ++c) {
     const JitCpu& jc = r.cpus[c];
     if (!jc.fastmem) continue;
@@ -1026,9 +905,7 @@ bool attach(NDS& nds, bool arm9, bool arm7) {
     jc.arm9 = c == 0;
     jc.hot.pt = ctx.page_table.raw();
     jc.hot.table = ctx.page_table.raw();
-    // Fastmem: the backend emits view accesses, the bus built a view for this
-    // CPU, and nothing that translates off the emulation thread is on.
-    // DS_FASTMEM_DSI=0 keeps a DSi session on the table (P4 measurement knob).
+    // DS_FASTMEM_DSI=0: no fastmem in DSi mode.
     jc.fastmem = false;
     static const bool dsi_ok = [] { const char* e = std::getenv("DS_FASTMEM_DSI"); return !e || std::atoi(e) != 0; }();
     if (const mem::GuestView* v = nds.bus.view(c == 0 ? Cpu::ARM9 : Cpu::ARM7);
@@ -1052,8 +929,6 @@ bool attach(NDS& nds, bool arm9, bool arm7) {
     }
     jc.hot.timing = c == 0 ? reinterpret_cast<const u8*>(ctx.timing9) : reinterpret_cast<const u8*>(ctx.timing7);
     jc.hot.arena = r.arena;
-    // An overlay-heavy scene translates ~20 k blocks; growing these through a
-    // burst rehashes/reallocates on the critical path of the burst frame.
     jc.blocks.reserve(1u << 15);
     jc.all_blocks.reserve(1u << 15);
     r.code_pages.reserve(1u << 13);
@@ -1099,9 +974,7 @@ DensitySlot* density_new_slot() {
 
 void report(std::FILE* out) {
   const Stats& s = g_rt.stats;
-  // DS_JIT_DUMP=<path>: the arena bytes as they stand at exit, with a one-line
-  // header "<base> <size>", so a perf sample's ip decodes to the host
-  // instruction it landed on (objdump -b binary -maarch64 on the file).
+  // DS_JIT_DUMP=<path>: dump the arena at exit after a "<base> <size>" line.
   if (const char* dump = std::getenv("DS_JIT_DUMP")) {
     if (FILE* f = std::fopen(dump, "wb")) {
       std::fprintf(f, "%llx %llx\n", (unsigned long long)reinterpret_cast<uintptr_t>(g_rt.arena), (unsigned long long)g_rt.pos);
@@ -1124,8 +997,7 @@ void report(std::FILE* out) {
                s.instrs_translated ? static_cast<double>(s.code_bytes) / static_cast<double>(s.instrs_translated) : 0.0,
                s.instrs_translated ? static_cast<double>(s.hot_bytes) / static_cast<double>(s.instrs_translated) : 0.0);
   if (g_rt.census) {
-    // Everything executed-weighted: a block translated once and run a million
-    // times counts a million times. Machine-readable, one fact per line.
+    // Execution-weighted.
     long double ex = 0, gi = 0, fb = 0, mem = 0, memfl = 0, memfli = 0, fl = 0, efl = 0;
     long double rr[16] = {}, rw[16] = {}, li[16] = {}, wr[16] = {};
     long double len_hist[8] = {};   // 1-2, 3-4, 5-8, 9-16, 17-32, 33-64
@@ -1161,17 +1033,11 @@ void report(std::FILE* out) {
     }
     std::fprintf(out, "[jit] density: %zu translations, %llu block entries, %.0Lf guest instrs executed, %.0Lf hot bytes fetched\n",
                  g_rt.density_slots.size(), (unsigned long long)ex, gi, hb);
-    // The static figure has to be recomputed from the slots, not read from
-    // Stats: stats.hot_bytes counts the counter code itself, which is ~24 bytes
-    // on every block and would inflate the very baseline being compared against.
-    // Same population, same fields -- the only difference is the weighting.
+    // From slots, not Stats: stats.hot_bytes includes the counter code.
     long double shb = 0.0L, sgi = 0.0L;
     for (const DensitySlot& d : g_rt.density_slots) { shb += d.hot_bytes; sgi += d.guest_instrs; }
     std::fprintf(out, "[jit] density: %.2Lf hot bytes per guest instruction executed, against %.2Lf translated (static)\n",
                  gi > 0.0L ? hb / gi : 0.0L, sgi > 0.0L ? shb / sgi : 0.0L);
-    // Block length, by translation and weighted by execution. The averages hide
-    // the shape: what matters for dispatch cost is how many *executed* blocks
-    // are short, not how many translated ones are.
     static const int lo[9] = {1, 2, 3, 4, 5, 9, 17, 33, 65};
     u64 tx[8] = {}, bex[8] = {};
     long double gx[8] = {};

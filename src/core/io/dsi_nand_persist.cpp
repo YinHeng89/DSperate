@@ -26,8 +26,7 @@ bool slurp(const std::string& path, std::vector<u8>& out) {
   return true;
 }
 
-// Written beside itself and renamed over, so a crash mid-write never leaves a
-// half file where a good one was.
+// Written beside itself and renamed over, so a crash mid-write never leaves a half file.
 bool spill(const std::string& path, const u8* data, size_t len) {
   std::error_code ec;
   const fs::path p(path);
@@ -66,9 +65,8 @@ std::string game_code(const std::string& hex8) {
   return out.size() == 4 ? out : hex8;
 }
 
-// A title save's host extension, or null for any other file.
+// A title save's host extension, or null for any other file (/TITLE/00030004/<ID>/DATA/<NAME>).
 const char* save_ext(const std::string& path) {
-  // /TITLE/00030004/<ID>/DATA/<NAME>
   if (!starts_with(path, "/TITLE/00030004/") || path.size() < 30 || path.compare(24, 6, "/DATA/") != 0) return nullptr;
   const std::string name = path.substr(30);
   if (name == "PUBLIC.SAV") return ".pub";
@@ -77,8 +75,7 @@ const char* save_ext(const std::string& path) {
   return nullptr;
 }
 
-// Files that belong to no sidecar: scratch space, title saves (which have
-// their own files), and what a virtual install writes.
+// Excludes scratch space, title saves (own files), and virtual-install writes.
 bool system_file(const std::string& path) {
   if (starts_with(path, "/TMP/") || starts_with(path, "/IMPORT/")) return false;
   if (starts_with(path, "/TICKET/00030004/")) return false;
@@ -86,9 +83,8 @@ bool system_file(const std::string& path) {
   return true;
 }
 
-// Whether the session wrote any of a file's data. Not its directory entry: a
-// directory sector holds sixteen entries, so one file's size update would mark
-// every neighbour; a new file is caught by its data clusters.
+// Whether the session wrote any of a file's data. Not its directory entry, since a size update
+// there would mark every neighbour in the same sector; a new file is caught by its clusters.
 bool touched(const NandImage& nand, u64 base, const FatVolume& vol, const FatVolume::Entry& e) {
   if (!nand.any_changed()) return false;
   for (u64 off : vol.extents(e))
@@ -160,9 +156,7 @@ NandPersistReport nand_import(NandImage& nand, const u8* bios7i, const NandPersi
   if (!nfs.mount(nand, bios7i, &err)) { r.notes.push_back("nand: " + err); return r; }
   FatVolume& vol = nfs.main();
 
-  // Title saves: each DSiWare title's save files, replaced by the host's copy
-  // when there is one of the same size (a different size is a different
-  // title's save, or a broken one, and the NAND's is kept).
+  // Replace with the host's copy only when it's the same size (else a different/broken save).
   std::vector<std::pair<std::string, FatVolume::Entry>> saves;
   vol.walk([&](const std::string& path, const FatVolume::Entry& e) { if (!e.dir() && save_ext(path)) saves.emplace_back(path, e); });
   for (const auto& [path, e] : saves) {

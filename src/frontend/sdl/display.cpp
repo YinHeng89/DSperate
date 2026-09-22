@@ -19,14 +19,11 @@
 namespace ds::sdl {
 
 // ---- rotation ----------------------------------------------------------------
-// The logical frame (lw x lh, pitch lw) onto the presented buffer (pitch dp),
-// the mapping the display-engine tier uses (display_disp.cpp), so DS_ROTATE
+// Same mapping the display-engine tier uses (display_disp.cpp), so DS_ROTATE
 // means the same on both: 270: dst[py][px] = src[px][lw-1-py]; 90:
 // dst[py][px] = src[lh-1-px][py]; 180: dst[py][px] = src[lh-1-py][lw-1-px].
-// The presented memory is uncached on the scanout tiers, so the 90/270
-// kernels store whole 64-byte lines: 16 source rows x 4 columns per step,
-// four 4x4 NEON transposes, one 16-pixel column store each. Edges that do
-// not fill a block (no handheld panel has them) go scalar.
+// Presented memory is uncached on the scanout tiers, so 90/270 store whole
+// 64-byte lines via 4x4 NEON transposes; edges go scalar.
 namespace {
 
 #if DS_ROT_NEON
@@ -59,8 +56,6 @@ void rot270(const u32* src, int lw, int lh, u32* dst, int dp) {
   }
   sxb = lw4;
 #endif
-  // The rows past the last full block, every column; then the columns past
-  // the last full block, the blocked rows.
   for (int y = sy; y < lh; ++y) for (int x = 0; x < lw; ++x) dst[static_cast<size_t>(lw - 1 - x) * dp + y] = src[static_cast<size_t>(y) * lw + x];
   for (int y = 0; y < sy; ++y) for (int x = sxb; x < lw; ++x) dst[static_cast<size_t>(lw - 1 - x) * dp + y] = src[static_cast<size_t>(y) * lw + x];
 }
@@ -147,7 +142,7 @@ bool Display::parse_int_scale(const std::string& s, IntScale& m) {
 }
 double Display::snap_scale(double s, IntScale m) {
   if (m == IntScale::Off || s <= 0.0) return s;
-  const double f = std::floor(s + 1e-9);          // 2.9999 from a division is 3
+  const double f = std::floor(s + 1e-9);          // handle 2.9999 from a division
   if (f == s || (s - f) < 1e-9) return f;
   return m == IntScale::Under ? std::max(1.0, f) : f + 1.0;
 }
@@ -159,13 +154,11 @@ void Display::natural_size(const Layout& l, double scale, int& w, int& h) {
     case Mode::Vertical:   fh = sh * 2; break;
     case Mode::Horizontal: fw = sw * 2; break;
     case Mode::Single: case Mode::Pip: break;
-    // Auto has no ratio until there is a window to fit; the smallest it
-    // would accept sizes the window.
     case Mode::DominantV:  fh = sh * (1 + (l.dominant_auto ? l.dominant_min : l.dominant)); break;
     case Mode::DominantH:  fw = sw * (1 + (l.dominant_auto ? l.dominant_min : l.dominant)); break;
     case Mode::Count: break;
   }
-  // The gap is not scaled: it is a distance on the glass, not part of the DS.
+  // The gap is not scaled: a distance on the glass, not part of the DS.
   if (l.mode == Mode::Vertical || l.mode == Mode::DominantV) fh += l.gap;
   if (l.mode == Mode::Horizontal || l.mode == Mode::DominantH) fw += l.gap;
   w = std::max(1, static_cast<int>(fw)); h = std::max(1, static_cast<int>(fh));
@@ -187,7 +180,6 @@ bool Display::open(const char* title, int scale, bool fullscreen, bool linear, b
   if (only_screen_ >= 0) { w = static_cast<int>(SCREEN_W) * scale; h = static_cast<int>(SCREEN_H) * scale; }
   else natural_size(layout_, scale, w, h);
   {
-    // A windowed window is the presented side: portrait for a rotated layout.
     int r = rot_wanted_;
     if (!r) if (const char* e = std::getenv("DS_ROTATE")) r = std::atoi(e);
     r = ((r % 360) + 360) % 360;
@@ -198,24 +190,19 @@ bool Display::open(const char* title, int scale, bool fullscreen, bool linear, b
   if (!win_) { std::fprintf(stderr, "SDL_CreateWindow: %s\n", SDL_GetError()); return false; }
   fullscreen_ = fullscreen;
 
-  // The panel's rotation, for whichever tier presents: set_rotation(), or
-  // DS_ROTATE as the spruce launcher passes it.
   int rot = rot_wanted_;
   if (!rot) if (const char* r = std::getenv("DS_ROTATE")) rot = std::atoi(r);
   rot = ((rot % 360) + 360) % 360;
   if (rot != 0 && rot != 90 && rot != 180 && rot != 270) { std::fprintf(stderr, "video: rotation %d not supported; 0\n", rot); rot = 0; }
   rot_ = 0;
 
-  // Display-engine tier: the hardware scales a DS-resolution canvas, so
-  // there is no renderer and no scaling here at all; the views are laid out
-  // on the canvas (the layout's natural size at scale 1) and draw() draws
-  // them into the layer's source.
+  // Display-engine tier: hardware scales a DS-resolution canvas, so there is
+  // no renderer/scaling here; views are laid out on the canvas and draw()
+  // draws into the layer's source.
   if (disp_wanted_ && only_screen_ < 0 && DispOut::available()) {
     auto d = std::make_unique<DispOut>();
     d->set_grid(disp_grid_);
-    // The menu and the OSD want panel pixels; the layer they share with the
-    // grid is the only place on this chip to get them.
-    d->set_overlay(true);
+    d->set_overlay(true);   // menu/OSD panel pixels: the only place on this chip to get them
     d->set_nearest(!linear);
     d->set_integer_scale(static_cast<int>(int_scale_));
     if (d->open(rot, vsync)) {
@@ -230,9 +217,8 @@ bool Display::open(const char* title, int scale, bool fullscreen, bool linear, b
     }
   }
 
-  // fbdev tier: the scanline path straight into fb0's buffers, for the SDL2s
-  // whose only video driver is Mali EGL over fbdev (the H700 handhelds under
-  // BaseOS). Sizes the window to the panel; nothing SDL draws reaches it.
+  // fbdev tier: scanline path straight into fb0's buffers, for SDL2 builds
+  // whose only driver is Mali EGL over fbdev (H700 handhelds under BaseOS).
   if (fbdev_wanted_ && only_screen_ < 0) {
     auto fo = std::make_unique<FbdevOut>();
     if (fo->open(win_, vsync)) {
@@ -248,27 +234,12 @@ bool Display::open(const char* title, int scale, bool fullscreen, bool linear, b
     std::fprintf(stderr, "video.fbdev: /dev/fb0 not usable; using SDL\n");
   }
 
-  // Per-scanline scaling renders into the presented buffer directly, which
-  // cannot coexist with an SDL_Renderer on the same window, so it is decided
-  // here and the renderer is skipped entirely.
-  //
-  // Default on wherever a zero-copy destination exists for it:
-  //
-  //  - Wayland: the window surface is a cheap shm attach and the mode removes
-  //    SDL's texture upload, scaled blit and surface copy in favour of one
-  //    write (etody, both boards: ~15 % less emu+present work per frame, and
-  //    the shoulders of the over-budget clusters with it) -- and it is the
-  //    write path the dmabuf tier builds on.
-  //  - KMSDRM: the DrmOut tier below page-flips our own CMA buffers, which
-  //    takes the present from 13.4 ms to ~0.05 ms (etody, 900 frames, both
-  //    panels). Even when that tier is unavailable and this falls back to
-  //    SDL's window surface, the scanline path still wins there now: 14.8 ms
-  //    of emu+present work against the renderer's 17.9. (An older comment
-  //    here said the opposite. It was measured before the dual-window default
-  //    and before SDL's KMSDRM window surface was understood to be a hidden
-  //    GLES renderer rather than a shadow blit -- see display_drm.h.)
-  //
-  // --linear is bilinear on this path (Gpu::emit_bilinear), and the
+  // Per-scanline scaling renders straight into the presented buffer, so it
+  // can't coexist with an SDL_Renderer and is decided here. Default on
+  // wherever a zero-copy destination exists: Wayland's shm window surface,
+  // or KMSDRM's DrmOut page-flip tier below (even its SDL window-surface
+  // fallback wins, since that's secretly a hidden GLES renderer there; see
+  // display_drm.h). --linear is bilinear here (Gpu::emit_bilinear), the
   // renderer's own filter on the fallback. DS_SCANLINE_SCALE=0/1 overrides.
   const char* vd = SDL_GetCurrentVideoDriver();
   const bool wayland = vd && !std::strcmp(vd, "wayland");
@@ -282,9 +253,8 @@ bool Display::open(const char* title, int scale, bool fullscreen, bool linear, b
     const bool dm_forbidden = dmenv && !std::strcmp(dmenv, "0");
     const bool dm_required = dmenv && !std::strcmp(dmenv, "1");
 
-    // KMSDRM first, and before anything asks for a window surface: on that
-    // driver SDL_GetWindowSurface *succeeds* by quietly building a GLES
-    // renderer for the window, which is the cost this tier exists to avoid.
+    // KMSDRM first, before asking for a window surface: SDL_GetWindowSurface
+    // there *succeeds* by quietly building a GLES renderer, the cost this tier avoids.
     if (kms && !dm_forbidden) {
       int ow = 0, oh = 0;
       SDL_GetWindowSize(win_, &ow, &oh);
@@ -308,8 +278,7 @@ bool Display::open(const char* title, int scale, bool fullscreen, bool linear, b
     } else {
       layout();
       build_scale();
-      // Tier 1 on top of the same scanline path: same targets, but the
-      // pixels land in a CMA dmabuf instead of the shm surface.
+      // Same scanline path/targets; pixels land in a CMA dmabuf instead of the shm surface.
       if (scaled_ && wayland && !dm_forbidden) {
         int ow = 0, oh = 0;
         output_size(ow, oh);   // the presented size, whatever the rotation
@@ -327,18 +296,9 @@ bool Display::open(const char* title, int scale, bool fullscreen, bool linear, b
   }
   if (rot) std::fprintf(stderr, "video: rotation %d is not applied on the renderer path\n", rot);
 
-  // The SDL_Renderer fallback: reached only where none of the tiers above
-  // applies -- a video driver with no zero-copy destination (X11), --linear,
-  // or DS_SCANLINE_SCALE=0. The GPU renderer is tried first and software is
-  // taken when it cannot be created (KMSDRM without GLES, a headless test
-  // box). It is not selectable: on the handhelds the scanline tiers are the
-  // measured winners (the GL driver's threads cost more than the scale on a
-  // four-core board where the emulation thread, the engine-B worker and the
-  // raster workers already want every core -- etody, 1800 frames, two RG DS
-  // boards: software 14173/14452 ms against opengles2 15426/15508, with a
-  // third of the over-budget frames), and those tiers are what the
-  // handhelds now get; where this fallback is reached at all the GPU is
-  // unlikely to be sharing a die with four A55s.
+  // SDL_Renderer fallback: reached where no tier above applies (X11,
+  // --linear, DS_SCANLINE_SCALE=0). GPU renderer tried first, software if
+  // it can't be created.
   const u32 vflag = vsync ? static_cast<u32>(SDL_RENDERER_PRESENTVSYNC) : 0u;
   ren_ = SDL_CreateRenderer(win_, -1, static_cast<u32>(SDL_RENDERER_ACCELERATED) | vflag);
   if (!ren_) {
@@ -349,7 +309,7 @@ bool Display::open(const char* title, int scale, bool fullscreen, bool linear, b
 
   SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, linear ? "linear" : "nearest");
   for (int i = 0; i < SCREENS; ++i) {
-    // The core's framebuffers are 0xAARRGGBB words, which is ARGB8888.
+    // The core's framebuffers are 0xAARRGGBB words: ARGB8888.
     tex_[i] = SDL_CreateTexture(ren_, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, static_cast<int>(SCREEN_W), static_cast<int>(SCREEN_H));
     if (!tex_[i]) { std::fprintf(stderr, "SDL_CreateTexture: %s\n", SDL_GetError()); return false; }
   }
@@ -359,8 +319,7 @@ bool Display::open(const char* title, int scale, bool fullscreen, bool linear, b
   if (SDL_GetRendererInfo(ren_, &info) == 0)
     std::fprintf(stderr, "video: %s renderer, %s driver, vsync %s\n", info.name, SDL_GetCurrentVideoDriver(), (info.flags & SDL_RENDERER_PRESENTVSYNC) ? "on" : "off");
 
-  // Which GL stack actually ended up driving the window (Mesa/panfrost or a
-  // vendor blob) is the thing that changes underneath us, so name it.
+  // Which GL stack actually drives the window (Mesa/panfrost vs a vendor blob) varies; name it.
   using GetString = const unsigned char* (*)(unsigned);
   if (auto gl_get_string = reinterpret_cast<GetString>(SDL_GL_GetProcAddress("glGetString"))) {
     const unsigned char* rend = gl_get_string(0x1F01);      // GL_RENDERER
@@ -382,10 +341,7 @@ void Display::close() {
   if (win_) { SDL_DestroyWindow(win_); win_ = nullptr; }
 }
 
-// Screen rects for the current mode: aspect preserved, centred. Integer
-// scaling is not the default: a 1280x720 handheld panel fits the 256x384
-// stack 1.875 times, and rounding that down to 1 would waste most of the
-// screen.
+// Screen rects for the current mode: aspect preserved, centred.
 void Display::layout() {
   if (disp_) { int cw = 0, ch = 0; natural_size(layout_, 1.0, cw, ch); disp_->set_canvas(cw, ch); }
   int w = 0, h = 0;
@@ -393,9 +349,8 @@ void Display::layout() {
   if (only_screen_ >= 0) {
     const double sw = SCREEN_W, sh = SCREEN_H, s = snap_scale(std::min(w / sw, h / sh), int_scale_);
     const int dw = static_cast<int>(sw * s), dh = static_cast<int>(sh * s);
-    // Overscale on a dual-window screen crops away from the edge it shares
-    // with the other panel: the top screen keeps its bottom row and loses
-    // rows at the top, the bottom screen the reverse. Columns are centred.
+    // Overscale crops away from the edge shared with the other panel: top
+    // screen keeps its bottom row, bottom screen the reverse.
     int y = (h - dh) / 2;
     if (dh > h) y = only_screen_ == 0 ? h - dh : 0;
     views_[0] = View{only_screen_, SDL_Rect{(w - dw) / 2, y, dw, dh}, true, true};
@@ -447,8 +402,6 @@ void Display::place(const Layout& layout_, int w, int h, View views_[SCREENS], I
   auto fit = [&](double cols, double rows) { return snap_scale(std::min(fw / (sw * cols), fh / (sh * rows)), snap); };
   auto rect = [&](double x, double y, double s) { return SDL_Rect{static_cast<int>(x), static_cast<int>(y), static_cast<int>(sw * s), static_cast<int>(sh * s)}; };
   const int p = layout_.primary, q = 1 - p;
-  // Views are drawn in order, so the inset goes last; map_point() looks from
-  // the end, so the inset also wins the touch.
   switch (layout_.mode) {
     case Mode::Vertical: case Mode::Horizontal: {
       const bool across = layout_.mode == Mode::Horizontal;
@@ -477,8 +430,6 @@ void Display::place(const Layout& layout_, int w, int h, View views_[SCREENS], I
       break;
     }
     case Mode::DominantV: case Mode::DominantH: {
-      // DS order (top above / left of bottom), the pair centred; across the
-      // stack each screen is centred, along the row bottoms are aligned.
       const bool across = layout_.mode == Mode::DominantH;
       double s = 0, s2 = 0;    // the primary's and the secondary's scale
       if (!layout_.dominant_auto) { s = across ? fit(1 + layout_.dominant, 1) : fit(1, 1 + layout_.dominant); s2 = s * layout_.dominant; }
@@ -503,8 +454,6 @@ bool Display::try_gpu_present() {
   std::string why;
   gpu_ = GpuPresent::open(*out_, &why);
   if (!gpu_) { std::fprintf(stderr, "video.gpu_present: %s; scanline scaling instead\n", why.c_str()); return false; }
-  // The core writes its 256x192 frames (the draw() path); the layout stays
-  // in the logical frame and the GPU maps it onto the panel.
   scaled_ = false;
   out_->set_gpu_writes(true);
   layout();
@@ -514,7 +463,6 @@ bool Display::try_gpu_present() {
 }
 
 void Display::draw_gpu(const u32* const fb[SCREENS]) {
-  // A configure resized the window: the tier's buffers and our imports follow.
   int w = 0, h = 0;
   SDL_GetWindowSize(win_, &w, &h);
   if (w != out_->width() || h != out_->height()) {
@@ -533,7 +481,6 @@ void Display::draw_gpu(const u32* const fb[SCREENS]) {
   out_size(lw, lh);
   GpuPresent::View v[SCREENS];
   for (int i = 0; i < nviews_; ++i) v[i] = GpuPresent::View{views_[i].screen, views_[i].rect, views_[i].shown, !views_[i].direct, grid_on(views_[i].screen)};
-  // The LCD grid as the scanline tiers draw it (kern::scale_row_grid): the brightness kept on a seam.
   const u32 grid = grid_strength_ > 0.0 ? static_cast<u32>(std::lround((1.0 - grid_strength_) * 256.0)) : 256u;
   gpu_->present(*out_, fb, v, nviews_, rot_, lw, lh, inset_alpha_, gpu_layer_, gpu_layer_bytes_, gpu_layer_scale_, gpu_layer_screen_, canvas_drawn_, smooth3d_ ? gpu_layer_edge_ : 0, grid);
   canvas_drawn_ = SDL_Rect{0, 0, 0, 0};
@@ -542,28 +489,22 @@ void Display::draw_gpu(const u32* const fb[SCREENS]) {
 void Display::draw(const u32* const fb[SCREENS]) {
   if (gpu_) { draw_gpu(fb); return; }
   if (disp_) {
-    // Whatever the frontend drew (or stopped drawing) goes to the overlay
-    // layer with this frame, so the two reach the panel together.
     if (disp_->overlay_available()) { disp_->overlay_changed(canvas_taken_); canvas_taken_ = false; }
-    // In view order: view i is layer i, later views on top.
     const u32* slots[DispOut::VIEWS] = {nullptr, nullptr};
     for (int i = 0; i < nviews_ && i < DispOut::VIEWS; ++i) slots[i] = views_[i].shown ? fb[views_[i].screen] : nullptr;
     disp_->set_inset_alpha(inset_alpha_);
     disp_->present(slots);
     return;
   }
-  // The renderer tier only: open() returns before creating a renderer on the
-  // scanline tiers, where begin_frame/end_frame is the way to the screen.
-  if (!ren_) return;
+  if (!ren_) return;   // renderer tier only; scanline tiers use begin_frame/end_frame
   SDL_SetRenderDrawColor(ren_, 0, 0, 0, 255);
   SDL_RenderClear(ren_);
   for (int i = 0; i < nviews_; ++i) {
     const View& v = views_[i];
     if (!v.shown) continue;
     SDL_UpdateTexture(tex_[v.screen], nullptr, fb[v.screen], static_cast<int>(SCREEN_W) * 4);
-    // The GPU blends a translucent inset. Textures are per screen, not per
-    // view, so the mod is set around the inset's copy and cleared after it,
-    // or a screen swap would carry it to the large view.
+    // Textures are per screen, not per view, so the alpha mod is scoped to
+    // the inset's copy or a screen swap would carry it to the large view.
     const bool translucent = !v.direct && inset_alpha_ < 255;
     if (translucent) { SDL_SetTextureBlendMode(tex_[v.screen], SDL_BLENDMODE_BLEND); SDL_SetTextureAlphaMod(tex_[v.screen], inset_alpha_); }
     SDL_RenderCopy(ren_, tex_[v.screen], nullptr, &v.rect);
@@ -592,7 +533,6 @@ void Display::set_layout(const Layout& l) {
   const Mode was = layout_.mode;
   layout_ = l;
   if (!fullscreen_ && was != l.mode) {
-    // Keep the largest screen's size, resize the window around the new mode.
     int pw = 0;
     for (int i = 0; i < nviews_; ++i) if (views_[i].shown) pw = std::max(pw, views_[i].rect.w);
     int nw = 0, nh = 0;
@@ -606,8 +546,7 @@ void Display::set_layout(const Layout& l) {
 }
 
 bool Display::map_point(int wx, int wy, int& screen, int& sx, int& sy) const {
-  // Pointer events arrive in presented pixels; the views are laid out in the
-  // logical frame. The inverse of rotate_out()'s mapping.
+  // Pointer events arrive in presented pixels; inverse of rotate_out()'s mapping.
   if (rot_ && scaled_) {
     const int lw = scaled_w_, lh = scaled_h_;
     int lx = wx, ly = wy;
@@ -633,15 +572,12 @@ bool Display::map_point(int wx, int wy, int& screen, int& sx, int& sy) const {
 
 // ---- per-scanline scaling ---------------------------------------------------
 
-// The renderer's output size, or the window surface's when there is no
-// renderer. Both are in pixels, which is what the views are in.
 bool Display::out_size(int& w, int& h) const {
   if (disp_) { w = disp_->logical_w(); h = disp_->logical_h(); return true; }
   if (ren_) return SDL_GetRendererOutputSize(ren_, &w, &h) == 0;
   if (!win_) return false;
-  // On a scanout tier the window size is the truth: the shm surface can lag a
-  // configure by a frame, and the two must not disagree mid-rebuild. On
-  // KMSDRM there is no window surface to ask at all.
+  // Window size is the truth on a scanout tier: the shm surface can lag a
+  // configure by a frame, and KMSDRM has no window surface to ask at all.
   if (out_) { SDL_GetWindowSize(win_, &w, &h); if (rotated()) std::swap(w, h); return w > 0 && h > 0; }
   SDL_Surface* s = SDL_GetWindowSurface(win_);
   if (!s) return false;
@@ -650,21 +586,15 @@ bool Display::out_size(int& w, int& h) const {
   return true;
 }
 
-// Chunky on the display-engine tier. The panel cell is P panel pixels
-// that is a whole number D of DS pixels under the DE's fit: P dividing the
-// view's panel rect into a count that divides 256 x 192 -- on a 320x240
-// view 5 px is 4 DS pixels, 4 px would be 3.2 and cannot be. Auto takes the
-// smallest such P in 4..16, as the panel tiers do; an explicit P steps down.
-//
-// Two ways to draw it. In the scaler (DispOut::set_divisor): when every
-// shown view and the canvas divide by D, the composite is the canvas at
-// cell resolution -- each view box-downscaled by D, the cells' mean -- and
-// the DE's nearest table enlarges the cells whole. No work at DS
-// resolution and a rotate of a quarter the pixels; mean is the only mode.
-// Otherwise (the PiP inset does not divide; no whole cell exists; the pair
-// setting) at source: the scanline scaler runs at 1:1 into src_side_,
-// flattening cells (any mode) or pairs, which end_frame hands to the layer
-// in place of the core's framebuffer.
+// Chunky on the display-engine tier. Panel cell P must be a whole number D
+// of DS pixels under the DE's fit (P dividing the view's panel rect into a
+// count that divides 256x192). Auto picks the smallest such P in 4..16.
+// Two ways to draw it: in the scaler (DispOut::set_divisor) when every
+// shown view and the canvas divide by D -- box-downscale each view by D
+// (cells' mean), DE's nearest table enlarges them whole, no DS-resolution
+// work. Otherwise at source: the scanline scaler flattens cells/pairs at
+// 1:1 into src_side_, which end_frame hands to the layer instead of the
+// core's framebuffer.
 void Display::build_source_scale() {
   const double s = disp_ ? disp_->fit_scale() : 0.0;
   // First the cell each view would get, and whether the scaler can draw them.
@@ -691,7 +621,6 @@ void Display::build_source_scale() {
       else if (D_hw && D != D_hw) hw = false;      // views disagree
       else D_hw = D;
     }
-    // Every view (a downscaled one too) and the canvas must divide.
     if (D_hw && (v.rect.w % D_hw || v.rect.h % D_hw || v.rect.x % D_hw || v.rect.y % D_hw)) hw = false;
   }
   if (hw && (!D_hw || cw % D_hw || chh % D_hw)) hw = false;
@@ -715,8 +644,7 @@ void Display::build_source_scale() {
     src_side_[v.screen].assign(static_cast<size_t>(SCREEN_W) * SCREEN_H, 0xFF000000u);
     int cell = 2;
     const u32 pw = static_cast<u32>(std::lround(v.rect.w * s)), ph = static_cast<u32>(std::lround(v.rect.h * s));
-    // Shown smaller than the screen: flattening blocks before a downscale
-    // is only blur, so the view stays plain (the grid skips it too).
+    // Shown smaller than the screen: flattening before a downscale is only blur.
     src_chunky_[v.screen] = s > 0.0 && pw >= SCREEN_W && ph >= SCREEN_H;
     if (!src_chunky_[v.screen]) { if (disp_) disp_->set_view_cell(i, 1); continue; }
     if (chunky_cell_ != 0) {
@@ -748,8 +676,7 @@ void Display::build_source_scale() {
 void Display::build_scale() {
   if (!scaled_ || !win_ || disp_) return;   // the display-engine tier's tables are fixed at open()
   if (out_) {
-    // The scanout buffer is the destination; there may be no window surface
-    // to fetch (KMSDRM), and asking for one there would build a renderer.
+    // No window surface to fetch on KMSDRM, and asking would build a renderer.
     surf_ = nullptr;
     phys_w_ = out_->width(); phys_h_ = out_->height();
   } else {
@@ -763,18 +690,16 @@ void Display::build_scale() {
     }
     phys_w_ = surf_->w; phys_h_ = surf_->h;
   }
-  // The views and the tables are in the logical frame; under rotation that
-  // is the staging buffer, the presented buffer's size turned back.
+  // Views/tables are in the logical frame; under rotation that's the staging
+  // buffer, the presented buffer's size turned back.
   scaled_w_ = phys_w_; scaled_h_ = phys_h_;
   if (rotated()) std::swap(scaled_w_, scaled_h_);
   if (rot_) stage_.assign(static_cast<size_t>(scaled_w_) * scaled_h_, 0);
   else { stage_.clear(); stage_.shrink_to_fit(); }
 
   // Inverse of the dst_x -> src_x = dst_x * SCREEN_W / rect.w map used by
-  // draw() and map_point(), so the two paths land pixels in the same places:
-  // source pixel s covers [xrun[s], xrun[s+1]). One table per view, since
-  // the views differ in size in the inset and dominant modes.
-  // The largest shown view sets the chunky cell (in DS pixels) the others follow.
+  // draw()/map_point(): source pixel s covers [xrun[s], xrun[s+1]). One
+  // table per view. The largest shown view sets the chunky cell the others follow.
   int ref_view = 0;
   for (int i = 1; i < nviews_; ++i) if (views_[i].shown && (!views_[ref_view].shown || views_[i].rect.w > views_[ref_view].rect.w)) ref_view = i;
   const int order[SCREENS] = {ref_view, 1 - ref_view};   // the reference first, so ref_D is set
@@ -784,10 +709,9 @@ void Display::build_scale() {
     const View& v = views_[i];
     std::vector<u16>& xr = xrun_[v.screen];
     xr.resize(static_cast<size_t>(SCREEN_W) + 1);
-    // A direct view scaled past the buffer (integer overscale) is cropped to
-    // it: runs outside [x0, x1) collapse to empty ones, which scale_row
-    // skips, and the rest are relative to x0, where the target's px points.
-    // Rows are cropped the same way by targets(). An inset (a side buffer)
+    // A direct view scaled past the buffer (integer overscale) is cropped:
+    // runs outside [x0, x1) collapse to empty (scale_row skips them), rest
+    // relative to x0. Rows are cropped the same way by targets(). An inset
     // is never cropped here; blit_insets clips it at the edge.
     const u32 x0 = v.direct ? static_cast<u32>(std::max(0, -v.rect.x)) : 0u;
     const u32 x1 = v.direct ? static_cast<u32>(std::clamp(scaled_w_ - v.rect.x, 0, v.rect.w)) : static_cast<u32>(v.rect.w);
@@ -797,35 +721,21 @@ void Display::build_scale() {
       xr[x] = static_cast<u16>(std::clamp(raw, x0, x1) - x0);
     }
     xrun_plain_[v.screen] = xr;
-    // Chunky: the even pixel's run is widened over the odd one's, which is
-    // left empty (a zero-length run, which scale_row skips). The destination
-    // coverage is unchanged, so map_point still agrees.
+    // Chunky: the even pixel's run widens over the odd one's (left as a
+    // zero-length run scale_row skips); destination coverage is unchanged.
     cells_[v.screen] = {};
     src_chunky_[v.screen] = chunky_;
     bool pair = chunky_;
     if (chunky_) {
-      // A cell of P panel pixels needs P to divide both dimensions and no
-      // more than 256 cells across; auto takes the smallest P >= 4.
+      // Cell of P panel pixels needs P to divide both dimensions, <=256 cells across.
       const u32 w = static_cast<u32>(v.rect.w), h = static_cast<u32>(v.rect.h);
       u32 P = 0;
-      // The cell map is laid over the whole view; a cropped one takes the
-      // pairs (at a whole scale the pairs are exact cells anyway).
+      // A cropped view takes the pairs instead (exact cells at a whole scale anyway).
       auto fits = [&](u32 p) { return !cropped && p >= 2 && w % p == 0 && h % p == 0 && w / p <= SCREEN_W; };
-      // The largest view chooses the cell. An explicit cell that does not
-      // divide the screen steps down to the nearest one that does (5 on
-      // 640x480 -> 4), so a size chosen for one panel is still close on
-      // another -- but no further than auto's floor of 4: a view like the
-      // dominant layouts' 426x320 divides by nothing but 2, and a 2-px cell
-      // there is 1.2 DS pixels, no chunky at all. Below the floor the 2x2
-      // pairs take over, as with auto.
-      // The other views (the PiP inset, the dominant layouts' secondary)
-      // match its cell in DS pixels, not panel pixels: the same 4 px that
-      // is 2 DS pixels on a 512-wide view is 8 on a 128-wide one, and the
-      // smaller screen would come out the coarsest. So they take the P
-      // whose DS pixels per cell is nearest the large view's; and a view
-      // shown smaller than the screen goes plain, as it does on the
-      // display-engine tier -- flattening cells before a downscale is only
-      // blur.
+      // Largest view chooses the cell (steps down to the nearest divisor,
+      // never below auto's floor of 4). Other views match its DS-pixel cell
+      // size rather than its panel-pixel one, so the smaller screen isn't
+      // the coarsest; a view shown smaller than the screen goes plain.
       if (i == ref_view) {
         if (chunky_cell_ > 0) { for (u32 p = static_cast<u32>(chunky_cell_); p >= 4 && !P; --p) if (fits(p)) P = p; }
         else if (chunky_cell_ < 0) { for (u32 p = 4; p <= 16 && !P; ++p) if (fits(p)) P = p; }
@@ -864,12 +774,8 @@ void Display::build_scale() {
     // at b = (s+1) * w / 256; when that is fractional the panel pixel it
     // falls in (the last of run s, index floor(b)) covers pixel s from its
     // left edge up to the boundary -- frac(b) of it -- and pixel s+1 for the
-    // rest, 1 - frac(b). The weight stored is s+1's. (An earlier version
-    // stored frac(b) itself, which leaned every seam pixel the wrong way:
-    // invisible at 2.5x where every fraction is a half, plain at 3.75x, and
-    // on a view near 1x it left each seam pixel showing the pixel before it,
-    // so the small screens looked scaled like the large one.) Chunky pairs
-    // share a boundary at s+2's, so the odd boundaries are not seams.
+    // rest, 1 - frac(b). The weight stored is s+1's. Chunky pairs share a
+    // boundary at s+2's, so the odd boundaries are not seams.
     std::vector<u8>& sw = seam_w_[v.screen];
     sw.assign(SCREEN_W, 0);
     for (u32 s = 0; s + 1 < SCREEN_W; ++s) {
@@ -878,12 +784,9 @@ void Display::build_scale() {
       const u32 frac = b % SCREEN_W;
       if (frac && xr[s + 1] > xr[s]) sw[s] = static_cast<u8>(256 - (frac * 256) / SCREEN_W);
     }
-    // Bilinear: destination column x samples source u = (x + 0.5) * 256 / w
-    // - 0.5, between pixels floor(u) and floor(u)+1. Clamped at both edges;
-    // the right edge leans on pixel 254 at weight 255 so that the kernel's
-    // pair load never reads past the row.
-    // Indexed by the kept destination column, so a cropped view's tables
-    // start at x0.
+    // Bilinear: dst column x samples source u = (x+0.5)*256/w - 0.5, between
+    // floor(u) and floor(u)+1. Right edge leans on pixel 254 at weight 255
+    // so the kernel's pair load never reads past the row.
     std::vector<u16>& lsx = lin_sx_[v.screen];
     std::vector<u8>& lwx = lin_wx_[v.screen];
     lsx.assign(static_cast<size_t>(x1 - x0), 0); lwx.assign(static_cast<size_t>(x1 - x0), 0);
@@ -898,19 +801,15 @@ void Display::build_scale() {
   }
 }
 
-// The screen rects are overwritten in full every frame, so the rest of the
-// surface is cleared only when the layout changed under it -- the surface
-// keeps its contents between frames. The dominant modes leave gaps beside
-// the smaller screen, so it is simplest to clear everything outside the
-// rects row by row; on a panel the screens fill exactly, nothing is written.
-// `w`/`h` are the buffer's own size: on the dmabuf tier the shm surface (and
-// so scaled_w_/h_) can lag a configure, and the dmabuf is the smaller one.
+// Screen rects are overwritten in full every frame; the rest of the surface
+// (dominant modes leave gaps) is cleared row by row outside the rects only
+// when the layout changed under it. `w`/`h` are the buffer's own size: on
+// the dmabuf tier the shm surface can lag a configure behind it.
 void Display::clear_margins(u32* px, u32 pitch, int w, int h) const {
   for (int y = 0; y < h; ++y) {
     u32* row = px + static_cast<size_t>(y) * pitch;
     int x = 0;
-    // Direct views in x order on this row (at most two).
-    int xs[SCREENS], xe[SCREENS], n = 0;
+    int xs[SCREENS], xe[SCREENS], n = 0;   // direct views in x order on this row (at most two)
     for (int i = 0; i < nviews_; ++i) {
       const View& v = views_[i];
       if (!v.direct || y < v.rect.y || y >= v.rect.y + v.rect.h) continue;
@@ -925,10 +824,8 @@ void Display::clear_margins(u32* px, u32 pitch, int w, int h) const {
   }
 }
 
-// The frontend's own drawing on the canvas, accumulated into one rect for the
-// frame. One rect rather than a list because the two things drawn are a modal
-// page (which takes the lot) and a label in a corner: a union costs a few
-// cleared pixels and saves keeping a list.
+// Accumulated into one rect for the frame (a modal page and a corner label
+// are the two cases; a union costs a few cleared pixels, saves a list).
 void Display::note_canvas_draw(int x, int y, int w, int h) {
   if (w <= 0 || h <= 0) return;
   if (canvas_drawn_.w == 0 || canvas_drawn_.h == 0) { canvas_drawn_ = SDL_Rect{x, y, w, h}; return; }
@@ -946,16 +843,13 @@ void Display::clear_rect(u32* px, u32 pitch, int w, int h, const SDL_Rect& r) co
     std::memset(px + static_cast<size_t>(y) * pitch + x0, 0, static_cast<size_t>(x1 - x0) * sizeof(u32));
 }
 
-// Hands out one target per screen: the window buffer for direct views, the
-// side buffer for the rest.
 void Display::targets(u32* px, u32 stride, int w, int h, Target out[SCREENS]) {
   frame_px_ = px; frame_pitch_ = stride; frame_w_ = w; frame_h_ = h;
   insets_done_ = false;
   for (int i = 0; i < nviews_; ++i) {
     const View& v = views_[i];
     if (v.direct) {
-      // The part of the rect inside the buffer: px at its first kept row
-      // and column (the runs are relative to that column, see build_scale).
+      // px at the rect's first kept row/column; runs are relative to it (see build_scale).
       const int x0 = std::max(0, -v.rect.x), y0 = std::max(0, -v.rect.y);
       const int y1 = std::clamp(h - v.rect.y, 0, v.rect.h);
       out[v.screen] = Target{px + static_cast<size_t>(v.rect.y + y0) * stride + v.rect.x + x0, stride, static_cast<u32>(v.rect.h), xrun_[v.screen].data(), seam_w_[v.screen].data(), lin_sx_[v.screen].data(), lin_wx_[v.screen].data(), grid_on(v.screen), xrun_plain_[v.screen].data(),
@@ -966,32 +860,27 @@ void Display::targets(u32* px, u32 stride, int w, int h, Target out[SCREENS]) {
 }
 
 void Display::blend_row(u32* dst, const u32* src, size_t n, u32 alpha) {
-  // Per-channel lerp with the two channel pairs masked apart; the compiler
-  // vectorises the plain loop. 0..255 alpha scaled to 0..256 so 255 is exact.
+  // Per-channel lerp, channel pairs masked apart. 0..255 alpha scaled to 0..256 so 255 is exact.
   const u32 a = alpha + (alpha >> 7), b = 256 - a;
   for (size_t i = 0; i < n; ++i) {
     const u32 d = dst[i], s = src[i];
-    // Each channel product is under 2^16, so the two packed channels of a
-    // pair never carry into each other.
+    // Each channel product is under 2^16, so a packed pair never carries into the other.
     const u32 rb = (((s & 0x00FF00FFu) * a + (d & 0x00FF00FFu) * b) >> 8) & 0x00FF00FFu;
     const u32 g = (((s & 0x0000FF00u) * a + (d & 0x0000FF00u) * b) >> 8) & 0x0000FF00u;
     dst[i] = 0xFF000000u | rb | g;
   }
 }
 
-// Copies the shown side-buffer views (the inset) into the frame, or blends
-// them over it when the inset is translucent. The blend reads the frame
-// back, which on the scanout tiers is uncached memory: the inset is small
-// (a ninth of the large screen by default) and the rows are read
-// sequentially, so it stays cheap, but an opaque inset takes the copy.
+// Copies (or blends, if translucent) the shown side-buffer views into the
+// frame. The blend reads the frame back, uncached on the scanout tiers, but
+// the inset is small and sequential so it stays cheap.
 void Display::blit_insets() {
   if (!frame_px_ || insets_done_) return;
   insets_done_ = true;
   for (int i = 0; i < nviews_; ++i) {
     const View& v = views_[i];
     if (v.direct || !v.shown) continue;
-    // Clipped to the buffer: with the large screen overscaled the inset's
-    // corner can sit past the panel.
+    // Clipped to the buffer: the large screen overscaled can push the inset's corner past the panel.
     const int x0 = std::max(0, -v.rect.x), x1 = std::min(v.rect.w, frame_w_ - v.rect.x);
     if (x1 <= x0) continue;
     for (int y = std::max(0, -v.rect.y); y < std::min(v.rect.h, frame_h_ - v.rect.y); ++y) {
@@ -1011,9 +900,8 @@ bool Display::begin_frame(Target out[SCREENS]) {
     return true;
   }
   if (out_) {
-    // A configure (fullscreen granted, output reconfigured) resizes the
-    // window under us; the buffers must follow before anything writes at the
-    // new geometry. The shm path below re-checks its surface the same way.
+    // A configure resizes the window under us; buffers must follow before
+    // anything writes at the new geometry.
     int w = 0, h = 0;
     SDL_GetWindowSize(win_, &w, &h);
     if (w != out_->width() || h != out_->height()) {
@@ -1037,7 +925,6 @@ bool Display::begin_frame(Target out[SCREENS]) {
       out_frame_ = true;
       return true;
     }
-    // Protocol/driver death mid-run: drop the tier, keep playing on shm.
     std::fprintf(stderr, "video: scanout path lost; window surface from here\n");
     out_->close();
     out_.reset();
@@ -1045,8 +932,7 @@ bool Display::begin_frame(Target out[SCREENS]) {
     build_scale();
     if (!scaled_) return false;
   }
-  // SDL hands back a new surface after a resize; the pointer is only valid
-  // until then, so it is fetched every frame rather than cached across one.
+  // Fetched every frame, not cached: SDL hands back a new surface after a resize.
   SDL_Surface* s = SDL_GetWindowSurface(win_);
   if (!s) return false;
   if (s != surf_ || s->w != phys_w_ || s->h != phys_h_) {
@@ -1059,34 +945,23 @@ bool Display::begin_frame(Target out[SCREENS]) {
     std::fprintf(stderr, "SDL_LockSurface: %s\n", SDL_GetError());
     return false;
   }
-  // The window surface is one buffer, but SDL may hand back a different one:
-  // treat it as buffer 0 and scrub it the same way.
   take_frame(static_cast<u32*>(s->pixels), static_cast<u32>(s->pitch) / sizeof(u32), s->w, s->h, 0, out);
   return true;
 }
 
-// The frame's destination: the presented buffer itself, or under rotation
-// the staging buffer, with the presented one kept for present().
 void Display::take_frame(u32* px, u32 stride, int w, int h, int idx, Target out[SCREENS]) {
   if (rot_) {
-    // One logical buffer whatever the tier rotates: the rotate rewrites the
-    // presented buffer in full every frame, so the per-buffer letterbox and
-    // overlay bookkeeping collapses to buffer 0 of the staging frame.
+    // Rotation rewrites the presented buffer in full every frame, so
+    // per-buffer bookkeeping collapses to buffer 0 of the staging frame.
     phys_px_ = px; phys_pitch_ = stride;
     px = stage_.data(); stride = static_cast<u32>(scaled_w_); w = scaled_w_; h = scaled_h_; idx = 0;
   }
-  // Every buffer needs its margins cleared once, not just the one in
-  // hand, or the others keep the old layout and flash it back as they
-  // come round. Tracked per buffer index, not as a count of frames:
-  // the tiers hand out the lowest free buffer, so the same one can
-  // come back three frames running while another holds the old layout
-  // until a hiccup brings it round -- the stale frame seen after a
-  // layout switch.
+  // Every buffer's margins are cleared once (tracked per index, not a
+  // frame count): a buffer can come back several frames running while
+  // another still holds the old layout until it's cycled back to.
   if (margins_dirty_) { out_clean_ = 0; margins_dirty_ = false; }
   const u32 bit = idx >= 0 && idx < 32 ? 1u << idx : 0u;
   if (!(out_clean_ & bit)) { clear_margins(px, stride, w, h); out_clean_ |= bit; }
-  // Whatever the frontend drew on this buffer last time round: the views
-  // are redrawn over it, the letterbox is not.
   if (idx >= 0 && idx < kMaxBufs) {
     clear_rect(px, stride, w, h, canvas_prev_[idx]);
     canvas_prev_[idx] = SDL_Rect{0, 0, 0, 0};
@@ -1095,27 +970,19 @@ void Display::take_frame(u32* px, u32 stride, int w, int h, int idx, Target out[
   targets(px, stride, w, h, out);
 }
 
-// The insets go down before anything the frontend draws over the frame, so
-// that an overlay cannot be buried by the PiP inset the way it was when the
-// overlays lived in DS space and were drawn before this.
+// Insets go down before anything the frontend draws, so an overlay can't be
+// buried by the PiP inset.
 void Display::finish_views() {
   if (disp_) return;
   blit_insets();
 }
 
 bool Display::canvas_capable() const {
-  // The display-engine tier has no panel-resolution frame buffer, but it has a
-  // panel-resolution overlay layer, which serves the same purpose: what the
-  // frontend draws is composited by the DE over the picture rather than into
-  // it. Note this does NOT depend on the scaling path -- without chunky the
-  // tier gives the core's framebuffers to the layer as they are (scaled_
-  // false) and still has its overlay, and the frontend's unscaled path draws
-  // on it just the same.
+  // Display-engine tier has no panel-resolution frame buffer, but its
+  // overlay layer serves the same purpose regardless of the scaling path.
   if (disp_) return disp_->overlay_available();
-  if (gpu_) return true;   // the GPU present stage blends its own overlay plane
-  // Everywhere else the canvas is the frame itself, so it needs one: the
-  // SDL_Renderer path has no buffer of its own and keeps the DS-space path.
-  return scaled_;
+  if (gpu_) return true;   // GPU present stage blends its own overlay plane
+  return scaled_;   // else the canvas is the frame itself; SDL_Renderer has none
 }
 
 bool Display::canvas(CanvasView& out) const {
@@ -1124,8 +991,6 @@ bool Display::canvas(CanvasView& out) const {
     if (!out_size(lw, lh)) return false;
     u32* px = gpu_->overlay(lw, lh);
     if (!px) return false;
-    // note_canvas_draw_all() measures the canvas by these, which the scanline
-    // path sets in take_frame(); here the canvas is the overlay plane.
     const_cast<Display*>(this)->frame_w_ = lw;
     const_cast<Display*>(this)->frame_h_ = lh;
     out = CanvasView{px, static_cast<u32>(lw), lw, lh};
@@ -1150,8 +1015,7 @@ void Display::present() {
     draw(fb);
     return;
   }
-  // Remember what was drawn against the buffer it went into, so the next use
-  // of that buffer starts by taking it back out.
+  // Remember what was drawn to this buffer, so its next use clears it back out.
   const int idx = rot_ ? 0 : out_frame_ && out_ ? out_->current() : 0;
   if (idx >= 0 && idx < kMaxBufs) canvas_prev_[idx] = canvas_drawn_;
   canvas_drawn_ = SDL_Rect{0, 0, 0, 0};

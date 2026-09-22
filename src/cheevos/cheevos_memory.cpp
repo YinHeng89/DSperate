@@ -12,8 +12,7 @@
 namespace ds::cheevos {
 
 const char* user_agent() {
-  // "DSperate/<tag> rcheevos/<ver>". Built once; rcheevos' half comes from the
-  // vendored snapshot so it cannot disagree with the library we linked.
+  // "DSperate/<tag> rcheevos/<ver>"
   static const std::string ua = std::string("DSperate/") + DSPERATE_CHEEVOS_VERSION +
                                 " rcheevos/" + RCHEEVOS_VERSION_STRING;
   return ua.c_str();
@@ -24,19 +23,13 @@ bool Memory::attach(NDS& nds, std::string& err) {
   for (Region& r : regions_) r = Region{};
   max_address_ = 0;
 
-  // The DSi's map is the DS's with the hole filled: the same addresses, 16 MB
-  // of main RAM where the DS has 4 MB and padding, then data TCM. A title on
-  // the DSi machine is read through it, so a condition on DSi RAM sees the
-  // bytes it was written against; a DS game keeps the DS map and its hole.
+  // DSi map = DS map with its hole filled: 16 MB main RAM instead of 4 MB, then data TCM.
   const bool dsi = nds.dsi;
   const rc_memory_regions_t* map = rc_console_memory_regions(dsi ? RC_CONSOLE_NINTENDO_DSI : RC_CONSOLE_NINTENDO_DS);
   const char* console = dsi ? "DSi" : "DS";
   if (!map) { err = std::string("rcheevos has no memory map for the ") + console; return false; }
 
-  // The map this code was written against -- DS: main RAM, the DSi-only hole,
-  // data TCM; DSi: main RAM, data TCM. Anything else and we would be mapping
-  // the wrong bytes to the addresses achievements are written against, so
-  // refuse rather than guess.
+  // Refuse rather than mis-map achievement addresses against an unexpected map.
   struct Expect { u32 size; u8* host; const char* what; };
   mem::Bus& bus = nds.bus;
   const Expect expect_ds[3] = {
@@ -67,8 +60,7 @@ bool Memory::attach(NDS& nds, std::string& err) {
     regions_[i].start = rr.start_address;
     regions_[i].end = rr.end_address;
     regions_[i].size = size;
-    // The hole stays unbacked on purpose even though the map calls it a real
-    // region: RC_MEMORY_TYPE_UNUSED is padding, and we must not answer for it.
+    // The hole (RC_MEMORY_TYPE_UNUSED) stays unbacked despite being a region.
     regions_[i].host = rr.type == RC_MEMORY_TYPE_UNUSED ? nullptr : expect[i].host;
     if (rr.type != RC_MEMORY_TYPE_UNUSED && !regions_[i].host) {
       err = std::string("no buffer for ") + expect[i].what;
@@ -87,8 +79,6 @@ u32 Memory::read(u32 address, u8* dst, u32 n) const {
       if (r.size && address >= r.start && address <= r.end) { hit = &r; break; }
     }
     if (!hit) {
-      // Past the end of the map entirely. Zero the rest and stop looking: the
-      // regions are contiguous, so nothing further along can be backed.
       std::memset(dst, 0, n);
       return backed;
     }
@@ -107,8 +97,6 @@ u32 Memory::read(u32 address, u8* dst, u32 n) const {
 
 bool Memory::supported(u32 address, u32 n) const {
   if (n == 0) return true;
-  // Cheap and allocation-free: ask read() about it through a small stack
-  // buffer, in chunks, and require every byte to come back backed.
   u8 scratch[64];
   while (n) {
     const u32 take = n < sizeof scratch ? n : static_cast<u32>(sizeof scratch);
@@ -123,8 +111,7 @@ u32 Memory::peek(u32 address, u32 num_bytes, void* ud) {
   u8 b[4] = {};
   if (num_bytes > sizeof b) num_bytes = sizeof b;
   if (m) m->read(address, b, num_bytes);
-  // Little-endian, which is both the DS's byte order and rcheevos' convention.
-  u32 v = 0;
+  u32 v = 0;   // little-endian, matching rcheevos' convention
   for (u32 i = 0; i < num_bytes; ++i) v |= static_cast<u32>(b[i]) << (8 * i);
   return v;
 }

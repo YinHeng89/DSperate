@@ -14,17 +14,14 @@
 
 namespace ds::cart {
 
-// A DS card tops out at 512 MB; the same bound zip.cpp applies to what an
-// archive declares, so a wrong file cannot ask for a 4 GB mapping.
-static constexpr u64 MAX_ROM = 512ull << 20;
+static constexpr u64 MAX_ROM = 512ull << 20;   // a DS card tops out at 512 MB
 
 RomSource::~RomSource() {
   if (worker_.joinable()) { stop_ = true; worker_.join(); }
   if (map_) munmap(map_, map_len_);
 }
 
-// MemAvailable, or what a 3.x kernel offers instead (free + page cache: the
-// cache is what a prefetch competes with, and what it becomes).
+// MemAvailable, or free + page cache on kernels without it.
 static u64 mem_available() {
   FILE* f = std::fopen("/proc/meminfo", "r");
   if (!f) return 0;
@@ -45,8 +42,7 @@ bool RomSource::prefetch(u64 margin) {
   if (!e || std::atoi(e) == 0) return false;
   if (mem_available() < static_cast<u64>(map_len_) + margin) return false;
   worker_ = std::thread([this] {
-    // madvise is synchronous on old kernels and a hint on new ones; the
-    // touch after it makes both read the pages, and is free when they did.
+    // madvise is a hint; the touch after forces the read where it's ignored.
     constexpr size_t STEP = 4u << 20;
     volatile u8 sink = 0;
     u8* base = static_cast<u8*>(map_);
@@ -70,8 +66,7 @@ void RomSource::finish() {
   mask_ = m - 1;
   const u32 rem = size_ & (PAGE - 1);
   if (rem) {
-    // The last, partial page: its bytes then 0xFF, so nothing reads the
-    // mapping past EOF (SIGBUS beyond the last file page, zeros before it).
+    // Real bytes then 0xFF, so nothing reads the mapping past EOF.
     tail_.assign(PAGE, 0xFF);
     std::memcpy(tail_.data(), data_ + (size_ - rem), rem);
   }
@@ -105,7 +100,7 @@ std::unique_ptr<RomSource> RomSource::map_file(const std::string& path, u64 offs
   const u64 base = offset & ~(align - 1);
   const size_t len = static_cast<size_t>(offset - base + size);
   void* m = mmap(nullptr, len, PROT_READ, MAP_PRIVATE, fd, static_cast<off_t>(base));
-  close(fd);   // the mapping keeps its own reference
+  close(fd);
   if (m == MAP_FAILED) { err = std::string("mmap: ") + std::strerror(errno); return nullptr; }
 
   std::unique_ptr<RomSource> s(new RomSource);
@@ -135,10 +130,8 @@ void RomSource::read(u32 addr, u8* dst, u32 n) const {
 }
 
 u32 RomSource::read_unpatched(u32 addr, u8* dst, u32 n) const {
-  // How much of the request the file actually covers. Deliberately linear:
-  // a request that would wrap the power-of-two mask is not something a file
-  // reader should answer with bytes from the front of the image, so it simply
-  // counts as unavailable, and the 0xFF fill below stands.
+  // Deliberately linear, not wrapping at the mask: a wrapping request counts
+  // as unavailable rather than reading from the front of the image.
   const u32 start = addr & mask_;
   u32 have = 0;
   if (start < size_) have = n < size_ - start ? n : size_ - start;

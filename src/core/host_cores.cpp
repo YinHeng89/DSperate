@@ -29,7 +29,7 @@ int forced_cores() {
 }
 
 #if defined(__linux__)
-// "0,3" or "0-3,6": the kernel's online list. 0 when unreadable.
+// "0,3" or "0-3,6" -> mask. 0 when unreadable.
 u64 read_online_mask() {
   FILE* f = std::fopen("/sys/devices/system/cpu/online", "r");
   if (!f) return 0;
@@ -51,9 +51,7 @@ u64 read_online_mask() {
   return mask;
 }
 
-// The process's affinity as first read -- always before a DS_PIN_THREADS pin
-// narrows the calling thread's own, since pinning reads the usable set first.
-// A taskset or cpuset is a standing restriction.
+// Process affinity as first read, before any pin narrows it.
 u64 read_affinity() {
   cpu_set_t set;
   CPU_ZERO(&set);
@@ -69,7 +67,6 @@ u64 startup_affinity() {
   return m;
 }
 
-// One small integer from a sysfs file, or `fallback`.
 long read_long(const char* path, long fallback) {
   FILE* f = std::fopen(path, "r");
   if (!f) return fallback;
@@ -79,8 +76,7 @@ long read_long(const char* path, long fallback) {
   return v;
 }
 
-// A CPU's capacity for the "equal or greater" rule: the scheduler's
-// cpu_capacity where the kernel exports it, else the maximum frequency.
+// cpu_capacity where the kernel exports it, else max frequency.
 long cpu_capacity(u32 cpu) {
   char path[96];
   std::snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%u/cpu_capacity", cpu);
@@ -90,7 +86,6 @@ long cpu_capacity(u32 cpu) {
   return read_long(path, 0);
 }
 
-// "0" / "0-3" / "1,3" -> bit mask.
 u64 parse_cpu_list(const char* s) {
   u64 mask = 0;
   for (const char* p = s; *p;) {
@@ -133,8 +128,7 @@ u64 gpu_irq_cpus() {
   u64 cpus = 0;
   char line[1024];
   while (std::fgets(line, sizeof line, f)) {
-    // "81:  1268499  0  0  0  GICv3 72 Level  fde60000.gpu": the device name
-    // is the last word; the rows of interest name a gpu or mali device.
+    // Device name is the row's last word; interested in gpu/mali rows.
     char* colon = std::strchr(line, ':');
     if (!colon) continue;
     char* name = line + std::strlen(line);
@@ -201,9 +195,7 @@ bool pin_threads() {
 
 void pin_current_thread(u32 k) {
 #if defined(__linux__)
-  // The k-th usable CPU, wrapping: the online set need not be contiguous
-  // (spruce's powersave on the A30 leaves cpus 0 and 3).
-  const u64 m = usable_mask();
+  const u64 m = usable_mask();   // k-th usable CPU, wrapping
   const u32 count = m == ~u64{0} ? 0 : static_cast<u32>(__builtin_popcountll(m));
   if (!count) return;
   u32 want = k % count, cpu = 0;

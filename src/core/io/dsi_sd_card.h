@@ -1,23 +1,17 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // DSperate - Nintendo DS emulator. Copyright (C) 2026 DSperate contributors.
 //
-// The DSi's SD card slot, backed by a folder on the host (docs/dsiware-
-// scoping.md 5.4): `--dsi-sd DIR` / `paths.dsi_sd`.
+// The DSi's SD card slot, backed by a folder on the host (`--dsi-sd DIR` / `paths.dsi_sd`).
 //
-// The folder is never copied into an image. At boot the card is built in
-// memory: an MBR, one FAT16 or FAT32 partition, and the folder's directory
-// tree, with every file's clusters allocated but not filled. A data sector the
-// guest has not written is read from the host file that owns it. What the
-// guest writes is held in memory, like the NAND's session writes.
+// The folder is never copied into an image. At boot the card is built in memory: an MBR, one
+// FAT16/32 partition, and the folder's directory tree, with clusters allocated but unfilled. An
+// unwritten data sector reads from the host file that owns it; guest writes are held in memory.
 //
-// sync() carries the guest's changes back into the folder: new and changed
-// files are written (to a temporary name, then renamed over), files and
-// directories the guest removed are removed. A host file that changed on the
-// host since the card was built is never overwritten or deleted; it is
-// reported and the card keeps its own copy for the session.
+// sync() carries guest changes back: new/changed files are written (temp name, renamed over),
+// removed files/dirs are removed. A host file that changed on the host since the card was built
+// is never overwritten or deleted; it is reported and the card keeps its own copy.
 //
-// Card size follows melonDS's FATStorage: the folder's size plus 128 MB,
-// rounded up to a power of two; FAT32 from 1 GB. At most 32 GB (SDHC).
+// Card size: folder size + 128 MB, rounded to a power of two; FAT32 from 1 GB. At most 32 GB.
 #pragma once
 #include "core/types.h"
 #include "core/io/dsi_nand_fs.h"
@@ -36,7 +30,6 @@ namespace ds::io {
 
 class SdCard : public BlockStorage {
  public:
-  // melonDS DSi_MMCStorage::DSiSDCardCID.
   static constexpr u8 kCid[16] = {0xBD, 0x12, 0x34, 0x56, 0x78, 0x03, 0x4D, 0x30, 0x30, 0x46, 0x50, 0x41, 0x00, 0x00, 0x15, 0x00};
   static constexpr u64 kMaxBytes = 32ull << 30;
   static constexpr u64 kPartitionStart = 8192;   // sectors before the partition
@@ -52,7 +45,7 @@ class SdCard : public BlockStorage {
   SdCard(const SdCard&) = delete;
   SdCard& operator=(const SdCard&) = delete;
 
-  // Build the card from `dir` (created when missing).
+  // Builds the card from `dir` (created if missing).
   bool open(const std::string& dir, Report* report = nullptr, std::string* err = nullptr);
   void close();
   bool valid() const { return length_ != 0; }
@@ -61,26 +54,20 @@ class SdCard : public BlockStorage {
   int fat_bits() const { return fat_bits_; }
   bool any_changed() const { return !changed_.empty(); }
 
-  // Carry what the guest changed out to the folder. Cheap when nothing was
-  // written.
+  // Carries guest changes out to the folder. Cheap when nothing was written.
   Report sync();
 
-  // BlockStorage: the guest's view. read/write count and (DS_SD_LOG=<file>)
-  // log in trace_melonds's NAND log format.
+  // BlockStorage: the guest's view. read/write count and (DS_SD_LOG=<file>) log.
   void read(u64 addr, u32 len, u8* out) override;
   void write(u64 addr, u32 len, const u8* in) override;
   const u8* cid() const override { return kCid; }
-  // The same for the emulator's own filesystem work: not counted, not logged,
-  // and a poke does not count as a guest change.
+  // Same, for the emulator's own filesystem work: not counted, not logged, no guest change.
   void peek(u64 addr, u32 len, u8* out);
   void poke(u64 addr, u32 len, const u8* in);
 
-  // Save states (docs/dsiware-scoping.md 2.5). The card's file data stays in
-  // the host folder, so a state holds what the card keeps in memory -- the
-  // filesystem's own sectors and the guest's unsynced writes -- and which host
-  // files back the rest, as they were then. It loads onto this session's
-  // folder only while each of those files is unchanged (state_matches);
-  // otherwise the frontend loads the state without a card.
+  // The card's file data stays in the host folder, so a state holds only what the card keeps in
+  // memory plus which host files back the rest, as they were then. Loads onto this session's
+  // folder only while those files are unchanged (state_matches); else loaded without a card.
   struct StateSnapshot {
     bool present = false;
     u64 length = 0, part_base = 0;
@@ -102,7 +89,7 @@ class SdCard : public BlockStorage {
   bool state_matches(const StateSnapshot& snap, std::string* why) const;
   void apply_state_snapshot(const StateSnapshot& snap);
 
-  // The whole card as an image file (for the melonDS oracle, and inspection).
+  // The whole card as an image file (for inspection).
   bool dump(const std::string& path);
 
   u64 reads = 0, writes = 0;

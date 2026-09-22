@@ -32,19 +32,13 @@ void Spu::reset() {
   dbg_ = std::getenv("DS_DEBUG_SPU") != nullptr;
   if (const char* b = std::getenv("DS_SPU_BATCH")) batch_ = std::clamp(std::atoi(b), 1, 64);
   // Capture writes ARM7 RAM, so the batch drops to one sample while one runs.
-  // Inside a batch run_to() still mixes sample by sample, so capture flushes
-  // and the FIFO refills that read a capture buffer back interleave in the
-  // per-sample order; the only observer that could tell is a CPU reading the
-  // capture buffer between two consecutive samples without touching an SPU
-  // register (every register access catches up first). Opt-in until measured.
   if (const char* b = std::getenv("DS_SPU_CAP_BATCH")) cap_batch_ = std::clamp(std::atoi(b), 1, 64);
   for (auto& c : ch_) c = Channel{};
   for (auto& cp : cap_) cp = Capture{};
   cnt_ = 0; bias_ = 0; master_ = 0; muted_ = true;
   rd_ = wr_ = 0;
-  mix_period_ = MIX_PERIOD; timer_step_ = TIMER_STEP;   // a DSi title re-selects 47.6 kHz through SNDEXCNT
-  // DSi: one mix event per sample, as melonDS, so the slice boundaries it
-  // makes match the oracle's (see EventId::RtcClock); DS_SPU_BATCH still wins.
+  mix_period_ = MIX_PERIOD; timer_step_ = TIMER_STEP;
+  // DSi defaults to batch 1 (slice-aligned mix events); DS_SPU_BATCH overrides.
   if (nds_.dsi && !std::getenv("DS_SPU_BATCH")) batch_ = 1;
   mix_at_ = nds_.sched.now() + mix_period_;
   nds_.sched.schedule(EventId::Spu, mix_at_, ev_mix);
@@ -317,16 +311,8 @@ void Spu::cap_run(Capture& cp, s32 sample) {
 
 // ---- mixer ------------------------------------------------------------------
 
-// The next sample is scheduled from this one's nominal time, not from now():
-// events fire at slice ends, up to a CPU overshoot late, and rescheduling
-// from the late time would accumulate into a slow sample clock (measured
-// 0.036 %; enough for Rhythm Heaven's just-in-time stream writer to overtake
-// the FIFO prefetch and play next-lap samples).
-//
-// One event mixes a batch: it fires at the nominal time of the batch's last
-// sample and mixes everything due (less whatever a register access already
-// caught up), then schedules the next batch end. Sample times are unchanged;
-// only the event count is (~546/frame -> ~34).
+// Rescheduled from the nominal time, not now(), so CPU overshoot doesn't
+// accumulate into a slow sample clock.
 void Spu::ev_mix(NDS& nds, u32) {
   Spu& s = nds.spu;
   s.run_to(nds.sched.event_time());
@@ -339,13 +325,11 @@ void Spu::catch_up() { run_to(nds_.sched.now()); }
 void Spu::write_sndexcnt(u16 value, u16 mask) {
   u16& cur = nds_.io.dsi.sndexcnt;
   value = static_cast<u16>((value & mask) | (cur & ~mask));
-  // The I2S frequency can only change while the interface is disabled.
-  if (cur & 0x8000) value = static_cast<u16>((value & ~0x2000) | (cur & 0x2000));
+  if (cur & 0x8000) value = static_cast<u16>((value & ~0x2000) | (cur & 0x2000));   // I2S freq locked while enabled
   if ((cur ^ value) & 0x2000) {
     catch_up();
     mix_period_ = (value & 0x2000) ? MIX_PERIOD_47K : MIX_PERIOD;
     timer_step_ = mix_period_ / 4;
-    // The next sample keeps its nominal slot; only the spacing after it changes.
     if (dbg_) std::fprintf(stderr, "[spu] SNDEXCNT: output %.1f Hz\n", output_rate_hz());
   }
   catch_up();
@@ -380,10 +364,7 @@ void Spu::mix() {
     pan_out(ch_[0], ch0); pan_out(ch_[2], ch2);
     if (!(cnt_ & 0x1000)) pan_out(ch_[1], ch1);     // bit 12/13: channel 1/3 bypass the mixer
     if (!(cnt_ & 0x2000)) pan_out(ch_[3], ch3);
-    // A channel with bit 31 clear contributes exactly 0 (run_channel returns
-    // 0 and 0 * pan >> 10 is 0), so it is skipped before the call: Spirit
-    // Tracks runs 4-5 voices and paid the call and two 64-bit multiplies for
-    // each of the other eleven, 32 k times a second.
+    // Skip disabled channels before the call: run_channel(off) is exactly 0 anyway.
     for (int i = 4; i < 16; ++i)
       if (ch_[i].cnt & 0x80000000u) pan_out(ch_[i], run_channel(ch_[i], timer_step_));
 
@@ -413,10 +394,8 @@ void Spu::mix() {
   s16 l = muted_ ? 0 : static_cast<s16>(std::clamp(out_l, -0x8000, 0x7FFF));
   s16 r = muted_ ? 0 : static_cast<s16>(std::clamp(out_r, -0x8000, 0x7FFF));
   if (nds_.dsi) {
-    // The I2S interface (melonDS DSi_I2S::SampleClock): nothing reaches the
-    // output or the microphone while SNDEXCNT disables it. Otherwise each
-    // output sample is a mic sample clock, and the output is the NITRO/DSP
-    // mix (the DSP contributes silence until it exists).
+    // Nothing reaches output/mic while SNDEXCNT disables I2S; otherwise each
+    // output sample is a mic sample clock, mixing NITRO with (silent) DSP.
     const u16 sx = nds_.io.dsi.sndexcnt;
     if (!(sx & 0x8000)) {
       l = r = 0;

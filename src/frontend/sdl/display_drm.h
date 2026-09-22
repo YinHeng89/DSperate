@@ -2,31 +2,14 @@
 // DSperate - Nintendo DS emulator. Copyright (C) 2026 DSperate contributors.
 //
 // Direct KMS scanout: the KMSDRM counterpart of the Wayland dmabuf tier.
-//
-// SDL2's KMSDRM backend implements no window framebuffer, so *every* SDL
-// presentation path there is secretly the same one -- SDL_GetWindowSurface
-// and the software renderer both route through SDL_CreateWindowTexture, i.e.
-// a hidden GLES renderer. The default path costs a scalar stretch blit, a
-// full-screen memcpy into a streaming GL texture, a textured quad, and an
-// eglSwapBuffers that blocks on the pending flip: 13.4 ms per frame on the
-// RG DS against 0.2 ms for the same content on Wayland dmabuf (etody, 900
-// frames, both panels). Roughly 4.5 ms of that is CPU copying and the rest
-// is the blocking swap; ~7 ms is the floor for any SDL path there.
-//
-// So we do not present through SDL at all. The scanline path already writes
-// panel-sized frames; here they are written straight into CMA dma-heap
-// buffers, imported as DRM framebuffers, and page-flipped onto the CRTC. The
-// present becomes one non-blocking ioctl -- measured at 0.045 ms for both
-// panels of the dual-panel board (tools/kms_scanout_probe.cpp).
-//
-// SDL keeps the window, the input and the DRM master; we borrow its DRM fd
-// through SDL_SysWMinfo and take over only what is scanned out. Nothing else
-// in the process flips that CRTC, because in scanline mode there is no
-// renderer and no GL surface, so SDL never swaps.
-//
-// No libdrm and no kernel DRM headers: the ioctls go through drm_uapi.h. A
-// device where any of this is missing fails open() cleanly and Display falls
-// back to SDL's window surface.
+// SDL2's KMSDRM backend has no window framebuffer -- every SDL presentation
+// path there secretly routes through a hidden GLES renderer and a blocking
+// eglSwapBuffers. Instead we write scanline frames straight into CMA
+// dma-heap buffers, import them as DRM framebuffers, and page-flip onto the
+// CRTC directly (SDL keeps the window/input/DRM master; we borrow its fd via
+// SDL_SysWMinfo). No libdrm/kernel DRM headers needed: ioctls go through
+// drm_uapi.h. open() fails cleanly if unsupported, and Display falls back to
+// SDL's window surface.
 #pragma once
 
 #include "core/types.h"
@@ -38,21 +21,15 @@ namespace ds::sdl {
 
 class DrmOut : public ScanoutOut {
 public:
-  // Three: one on screen, one whose flip is pending (only one may be
-  // outstanding per CRTC), and one queued -- drawn, waiting for that flip
-  // to retire before its own can be issued. begin_frame() blocks only when
-  // all three are taken, so an emulation frame longer than a refresh
-  // borrows from the next one instead of presenting a whole refresh late.
-  static constexpr int BUFS = 4;   // the array; nbufs_ is the count in use (default 3; 4 under the GPU present stage)
+  // One on screen, one flip pending (only one outstanding per CRTC), one
+  // queued behind it. begin_frame() blocks only when all three are taken.
+  static constexpr int BUFS = 4;   // array size; nbufs_ is the count in use (default 3, 4 under GPU present)
   static constexpr int DEFAULT_BUFS = 3;
 
-  // False if any precondition is missing (not the KMSDRM video driver, no
-  // usable connector for this display, the window is not the size of the
-  // panel's mode, CMA allocation or the DRM import failed).
-  //
+  // False if any precondition is missing (wrong video driver, no usable
+  // connector, window size doesn't match a panel mode, allocation failed).
   // `display_index` is SDL's: KMSDRM enumerates one display per connected
-  // connector in DRM resource order, so the Nth connected connector is SDL
-  // display N. A dual-window layout needs this to pick its own panel.
+  // connector in DRM resource order.
   bool open(SDL_Window* win, int w, int h, int display_index);
 
   bool reopen(SDL_Window* win, int w, int h) override { const int d = display_; close(); return open(win, w, h, d); }
@@ -64,10 +41,8 @@ public:
   void set_bufs(int n) { nbufs_ = n < 2 ? 2 : n > BUFS ? BUFS : n; }
   int current() const override { return cur_; }
 
-  // Hands out a free buffer, waiting for a flip to retire only when none
-  // is -- that wait is the display's pacing, and it is taken here rather
-  // than in end_frame() so it overlaps the frame's emulation instead of
-  // extending its present.
+  // Waits for a flip to retire only when no buffer is free; taken here
+  // rather than end_frame() so the wait overlaps emulation, not the present.
   u32* begin_frame() override;
   bool dmabuf_plane(int buf, DmabufPlane& out) const override;
   void set_gpu_writes(bool on) override { gpu_writes_ = on; }
@@ -86,11 +61,8 @@ private:
   bool flip(int i);               // issue the page flip for bufs_[i]; false = driver error
   bool alloc_buf(Buf& b);
   void drop_buf(Buf& b);
-  // Reads whatever the DRM fd has queued and hands each completion to the
-  // instance that asked for it. The fd is SDL's and a dual-window layout has
-  // one DrmOut per panel on it, so an instance that consumed events by count
-  // rather than by owner would retire the other panel's buffer -- a read of
-  // a buffer already being drawn into. `block` waits for at least one event.
+  // Reads events on the shared DRM fd and routes each to its owning DrmOut
+  // (a dual-window layout has one instance per panel). `block` waits for one.
   static bool pump(int fd, bool block);
   void retire();                  // our flip completed
 

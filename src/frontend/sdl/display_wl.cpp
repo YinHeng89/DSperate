@@ -23,23 +23,17 @@ namespace ds::sdl {
 
 namespace {
 
-constexpr u32 FMT_XRGB8888 = 0x34325258;   // 'XR24'; the core writes 0xAARRGGBB and we are opaque
+constexpr u32 FMT_XRGB8888 = 0x34325258;   // 'XR24'; core writes 0xAARRGGBB, opaque
 
-// The two layouts we can actually hand over. LINEAR says the buffer is a
-// plain row-major image, which is what the CMA heap gives us; INVALID says
-// "no explicit layout, derive it from the dmabuf", which is the same memory
-// described the other way round. A compositor may accept one and not the
-// other -- see pick_modifier().
+// LINEAR: plain row-major (what the CMA heap gives us). INVALID: "derive
+// layout from the dmabuf". A compositor may accept one and not the other.
 constexpr u64 MOD_LINEAR  = 0;
 constexpr u64 MOD_INVALID = 0x00ffffffffffffffULL;
 
-// The globals are bound once per process and never destroyed: proxies we
-// create can be referenced by events queued for OTHER dispatchers -- the
-// compositor sends wl_surface.enter to SDL's queue naming *our* wl_output
-// binding -- so tearing them down on a close/reopen leaves a dangling proxy
-// in a queue we don't control (measured as a use-after-free inside SDL's
-// dispatch on the first fullscreen configure). Four proxies and a queue for
-// the lifetime of the connection is the correct price.
+// Bound once per process, never destroyed: proxies we create can be
+// referenced by events queued for other dispatchers (compositor sends
+// wl_surface.enter to SDL's queue naming our wl_output), so tearing them
+// down on close/reopen leaves a dangling proxy in a queue we don't control.
 struct Globals {
   wl_display* dpy = nullptr;
   wl_event_queue* q = nullptr;
@@ -50,9 +44,8 @@ struct Globals {
   int n_outputs = 0;
   bool tried = false;
 
-  // What the compositor said it can import, gathered during the bind
-  // roundtrip. A v3 bind gets modifier events; older ones only get format
-  // events and tell us nothing about layout.
+  // What the compositor can import, gathered during the bind roundtrip.
+  // v3 bind gets modifier events; older only format events (no layout info).
   bool any_format = false;        // at least one format event arrived
   bool any_modifier = false;      // at least one modifier event arrived
   bool xr24 = false;              // XR24 in a format event
@@ -102,21 +95,14 @@ void on_dmabuf_modifier(void* data, zwp_linux_dmabuf_v1*, u32 format, u32 hi, u3
 
 const zwp_linux_dmabuf_v1_listener dmabuf_listener = { on_dmabuf_format, on_dmabuf_modifier };
 
-// Decide what to declare in the add request, or refuse the tier.
-//
-// The compositor's `created` event is NOT proof that it can display the
-// buffer: wlroots validates the params (plane count, stride, size) and
-// answers `created` there and then, but the import into its renderer happens
-// later, at composite time. When that import fails the surface simply
-// contributes nothing and we are never told -- every frame still looks like
-// a clean attach/damage/commit from here. That is a black screen with the
-// emulator running behind it, and it is why this checks the advertised table
-// up front instead of trusting `created`.
+// Decide what to declare in the add request, or refuse the tier. `created`
+// is not proof the buffer displays: wlroots validates params up front but
+// imports at composite time, silently, so this checks the advertised table
+// instead of trusting `created` (a late failure is a black screen).
 bool pick_modifier(Globals* g) {
-  // The same DS_VERBOSE gate as display.cpp and main.cpp.
   static const bool verbose = std::getenv("DS_VERBOSE") != nullptr;
   if (g->any_modifier) {
-    // A v3 table is authoritative: what is not in it will not import.
+    // v3 table is authoritative: what is not in it will not import.
     if (g->xr24_linear) {
       g->mod = MOD_LINEAR;
       if (verbose) std::fprintf(stderr, "dmabuf: XR24 linear\n");
@@ -135,8 +121,7 @@ bool pick_modifier(Globals* g) {
     std::fprintf(stderr, "dmabuf: compositor does not import XR24\n");
     return false;
   }
-  // Pre-v3, or a compositor that advertised nothing: no table to consult, so
-  // declare LINEAR and let create answer, as before.
+  // Pre-v3 or nothing advertised: no table to consult; declare LINEAR.
   g->mod = MOD_LINEAR;
   if (verbose) std::fprintf(stderr, "dmabuf: no modifier table; assuming XR24 linear\n");
   return true;
@@ -150,8 +135,7 @@ bool globals_init(wl_display* dpy) {
   g_.q = wl_display_create_queue(dpy);
   if (!g_.q) return false;
   g_.reg = wl_display_get_registry(dpy);
-  // The registry inherits SDL's default queue; move it to ours before any
-  // dispatch can deliver its events to SDL's handlers.
+  // Move off SDL's default queue before any dispatch reaches SDL's handlers.
   wl_proxy_set_queue(reinterpret_cast<wl_proxy*>(g_.reg), g_.q);
   wl_registry_add_listener(g_.reg, &reg_listener, &g_);
   wl_display_roundtrip_queue(dpy, g_.q);
@@ -159,8 +143,7 @@ bool globals_init(wl_display* dpy) {
     std::fprintf(stderr, "dmabuf: compositor lacks zwp_linux_dmabuf_v1\n");
     return false;
   }
-  // The format/modifier events are sent once on bind, so a second roundtrip
-  // after adding the listener is what collects them.
+  // format/modifier events fire once on bind; second roundtrip collects them.
   zwp_linux_dmabuf_v1_add_listener(g_.dmabuf, &dmabuf_listener, &g_);
   wl_display_roundtrip_queue(dpy, g_.q);
   g_.usable = pick_modifier(&g_);
@@ -174,8 +157,8 @@ void DmabufOut::on_release(void* data, wl_buffer*) { static_cast<Buf*>(data)->bu
 namespace { const wl_buffer_listener buf_listener = { DmabufOut::on_release }; }
 
 namespace {
-// The non-immediate create: create_immed answers a buffer the compositor
-// cannot import with a fatal protocol error, which is no way to probe heaps.
+// Non-immediate create: create_immed would turn a rejected buffer into a
+// fatal protocol error, which is no way to probe heaps.
 struct Created { wl_buffer* wb = nullptr; bool done = false; };
 void on_created(void* d, zwp_linux_buffer_params_v1*, wl_buffer* wb) { auto* c = static_cast<Created*>(d); c->wb = wb; c->done = true; }
 void on_failed(void* d, zwp_linux_buffer_params_v1*) { static_cast<Created*>(d)->done = true; }
@@ -188,7 +171,7 @@ bool DmabufOut::alloc_buf(Buf& b) {
     zwp_linux_buffer_params_v1* p = zwp_linux_dmabuf_v1_create_params(g_.dmabuf);
     Created c;
     zwp_linux_buffer_params_v1_add_listener(p, &params_listener, &c);
-    // plane 0, with the layout pick_modifier() settled at bind time
+    // plane 0, layout settled by pick_modifier() at bind time
     zwp_linux_buffer_params_v1_add(p, fd, 0, 0, w_ * 4,
                                    static_cast<u32>(g_.mod >> 32), static_cast<u32>(g_.mod));
     zwp_linux_buffer_params_v1_create(p, w_, h_, FMT_XRGB8888, 0);
@@ -238,9 +221,8 @@ bool DmabufOut::open(SDL_Window* win, int w, int h, int output_index) {
       close();
       return false;
     }
-    // The toplevel is SDL's; the request only needs its proxy and our
-    // wl_output bind. The compositor answers with a configure carrying the
-    // output's size, which the caller's per-frame size check then follows.
+    // Compositor answers with a configure carrying the output's size; the
+    // caller's per-frame size check follows it.
     if (auto* tl = static_cast<xdg_toplevel*>(wm.info.wl.xdg_toplevel))
       xdg_toplevel_set_fullscreen(tl, g_.outputs[output_index]);
     else
@@ -252,11 +234,10 @@ bool DmabufOut::open(SDL_Window* win, int w, int h, int output_index) {
 
   for (int i = 0; i < nbufs_; ++i)
     if (!alloc_buf(bufs_[i])) { close(); return false; }
-  wl_display_roundtrip_queue(dpy_, q_);   // surface any create_immed protocol error now, not mid-game
+  wl_display_roundtrip_queue(dpy_, q_);   // surface any create_immed error now, not mid-game
 
-  // Fullscreen and opaque are two of the three scanout conditions (the third
-  // -- an untransformed output -- is the compositor's). SDL declares opacity
-  // from the window's pixel format, which has alpha, so declare it ourselves.
+  // Fullscreen+opaque are two of the three scanout conditions (third is the
+  // compositor's untransformed output). SDL's format has alpha, so declare opacity ourselves.
   if (g_.comp) {
     wl_region* r = wl_compositor_create_region(g_.comp);
     wl_region_add(r, 0, 0, w_, h_);
@@ -267,8 +248,7 @@ bool DmabufOut::open(SDL_Window* win, int w, int h, int output_index) {
 }
 
 void DmabufOut::close() {
-  // Only per-instance objects die here; the globals (queue included) live for
-  // the connection -- see the comment on Globals.
+  // Only per-instance objects die here; globals live for the connection.
   for (Buf& b : bufs_) drop_buf(b);
   dpy_ = nullptr; surf_ = nullptr; q_ = nullptr; cur_ = -1; dead_ = false;
 }
@@ -287,12 +267,10 @@ u32* DmabufOut::begin_frame() {
     for (int i = 0; i < nbufs_; ++i)
       if (!bufs_[i].busy) {
         cur_ = i;
-        // CPU writes into a dmabuf are bracketed; see dmaheap::sync_begin_write.
         if (!gpu_writes_) dmaheap::sync_begin_write(bufs_[i].fd);
         return bufs_[i].px;
       }
-    // All buffers pending: wait for a release. This is where the display's
-    // pacing is felt, the same place the shm path feels its commit.
+    // All buffers pending: wait for a release (vsync pacing).
     wl_display_flush(dpy_);
     if (wl_display_dispatch_queue(dpy_, q_) < 0) {
       std::fprintf(stderr, "dmabuf: display error %d; falling back\n", wl_display_get_error(dpy_));
@@ -305,8 +283,6 @@ u32* DmabufOut::begin_frame() {
 void DmabufOut::end_frame() {
   if (dead_ || cur_ < 0) return;
   Buf& b = bufs_[cur_];
-  // Everything drawn this frame has to be visible to the compositor and to
-  // the display controller before the buffer is handed over.
   if (!gpu_writes_) dmaheap::sync_end_write(b.fd);
   b.busy = true;
   wl_surface_attach(surf_, b.wb, 0, 0);

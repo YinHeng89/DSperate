@@ -1,10 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // DSperate - Nintendo DS emulator. Copyright (C) 2026 DSperate contributors.
 //
-// See wifi.h. Function by function this follows melonDS's Wifi.cpp and
-// WifiAP.cpp (GPL-3.0-or-later, melonDS team); the comments that explain a
-// hardware behaviour are theirs. Where a value was measured on hardware by
-// them, it is not a value to tune here.
+// Follows melonDS's Wifi.cpp and WifiAP.cpp (GPL-3.0-or-later, melonDS team);
+// the hardware-behaviour comments and measured values are theirs.
 //
 // RFSTATUS values:
 //   0 initial, 1 waiting for incoming packets, 2 switching RX to TX, 3 TX,
@@ -38,14 +36,12 @@ inline void st16(u8* p, u16 v) { std::memcpy(p, &v, 2); }
 inline void st32(u8* p, u32 v) { std::memcpy(p, &v, 4); }
 inline void st64(u8* p, u64 v) { std::memcpy(p, &v, 8); }
 
-// DS_WIFI_TRACE=<file>: every register access as "R|W addr value", the same
-// format the melonDS oracle harness writes under TRACE_WIFI_REGS, so the two
-// can be diffed (docs/wifi-scoping.md). Off: one predictable branch per access.
+// DS_WIFI_TRACE=<file>: log register accesses as "R|W addr value".
 FILE* wifi_trace_file() {
   static FILE* f = [] { const char* p = std::getenv("DS_WIFI_TRACE"); return p ? std::fopen(p, "w") : nullptr; }();
   return f;
 }
-bool wifi_trace_time() { static const bool on = std::getenv("DS_WIFI_TRACE_TIME") != nullptr; return on; }   // append the 8 us timer to each access
+bool wifi_trace_time() { static const bool on = std::getenv("DS_WIFI_TRACE_TIME") != nullptr; return on; }   // DS_WIFI_TRACE_TIME: add the us timer
 bool wifi_log_enabled() { static const bool on = std::getenv("DS_WIFI_LOG") != nullptr; return on; }
 #define WIFI_LOG(...) do { if (wifi_log_enabled()) std::fprintf(stderr, "[wifi] " __VA_ARGS__); } while (0)
 } // namespace
@@ -63,9 +59,7 @@ void Wifi::reset() {
   fixed(0x5D, 0x01); fixed(0x64, 0xFF);
   for (u32 id = 0x69; id < 0x100; ++id) fixed(id, 0x00);
 
-  // Chip ID, RF type and the per-channel RF register pairs from the firmware
-  // header (GBATEK "Firmware Header"): the current channel is whichever pair
-  // the RF registers hold.
+  // Chip ID, RF type and RF init values from the firmware header.
   const auto& fw = nds_.firmware;
   u8 console = 0xFF;
   rf_version_ = 2;
@@ -117,8 +111,7 @@ void Wifi::schedule_timer(bool first) {
 }
 
 void Wifi::update_power_on() {
-  // melonDS Wifi::UpdatePowerOn: POWCNT2 bit 1, and on a DS W_POWER_US bit 0
-  // clear (the DSi's DWM-W024 ignores it). The 8 us timer runs only while on.
+  // POWCNT2 bit 1, and on DS W_POWER_US bit 0 clear (DSi DWM-W024 ignores it).
   bool on = (nds_.io.powcnt2 & 2) != 0;
   if (!nds_.dsi) on = on && (reg(W_PowerUS) & 1) == 0;
   if (on == on_) return;
@@ -164,9 +157,8 @@ void Wifi::set_status(u32 status) {
 }
 
 void Wifi::update_power_status(int power) {
-  // W_PowerForce overrides all else; W_ModeReset bit 0 clear forces the
-  // transceiver off; otherwise IRQ13/15 or W_PowerState turn it on or off
-  // per the mode in W_ModeWEP, with W_PowerDownCtrl inhibiting a power-down.
+  // W_PowerForce overrides all else; W_ModeReset bit 0 clear forces off;
+  // else IRQ13/15 or W_PowerState turn it on/off per W_ModeWEP's mode.
   int cur = 0;
   if (reg(W_TRXPower) == 1) cur |= 1;
   if (!(reg(W_PowerState) & 0x0200)) cur |= 2;
@@ -186,15 +178,13 @@ void Wifi::update_power_status(int power) {
   if (req == cur) return;
   if (req & 1) { if (!(cur & 1)) { reg(W_TRXPower) = 1; set_status(1); } }
   else {
-    // signal the transceiver is going to turn off (checkme)
+    // transceiver turning off (checkme)
     reg(W_TRXPower) = 2;
     if (!com_status_) { reg(W_TRXPower) = 0; set_status(9); }
   }
   if (req & 2) {
     reg(W_PowerState) |= 0x0100;
-    // The 2048 us power-on delay counts down in the timer, so it only
-    // elapses while the block is powered.
-    if (!(cur & 2) && us_until_power_on_ == 0) { us_until_power_on_ = -2048; set_irq(11); }
+    if (!(cur & 2) && us_until_power_on_ == 0) { us_until_power_on_ = -2048; set_irq(11); }   // 2048 us delay
   } else {
     reg(W_PowerState) &= static_cast<u16>(~0x0101);
     reg(W_PowerState) |= 0x0200;
@@ -222,18 +212,10 @@ void Wifi::us_timer() {
 
   if (is_mp_client_ && !com_status_) {
     if (rx_timestamp_ && us_timestamp_ >= rx_timestamp_) { rx_timestamp_ = 0; start_rx(); }
-    if (us_timestamp_ >= next_sync_) check_rx(2);   // TODO (melonDS): not every tick when it fails
-    // Every 64 us: a host frame already here, held to its timestamp
-    // (peek_host_packet) -- but never while our reply is still going out,
-    // and never in the tick that just started a held frame's reception:
-    // com_status_ was clear when this block was entered and start_rx() above
-    // has just set it, so it must be re-checked here. Without that, the
-    // fetch overwrote rx_buffer_ (the ack being received) with the next CMD;
-    // the ack's reception then completed with the CMD's bytes, the ack was
-    // lost, the CMD was received twice (once early, once at its own time),
-    // and Download Play's client counted the missed ack and gave up.
-    // melonDS's client fetches only at next_sync, after the reply slot, and
-    // can never do this.
+    if (us_timestamp_ >= next_sync_) check_rx(2);
+    // Peek every 64 us, but never while our reply is out or right after
+    // start_rx() (hence com_status_ re-checked): the fetch would overwrite the
+    // ack being received with the next CMD, breaking Download Play.
     else if (!no_peek_ && !com_status_ && !rx_timestamp_ && !(reg(W_TXBusy) & 0x0080) && !(us_timestamp_ & 0x38)) check_rx(3);
   }
 
@@ -292,8 +274,6 @@ void Wifi::us_timer() {
     const bool finished = process_tx(tx_slots_[tx_cur_slot_], tx_cur_slot_);
     if (finished) {
       if (reg(W_PowerState) & 0x0200) { reg(W_TXBusy) = 0; reg(W_TRXPower) = 0; set_status(9); }
-      // transfer finished, see if there's another slot to do
-      // checkme: priority order of beacon/reply
       const u16 txbusy = reg(W_TXBusy);
       if      (txbusy & 0x0080) tx_cur_slot_ = 5;
       else if (txbusy & 0x0010) tx_cur_slot_ = 4;
@@ -315,7 +295,6 @@ void Wifi::us_timer() {
       rx_buffer_ptr_ += 2;
       if (rx_time_ <= 0) finish_rx();
       else if (addr == (reg(W_RXBufReadCursor) << 1)) {
-        // TODO (melonDS): properly check the crossing of the read cursor
         WIFI_LOG("RX buffer full (buf=%04X/%04X rd=%04X wr=%04X)\n", (reg(W_RXBufBegin) >> 1) & 0xFFF, (reg(W_RXBufEnd) >> 1) & 0xFFF,
                  reg(W_RXBufReadCursor), reg(W_RXBufWriteCursor));
         rx_time_ = 0;
@@ -347,7 +326,6 @@ void Wifi::increment_tx_count(const TxSlot& slot) {
 }
 void Wifi::trace_frame(int frame) { if (FILE* tf = wifi_trace_file()) std::fprintf(tf, "# frame %d us %llX\n", frame, (unsigned long long)us_timestamp_); }
 void Wifi::report_mp_reply_errors(u16 clientfail) {
-  // TODO (melonDS): do these trigger any IRQ?
   u8* stat = reinterpret_cast<u8*>(io_.data()) + W_CMDStat0;
   for (int i = 1; i < 16; ++i) if (clientfail & (1 << i)) stat[i]++;
 }
@@ -361,8 +339,7 @@ void Wifi::tx_send_frame(const TxSlot& slot, int num) {
     reg(W_TXSeqNo) = (reg(W_TXSeqNo) + 1) & 0x0FFF;
   }
   const u16 framectl = ram16(slot.addr + 0xC);
-  if (framectl & 0x4000) {
-    // WEP frame: no real WEP processing; some games require a nonzero WEP FCS.
+  if (framectl & 0x4000) {   // WEP not emulated; some games need a nonzero WEP FCS
     if (reg(W_WEPCnt) & 0x8000) {
       const u32 wep_fcs = (slot.addr + 0xC + slot.length - 7) & ~1u;
       st32(&ram_[wep_fcs & 0x1FFC], 0x22334466);
@@ -389,9 +366,7 @@ void Wifi::tx_send_frame(const TxSlot& slot, int num) {
     break;
   case 5:
     increment_tx_count(slot);
-    // The reply carries the CMD's arrival timestamp (us_timestamp_ here, as
-    // this runs at CMD arrival): the host's reply wait keys on it and both
-    // transports drop a reply stamped more than 32 us before the CMD's end.
+    // Stamped with the CMD's arrival time; transports drop replies >32 us before the CMD's end.
     if (mp_) mp_->send_reply(tx_buffer_.data(), 12 + len, us_timestamp_, reg(W_AIDLow));
     break;
   case 4:
@@ -424,7 +399,7 @@ void Wifi::start_tx_cmd() {
   duration += 32 * (slot.rate == 2 ? 4 : 8);
   if (cmd_counter_ > duration + 100) { slot.cur_phase = 0; slot.cur_phase_time = preamble_len(slot.rate); }
   else { slot.cur_phase = 13; slot.cur_phase_time = static_cast<s32>(cmd_counter_) - 100; }
-  // starting a CMD transfer wakes up the transceiver automatically
+  // a CMD transfer wakes the transceiver
   update_power_status(1);
 }
 
@@ -459,7 +434,7 @@ void Wifi::fire_tx() {
 void Wifi::send_mp_default_reply() {
   u8 reply[12 + 28] = {};
   st16(&reply[0xA], 28);
-  reply[0x8] = 0x14;   // rate (TODO melonDS: follow the CMD's)
+  reply[0x8] = 0x14;   // rate
   if (cur_channel_ == 0) return;
   reply[0x9] = static_cast<u8>(cur_channel_);
   st16(&reply[0xC + 0x00], 0x0158);
@@ -476,19 +451,10 @@ void Wifi::send_mp_default_reply() {
 
 void Wifi::send_mp_reply(u16 clienttime, u16 clientmask) {
   TxSlot& slot = tx_slots_[5];
-  // mark the last packet as success. dunno what the MSB is, it changes.
-  if (reg(W_TXSlotReply2) & 0x8000) ram16(slot.addr, 0x0001);
-  // CHECKME (melonDS): can the reply rate be set, or does it follow the CMD's?
+  if (reg(W_TXSlotReply2) & 0x8000) ram16(slot.addr, 0x0001);   // mark last packet success (MSB meaning unclear)
   slot.rate = 2;
-  // Which buffer answers this CMD is decided now: W_TXBUF_REPLY1 moves to
-  // REPLY2 as the CMD arrives. What it *contains* is read when the reply
-  // is transmitted, 16 us plus the preamble later (phase 0 below): GBATEK
-  // has the client "update the reply within a few hundred clock cycles of
-  // receiving a command", and the firmware does exactly that, rewriting a
-  // few words of its one reply buffer in place after each CMD. Copying the
-  // buffer out here, as melonDS does, sends every reply's contents one CMD
-  // late; Download Play's host then never sees the RsaReply against its
-  // RSA command (docs/wifi-scoping.md, Download Play).
+  // Reply contents are read at transmit (phase 0), not here: firmware rewrites
+  // its one buffer per CMD, so copying now would send each reply one CMD late.
   reg(W_TXSlotReply2) = reg(W_TXSlotReply1);
   reg(W_TXSlotReply1) = 0;
   if (!(reg(W_TXSlotReply2) & 0x8000)) slot.valid = false;
@@ -496,18 +462,11 @@ void Wifi::send_mp_reply(u16 clienttime, u16 clientmask) {
     slot.valid = true;
     slot.addr = (reg(W_TXSlotReply2) & 0x0FFF) << 1;
     slot.length = ram16(slot.addr + 0xA) & 0x3FFF;
-    // the packet is entirely ignored if it lasts longer than the maximum reply time
     const u32 duration = preamble_len(slot.rate) + slot.length * (slot.rate == 2 ? 4 : 8);
-    if (duration > clienttime) slot.valid = false;
+    if (duration > clienttime) slot.valid = false;   // ignored entirely if longer than the max reply time
   }
   if (FILE* tf = wifi_trace_file()) std::fprintf(tf, "# reply %s len %u clienttime %u\n", slot.valid ? "data" : "empty", slot.valid ? slot.length : 0u, clienttime);
-  // Transmit now, at the CMD's arrival, exactly as melonDS does: the reply
-  // carries this timestamp and the host's reply wait (at its CMD end) keys on
-  // it. The earlier scheme copied the buffer out at TX-end to catch the
-  // firmware's in-place reply patching, but that made the client's reply
-  // timeline drift from the host's and Download Play's data stage stalled
-  // intermittently; the RsaReply mis-attribution it was working around is
-  // now prevented in the transport (LanMp::send_cmd flushes stale replies).
+  // Transmit now: the host's reply wait keys on the CMD-arrival timestamp.
   if (slot.valid) { slot.cur_phase = 0; tx_send_frame(slot, 5); }
   else { slot.cur_phase = 10; send_mp_default_reply(); }
   u16 clientnum = 0;
@@ -576,9 +535,7 @@ bool Wifi::process_tx(TxSlot& slot, int num) {
     slot.cur_phase_time = static_cast<s32>(len);
     reg(W_RXTXAddr) = slot.addr >> 1;
     if (num != 5) tx_send_frame(slot, num);   // slot 5's went out above
-    // if the packet is being sent via LOC1..3, send it to the AP
-    // any packet sent via CMD/REPLY/BEACON isn't going to have much use outside of local MP
-    if (num == 0 || num == 2 || num == 3) {
+    if (num == 0 || num == 2 || num == 3) {   // LOC1..3 also go to the AP; CMD/REPLY/BEACON stay local-MP only
       const u16 framectl = ram16(slot.addr + 0xC);
       if ((framectl & 0x00FF) == 0x0010) {
         const u16 aid = ram16(slot.addr + 0xC + 24 + 4);
@@ -609,14 +566,11 @@ bool Wifi::process_tx(TxSlot& slot, int num) {
       if (mp_client_mask_ && mp_) res = mp_->recv_replies(mp_client_replies_.data(), us_timestamp_, mp_client_mask_);
       mp_client_fail_ &= static_cast<u16>(~res);
       WIFI_LOG("CMD done: clients %04X replied %04X fail %04X cmdcount %u\n", mp_client_mask_, res, mp_client_fail_, cmd_counter_);
-      // TODO (melonDS): 112 likely includes the ack preamble
       slot.cur_phase = 2;
       slot.cur_phase_time = 112 + (10 + reg(W_CmdReplyTime)) * static_cast<s32>(num_clients(mp_client_mask_));
       break;
     }
-    if (num == 5) {
-      // The reply frame was already transmitted at CMD arrival (send_mp_reply);
-      // here the reply slot's transfer just completes.
+    if (num == 5) {   // reply frame already went out in send_mp_reply; this just completes its transfer
       if (reg(W_TXStatCnt) & 0x1000) { reg(W_TXStat) = 0x0401; set_irq(1); }
       set_status(1);
       reg(W_TXBusy) &= static_cast<u16>(~0x80);
@@ -663,7 +617,7 @@ bool Wifi::process_tx(TxSlot& slot, int num) {
     if (!mp_client_fail_) increment_tx_count(slot);
     reg(W_TXSeqNo) = (reg(W_TXSeqNo) + 1) & 0x0FFF;
     if (reg(W_TXStatCnt) & 0x2000) { reg(W_TXStat) = 0x0B01; set_irq(1); }
-    // melonDS: retrying the CMD for the clients that failed causes instability; not done.
+    // Not retried for the clients that failed: causes instability.
     reg(W_TXBusy) &= static_cast<u16>(~2);
     reg(W_TXSlotCmd) &= 0x7FFF;
     set_status(1);
@@ -714,18 +668,13 @@ void Wifi::finish_rx() {
     if (reg(W_PowerState) & 0x0200) { reg(W_TRXPower) = 0; set_status(9); }
     else set_status(1);
   }
-  // TODO (melonDS): RX stats
   const u16 framectl = ld16(&rx_buffer_[12]);
   const u16 seqno = ld16(&rx_buffer_[12 + 22]);
-  // the hardware always checks the first address field, regardless of the frame type
-  const u8* dstmac = &rx_buffer_[12 + 4];
+  const u8* dstmac = &rx_buffer_[12 + 4];   // hardware always checks the first address field
   if (!(dstmac[0] & 1)) { if (!mac_equal(dstmac, mac())) return; }
-  // reject the frame if it's a WEP frame and WEP is off
-  if (framectl & 0x4000) { if (!(reg(W_WEPCnt) & 0x8000)) return; }
+  if (framectl & 0x4000) { if (!(reg(W_WEPCnt) & 0x8000)) return; }   // reject WEP frame if WEP is off
 
-  // apply RX filtering (RXFILTER bits 0, 9, 10, 12 not fully understood;
-  // port 0D8 also affects reception; MP CMD frames with a duplicate sequence
-  // number are ignored)
+  // RXFILTER bits 0, 9, 10, 12 and port 0D8 not fully understood. Duplicate-seq MP CMDs are ignored.
   u16 rxflags = 0x0010;
   bool cmd_dupe = false;
   switch ((framectl >> 2) & 3) {
@@ -756,8 +705,7 @@ void Wifi::finish_rx() {
     const u16 rxfilter = reg(W_RXFilter);
     if (!(rxflags & 0x8000)) { if (!(rxfilter & (1 << 11))) return; }
     if (framectl & 0x0800) { if (!(rxfilter & 1)) return; }   // retransmit
-    // MP frames: the hardware simply checks for these specific MAC addresses;
-    // the reply check has priority over the others.
+    // MP frames: checked by MAC address; reply check has priority over others.
     if (mac_equal(&rx_buffer_[12 + 16], kMpReplyMac)) rxflags |= ((framectl & 0xF0) == 0x50) ? 0x000F : 0x000E;
     else if (mac_equal(&rx_buffer_[12 + 4], kMpCmdMac)) { if (seqno == mp_last_seqno_) cmd_dupe = true; mp_last_seqno_ = seqno; rxflags |= 0x000C; }
     else if (mac_equal(&rx_buffer_[12 + 4], kMpAckMac)) {
@@ -786,36 +734,32 @@ void Wifi::finish_rx() {
   }
   }
 
-  if (!cmd_dupe) {
-    // build the RX header
+  if (!cmd_dupe) {   // build the RX header
     u16 headeraddr = reg(W_RXBufWriteCursor) << 1;
     ram16(headeraddr, rxflags);
     increment_rx_addr(headeraddr);
-    ram16(headeraddr, 0x0040);   // ???
+    ram16(headeraddr, 0x0040);
     increment_rx_addr(headeraddr, 4);
     ram16(headeraddr, ld16(&rx_buffer_[6]));   // TX rate
     increment_rx_addr(headeraddr);
     ram16(headeraddr, ld16(&rx_buffer_[8]));   // frame length
     increment_rx_addr(headeraddr);
     ram16(headeraddr, 0x4080);   // RSSI
-    // signal successful reception
-    u16 addr = reg(W_RXTXAddr) << 1;
+    u16 addr = reg(W_RXTXAddr) << 1;   // signal successful reception
     if (addr & 2) increment_rx_addr(addr);
     reg(W_RXBufWriteCursor) = (addr & ~3u) >> 1;
     set_irq(0);
   }
 
-  if ((rxflags & 0x800F) == 0x800C) {
-    // reply to CMD frames
+  if ((rxflags & 0x800F) == 0x800C) {   // reply to CMD frames
     const u16 clientmask = ld16(&rx_buffer_[0xC + 26]);
     if (FILE* tf = wifi_trace_file()) std::fprintf(tf, "# CMD rx seq %04X len %u reply1 %04X reply2 %04X us %llX via %d\n", seqno, ld16(&rx_buffer_[8]), reg(W_TXSlotReply1), reg(W_TXSlotReply2), (unsigned long long)us_timestamp_, last_rx_type_);
     if (reg(W_AIDLow) && (clientmask & (1 << reg(W_AIDLow)))) send_mp_reply(ld16(&rx_buffer_[0xC + 24]), clientmask);
-    else if (mp_) mp_->send_reply(nullptr, 0, us_timestamp_, 0);   // a blank, so the host has something to receive instead of a timeout
-  } else if ((rxflags & 0x800F) == 0x8001) {
-    // a beacon with the right BSSID copies its timestamp to USCOUNTER
+    else if (mp_) mp_->send_reply(nullptr, 0, us_timestamp_, 0);   // blank, so the host has something to receive instead of a timeout
+  } else if ((rxflags & 0x800F) == 0x8001) {   // beacon with the right BSSID copies its timestamp to USCOUNTER
     u32 len = ld16(&rx_buffer_[8]);
     len *= (ld16(&rx_buffer_[6]) == 0x14) ? 4 : 8;
-    len -= 76;   // CHECKME (melonDS): is this offset fixed?
+    len -= 76;   // CHECKME: is this offset fixed?
     us_counter_ = ld64(&rx_buffer_[12 + 24]) + len;
   }
 }
@@ -866,8 +810,7 @@ bool Wifi::check_rx(int type) {   // 0 = regular, 1 = MP replies, 2 = MP host fr
     if (framelen != rxlen - 12) { WIFI_LOG("bad frame length %d/%d\n", framelen, rxlen - 12); continue; }
     const u8 chan = rx_buffer_[9];
     if (chan != cur_channel_ || cur_channel_ == 0) { WIFI_LOG("frame on channel %d, expected %d\n", chan, cur_channel_); continue; }
-    // hack: ignore MP frames if not engaged in a MP comm
-    if (type == 0 && !is_mp_) {
+    if (type == 0 && !is_mp_) {   // ignore MP frames if not engaged in an MP comm
       if (mac_equal(&rx_buffer_[12 + 16], kMpReplyMac) || mac_equal(&rx_buffer_[12 + 4], kMpCmdMac) || mac_equal(&rx_buffer_[12 + 4], kMpReplyMac)) continue;
     }
     framectl = ld16(&rx_buffer_[12]);
@@ -885,8 +828,7 @@ bool Wifi::check_rx(int type) {   // 0 = regular, 1 = MP replies, 2 = MP host fr
 
   const u16 frametype = framectl & 0x00FF;
   const bool macgood = (rx_buffer_[12 + 4] & 1) || mac_equal(&rx_buffer_[12 + 4], mac());
-  // HACK (melonDS): when receiving auth/assoc frames, extend the post-beacon
-  // interval so a not-yet-synced client's frames still land in the window.
+  // auth/assoc frames extend the post-beacon window for unsynced clients.
   if ((frametype == 0x00B0 || frametype == 0x0010 || frametype == 0x0000) && timestamp && macgood) {
     if (reg(W_BeaconCount2)) reg(W_BeaconCount2) += 10;
   }
@@ -907,8 +849,7 @@ bool Wifi::check_rx(int type) {   // 0 = regular, 1 = MP replies, 2 = MP host fr
     rx_timestamp_ = 0;
     start_rx();
   } else if (macgood && is_mp_client_) {
-    // as a client, hold this frame until its timestamp, and work out how far
-    // we may run after it
+    // Client: hold until the frame's timestamp; next_sync_ bounds how far we may run.
     if (FILE* tf = wifi_trace_file()) std::fprintf(tf, "# hf via %d fc %04X len %d ts %llX us %llX\n", type, framectl, framelen, (unsigned long long)timestamp, (unsigned long long)us_timestamp_);
     rx_timestamp_ = std::max(timestamp, us_timestamp_);
     next_sync_ = rx_timestamp_ + framelen * (txrate == 0x14 ? 4 : 8);
@@ -1168,12 +1109,12 @@ struct PacketWriter {
   int len() const { return static_cast<int>(p - base); }
   void align4() { while (len() & 3) *p++ = 0xFF; }
 };
-// The 12-byte TX header the hardware expects in front of a received frame.
+// 12-byte TX header in front of a received frame.
 void write_txh(u8* p, int len, u8 rate) { std::memset(p, 0, 8); p[8] = rate; p[9] = kApChannel; st16(p + 10, static_cast<u16>(len)); }
 } // namespace
 
 void Wifi::ap_reset() {
-  ap_.us_counter = 0x428888000ULL;   // random starting point for the counter
+  ap_.us_counter = 0x428888000ULL;   // arbitrary
   ap_.seq_no = 0x0120;
   ap_.beacon_due = false;
   ap_.packet.fill(0); ap_.packet_len = 0; ap_.rx_num = 0;
@@ -1183,16 +1124,11 @@ void Wifi::ap_reset() {
 
 void Wifi::ap_ms_timer() {
   ap_.us_counter += 0x400;
-  // A beacon every 100 TU (102.4 ms), as real access points send them.
-  // melonDS's AP beacons every 0x20000 us (131 ms), which is longer than the
-  // ~110 ms a passive scan stays on each channel (the DSi's legacy "Search
-  // for an Access Point"): whether a scan saw it at all came down to phase.
-  if (static_cast<u32>(ap_.us_counter) % (100 * 0x400) == 0) ap_.beacon_due = true;
+  if (static_cast<u32>(ap_.us_counter) % (100 * 0x400) == 0) ap_.beacon_due = true;   // beacon every 100 TU (102.4 ms)
 }
 
 int Wifi::ap_handle_management(const u8* data, int len) {
-  // frames sent pre-auth/assoc don't have a proper BSSID, so the BSSID is
-  // only checked where the client must already know us
+  // BSSID only checked where the client must already know us.
   if (ap_.rx_num) { WIFI_LOG("AP: can't reply\n"); return 0; }
   const u16 framectl = ld16(&data[0]);
   PacketWriter w(ap_.packet.data());
@@ -1213,9 +1149,8 @@ int Wifi::ap_handle_management(const u8* data, int len) {
     ap_.packet_len = w.len(); ap_.rx_num = 1;
     return len;
   }
-  case 0x4: {   // probe request: the WFC setup utility sends these when scanning
-    // Answer under the SSID the request names, if any, so a firmware
-    // configured for any open network finds "its" AP; otherwise ours.
+  case 0x4: {   // probe request
+    // Answer as whatever SSID is requested.
     std::string ssid = ap_.name;
     if (len >= 26 && data[24] == 0x00) {
       const int n = data[25];

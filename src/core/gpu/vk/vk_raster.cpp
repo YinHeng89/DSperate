@@ -23,49 +23,29 @@ namespace ds::gpu::vk {
 
 namespace {
 
-// The texel arena. The DS can address 512 KB of texture VRAM, but the cache
-// decodes to one 32-bit word per texel, so a frame's worth of distinct
-// decoded textures is bounded by the number of polygons rather than by VRAM.
-// 8 MB is two million texels, which no real frame approaches; a frame that
-// did would be refused rather than truncated.
+// Texel arena: 8 MB (2M texels); overflow is refused, not truncated.
 constexpr u32 kTexelWords = 2u * 1024 * 1024;
 
 constexpr size_t kTilesBytes =
   sizeof(u32) * DS_TILE_COUNT + sizeof(u32) * 4 +
   3 * sizeof(u32) * static_cast<size_t>(DS_TILE_COUNT) * DS_TILE_POLYS;   // list, bias, yrng
-// Only the counters and the overflow word are cleared each frame; the lists
-// themselves are written before they are read.
 constexpr size_t kTilesHeader = sizeof(u32) * DS_TILE_COUNT + sizeof(u32) * 4;
 
 enum Binding { B_POLYS = 0, B_VERTS = 1, B_TILES = 2, B_TEXELS = 3, B_OUT = 4,
                B_POST = 5, B_DEPTH = 6, B_ATTR = 7, B_SHCLEAR = 8, B_ROWS = 9, B_KEYS = 10, B_ROWPOLY = 11, B_OUTNAT = 12, B_ORDER = 13, B_NATATTR = 14, B_NATZ = 15, B_TOUCH = 16,
                B_UCOL = 17, B_UATTR = 18, B_UZ = 19, B_EDGE = 20, B_COUNT = 21 };
 
-// DS_VK_VIS: 0 sends the whole list through the ordered loop, as before the
-// visibility pass existed. Attribution and a safety valve, not a feature: the
-// two settings draw the same picture, and the A/B harness is what says so.
+// DS_VK_VIS=0: whole list through the ordered loop instead of the visibility pass (default on).
 bool vis_wanted() {
   static const bool v = [] { const char* e = std::getenv("DS_VK_VIS"); return !e || std::atoi(e) != 0; }();
   return v;
 }
 
-// DS_VK_STAGES: which passes a frame runs -- 1 binning, 2 span + raster, 4
-// the visibility pass, 8 the final pass; 15 (the default) all of them. Attribution, not a
-// feature: the frame's GPU time is one fence wait, and the only way to learn
-// which dispatch it is spent in is to leave one out. With bit 4 clear the
-// raster finds every key untouched and shades the clear, so the difference
-// against the full frame is the visibility pass's own cost. A frame drawn
-// with any bit clear is wrong on purpose, so it is never something a user
-// turns on.
+// DS_VK_STAGES: bitmask of passes to run -- 1 binning, 2 span+raster, 4 visibility, 8 final; default 15.
+// Diagnostic only: clearing a bit produces a wrong frame.
 constexpr u32 kMaxBands = 16;
 
-// DS_VK_BANDS: completion checkpoints per frame. Must divide the tile rows,
-// so it is snapped down to the nearest divisor rather than rejected.
-//
-// Eight, measured (Etrian Odyssey, RG DS Plus, composite wait per frame):
-// 9.358 / 8.990 / 8.883 / 8.415 / 8.643 / 8.688 ms at 1 / 2 / 4 / 8 / 12 / 16.
-// A shallow minimum, and a far smaller win than the reasoning predicted --
-// see the note in vk_raster.h about why.
+// DS_VK_BANDS: completion checkpoints per frame (default 8), snapped to a divisor of the tile rows.
 u32 band_count() {
   static const u32 n = [] {
     const char* e = std::getenv("DS_VK_BANDS");
@@ -73,16 +53,14 @@ u32 band_count() {
     if (v < 1) v = 1;
     if (v > static_cast<long>(kMaxBands)) v = kMaxBands;
     if (v > DS_TILES_Y) v = DS_TILES_Y;
-    while (DS_TILES_Y % v) --v;        // must divide the tile rows evenly
+    while (DS_TILES_Y % v) --v;
     return static_cast<u32>(v);
   }();
   return n;
 }
 
-// DS_VK_TIMING: stamp every dispatch with a GPU timestamp and accumulate the
-// time per pass (Raster::pass_times). Attribution: it adds a barrier between
-// the binning and span passes, which otherwise overlap, so that each stamp
-// closes exactly one dispatch.
+// DS_VK_TIMING: GPU-timestamp every dispatch, accumulated per pass. Adds a barrier between
+// binning and span passes so each stamp closes one dispatch.
 bool timing_wanted() {
   static const bool v = [] { const char* e = std::getenv("DS_VK_TIMING"); return e && std::atoi(e) != 0; }();
   return v;
@@ -104,18 +82,11 @@ struct Raster::Impl {
   const Api* api = nullptr;
 
   Buffer polys, verts, tiles, texels, post, shclear, rows;
-  Buffer keys;               // the visibility pass's per-pixel owner keys, 64-bit
-  // The native-resolution tail (S >= 2): the prefix's records shrunk to 1x,
-  // the tail drawn on them, the touched pixels expanded back (see submit).
+  Buffer keys;               // visibility pass's per-pixel owner keys, 64-bit
+  // Native-res tail (S >= 2): prefix shrunk to 1x, tail drawn there, touched pixels expanded back.
   Buffer nat_attr, nat_z, touch;
-  // The anti-aliasing pass (1x): the pixel underneath -- colour, attribute,
-  // depth record -- as three more attachments aliased on these buffers, which
-  // post.comp then reads for the coverage blend.
-  Buffer ucol, uattr, uz;
-  // The smooth filter's edge plane (DS_VK_SMOOTH3D=1, video.smooth3d): one
-  // per output slot, written by the final pass, read by the present stage's
-  // composite for the frame output_hires_handle() names. edge_valid says
-  // whether the slot's frame wrote it (a frame with no final pass did not).
+  Buffer ucol, uattr, uz;    // AA pass (1x) under layer: colour/attribute/depth, for post.comp's blend
+  // Smooth filter edge plane (DS_VK_SMOOTH3D=1). edge_valid: slot's frame ran the final pass.
   Buffer edge[3];
   bool edge_valid[3] = {false, false, false};
   bool smooth = false;
@@ -130,24 +101,19 @@ struct Raster::Impl {
   VkDescriptorSet set_in1[3] = {VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE};
   VkPipeline pipe_tail1 = VK_NULL_HANDLE, pipe_mask1 = VK_NULL_HANDLE, pipe_expand = VK_NULL_HANDLE;
   bool nat_tail = false;
-  Buffer order;              // the triangle path's draw order of the opaque prefix: polygon indices sorted near to far (tri.vert, DS_FF_SORTED)
-  std::vector<u32> order_idx; std::vector<u32> order_key;   // the sort's scratch
-  Buffer rowpoly;            // each span row's polygon, written by the host with the table layout
-  Buffer depth, attr;        // the depth and attribute planes: the resolve pass writes them, the raster reads them
-  // Three, so that a deferred composite can read frame N-2 while N-1 is in
-  // flight and N is about to be submitted. Two sufficed while the compositor
-  // read the frame just drawn.
-  Buffer out[3];
-  // At S >= 2 out[] is the hi-res layer and these are its native-resolution
-  // reduction (downsample.comp), which is what the CPU reads. At S = 1 they
-  // alias out[] (the same Buffer, not allocated twice).
+  Buffer order;              // triangle path's opaque-prefix draw order: polygon indices sorted near to far (tri.vert, DS_FF_SORTED)
+  std::vector<u32> order_idx; std::vector<u32> order_key;   // sort scratch
+  Buffer rowpoly;            // each span row's polygon, host-written
+  Buffer depth, attr;        // resolve pass writes, raster reads
+  Buffer out[3];             // triple-buffered: deferred composite reads N-2 while N-1 in flight, N submitting
+  // At S >= 2, out[] is the hi-res layer and this its native-res reduction (downsample.comp); at S=1 aliases out[].
   Buffer out_nat[3];
-  bool cpu_down = false;                                   // S >= 2: the native plane is reduced on the CPU (reduce_line), not by downsample.comp
-  std::vector<u32> nat[3];                                 // the CPU-built native planes, one per slot
-  std::array<std::atomic<u8>, 192> nat_done[3]{};          // per slot: which lines are reduced for the frame the slot holds
+  bool cpu_down = false;                                   // S >= 2: native plane reduced on CPU (reduce_line) not downsample.comp
+  std::vector<u32> nat[3];                                 // CPU-built native planes, one per slot
+  std::array<std::atomic<u8>, 192> nat_done[3]{};          // per slot: which lines are reduced for that slot's frame
   VkShaderModule mod_down = VK_NULL_HANDLE;
   VkPipeline pipe_down = VK_NULL_HANDLE;
-  Buffer host_textures;      // an imported arena, when one is ever bound
+  Buffer host_textures;      // imported arena, when bound
 
   VkShaderModule       mod_bin = VK_NULL_HANDLE, mod_raster = VK_NULL_HANDLE;
   VkDescriptorSetLayout dsl = VK_NULL_HANDLE;
@@ -162,20 +128,16 @@ struct Raster::Impl {
   VkCommandBuffer      cmd[3][kMaxBands + 1]{};
   VkFence              fence[kMaxBands + 1]{};
 
-  // Timestamps, when on: per frame in flight, two per pass plus two per
-  // raster band. Slot layout: 0-1 bin, 2-3 span, 4-5 vis, 6-7 post,
-  // 8 + 2b .. 9 + 2b band b's raster.
+  // Query slots/frame: 0-1 bin, 2-3 span, 4-5 vis, 6-7 post, 8+2b/9+2b band b's raster.
   VkQueryPool          qpool[3] = {VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE};
   u32                  qcount = 0;
   bool                 timing = false;
-  bool                 stamped[3] = {false, false, false};   // that frame wrote stamps worth reading
+  bool                 stamped[3] = {false, false, false};   // frame wrote stamps worth reading
   double               tick_ns = 0;
   Raster::PassTimes    times;
 
-  // The triangle path (P3). Images the render pass draws into and the copies
-  // back into the compute path's buffers, so out[], depth and attr -- and the
-  // final pass, and the host -- see exactly what they see from the compute
-  // raster.
+  // Triangle path: renders into images, then copies into the compute path's buffers (out[],
+  // depth, attr) so the final pass and host see the same data as the compute raster.
   bool tri = false, roaa = false;
   VkShaderModule        mod_tv = VK_NULL_HANDLE, mod_tof = VK_NULL_HANDLE, mod_ttf = VK_NULL_HANDLE;
   VkDescriptorSetLayout dsl_g = VK_NULL_HANDLE, dsl_in = VK_NULL_HANDLE;
@@ -183,53 +145,46 @@ struct Raster::Impl {
   VkDescriptorSet       set_g[3] = {VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE}, set_in = VK_NULL_HANDLE;
   VkRenderPass          rp = VK_NULL_HANDLE;
   VkFramebuffer         fb = VK_NULL_HANDLE;
-  // No-copy form: LINEAR images aliased on out[i], depth and attr, so the
-  // render pass writes the buffers the host, the final pass and the
-  // downsample read. One colour image and framebuffer per out[] slot.
+  // No-copy form: LINEAR images aliased on out[i]/depth/attr, render pass writes them directly.
   bool alias = false;
   VkFramebuffer fb3[3] = {VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE};
   VkDescriptorSet set_in3[3] = {VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE};
   VkPipeline            pipe_op[2][2] = {{VK_NULL_HANDLE, VK_NULL_HANDLE}, {VK_NULL_HANDLE, VK_NULL_HANDLE}};   // [wbuffer][front-facing: equal depth passes]
   VkPipeline            pipe_tail[2][2] = {{VK_NULL_HANDLE, VK_NULL_HANDLE}, {VK_NULL_HANDLE, VK_NULL_HANDLE}};   // [wbuffer][depth write]
-  // Shadow volumes: a mask polygon marks the stencil where its depth test
-  // FAILS (the volume's interior), a shadow polygon draws only there.
+  // Shadow: mask polygon marks where its depth test fails (volume interior); shadow draws only there.
   VkShaderModule        mod_expand = VK_NULL_HANDLE;
   VkPipeline            pipe_pre[2][2] = {{VK_NULL_HANDLE, VK_NULL_HANDLE}, {VK_NULL_HANDLE, VK_NULL_HANDLE}};   // DS_VK_TRI_PREPASS: depth-only prefix [wbuffer][front]
-  VkPipeline            pipe_op_eq[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};   // ... then the shaded prefix at EQUAL depth, no depth write
+  VkPipeline            pipe_op_eq[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};   // shaded prefix at EQUAL depth, no depth write
   VkShaderModule        mod_flat = VK_NULL_HANDLE;
   bool                  prepass = false;
-  VkBufferView          texel_view = VK_NULL_HANDLE;   // the texel arena as a uniform texel buffer (graphics set, binding 3)
-  VkPipeline            pipe_mask = VK_NULL_HANDLE;   // shadow masks: no depth test, writes the shadow plane only (tri_mask.frag)
+  VkBufferView          texel_view = VK_NULL_HANDLE;   // texel arena as uniform texel buffer (graphics set, binding 3)
+  VkPipeline            pipe_mask = VK_NULL_HANDLE;   // shadow masks: no depth test, writes shadow plane only (tri_mask.frag)
   VkShaderModule        mod_tmf = VK_NULL_HANDLE;
   VkFormat              ds_format = VK_FORMAT_D32_SFLOAT;
-  bool                  stencil = false;   // shadows drawn (the name is historical: the stencil attachment is gone, see tri_mask.frag)
+  bool                  stencil = false;   // shadows drawn (no actual stencil attachment)
   struct Img { VkImage img = VK_NULL_HANDLE; VkDeviceMemory mem = VK_NULL_HANDLE; VkImageView view = VK_NULL_HANDLE; };
   Img img_col, img_attr, img_z, img_d, img_sh;
   Img img_nat_col3[3], img_nat_attr, img_nat_z, img_touch, img_sh1;
-  Img img_ucol, img_uattr, img_uz;   // the anti-aliasing pass's under layer, aliased on ucol/uattr/uz   // the native tail's 1x attachments: aliased on out_nat[i], nat_attr, nat_z, touch; the shadow plane its own   // img_sh: the shadow plane (R32_UINT run ids), colour attachment 3
+  Img img_ucol, img_uattr, img_uz;   // AA pass under layer, aliased on ucol/uattr/uz
   Img img_col3[3];
 
-  u64  gen = 0;              // frames submitted; the buffer is gen % 3
+  u64  gen = 0;              // frames submitted; buffer is gen % 3
   u32  bands = 1;
-  bool post_frame = false;   // the frame in flight ends with the final pass
-  u32  in_flight = 0;        // bitmask of bands submitted and not yet waited for (bit `bands` is the final pass)
+  bool post_frame = false;   // frame in flight ends with the final pass
+  u32  in_flight = 0;        // bitmask of bands submitted, not yet waited on (bit `bands` = final pass)
   std::mutex wait_mutex;     // waited from the compositor and the emulation thread
 };
 
-// The triangle path's resources: three R32_UINT colour attachments (the 3D
-// layer record, the attribute plane, the depth plane) and a D32 depth buffer,
-// one render pass whose single subpass also reads the colour and attribute
-// attachments as input attachments (ordered per pixel with
-// VK_EXT_rasterization_order_attachment_access, else behind a per-polygon
-// barrier), and six pipelines: the opaque prefix and the translucent tail,
-// each for the Z-buffer (LESS on z) and W-buffer (GREATER on 1 / depth) modes, the
-// tail with and without the depth write.
+// Triangle path resources: three R32_UINT colour attachments (record, attribute, depth) plus a
+// D32 depth buffer; subpass reads colour/attribute as input attachments (ordered per-pixel via
+// VK_EXT_rasterization_order_attachment_access, else a per-polygon barrier); six pipelines:
+// opaque/tail x Z-buffer(LESS)/W-buffer(GREATER) x depth write.
 bool Raster::tri_setup(Impl& d, Device& dev, std::string* why) {
   const Api& a = *d.api;
   const DeviceInternal* vk = d.vk;
   auto fail = [&](const char* m) { if (why) *why = m; return false; };
   const u32 W = 256 * scale_, H = 192 * scale_;
-  d.roaa = dev.limits().ordered_attachments && !std::getenv("DS_VK_TRI_NOROAA");   // DS_VK_TRI_NOROAA=1: the per-polygon barrier fallback, for bisecting
+  d.roaa = dev.limits().ordered_attachments && !std::getenv("DS_VK_TRI_NOROAA");   // DS_VK_TRI_NOROAA=1 forces the per-polygon barrier fallback
 
   auto shader = [&](Spirv s, VkShaderModule* out) {
     VkShaderModuleCreateInfo ci{}; ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO; ci.codeSize = s.bytes; ci.pCode = s.code;
@@ -238,19 +193,17 @@ bool Raster::tri_setup(Impl& d, Device& dev, std::string* why) {
   if (!shader(shader_tri_vert(), &d.mod_tv) || !shader(shader_tri_opaque(), &d.mod_tof) || !shader(shader_tri_tail(), &d.mod_ttf) || !shader(shader_tri_mask(), &d.mod_tmf)) return fail("triangle shaders rejected by the driver");
   if (std::getenv("DS_VK_TRI_FLAT")) { if (!shader(shader_tri_flat(), &d.mod_tof)) return fail("flat shader rejected"); std::fprintf(stderr, "gpu raster: ATTRIBUTION -- flat fragment stage\n"); }
 
-  // Set 0: the same buffers as the compute passes, for the vertex and fragment stages.
+  // Set 0: same buffers as the compute passes.
   VkDescriptorSetLayoutBinding binds[B_COUNT]{};
   for (u32 i = 0; i < B_COUNT; ++i) { binds[i].binding = i; binds[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; binds[i].descriptorCount = 1; binds[i].stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT; }
-  binds[B_TEXELS].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER;   // the texel arena through the texture cache (tri_frag_common.glsl)
+  binds[B_TEXELS].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER;
   {
     VkBufferViewCreateInfo bv{}; bv.sType = VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO; bv.buffer = vk_buf(d.texels); bv.format = VK_FORMAT_R32_UINT; bv.offset = 0; bv.range = VK_WHOLE_SIZE;
     if (a.vkCreateBufferView(vk->dev, &bv, nullptr, &d.texel_view) != VK_SUCCESS) return fail("texel buffer view");
   }
   VkDescriptorSetLayoutCreateInfo dsli{}; dsli.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO; dsli.bindingCount = B_COUNT; dsli.pBindings = binds;
   if (a.vkCreateDescriptorSetLayout(vk->dev, &dsli, nullptr, &d.dsl_g) != VK_SUCCESS) return fail("graphics descriptor layout");
-  // Set 1: the colour, attribute, depth and shadow attachments, read back in
-  // the tail; 4-6 the anti-aliasing pass's under layer (other passes bind a
-  // placeholder there).
+  // Set 1: colour/attribute/depth/shadow (0-3); 4-6 the AA pass's under layer (placeholder otherwise).
   VkDescriptorSetLayoutBinding inb[7]{};
   for (u32 i = 0; i < 7; ++i) { inb[i].binding = i; inb[i].descriptorType = VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT; inb[i].descriptorCount = 1; inb[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT; }
   VkDescriptorSetLayoutCreateInfo dsli2{}; dsli2.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO; dsli2.bindingCount = 7; dsli2.pBindings = inb;
@@ -298,10 +251,7 @@ bool Raster::tri_setup(Impl& d, Device& dev, std::string* why) {
     return a.vkCreateImageView(vk->dev, &vi, nullptr, &o.view) == VK_SUCCESS;
   };
   const VkImageUsageFlags cu = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
-  // A LINEAR image bound to a buffer's memory: the render pass then writes
-  // the buffer itself and the three copies (1.9 ms a frame on the G52, a
-  // tiled-to-linear conversion) go away. Needs the format to render linear,
-  // the driver's row pitch to be ours, and a memory type both can share.
+  // LINEAR image bound to a buffer's memory: render pass writes the buffer directly, no copy.
   auto alias_image = [&](const Buffer& buf, Impl::Img& o, u32 iw = 0, u32 ih = 0) {
     if (!iw) { iw = W; ih = H; }
     VkImageCreateInfo ii{}; ii.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO; ii.imageType = VK_IMAGE_TYPE_2D; ii.format = VK_FORMAT_R32_UINT;
@@ -340,9 +290,8 @@ bool Raster::tri_setup(Impl& d, Device& dev, std::string* why) {
     if (!make_image(VK_FORMAT_R32_UINT, cu, VK_IMAGE_ASPECT_COLOR_BIT, d.img_attr)) return fail("attribute attachment");
     if (!make_image(VK_FORMAT_R32_UINT, cu, VK_IMAGE_ASPECT_COLOR_BIT, d.img_z)) return fail("depth plane attachment");
   }
-  // No stencil attachment: shadow volumes go through the shadow plane
-  // (tri_mask.frag) after libmali held job completion for up to a second on
-  // frames with stencil masks. DS_VK_TRI_NOSTENCIL=1 still means "no shadows".
+  // No stencil attachment: shadow volumes go through the shadow plane instead.
+  // DS_VK_TRI_NOSTENCIL=1 disables shadows.
   d.ds_format = VK_FORMAT_D32_SFLOAT;
   d.stencil = !std::getenv("DS_VK_TRI_NOSTENCIL");
   if (!make_image(VK_FORMAT_R32_UINT, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT, VK_IMAGE_ASPECT_COLOR_BIT, d.img_sh)) return fail("shadow plane attachment");
@@ -382,8 +331,8 @@ bool Raster::tri_setup(Impl& d, Device& dev, std::string* why) {
   sp.inputAttachmentCount = 4; sp.pInputAttachments = ir;
   sp.colorAttachmentCount = 4; sp.pColorAttachments = cr;
   sp.pDepthStencilAttachment = &dr;
-  // The self-dependency that makes reading the attachment just written legal
-  // (and, without ordered access, the barrier the host puts between tail polygons).
+  // Self-dependency: legalizes reading the attachment just written (and, without ordered
+  // access, is the barrier the host puts between tail polygons).
   VkSubpassDependency dep{};
   dep.srcSubpass = 0; dep.dstSubpass = 0;
   dep.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT; dep.dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
@@ -398,15 +347,9 @@ bool Raster::tri_setup(Impl& d, Device& dev, std::string* why) {
   }
   d.fb = d.fb3[0];
 
-  // The native-resolution tail: a second pass at 1x on images aliased on
-  // the shrunk planes (colour = the native plane itself), loading what the
-  // shrink wrote, plus its own shadow plane and a "touched" plane that
-  // expand.comp reads. Only at S >= 2, only with the aliasing (the planes
-  // must be the buffers the compute passes see).
-  // Measured on the device (docs/gpu-path-scoping.md): gsdd 2x fence wait
-  // 6.6 -> 5.7 ms, etody 2.1 -> 3.1 (its tail is small and the shrink and
-  // expand passes are not), st and nsmb neutral. Opt-in until the two
-  // compute passes are cheaper (DS_VK_TRI_NATIVE_TAIL=1).
+  // Native-res tail: second pass at 1x on images aliased on the shrunk planes, loading what the
+  // shrink wrote, plus its own shadow plane and a "touched" plane expand.comp reads. Only at
+  // S >= 2 with aliasing. Opt-in (DS_VK_TRI_NATIVE_TAIL=1).
   d.nat_tail = scale_ > 1 && d.alias && !d.cpu_down && std::getenv("DS_VK_TRI_NATIVE_TAIL");
   if (d.nat_tail) {
     bool ok = true;
@@ -428,8 +371,7 @@ bool Raster::tri_setup(Impl& d, Device& dev, std::string* why) {
       for (u32 i = 0; i < 7; ++i) { w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[i].dstSet = d.set_in1[k]; w[i].dstBinding = i; w[i].descriptorCount = 1; w[i].descriptorType = VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT; w[i].pImageInfo = &di[i]; }
       a.vkUpdateDescriptorSets(vk->dev, 7, w, 0, nullptr);
     }
-    // Five colour attachments: colour, attribute, depth record (loaded: the
-    // shrink wrote them), the shadow plane and the touched plane (cleared).
+    // Colour/attribute/depth loaded (shrink wrote them); shadow and touched planes cleared.
     VkAttachmentDescription at1[5]{};
     for (u32 i = 0; i < 5; ++i) {
       at1[i].format = VK_FORMAT_R32_UINT; at1[i].samples = VK_SAMPLE_COUNT_1_BIT;
@@ -459,10 +401,9 @@ bool Raster::tri_setup(Impl& d, Device& dev, std::string* why) {
     }
   }
 
-  // The anti-aliasing pass (1x only): seven colour attachments -- the four
-  // of the ordinary pass plus the under layer aliased on ucol/uattr/uz --
-  // and no depth buffer (the DS test runs in the shader, tri_aa_common.glsl).
-  d.aa_ok = scale_ == 1 && d.alias && std::getenv("DS_VK_TRI_AA_EXACT");   // the exact pass: 4x the fragment cost (no hardware depth test); the fast path is the default
+  // AA pass (1x only): four ordinary attachments plus the under layer (ucol/uattr/uz), no
+  // depth buffer -- the DS depth test runs in the shader.
+  d.aa_ok = scale_ == 1 && d.alias && std::getenv("DS_VK_TRI_AA_EXACT");   // exact pass costs 4x the fragment work; fast path is default
   if (d.aa_ok) {
     bool ok = alias_image(d.ucol, d.img_ucol) && alias_image(d.uattr, d.img_uattr) && alias_image(d.uz, d.img_uz);
     if (!ok) { std::fprintf(stderr, "gpu raster: anti-aliasing pass unavailable (under-layer aliases); AA frames stay on the CPU\n"); d.aa_ok = false; }
@@ -510,7 +451,6 @@ bool Raster::tri_setup(Impl& d, Device& dev, std::string* why) {
     if (!shader(shader_tri_opaque_aa(), &d.mod_toaa) || !shader(shader_tri_tail_aa(), &d.mod_ttaa)) return fail("AA shaders rejected by the driver");
   }
 
-  // Pipelines. Compile time is 13-45 ms each on the G52; six of them, at startup.
   auto pipeline = [&](VkShaderModule fs, bool wbuf, bool depth_write, VkPipeline* out, int kind = 0, bool equal_passes = false, bool equal_only = false, int pass = 0) {
     const bool at1x = pass == 1, aa = pass == 2;
     const u32 PW = at1x ? 256u : W, PH = at1x ? 192u : H;
@@ -525,19 +465,18 @@ bool Raster::tri_setup(Impl& d, Device& dev, std::string* why) {
     VkPipelineRasterizationStateCreateInfo rs{}; rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO; rs.polygonMode = VK_POLYGON_MODE_FILL; rs.cullMode = VK_CULL_MODE_NONE; rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE; rs.lineWidth = 1.f;
     VkPipelineMultisampleStateCreateInfo ms{}; ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO; ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
     VkPipelineDepthStencilStateCreateInfo dss{}; dss.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
-    dss.depthTestEnable = VK_TRUE; dss.depthWriteEnable = depth_write ? VK_TRUE : VK_FALSE; dss.depthCompareOp = wbuf ? (equal_passes ? VK_COMPARE_OP_GREATER_OR_EQUAL : VK_COMPARE_OP_GREATER) : (equal_passes ? VK_COMPARE_OP_LESS_OR_EQUAL : VK_COMPARE_OP_LESS);   // W-buffer: GREATER on 1 / depth (tri.vert)
-    if (equal_only) dss.depthCompareOp = VK_COMPARE_OP_EQUAL;   // the shaded pass after a depth prepass
+    dss.depthTestEnable = VK_TRUE; dss.depthWriteEnable = depth_write ? VK_TRUE : VK_FALSE; dss.depthCompareOp = wbuf ? (equal_passes ? VK_COMPARE_OP_GREATER_OR_EQUAL : VK_COMPARE_OP_GREATER) : (equal_passes ? VK_COMPARE_OP_LESS_OR_EQUAL : VK_COMPARE_OP_LESS);   // W-buffer: GREATER on 1/depth
+    if (equal_only) dss.depthCompareOp = VK_COMPARE_OP_EQUAL;   // shaded pass after a depth prepass
     if (kind == 1) {
-      // The mask: no depth test (the shader does the DS's, against the depth
-      // record), no depth write, the shadow plane its only output.
+      // Mask: no depth test (shader does the DS's, against the depth record), no depth write, shadow plane only output.
       dss.depthTestEnable = VK_FALSE; dss.depthWriteEnable = VK_FALSE;
     }
     VkPipelineColorBlendAttachmentState cba[4]{};
-    for (u32 i = 0; i < 4; ++i) cba[i].colorWriteMask = (i == 3) == (kind == 1) ? 0xFu : 0u;   // the mask writes the shadow plane alone; everything else never touches it
-    if (kind == 3) for (auto& c : cba) c.colorWriteMask = 0u;   // the depth prepass writes no colour
+    for (u32 i = 0; i < 4; ++i) cba[i].colorWriteMask = (i == 3) == (kind == 1) ? 0xFu : 0u;   // mask writes only the shadow plane
+    if (kind == 3) for (auto& c : cba) c.colorWriteMask = 0u;   // depth prepass writes no colour
     VkPipelineColorBlendAttachmentState cba1[7]{};
-    if (at1x) { for (u32 i = 0; i < 4; ++i) cba1[i] = cba[i]; cba1[4].colorWriteMask = kind == 0 ? 0xFu : 0u; dss.depthTestEnable = VK_FALSE; dss.depthWriteEnable = VK_FALSE; }   // the touched plane: the tail writes it, the mask does not; no depth attachment
-    if (aa) { for (u32 i = 0; i < 4; ++i) cba1[i] = cba[i]; for (u32 i = 4; i < 7; ++i) cba1[i].colorWriteMask = kind == 1 ? 0u : 0xFu; dss.depthTestEnable = VK_FALSE; dss.depthWriteEnable = VK_FALSE; }   // the under layer: written by everything but the mask; the DS depth test is in the shader
+    if (at1x) { for (u32 i = 0; i < 4; ++i) cba1[i] = cba[i]; cba1[4].colorWriteMask = kind == 0 ? 0xFu : 0u; dss.depthTestEnable = VK_FALSE; dss.depthWriteEnable = VK_FALSE; }   // touched plane: tail writes it, mask doesn't; no depth attachment
+    if (aa) { for (u32 i = 0; i < 4; ++i) cba1[i] = cba[i]; for (u32 i = 4; i < 7; ++i) cba1[i].colorWriteMask = kind == 1 ? 0u : 0xFu; dss.depthTestEnable = VK_FALSE; dss.depthWriteEnable = VK_FALSE; }   // under layer: written by all but the mask; DS depth test is in-shader
     VkPipelineColorBlendStateCreateInfo cbs{}; cbs.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO; cbs.attachmentCount = at1x ? 5 : (aa ? 7 : 4); cbs.pAttachments = (at1x || aa) ? cba1 : cba;
     if (d.roaa) cbs.flags = VK_PIPELINE_COLOR_BLEND_STATE_CREATE_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_BIT_EXT;
     VkGraphicsPipelineCreateInfo gpi{}; gpi.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO; gpi.stageCount = 2; gpi.pStages = st;
@@ -560,7 +499,7 @@ bool Raster::tri_setup(Impl& d, Device& dev, std::string* why) {
     if (!pipeline(d.mod_ttaa, false, false, &d.pipe_tail_aa, 0, false, false, 2)) return fail("AA tail pipeline");
     if (!pipeline(d.mod_tmf, false, false, &d.pipe_mask_aa, 1, false, false, 2)) return fail("AA mask pipeline");
   }
-  d.prepass = std::getenv("DS_VK_TRI_PREPASS") != nullptr;   // experiment: shade each opaque pixel once
+  d.prepass = std::getenv("DS_VK_TRI_PREPASS") != nullptr;   // shade each opaque pixel once
   if (d.prepass) {
     if (!shader(shader_tri_pre(), &d.mod_flat)) return fail("prepass shader");
     for (int wb = 0; wb < 2; ++wb) {
@@ -586,65 +525,53 @@ std::unique_ptr<Raster> Raster::create(Device& dev, std::string* why) {
   d.vk = vk;
   d.api = vk->api;
   self->scale_ = 1;
-  // DS_VK_MODE: "tri" for the triangle path, "compute" for the compute
-  // passes. The triangle path is the default where the device can run it.
+  // DS_VK_MODE: "tri" or "compute". Triangle path is default where the device supports it.
   {
     const Api& a0 = *d.api;
     const bool tri_wanted = [] { const char* e = std::getenv("DS_VK_MODE"); return !e || std::strcmp(e, "compute") != 0; }();
     d.tri = tri_wanted && dev.limits().graphics && a0.vkCreateGraphicsPipelines && a0.vkCreateRenderPass && a0.vkCmdCopyImageToBuffer;
   }
 
-  // The tile shape the pixel pipeline uses has to fit the device; check it
-  // here so a part with a smaller limit fails at startup rather than in the
-  // middle of a scene.
+  // Pixel pipeline's tile shape must fit the device; check at startup rather than mid-scene.
   if (dev.limits().max_workgroup_invocations < DS_TILE_W * DS_TILE_H)
     return set_why("workgroup invocations below 16x16");
 
-  // DS_VK_SCALE: the internal resolution of the triangle path (1..4). The
-  // compute passes stay at 1.
+  // DS_VK_SCALE: triangle path internal resolution (1..4). Compute passes stay at 1.
   if (d.tri) if (const char* e = std::getenv("DS_VK_SCALE")) { const int s = std::atoi(e); if (s >= 1 && s <= 4) self->scale_ = static_cast<u32>(s); }
-  // A little past the plane: a LINEAR image aliased on the buffer (the
-  // triangle path's no-copy form) asks for slightly more than W*H*4 on
-  // libmali (198208 for 196608), and the aliasing is refused without it.
+  // Slightly more than W*H*4: libmali's LINEAR image alias (triangle path no-copy form) needs
+  // a bit of slack past the plane (198208 for 196608), else aliasing is refused.
   const size_t out_bytes = static_cast<size_t>(256 * self->scale_) *
                            static_cast<size_t>(192 * self->scale_) * sizeof(u32) + 16384;
 
-  // The 3D layer, one per frame in flight. Access::CpuRead is not a
-  // preference: the NEON composite reads this buffer directly.
+  // Access::CpuRead is required, not a preference: the NEON composite reads this buffer directly.
   for (int i = 0; i < 3; ++i) {
     d.out[i] = dev.alloc(out_bytes, Access::CpuRead);
     if (!d.out[i]) return set_why("3D layer allocation failed");
-    // Measured a LOSS on the device (docs/gpu-path-scoping.md): the dispatch
-    // is ~0.15 ms of GPU, the strided gather lands on the thread that reads
-    // the line -- st 2x +0.5 ms median. Opt-in for a host with CPU to spare.
-    d.cpu_down = self->scale_ > 1 && std::getenv("DS_VK_CPU_DOWNSAMPLE");
-    d.smooth = self->scale_ == 1 && std::getenv("DS_VK_SMOOTH3D") != nullptr && std::strcmp(std::getenv("DS_VK_SMOOTH3D"), "0") != 0;   // the frontend sets it through set_smooth; the environment is the override
-    d.edge[i] = dev.alloc(out_bytes, Access::CpuWrite);   // GPU-only; allocated whether or not the filter is on, so the menu can turn it on
+    d.cpu_down = self->scale_ > 1 && std::getenv("DS_VK_CPU_DOWNSAMPLE");   // opt-in CPU downsample instead of downsample.comp
+    d.smooth = self->scale_ == 1 && std::getenv("DS_VK_SMOOTH3D") != nullptr && std::strcmp(std::getenv("DS_VK_SMOOTH3D"), "0") != 0;   // frontend also sets this via set_smooth
+    d.edge[i] = dev.alloc(out_bytes, Access::CpuWrite);   // allocated regardless, so the filter can be toggled at runtime
     if (!d.edge[i]) return set_why("edge plane allocation failed");
     if (i == 0) {
       d.order = dev.alloc(sizeof(u32) * DS_MAX_POLYS, Access::CpuWrite); if (!d.order) return set_why("order buffer allocation failed");
-      const size_t nat_bytes = 256 * 192 * sizeof(u32) + 16384;   // the alias slack, as out_bytes
+      const size_t nat_bytes = 256 * 192 * sizeof(u32) + 16384;
       d.nat_attr = dev.alloc(nat_bytes, Access::CpuWrite); d.nat_z = dev.alloc(nat_bytes, Access::CpuWrite); d.touch = dev.alloc(nat_bytes, Access::CpuWrite);
       if (!d.nat_attr || !d.nat_z || !d.touch) return set_why("native tail plane allocation failed");
-      const size_t under_bytes = static_cast<size_t>(256 * self->scale_) * static_cast<size_t>(192 * self->scale_) * sizeof(u32) + 16384;   // the fast AA's scratch is frame-sized
+      const size_t under_bytes = static_cast<size_t>(256 * self->scale_) * static_cast<size_t>(192 * self->scale_) * sizeof(u32) + 16384;
       d.ucol = dev.alloc(under_bytes, Access::CpuWrite); d.uattr = dev.alloc(nat_bytes, Access::CpuWrite); d.uz = dev.alloc(nat_bytes, Access::CpuWrite);
       if (!d.ucol || !d.uattr || !d.uz) return set_why("under layer allocation failed");
     }
     if (self->scale_ > 1 && !d.cpu_down) { d.out_nat[i] = dev.alloc(256 * 192 * sizeof(u32) + 16384, Access::CpuRead); if (!d.out_nat[i]) return set_why("native layer allocation failed"); }
-    else d.out_nat[i] = d.out[i];   // (binding 12 must name a buffer; with cpu_down it is never read)
+    else d.out_nat[i] = d.out[i];   // binding 12 must name a buffer even when unread (cpu_down)
     if (d.cpu_down) d.nat[i].assign(256 * 192, 0u);
   }
-  // Everything the CPU writes and never reads back. Write-combine is the
-  // right side of the 35x cliff for these.
   d.polys  = dev.alloc(sizeof(GpuPoly) * DS_MAX_POLYS, Access::CpuWrite);
   d.verts  = dev.alloc(sizeof(GpuVert) * DS_MAX_VERTS, Access::CpuWrite);
   d.tiles  = dev.alloc(kTilesBytes, Access::CpuWrite);
   d.texels = dev.alloc(sizeof(u32) * kTexelWords, Access::CpuWrite);
   d.post   = dev.alloc(sizeof(GpuPost), Access::CpuWrite);
   d.shclear = dev.alloc(sizeof(u32) * DS_MAX_POLYS * DS_SHRUN_LINES, Access::CpuWrite);
-  // The span table. GPU-only: the span pass writes it, the raster reads it.
-  d.rows = dev.alloc(sizeof(GpuRow) * DS_MAX_SPAN_ROWS, Access::CpuWrite);
-  // GPU-only planes: the CPU never reads them.
+  d.rows = dev.alloc(sizeof(GpuRow) * DS_MAX_SPAN_ROWS, Access::CpuWrite);   // span pass writes, raster reads
+  // GPU-only planes: CPU never reads them.
   d.depth  = dev.alloc(out_bytes, Access::CpuWrite);
   d.attr   = dev.alloc(out_bytes, Access::CpuWrite);
   d.keys   = dev.alloc(out_bytes * 2, Access::CpuWrite);
@@ -665,9 +592,8 @@ std::unique_ptr<Raster> Raster::create(Device& dev, std::string* why) {
   if (!shader(shader_raster(), &d.mod_raster)) return set_why("raster.spv rejected by the driver");
   if (!shader(shader_post(), &d.mod_post)) return set_why("post.spv rejected by the driver");
   if (!shader(shader_span(), &d.mod_span)) return set_why("span.spv rejected by the driver");
-  // The visibility pass needs 64-bit atomics; its SPIR-V declares the
-  // capability, so on a part without them the module is never even created
-  // and the whole list goes through the ordered loop instead.
+  // Visibility pass needs 64-bit atomics; without them the module is never created and the
+  // whole list goes through the ordered loop instead.
   self->vis_ = dev.limits().int64_atomics && vis_wanted();
   if (self->vis_) {
     if (!shader(shader_vis(), &d.mod_vis)) return set_why("vis.spv rejected by the driver");
@@ -701,8 +627,6 @@ std::unique_ptr<Raster> Raster::create(Device& dev, std::string* why) {
   if (a.vkCreatePipelineLayout(vk->dev, &pli, nullptr, &d.layout) != VK_SUCCESS)
     return set_why("pipeline layout failed");
 
-  // Pipeline compilation is 13-45 ms a shader on the G52. It happens here,
-  // at startup, and never on a frame.
   auto pipeline = [&](VkShaderModule m, VkPipeline* out) {
     VkComputePipelineCreateInfo ci{};
     ci.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
@@ -733,7 +657,7 @@ std::unique_ptr<Raster> Raster::create(Device& dev, std::string* why) {
   psz[1].type = VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT;
   psz[1].descriptorCount = 96;   // seven input attachments per set: set_in3, set_in, set_in1, set_in_aa (ten sets)
   psz[2].type = VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER;
-  psz[2].descriptorCount = 4;    // the texel view in each graphics set
+  psz[2].descriptorCount = 4;    // texel view in each graphics set
   VkDescriptorPoolCreateInfo dpi{};
   dpi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
   dpi.maxSets = 24;
@@ -742,8 +666,7 @@ std::unique_ptr<Raster> Raster::create(Device& dev, std::string* why) {
   if (a.vkCreateDescriptorPool(vk->dev, &dpi, nullptr, &d.pool) != VK_SUCCESS)
     return set_why("descriptor pool failed");
 
-  // One set per output buffer. Everything but the output is the same in both,
-  // so a frame changes which set it binds rather than rewriting descriptors.
+  // One set per output buffer; a frame changes which set it binds rather than rewriting descriptors.
   VkDescriptorSetLayout layouts[3] = {d.dsl, d.dsl, d.dsl};
   VkDescriptorSetAllocateInfo dsa{};
   dsa.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
@@ -777,14 +700,10 @@ std::unique_ptr<Raster> Raster::create(Device& dev, std::string* why) {
     if (!self->tri_setup(d, dev, &treason)) {
       std::fprintf(stderr, "gpu raster: triangle path unavailable (%s); compute passes instead\n", treason.c_str());
       d.tri = false;
-      // The compute path wants its bands back; the command buffers and
-      // fences below are sized from d.bands.
-      d.bands = band_count();
+      d.bands = band_count();   // command buffers and fences below are sized from d.bands
       self->bands_ = d.bands;
     } else {
-      // The host lays out the list as it does for the visibility pass: the
-      // real order-free prefix, and only the tail binned.
-      self->vis_ = true;
+      self->vis_ = true;   // triangle path lays out the list as an order-free prefix + binned tail, same as the visibility pass
       std::fprintf(stderr, "gpu raster: triangle path at %ux, ordered attachment access %s, %s, %s\n", self->scale_, d.roaa ? "on" : "OFF (a barrier per tail polygon)", d.alias ? "attachments aliased on the buffers" : "attachments copied into the buffers", d.stencil ? "shadows through the shadow plane" : "shadows OFF");
       std::fprintf(stderr, "gpu raster: anti-aliasing %s\n", d.aa_ok ? "EXACT (the two-deep pixel stack, no hardware depth test)" : "fast (span-table coverage, neighbour blend in the final pass)");
       if (self->scale_ > 1) std::fprintf(stderr, "gpu raster: native plane %s; translucent tail at %s\n", d.cpu_down ? "reduced on the CPU a line at a time (DS_VK_CPU_DOWNSAMPLE)" : "by downsample.comp on the GPU", d.nat_tail ? "1x (native)" : "full resolution");
@@ -830,8 +749,7 @@ std::unique_ptr<Raster> Raster::create(Device& dev, std::string* why) {
     if (a.vkCreateFence(vk->dev, &fi, nullptr, &d.fence[b]) != VK_SUCCESS)
       return set_why("fence creation failed");
 
-  // Start from a cleared layer, so a frame read before anything is drawn is
-  // black rather than whatever the allocation held.
+  // First read before any draw must be black, not garbage.
   for (int i = 0; i < 3; ++i) std::memset(d.out[i].ptr, 0, out_bytes);
 
   self->ready_ = true;
@@ -896,9 +814,6 @@ u32* Raster::texel_buffer(u32* capacity) {
 }
 
 bool Raster::bind_texture_arena(void* ptr, size_t size) {
-  // Kept for when the texture cache keeps its texels in one arena; today each
-  // entry owns its own vector, so there is no single pointer to import and
-  // the upload copies through texel_buffer() instead.
   Impl& d = *d_;
   if (d.host_textures) d.dev->free(d.host_textures);
   d.host_textures = d.dev->import_host(ptr, size);
@@ -914,18 +829,14 @@ s32 Raster::band_line(u32 b) const {
 bool Raster::submit(u32 npoly, u32 nvert, u32 ntexels, const GpuFrame& frame_in) {
   if (!ready_) return false;
   Impl& d = *d_;
-  GpuFrame frame = frame_in;   // the flags below are added to it
+  GpuFrame frame = frame_in;   // flags below are added to it
   const Api& a = *d.api;
-  // npoly == 0 is a real frame, not a refusal: the binning dispatch is zero
-  // workgroups and the raster still clears the layer, which is exactly what
-  // the CPU does for a frame with no live polygons.
+  // npoly == 0 is valid: binning dispatches zero workgroups and the raster still clears.
   if (npoly > DS_MAX_POLYS || nvert > DS_MAX_VERTS || ntexels > kTexelWords) return false;
 
-  wait();                       // the previous frame must be off the buffers
+  wait();                       // previous frame must be off the buffers
 
-  // Collect the stamps of the frame that used this slot last (three frames
-  // ago -- long finished) before its pool is reset below.
-  const u32 slot = static_cast<u32>(d.gen % 3);
+  const u32 slot = static_cast<u32>(d.gen % 3);   // frame that last used this slot, before its pool resets below
   if (d.timing && d.stamped[slot]) {
     std::vector<u64> t(d.qcount, 0);
     if (a.vkGetQueryPoolResults(d.vk->dev, d.qpool[slot], 0, d.qcount, sizeof(u64) * d.qcount, t.data(),
@@ -941,18 +852,8 @@ bool Raster::submit(u32 npoly, u32 nvert, u32 ntexels, const GpuFrame& frame_in)
     d.stamped[slot] = false;
   }
 
-  // Make the uploads visible to the GPU. A coherent mapping needs none of
-  // this; whether one was handed out is the driver's choice, so it is always
-  // called and costs nothing when it is a no-op.
-  // The opaque prefix near to far. The DS defines its pixels' owners
-  // order-free (see GpuFrame::first_ordered), so any order draws the same
-  // picture up to equal-depth ties; near first lets early-Z reject the
-  // hidden fragments before their texel fetch, which is where a Golden Sun
-  // frame at 2x spent 3.6 of its 5.9 ms (cut-out layers over each other).
-  // Measured: no gain on any scene (docs/gpu-path-scoping.md) -- Mali's
-  // early-Z does not reject behind a discarding shader before the fetch --
-  // and reading the vertices back from write-combined memory here cost the
-  // job thread a millisecond. Opt-in for other GPUs (DS_VK_TRI_SORT=1).
+  // Opaque prefix near-to-far sort, opt-in (DS_VK_TRI_SORT=1): only helps early-Z rejection
+  // before the texel fetch, ineffective on Mali, and costs a CPU readback.
   static const bool want_sort = std::getenv("DS_VK_TRI_SORT") != nullptr;
   bool sorted = false;
   if (d.tri && want_sort && frame.first_ordered > 1) {
@@ -962,7 +863,7 @@ bool Raster::submit(u32 npoly, u32 nvert, u32 ntexels, const GpuFrame& frame_in)
     d.order_idx.resize(n); d.order_key.resize(n);
     for (u32 i = 0; i < n; ++i) {
       u32 k = 0xFFFFFFFFu;
-      for (u32 v = 0; v < gp[i].nverts; ++v) k = std::min(k, static_cast<u32>(std::max(gv[gp[i].first_vert + v].z, 0)));   // the depth the test uses in both modes (tri.vert)
+      for (u32 v = 0; v < gp[i].nverts; ++v) k = std::min(k, static_cast<u32>(std::max(gv[gp[i].first_vert + v].z, 0)));   // depth used by the test in both modes (tri.vert)
       d.order_idx[i] = i; d.order_key[i] = k;
     }
     std::sort(d.order_idx.begin(), d.order_idx.end(), [&](u32 a, u32 b) { return d.order_key[a] != d.order_key[b] ? d.order_key[a] < d.order_key[b] : a < b; });
@@ -977,21 +878,8 @@ bool Raster::submit(u32 npoly, u32 nvert, u32 ntexels, const GpuFrame& frame_in)
   d.dev->flush(d.shclear, 0, sizeof(u32) * npoly * DS_SHRUN_LINES);
   d.dev->flush(d.rowpoly, 0, sizeof(u32) * frame.nrows);
 
-  // Edge marking or fog: the raster writes its depth and attribute planes and
-  // a final pass follows it. Edge marking reads across band boundaries, so
-  // such a frame reports one band -- no part of the picture is final until
-  // the whole of it is.
-  // Anti-aliasing on the triangle path: the exact pass (the two-deep pixel
-  // stack, no hardware depth test, opt-in) or the fast one (edge flags and
-  // coverage from the span table on the hardware-depth path, the final pass
-  // blending each edge pixel with its outside neighbour). Either way, and
-  // for edge marking too, the span pass runs so the rows exist.
-  // The smooth filter draws every frame as an anti-aliased one: the span
-  // table's coverage is what it reconstructs the edges from.
-  // 1x only: at S >= 2 the hardware's own edge (at S x) and the native
-  // record's reconstruction disagree inside an edge pixel (a sawtooth), and
-  // culling the polygons to their DS span (DS_FF_SPANCULL) is 1x code in
-  // tri.vert. The hi-res path keeps its hardware edges until that is done.
+  // Smooth filter forces the frame through the AA/coverage path (span table) for edges to
+  // reconstruct from; 1x only, since S >= 2's hardware edge and native reconstruction disagree.
   if (d.smooth && d.tri) { frame.dispcnt |= 1u << 4; frame.flags2 |= DS_FF2_SMOOTH; }
   const bool aa_frame = d.tri && d.aa_ok && (frame.dispcnt & (1u << 4)) != 0u;
   const bool aa_fast = d.tri && !aa_frame && (frame.dispcnt & (1u << 4)) != 0u;
@@ -1003,21 +891,16 @@ bool Raster::submit(u32 npoly, u32 nvert, u32 ntexels, const GpuFrame& frame_in)
   const u32 back = static_cast<u32>(d.gen % 3);
   d.edge_valid[back] = d.smooth && aa_fast;
   const u32 rows = DS_TILES_Y / d.bands;
-  if (d.cpu_down) for (auto& f : d.nat_done[back]) f.store(0, std::memory_order_relaxed);   // this slot now holds a new frame
+  if (d.cpu_down) for (auto& f : d.nat_done[back]) f.store(0, std::memory_order_relaxed);   // slot now holds a new frame
 
-  // A stamp after a dispatch, at the bottom of the pipe, closes it: the
-  // passes are serialised by barriers, so the interval to the stamp before
-  // it is that dispatch alone. Unused slots stay zero (the pool is reset) and
-  // read as an empty interval.
+  // Passes are barrier-serialised, so a bottom-of-pipe stamp closes an interval covering only
+  // that dispatch. Unused slots stay zero (pool reset) and read as empty.
   auto stamp = [&](VkCommandBuffer cb, u32 q) {
     if (d.timing) a.vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, d.qpool[back], q);
   };
 
   if (d.tri) {
-    // One command buffer, one band: the render pass, then the three
-    // attachments copied into the compute path's buffers so out[], the
-    // depth and attribute planes, the final pass and the host all read what
-    // they always read.
+    // One command buffer, one band: render pass, then attachments copied into out[]/depth/attr.
     VkCommandBuffer cb = d.cmd[back][0];
     a.vkResetCommandBuffer(cb, 0);
     VkCommandBufferBeginInfo bi{};
@@ -1025,14 +908,13 @@ bool Raster::submit(u32 npoly, u32 nvert, u32 ntexels, const GpuFrame& frame_in)
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     if (a.vkBeginCommandBuffer(cb, &bi) != VK_SUCCESS) return false;
     if (d.timing) a.vkCmdResetQueryPool(cb, d.qpool[back], 0, d.qcount);
-    for (u32 q = 0; q < 4; ++q) stamp(cb, q);   // the compute passes' slots: empty intervals (4/5 time the opaque draw below)
+    for (u32 q = 0; q < 4; ++q) stamp(cb, q);   // compute passes' slots: empty intervals here
     if (!(d.post_frame && (st & 10) == 10)) { stamp(cb, 6); stamp(cb, 7); }
     stamp(cb, 8);
     const u32 W = 256 * scale_, H = 192 * scale_;
     const bool wbuf = (frame.flags & DS_FF_WBUFFER) != 0u;
     if (aa_frame || rows_frame) {
-      // The span table (edge flags and coverage per polygon scanline): the
-      // span pass, then its rows to the fragment stage.
+      // Span table (edge flags + coverage per scanline), consumed by the fragment stage.
       a.vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, d.layout, 0, 1, &d.set[back], 0, nullptr);
       a.vkCmdPushConstants(cb, d.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(GpuFrame), &frame);
       a.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, d.pipe_span);
@@ -1044,8 +926,8 @@ bool Raster::submit(u32 npoly, u32 nvert, u32 ntexels, const GpuFrame& frame_in)
     cv[0].color.uint32[0] = frame.clear_color;
     cv[1].color.uint32[0] = frame.clear_attr;
     cv[2].color.uint32[0] = frame.clear_depth;
-    cv[3].color.uint32[0] = 0xFFFFFFFFu;   // the shadow plane: no run yet -- a shadow polygon before any mask (run 0 in its flags) must match nothing
-    if (aa_frame) { cv[4].color.uint32[0] = frame.clear_color; cv[5].color.uint32[0] = frame.clear_attr; cv[6].color.uint32[0] = frame.clear_depth; }   // the under layer starts as the clear too
+    cv[3].color.uint32[0] = 0xFFFFFFFFu;   // shadow plane: no run yet, so a shadow polygon before any mask (run 0) matches nothing
+    if (aa_frame) { cv[4].color.uint32[0] = frame.clear_color; cv[5].color.uint32[0] = frame.clear_attr; cv[6].color.uint32[0] = frame.clear_depth; }   // under layer starts as the clear too
     else cv[4].depthStencil.depth = wbuf ? 1.f / static_cast<float>(std::max<u32>(frame.clear_depth, 1)) : static_cast<float>(frame.clear_depth) / 16777215.f;
     VkRenderPassBeginInfo rb{};
     rb.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
@@ -1055,13 +937,10 @@ bool Raster::submit(u32 npoly, u32 nvert, u32 ntexels, const GpuFrame& frame_in)
     a.vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, d.layout_g, 0, 2, gs, 0, nullptr);
     a.vkCmdPushConstants(cb, d.layout_g, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(GpuFrame), &frame);
     stamp(cb, 4);
-    static const bool no_opaque = std::getenv("DS_VK_TRI_NOOPAQUE") != nullptr;   // attribution: the pass with nothing drawn
+    static const bool no_opaque = std::getenv("DS_VK_TRI_NOOPAQUE") != nullptr;   // debug: skip the opaque draw
     if ((st & 2) && !no_opaque && frame.first_ordered && aa_frame) {
-      // The anti-aliasing pass: the DS depth rules in the shader, reading the
-      // attachments it writes -- ordered per pixel by rasterization_order_
-      // attachment_access; without it (the host's RADV) a barrier between
-      // polygons, which is what makes the host slow and exact rather than
-      // fast and racy.
+      // AA pass: DS depth rules run in the shader, reading attachments just written -- ordered
+      // per pixel via rasterization_order_attachment_access, else a barrier between polygons.
       GpuFrame faa = frame; faa.flags = frame.flags | DS_FF_SPANCULL;
       a.vkCmdPushConstants(cb, d.layout_g, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(GpuFrame), &faa);
       a.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, d.pipe_op_aa);
@@ -1072,8 +951,7 @@ bool Raster::submit(u32 npoly, u32 nvert, u32 ntexels, const GpuFrame& frame_in)
         a.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_DEPENDENCY_BY_REGION_BIT, 1, &mb, 0, nullptr, 0, nullptr);
       }
     } else if ((st & 2) && !no_opaque && frame.first_ordered) {
-      // Back faces, then front faces with equal depth passing (depth_pass
-      // mode 1); the flag in the push constant tells tri.vert which to keep.
+      // Back faces, then front faces with equal-depth passing; the push-constant flag tells tri.vert which to keep.
       GpuFrame fpass = frame;
       const u32 pre = (d.prepass ? DS_FF_ONLY_PLAIN : 0u) | (sorted ? DS_FF_SORTED : 0u);
       fpass.flags = frame.flags | pre | DS_FF_FACE_BACK;
@@ -1086,12 +964,8 @@ bool Raster::submit(u32 npoly, u32 nvert, u32 ntexels, const GpuFrame& frame_in)
       a.vkCmdDraw(cb, 24, frame.first_ordered, 0, 0);
       a.vkCmdPushConstants(cb, d.layout_g, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(GpuFrame), &frame);
       if (d.prepass) {
-        // The shaded pass for the plain polygons: once more, at EQUAL depth,
-        // so only the pixel's final owner pays the fragment stage. Then the
-        // alpha-tested polygons, which skipped the prepass (tri.vert,
-        // DS_FF_ONLY_PLAIN), with the normal test and depth write: they lose
-        // to plain geometry in front of them for free and overdraw only
-        // among themselves.
+        // Shaded pass for plain polygons at EQUAL depth: only the final owner pays the fragment
+        // stage. Then alpha-tested polygons (DS_FF_ONLY_PLAIN) at the normal test + depth write.
         fpass.flags = frame.flags | pre;
         a.vkCmdPushConstants(cb, d.layout_g, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(GpuFrame), &fpass);
         a.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, d.pipe_op_eq[wbuf ? 1 : 0]);
@@ -1108,19 +982,15 @@ bool Raster::submit(u32 npoly, u32 nvert, u32 ntexels, const GpuFrame& frame_in)
       }
     }
     stamp(cb, 5);
-    // The tail in runs of one kind (translucent, shadow mask, shadow) and one
-    // depth-write setting. A run of masks gets a fresh run id, which the
-    // masks write into the shadow plane where their depth test fails
-    // (tri_mask.frag) and the shadow polygons after them test for
-    // (tri_tail.frag); the id travels in the push constant's flags. The DS
-    // clears its stencil per scanline when a run begins; a new id per run is
-    // that, frame-wide.
+    // Tail runs of one kind (translucent, shadow mask, shadow) and depth-write setting. A mask
+    // run gets a fresh run id, written to the shadow plane where its depth test fails and tested
+    // by shadows after it; id rides in the push constant's flags, in place of a stencil clear.
     const GpuPoly* gp = static_cast<const GpuPoly*>(d.polys.ptr);
-    static const bool no_tail = std::getenv("DS_VK_TRI_NOTAIL") != nullptr;   // attribution: leave the translucent tail out
-    static const bool no_shadow_draw = std::getenv("DS_VK_TRI_NOSHADOWDRAW") != nullptr;   // bisecting: masks and shadows are not drawn
-    static const bool no_mask = std::getenv("DS_VK_TRI_NOMASK") != nullptr;                // bisecting: masks not drawn (shadows then match nothing)
-    static const bool no_shadow = std::getenv("DS_VK_TRI_NOSHADOW") != nullptr;            // bisecting: shadow polygons not drawn
-    static const bool mask_as_tail = std::getenv("DS_VK_TRI_MASKASTAIL") != nullptr;       // bisecting: masks drawn with the tail pipeline (their geometry, not their pipeline)
+    static const bool no_tail = std::getenv("DS_VK_TRI_NOTAIL") != nullptr;                // debug: skip the translucent tail
+    static const bool no_shadow_draw = std::getenv("DS_VK_TRI_NOSHADOWDRAW") != nullptr;   // debug: skip masks and shadows
+    static const bool no_mask = std::getenv("DS_VK_TRI_NOMASK") != nullptr;                // debug: skip masks (shadows then match nothing)
+    static const bool no_shadow = std::getenv("DS_VK_TRI_NOSHADOW") != nullptr;            // debug: skip shadow polygons
+    static const bool mask_as_tail = std::getenv("DS_VK_TRI_MASKASTAIL") != nullptr;       // debug: draw masks with the tail pipeline
     auto kind_of = [&](const GpuPoly& p) { return (p.flags & DS_PF_SHADOW_MASK) ? 1 : (p.flags & DS_PF_SHADOW) ? 2 : 0; };
     auto barrier = [&] {
       VkMemoryBarrier mb{}; mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER; mb.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT; mb.dstAccessMask = VK_ACCESS_INPUT_ATTACHMENT_READ_BIT;
@@ -1144,7 +1014,7 @@ bool Raster::submit(u32 npoly, u32 nvert, u32 ntexels, const GpuFrame& frame_in)
         a.vkCmdPushConstants(cb, d.layout_g, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(GpuFrame), &ftail);
         a.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, at1x ? d.pipe_mask1 : (aa ? d.pipe_mask_aa : d.pipe_mask));
         a.vkCmdDraw(cb, 24, j - i, 0, i);
-        if (!d.roaa) barrier();   // the shadows read what the masks wrote
+        if (!d.roaa) barrier();   // shadows read what the masks wrote
         i = j;
         continue;
       }
@@ -1157,9 +1027,7 @@ bool Raster::submit(u32 npoly, u32 nvert, u32 ntexels, const GpuFrame& frame_in)
     if (!d.nat_tail) record_tail(aa_frame ? 2 : 0);
     a.vkCmdEndRenderPass(cb);
     if (d.nat_tail) {
-      // The native-resolution tail. Pass A (above) left the prefix in the
-      // hi-res attachments, which are the buffers: shrink them to the 1x
-      // planes, draw the tail there, expand what it touched back.
+      // Native-res tail: shrink hi-res prefix to 1x, draw the tail, expand what it touched back.
       VkMemoryBarrier mb{}; mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
       mb.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT; mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
       a.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
@@ -1171,7 +1039,7 @@ bool Raster::submit(u32 npoly, u32 nvert, u32 ntexels, const GpuFrame& frame_in)
       mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT; mb.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_INPUT_ATTACHMENT_READ_BIT;
       a.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
       VkClearValue cv1[5]{};
-      cv1[3].color.uint32[0] = 0xFFFFFFFFu;   // the shadow plane: no run yet
+      cv1[3].color.uint32[0] = 0xFFFFFFFFu;   // shadow plane: no run yet
       cv1[4].color.uint32[0] = 0;             // nothing touched yet
       VkRenderPassBeginInfo rb1{};
       rb1.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
@@ -1190,12 +1058,11 @@ bool Raster::submit(u32 npoly, u32 nvert, u32 ntexels, const GpuFrame& frame_in)
       a.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
     }
     if (d.alias) {
-      // The attachments ARE the buffers: hand the writes to the host, the
-      // final pass and the downsample.
+      // Attachments ARE the buffers: hand the writes to the host, final pass, and downsample.
       VkMemoryBarrier mb{}; mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER; mb.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT; mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
       a.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
     } else {
-    // The attachments into the buffers: colour -> out[back], depth plane -> depth, attributes -> attr.
+    // Copy attachments into the buffers: colour -> out[back], depth plane -> depth, attributes -> attr.
     {
       VkImageMemoryBarrier ib[3]{};
       VkImage imgs[3] = {d.img_col.img, d.img_z.img, d.img_attr.img};
@@ -1207,10 +1074,10 @@ bool Raster::submit(u32 npoly, u32 nvert, u32 ntexels, const GpuFrame& frame_in)
       }
       a.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 3, ib);
       VkBufferImageCopy rg{}; rg.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}; rg.imageExtent = {W, H, 1};
-      static const bool no_copy = std::getenv("DS_VK_TRI_NOCOPY") != nullptr;   // attribution: the pass without its copies (the output is stale)
+      static const bool no_copy = std::getenv("DS_VK_TRI_NOCOPY") != nullptr;   // debug: skip copies (output goes stale)
       if (!no_copy) {
         a.vkCmdCopyImageToBuffer(cb, d.img_col.img, VK_IMAGE_LAYOUT_GENERAL, vk_buf(d.out[back]), 1, &rg);
-        // The depth and attribute planes are read by the final pass alone.
+        // Depth and attribute planes are read only by the final pass.
         if (d.post_frame) {
           a.vkCmdCopyImageToBuffer(cb, d.img_z.img, VK_IMAGE_LAYOUT_GENERAL, vk_buf(d.depth), 1, &rg);
           a.vkCmdCopyImageToBuffer(cb, d.img_attr.img, VK_IMAGE_LAYOUT_GENERAL, vk_buf(d.attr), 1, &rg);
@@ -1256,38 +1123,28 @@ bool Raster::submit(u32 npoly, u32 nvert, u32 ntexels, const GpuFrame& frame_in)
     };
 
     if (b == 0) {
-      // Band 0 carries the setup the rest depend on: clear the bin counters,
-      // then bin. Every later band opens with a barrier instead, which orders
-      // it after this binning in queue submission order.
+      // Band 0 clears the bin counters then bins; later bands open with a barrier instead, ordering
+      // them after this binning via queue submission order.
       a.vkCmdFillBuffer(cb, vk_buf(d.tiles), 0, kTilesHeader, 0);
-      // Every key starts as "nobody": all ones, which no fragment's key
-      // reaches. The 32-bit fill pattern repeats into the 64-bit words.
+      // Every key starts as "nobody" (all ones); 32-bit fill pattern repeats into the 64-bit words.
       if (vis_) a.vkCmdFillBuffer(cb, vk_buf(d.keys), 0, VK_WHOLE_SIZE, 0xFFFFFFFFu);
       barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
       a.vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, d.layout, 0, 1, &d.set[back], 0, nullptr);
       a.vkCmdPushConstants(cb, d.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(GpuFrame), &frame);
-      // One invocation per TILE, not per polygon: the binning pass scans the
-      // polygon list in order so the raster gets its list sorted (bin.comp).
+      // One invocation per tile; scans the polygon list in order so the raster's list comes out sorted.
       stamp(cb, 0);
       a.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, d.pipe_bin);
       if (st & 1) a.vkCmdDispatch(cb, (DS_TILE_COUNT + 63) / 64, 1, 1);
       stamp(cb, 1);
-      // The span pass: one workgroup per polygon, its threads taking that
-      // polygon's scanlines in stride. Independent of binning, so the two
-      // need no barrier between them (the raster reads both) -- except when
-      // being timed, when a barrier makes each stamp close one dispatch.
+      // Span pass: one workgroup per polygon. Independent of binning (no barrier) except when
+      // timed, where a barrier makes each stamp close one dispatch.
       if (d.timing) { barrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT); stamp(cb, 2); }
       a.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, d.pipe_span);
       if ((st & 2) && frame.nrows) a.vkCmdDispatch(cb, (frame.nrows + 63) / 64, 1, 1);
       stamp(cb, 3);
-      // Every stamp slot is written every frame, dispatch or no dispatch: a
-      // query left unwritten is "unavailable" and makes the whole readback
-      // fail, so an absent pass records an empty interval instead.
-      stamp(cb, 4);
+      stamp(cb, 4);   // every slot written every frame: an unwritten query is "unavailable" and fails the whole readback
       if (vis_ && (st & 6) == 6 && frame.opaque_rows) {
-        // The order-free prefix: one workgroup per eight span rows of it,
-        // deciding each pixel's owner. It needs the span pass's rows; the
-        // raster's bands then shade the winners and continue with the tail.
+        // Order-free prefix: one workgroup per eight span rows, deciding each pixel's owner.
         barrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT);
         a.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, d.pipe_vis);
         a.vkCmdDispatch(cb, (frame.opaque_rows + DS_VIS_ROWS - 1) / DS_VIS_ROWS, 1, 1);
@@ -1296,7 +1153,7 @@ bool Raster::submit(u32 npoly, u32 nvert, u32 ntexels, const GpuFrame& frame_in)
     } else {
       a.vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, d.layout, 0, 1, &d.set[back], 0, nullptr);
     }
-    // The raster reads what the binning pass wrote, in band 0's submission.
+    // Raster reads what binning wrote, within band 0's submission.
     barrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT);
 
     GpuFrame bf = frame;
@@ -1306,8 +1163,7 @@ bool Raster::submit(u32 npoly, u32 nvert, u32 ntexels, const GpuFrame& frame_in)
     a.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, vis_ ? d.pipe_raster_vis : d.pipe_raster);
     if (st & 2) a.vkCmdDispatch(cb, DS_TILES_X, rows, 1);
     stamp(cb, 9 + 2 * b);
-    // No final pass this frame: its two slots still have to exist (see above).
-    if (b + 1 == d.bands && !(d.post_frame && (st & 10) == 10)) { stamp(cb, 6); stamp(cb, 7); }
+    if (b + 1 == d.bands && !(d.post_frame && (st & 10) == 10)) { stamp(cb, 6); stamp(cb, 7); }   // final pass's slots must still exist
 
     if (a.vkEndCommandBuffer(cb) != VK_SUCCESS) return false;
 
@@ -1335,14 +1191,14 @@ bool Raster::submit(u32 npoly, u32 nvert, u32 ntexels, const GpuFrame& frame_in)
                            0, 1, &mb, 0, nullptr, 0, nullptr);
     a.vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, d.layout, 0, 1, &d.set[back], 0, nullptr);
     GpuFrame fpost = frame; if (aa_frame) fpost.flags |= DS_FF_AA; if (aa_fast) fpost.flags |= DS_FF_AAFAST;
-    if (d.smooth) fpost.flags2 |= DS_FF2_SMOOTH;   // stage 1 also writes the edge plane (the unblended pixel and its record)
+    if (d.smooth) fpost.flags2 |= DS_FF2_SMOOTH;   // stage 1 also writes the edge plane (unblended pixel + record)
     a.vkCmdPushConstants(cb, d.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(GpuFrame), &fpost);
     stamp(cb, 6);
     a.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, d.pipe_post);
     const u32 px = 256 * scale_ * 192 * scale_;
     a.vkCmdDispatch(cb, (px + 63) / 64, 1, 1);
     if (aa_fast) {
-      // Stage 2: the neighbour blend, reading stage 1's scratch plane.
+      // Stage 2: neighbour blend, reading stage 1's scratch plane.
       VkMemoryBarrier mb2{}; mb2.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER; mb2.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT; mb2.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
       a.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb2, 0, nullptr, 0, nullptr);
       fpost.flags |= DS_FF_POST2;
@@ -1370,7 +1226,7 @@ bool Raster::submit(u32 npoly, u32 nvert, u32 ntexels, const GpuFrame& frame_in)
   }
 
   d.stamped[back] = d.timing;
-  ++d.gen;                      // output() and the next frame name different buffers
+  ++d.gen;                      // output() and the next frame now name different buffers
   return true;
 }
 
@@ -1381,9 +1237,7 @@ bool Raster::tri_ordered() const { return d_ && d_->tri && d_->roaa; }
 const Raster::PassTimes& Raster::pass_times() const { return d_->times; }
 bool Raster::timing() const { return d_ && d_->timing; }
 
-// The stall probe's reader: this process's context under
-// /sys/kernel/debug/mali0/ctx/<pid>_<n>/ (atoms in flight, memory pools) and
-// the device-wide utilisation and power state.
+// Dumps this process's Mali context (debugfs) plus device-wide utilisation and power state.
 static void stall_probe_dump(const char* when) {
 #if defined(__linux__)
   auto cat = [&](const std::string& path, int max_lines) {
@@ -1416,24 +1270,19 @@ static void stall_probe_dump(const char* when) {
 void Raster::wait_band(u32 b) {
   if (!d_) return;
   Impl& d = *d_;
-  // A frame with a final pass has no partial result to hand out: wait for all
-  // of it, the final pass included.
+  // A frame with a final pass has no partial result to hand out: wait for all of it.
   if (d.post_frame) b = d.bands;
   else if (b >= d.bands) b = d.bands - 1;
   std::lock_guard<std::mutex> lk(d.wait_mutex);
-  // Bands 0..b, not band b alone: without explicit synchronisation between
-  // submissions the driver may complete them in any order, so an earlier
-  // band's fence is not implied by a later one's.
+  // Wait on bands 0..b, not band b alone: the driver may complete out-of-order submissions in
+  // any order, so an earlier band's fence is not implied by a later one's.
   VkFence pending[kMaxBands];
   u32 n = 0;
   for (u32 i = 0; i <= b; ++i)
     if (d.in_flight & (1u << i)) pending[n++] = d.fence[i];
   if (!n) return;
   const Api& a = *d.api;
-  // DS_GPU_STALL_PROBE=1: a fence that is not signalled within 100 ms is a
-  // stall (docs/gpu-path-scoping.md); read the Mali driver's view of this
-  // process's atoms and the GPU's utilisation WHILE it is happening, then
-  // keep waiting. Linux debugfs, root -- the RG DS Plus rig.
+  // DS_GPU_STALL_PROBE=1: dump Mali driver state if a fence isn't signalled within 100 ms.
   static const bool probe = std::getenv("DS_GPU_STALL_PROBE") != nullptr;
   if (probe) {
     VkResult r = a.vkWaitForFences(d.vk->dev, n, pending, VK_TRUE, 100'000'000ull);
@@ -1447,9 +1296,9 @@ void Raster::wait_band(u32 b) {
   } else
   a.vkWaitForFences(d.vk->dev, n, pending, VK_TRUE, UINT64_MAX);
 
-  // Invalidate only the scanlines these bands wrote -- the composite reads
-  // the top of the frame long before the bottom exists.
-  const Buffer& done = d.out[(d.gen + 2) % 3];   // the frame just submitted
+  // Invalidate only the scanlines these bands wrote, so the composite can read the top of the
+  // frame before the bottom exists.
+  const Buffer& done = d.out[(d.gen + 2) % 3];   // frame just submitted
   const size_t stride = static_cast<size_t>(256 * scale_) * sizeof(u32);
   for (u32 i = 0; i <= b; ++i) {
     if (!(d.in_flight & (1u << i))) continue;
@@ -1457,7 +1306,7 @@ void Raster::wait_band(u32 b) {
       const size_t y0 = static_cast<size_t>(band_line(i)), y1 = static_cast<size_t>(band_line(i + 1));
       d.dev->invalidate(done, y0 * stride, (y1 - y0) * stride);
     } else {
-      d.dev->invalidate(done, 0, done.size);   // the final pass rewrote the whole layer
+      d.dev->invalidate(done, 0, done.size);   // final pass rewrote the whole layer
     }
     d.in_flight &= ~(1u << i);
   }
@@ -1483,7 +1332,7 @@ void Raster::reduce_line(const u32* nat, u32 y) {
   const u32 S = scale_, W = 256 * S;
   const u32* src = static_cast<const u32*>(d.out[s].ptr) + static_cast<size_t>(y) * S * W;
   u32* dst = d.nat[s].data() + static_cast<size_t>(y) * 256;
-  for (u32 x = 0; x < 256; ++x) dst[x] = src[x * S];   // the top-left subpixel, as downsample.comp took it
+  for (u32 x = 0; x < 256; ++x) dst[x] = src[x * S];   // top-left subpixel, matching downsample.comp
   d.nat_done[s][y].store(1, std::memory_order_release);
 }
 

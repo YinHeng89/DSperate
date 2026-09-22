@@ -25,9 +25,9 @@ const char* stop_name(Stop s) {
   return "?";
 }
 
-// One code. `words` is read two at a time: `a` carries the opcode in its top
-// byte, `b` the operand. Most opcodes are skipped while the condition flag is
-// clear -- the exceptions are the ones that manipulate the flag itself.
+// `words` read two at a time: `a` carries the opcode in its top byte, `b` the
+// operand. Skipped while the condition flag is clear, except opcodes that
+// manipulate the flag itself.
 Stop Engine::run_code(NDS& nds, const Code& code) {
   mem::Bus& bus = nds.bus;
   const std::vector<u32>& w = code.words;
@@ -52,9 +52,8 @@ Stop Engine::run_code(NDS& nds, const Code& code) {
     const u8 op = static_cast<u8>(a >> 24);
     const u8 hi = static_cast<u8>(op >> 4);
 
-    // D0/D1/D2 and C5 run regardless -- they are what restores the flag, ends
-    // a loop, or counts -- so a skipped block can still be left. Everything
-    // else is gated, and a skipped block-write must still step over its data.
+    // D0/D1/D2 and C5 run regardless (they restore the flag, end a loop, or
+    // count); a skipped block-write must still step over its data.
     if ((op < 0xD0 && op != 0xC5) || op > 0xD2) {
       if (!cond) {
         if (hi == 0xE) {
@@ -66,8 +65,7 @@ Stop Engine::run_code(NDS& nds, const Code& code) {
       }
     }
 
-    // The conditionals take the address from `a`, or the offset register when
-    // `a`'s address field is zero -- the offset is not added to it.
+    // Address from `a`, or the offset register when `a`'s address field is zero.
     const auto cond_addr = [&] { const u32 addr = a & 0x0FFFFFFF; return addr ? addr : offset; };
     const auto push_cond = [&](bool taken) { condstack = (condstack << 1) | cond; cond = taken ? 1u : 0u; };
 
@@ -81,8 +79,7 @@ Stop Engine::run_code(NDS& nds, const Code& code) {
     case 0x5: push_cond(b == read32(cond_addr())); break;
     case 0x6: push_cond(b != read32(cond_addr())); break;
 
-    // The 16-bit conditionals mask the loaded halfword with ~b.h first, so a
-    // code can test a few bits of a word it does not otherwise care about.
+    // Masks the loaded halfword with ~b.h first, so a code can test a few bits.
     case 0x7: case 0x8: case 0x9: case 0xA: {
       const u16 val = static_cast<u16>(read16(cond_addr()) & ~static_cast<u16>(b >> 16));
       const u16 chk = static_cast<u16>(b);
@@ -103,18 +100,8 @@ Stop Engine::run_code(NDS& nds, const Code& code) {
         loopcond = cond;
         loopcondstack = condstack;
         break;
-      // C2 is a flashcard extension, not part of the AR set: the words that
-      // follow are ARM/Thumb machine code to be copied somewhere and called.
-      // Two codes in the published database use it, both marked "for
-      // flashcard users". Running injected native code is a different feature
-      // from interpreting an AR code, so it is refused here as melonDS
-      // refuses it -- but named, because it is a known extension and not
-      // corruption.
-      case 0xC2: return Stop::Unsupported;
-      // C4 stores a pointer to itself so a code can rewrite its own body.
-      // Nothing is known to use it, and supporting it would mean giving the
-      // interpreter a writable copy of the code; refuse rather than guess.
-      case 0xC4: return Stop::Unsupported;
+      case 0xC2: return Stop::Unsupported;   // flashcard native-code extension
+      case 0xC4: return Stop::Unsupported;   // self-modifying code
       case 0xC5:   // count++, then test it -- counted even while skipping
         ++c5count;
         if (!cond) break;
@@ -165,9 +152,8 @@ Stop Engine::run_code(NDS& nds, const Code& code) {
       }
       break;
 
-    // Copy b bytes that follow the opcode to a+offset. The data is packed
-    // two words per eight bytes, and a trailing run of 1-7 bytes still costs
-    // a whole pair, so the words are consumed in pairs either way.
+    // Copy b bytes to a+offset. Packed two words per eight bytes; a trailing
+    // 1-7 byte run still costs a whole pair.
     case 0xE: {
       const u64 pairs = (static_cast<u64>(b) + 7) / 8;
       if (pc + pairs * 2 > n) return Stop::Truncated;
@@ -179,9 +165,8 @@ Stop Engine::run_code(NDS& nds, const Code& code) {
         pc += 2; left -= 8;
       }
       if (left > 0) {
-        // The tail is byte-addressed within the pair, little-endian, so it is
-        // unpacked by hand rather than aliased -- the words are u32, and the
-        // host's byte order is not the code's business.
+        // Unpacked by hand, little-endian: the words are u32, host byte order
+        // is not the code's business.
         const u8 bytes[8] = {
           static_cast<u8>(w[pc]), static_cast<u8>(w[pc] >> 8), static_cast<u8>(w[pc] >> 16), static_cast<u8>(w[pc] >> 24),
           static_cast<u8>(w[pc + 1]), static_cast<u8>(w[pc + 1] >> 8), static_cast<u8>(w[pc + 1] >> 16), static_cast<u8>(w[pc + 1] >> 24)};
@@ -197,8 +182,7 @@ Stop Engine::run_code(NDS& nds, const Code& code) {
       break;
     }
 
-    // Copy b bytes from the offset register to a. Unlike 0xE the source is
-    // guest memory, so nothing is consumed from the code.
+    // Copy b bytes from the offset register to a (source is guest memory).
     case 0xF: {
       u32 src = offset, dst = a & 0x0FFFFFFF, left = b;
       for (; left >= 4; left -= 4, src += 4, dst += 4) bus.dma_write32(kCpu, dst, read32(src));
@@ -219,8 +203,7 @@ void Engine::run(NDS& nds) {
     const Code& c = codes[i];
     if (!c.enabled) continue;
     const Stop why = run_code(nds, c);
-    // A broken code fires every frame; say so once and let it keep failing,
-    // which is harmless -- it stops at the same place each time.
+    // Say so once; it stops at the same place every frame after.
     if (why != Stop::Ok && !complained_[i]) {
       complained_[i] = 1;
       std::fprintf(stderr, "cheat: \"%s\" stopped: %s\n", c.name.c_str(), stop_name(why));

@@ -163,10 +163,10 @@ C=(--direct --quantum 0 --bios9 "$DS_BIOS/bios9.bin" --bios7 "$DS_BIOS/bios7.bin
 train() { echo "  train: $1"; shift; $Q "$G" "${C[@]}" "$@" > /dev/null 2>&1 || echo "  (run failed: $*)"; }
 echo "== training"
 train mlbis  --save "$HERE/scenes/mlbis.sav"  --replay "$HERE/scenes/mlbis.dsin"  --frames 600 "$DS_ROMS/Mario & Luigi - Bowser's Inside Story.nds" &
-train sm64   --save "$HERE/scenes/sm64.sav"   --replay "$HERE/scenes/sm64.dsin"   --frames 600 "$DS_ROMS/Super Mario 64 DS.nds" &
-train etody  --save "$HERE/scenes/etody.sav"  --replay "$HERE/scenes/etody.dsin"  --frames 600 "$DS_ROMS/Etrian Odyssey.nds" &
+train sm64   --replay "$HERE/scenes/sm64.dsin"   --frames 600 "$DS_ROMS/Super Mario 64 DS.nds" &
+train etody  --replay "$HERE/scenes/etody.dsin"  --frames 600 "$DS_ROMS/Etrian Odyssey.nds" &
 train dbori  --replay "$HERE/scenes/dbori.dsin" --frames 600 "$DS_ROMS/Dragon Ball - Origins.nds" &
-train meteos --save "$HERE/scenes/meteos.sav" --replay "$HERE/scenes/meteos.dsin" --frames 600 "$DS_ROMS/Meteos.nds" &
+train meteos --replay "$HERE/scenes/meteos.dsin" --frames 600 "$DS_ROMS/Meteos.nds" &
 train gsdd   --load-state "$HERE/scenes/gsdd-phase2.dss" --frames 400 "$DS_ROMS/Golden Sun - Dark Dawn.nds" &
 train st     --load-state "$HERE/scenes/st-intro.dss" --frames 600 "$DS_ROMS/Legend of Zelda, The - Spirit Tracks.nds" &
 # From frame 0: the boot path, the cold translation burst, and then the

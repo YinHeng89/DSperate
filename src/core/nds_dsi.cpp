@@ -1,11 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // DSperate - Nintendo DS emulator. Copyright (C) 2026 DSperate contributors.
 //
-// The DSi machine's boot: the DSi BIOS pair, the launcher's main-RAM
-// leftovers, the NWRAM mapping from the header, the ARM9i/ARM7i binaries
-// and their modcrypt, and the CP15/SCFG state a DSiWare title starts from.
-// Mirrors melonDS DSi::SetupDirectBoot (DSi-mode branch) so the melonDS
-// trace harness is the oracle; see docs/dsiware-scoping.md.
+// The DSi machine's boot: BIOS pair, launcher main-RAM leftovers, NWRAM
+// mapping, ARM9i/ARM7i binaries and modcrypt, CP15/SCFG state for a DSiWare
+// title. Mirrors melonDS DSi::SetupDirectBoot (DSi-mode branch).
 #include "core/nds.h"
 #include "core/io/dsi_nand_synth.h"
 #include "core/io/dsi_nand_launch.h"
@@ -38,9 +36,7 @@ std::vector<u8> slurp_file(const std::string& path) {
 void bswap128(u8* dst, const u8* src) { for (int i = 0; i < 16; ++i) dst[i] = src[15 - i]; }
 
 // melonDS DSi::DecryptModcryptArea: AES-CTR over the binary the area covers,
-// in place in main RAM (the area is described in ROM offsets, and lands in
-// RAM where the matching binary was loaded). The DSi's AES engine works on
-// byte-reversed 128-bit blocks, hence the swaps.
+// in place in main RAM. Byte-reversed 128-bit blocks: the DSi's AES engine is big-endian.
 void decrypt_modcrypt_area(NDS& nds, u32 offset, u32 size, const u8* iv, bool trim) {
   if (!offset || !size) return;
   const cart::Header& h = nds.cart->header();
@@ -69,11 +65,8 @@ void decrypt_modcrypt_area(NDS& nds, u32 offset, u32 size, const u8* iv, bool tr
   else if (covers(t.arm9i_rom_offset, t.arm9i_size)) addr = t.arm9i_ram_address, bin = t.arm9i_size;
   else if (covers(t.arm7i_rom_offset, t.arm7i_size)) addr = t.arm7i_ram_address, bin = t.arm7i_size;
   else return;
-  // melonDS decrypts from where the binary starts, not from the area's
-  // offset within it (the areas always start at the binary in practice).
-  // The header's area size is already rounded, so its last block can run
-  // past the binary itself and turn what follows into keystream. The launcher
-  // decrypts only the binary (`trim`); melonDS does not.
+  // Header's area size is already rounded, so its last block can run past
+  // the binary into keystream; `trim` (launcher only) decrypts just the binary.
   const u32 keep = std::min(size, bin);
   u8 tail[32];
   for (u32 k = 0; k < rounded - keep && k < sizeof tail; ++k) tail[k] = nds.bus.dma_read8(Cpu::ARM9, addr + keep + k);
@@ -105,7 +98,7 @@ bool NDS::load_dsi_bios(const std::string& p9i, const std::string& p7i, std::str
   std::memcpy(bus.bios9i.get(), b9.data(), b9.size());
   std::memcpy(bus.bios7i.get(), b7.data(), b7.size());
   bios_native_dsi = true;
-  // Fold the DSi pair into the BIOS identity a save state checks (nds.cpp).
+  // Fold into the BIOS identity a save state checks.
   for (u32 i = 0; i < mem::Bus::BIOS9I_SIZE; ++i) bios_id = (bios_id ^ bus.bios9i.get()[i]) * 1099511628211ull;
   for (u32 i = 0; i < mem::Bus::BIOS7I_SIZE; ++i) bios_id = (bios_id ^ bus.bios7i.get()[i]) * 1099511628211ull;
   return true;
@@ -126,26 +119,18 @@ bool NDS::load_dsi_nand(const std::string& path, std::string* err, bool write_th
   return true;
 }
 
-// Boot the DSi the way the console does, from the NAND, instead of staging a
-// direct boot from the card image. With a *half* BIOS dump -- which is all we
-// have, and all melonDS needs -- the boot ROM's own boot2 loader is not
-// present, so melonDS does its job by hand and so do we (DSi.cpp LoadNAND, the
-// !FullBIOSBoot branch): read boot2's location from the NAND's boot info,
-// apply the NWRAM mapping it wants, decrypt boot2 into place, seed the bits of
-// state the missing BIOS code would have left, and enter boot2 directly.
-//
-// This is the path melonDS DS (libretro) relies on for DSiWare: boot2 brings up
-// the launcher, which reads the TLNC autoload block and launches the installed
-// title itself. Nothing here is reverse-engineered -- the console does it.
+// Boots the DSi from the NAND instead of staging a direct boot: reads
+// boot2's location from the NAND's boot info, applies its NWRAM mapping,
+// decrypts boot2 into place, seeds the state the missing BIOS code would
+// have left, and enters boot2 directly (melonDS DSi.cpp LoadNAND,
+// !FullBIOSBoot branch). boot2 brings up the launcher, which autoloads the title.
 bool NDS::boot_dsi_nand() {
   if (!dsi_nand.valid()) return false;
   io::DsiIo& d = io.dsi;
 
-  // reset() leaves CP15 in the state a *direct* boot wants -- vectors high,
-  // DTCM enabled -- because there is no BIOS to program it. boot2 is real BIOS
-  // code and programs CP15 itself, so hand it the ARM9's own reset value
-  // (melonDS CP15::Reset: control 0x2078, no TCM). Getting this wrong is not
-  // cosmetic: boot2 reads the control register back and branches on it.
+  // reset() sets CP15 up for a direct boot; boot2 is real BIOS code and
+  // programs CP15 itself, so give it the ARM9's true reset value instead
+  // (melonDS CP15::Reset) -- boot2 reads the control register back and branches on it.
   {
     CpuContext& a9 = cpu(Cpu::ARM9);
     a9.cp15_control = 0x00002078;
@@ -155,43 +140,33 @@ bool NDS::boot_dsi_nand() {
     bus.update_tcm(a9);
   }
 
-  // NWRAM has to be reachable before the mapping below means anything; reset
-  // leaves these bits at their startup values, which need not include it.
+  // NWRAM must be reachable before the mapping below means anything.
   d.scfg_ext[0] |= 1u << 25;
   d.scfg_ext[1] |= 1u << 25;
-  // The card slot as it is now: a frontend may put a card in after reset()
-  // (the SDL loader cart), which Io::reset would have reported as empty.
-  // Powered off, so the card is back in reset: after a soft reset it would
-  // otherwise still be in KEY2 mode from the last boot, and the DSi Menu's
-  // header read would get nothing it recognises (no card on the menu).
+  // Card slot powered off so it's back in reset (else still in KEY2 mode from the last boot).
   d.scfg_mc = static_cast<u16>(0x0010 | (cart ? 0 : 1));
   io.cart.romctrl &= ~(1u << 29);
   io.update_cart_reset();
   for (int i = 0; i < 3; ++i) std::memset(bus.nwram[i].get(), 0, mem::Bus::NWRAM_BANK_SIZE);
 
-  // The boot info block: where boot2 lives and where it goes. Raw NAND bytes --
-  // this area is outside the AES-CTR'd filesystem.
+  // Boot info block: where boot2 lives and where it goes. Raw NAND bytes, outside the AES-CTR'd filesystem.
   u32 bp[8], mbk[12];
   dsi_nand.read(0x220, sizeof bp, reinterpret_cast<u8*>(bp));
   dsi_nand.read(0x380, sizeof mbk, reinterpret_cast<u8*>(mbk));
 
-  // The NWRAM mapping boot2 expects, in our MBK register layout: slots 0-4 are
-  // shared, 5-7 are each CPU's own windows, 8 is the write protect.
+  // NWRAM mapping boot2 expects: slots 0-4 shared, 5-7 each CPU's own windows, 8 the write protect.
   for (int c = 0; c < 2; ++c) {
     for (int i = 0; i < 5; ++i) d.mbk[c][i] = mbk[i];
     for (int i = 0; i < 3; ++i) d.mbk[c][5 + i] = mbk[(c == 0 ? 5 : 8) + i];
     d.mbk[c][8] = mbk[11] & 0x00FFFF0F;
   }
   // A DSi resets with all shared WRAM on the ARM7 (melonDS DSi::Reset:
-  // MapSharedWRAM(3)); Io::reset leaves the DS value 0. Not cosmetic: under 0,
-  // 0x03000000-0x037FFFFF mirrors ARM7 WRAM, so boot2's ARM7 memset ending at
-  // 0x03800D18 wraps onto the top of its own 64 KB and wipes 0x0380FFC8.
+  // MapSharedWRAM(3)); under the DS default of 0 boot2's ARM7 memset would
+  // wrap and wipe 0x0380FFC8.
   io.wramcnt = 3;
   bus.update_nwram();
 
-  // boot2 itself: AES-CTR with a fixed key, the IV derived from the aligned
-  // size, over byte-reversed 16-byte blocks (the DSi's AES engine works on
-  // big-endian blocks, so every block is swapped in and back out).
+  // boot2: AES-CTR, fixed key, IV derived from the aligned size, byte-reversed 16-byte blocks.
   auto load_boot2 = [&](u32 offset, u32 size_aligned, u32 dst, Cpu cpu) {
     static const u8 key[16] = {0xAD, 0x34, 0xEC, 0xF9, 0x62, 0x6E, 0xC2, 0x3A,
                                0xF6, 0xB4, 0x6C, 0x00, 0x80, 0x80, 0xEE, 0x98};
@@ -228,10 +203,9 @@ bool NDS::boot_dsi_nand() {
       std::fprintf(stderr, "[boot2] arm7 view %08x = %08x\n", a, bus.dma_read32(Cpu::ARM7, a));
   }
 
-  // What the boot ROM code we do not have would have left behind: the eMMC CID
-  // and a handful of constants the ARM7 side reads back, plus the BIOS routines
-  // boot2 calls but which live in the missing halves -- copied into ITCM and
-  // ARM7 WRAM at the addresses melonDS uses.
+  // What the missing boot ROM would have left: eMMC CID and constants the
+  // ARM7 reads back, plus BIOS routines boot2 calls, copied into ITCM/ARM7
+  // WRAM at melonDS's addresses.
   const u8* cid = dsi_nand.emmc_cid();
   auto w7 = [&](u32 a, u32 v) { bus.dma_write32(Cpu::ARM7, a, v); };
   auto w7h = [&](u32 a, u16 v) { bus.dma_write16(Cpu::ARM7, a, v); };
@@ -257,14 +231,8 @@ bool NDS::boot_dsi_nand() {
 
   cpu(Cpu::ARM9).jump(bp[2], false);
   cpu(Cpu::ARM7).jump(bp[6], false);
-  // melonDS's pipeline fill after JumpTo, charged the way melonDS charges its
-  // pending Cycles: *after* the first instruction, not before it. Its first
-  // instruction costs 40 ARM9 / 10 ARM7 where ours costs 8 / 2, and every
-  // later instruction already agrees exactly. 64 and 4 are calibrated to hit
-  // those costs: defer_cost is in each CPU's own cycles, which the trace
-  // timeline scales differently per CPU, so they are measured, not derived.
-  // boot_stall is the wrong tool here -- it delays the start instead, moving
-  // our timeline off melonDS's t=0 without changing the phase.
+  // Pipeline-fill cost charged after the first instruction (melonDS's
+  // JumpTo); defer_cost, not boot_stall, so the timeline isn't shifted.
   cpu(Cpu::ARM9).defer_cost += 64;
   cpu(Cpu::ARM7).defer_cost += 4;
   std::fprintf(stderr, "dsi: boot2 from NAND -- ARM9 %08X (%u bytes), ARM7 %08X (%u bytes)\n",
@@ -272,11 +240,8 @@ bool NDS::boot_dsi_nand() {
   return true;
 }
 
-// melonDS DSi::SoftReset, in its order. What it leaves alone is as much the
-// model as what it resets: main RAM (a title can be named for the next boot
-// through it), the BPTWL register file (0x70 is the warm-boot flag), the
-// GPU, SPU, timers, IRQ registers, DMA and every armed event. The boot ROM
-// runs again, which with half BIOS dumps is boot2 loaded from the NAND.
+// melonDS DSi::SoftReset order. Leaves main RAM, BPTWL registers, GPU, SPU,
+// timers, IRQ, DMA and armed events alone; re-runs the boot ROM (boot2 from the NAND).
 void NDS::dsi_soft_reset() {
   dsi_soft_reset_pending = false;
   dsi_loader_launched = false;
@@ -285,16 +250,14 @@ void NDS::dsi_soft_reset() {
   dsi_title_running = false;
   std::memset(dsi_title_code, 0, sizeof dsi_title_code);
   if (dsi_nand_synthetic) {
-    // Nothing to reset into (see exit_requested). The ARM7 was halted by the
-    // request and stays so.
+    // Nothing to reset into; ARM7 stays halted by the exit request.
     std::fprintf(stderr, "dsi: soft reset on a synthesised NAND: the title is leaving\n");
     exit_requested = true;
     return;
   }
   std::fprintf(stderr, "dsi: soft reset\n");
 
-  // The CPUs, keeping what the recompiler and the sibling link hang off the
-  // hot block (reset() clears it whole).
+  // Keep what the recompiler/sibling link hang off the hot block; reset() clears it whole.
   for (CpuContext* c : {arm9.get(), arm7.get()}) {
     const u64 exit_native = c->hot.exit_native, other = c->hot.other_cpu;
     c->reset(c->which, this);
@@ -358,7 +321,7 @@ bool NDS::prepare_dsi_hle(const bios::UserSettings& user, std::string* err, std:
     if (!dsi_font_path.empty()) {
       files.font = slurp_file(dsi_font_path);
       if (files.font.size() < 0x100) return fail(dsi_font_path + ": not a TWLFontTable.dat");
-      // A title finds its fonts only in its own region's layout.
+      // A title finds fonts only in its own region's layout.
       const int want = region.region == 4 || region.region == 5 ? region.region : 0;
       const int have = io::font_table_region(files.font);
       static const char* kLayout[6] = {"normal", "", "", "", "Chinese", "Korean"};
@@ -394,10 +357,9 @@ bool NDS::prepare_dsi_hle(const bios::UserSettings& user, std::string* err, std:
     if (!io::build_synthetic_nand(dsi_nand, bus.bios7i.get(), srl, files, &why)) return fail("synthesising the NAND: " + why);
     dsi_nand_synthetic = true;
     dsi_nand.mark_baseline();
-    dsi_nand.mark_state_base();   // before any saves go in: a state carries its own
+    dsi_nand.mark_state_base();
     dsi_hle_content_id = 0;
-    // DS_NAND_DUMP=<file>: write the synthesised image out with a nocash
-    // footer, so tools/dsi_nand.py can read it (map, ls, extract).
+    // DS_NAND_DUMP=<file>: write the synthesised image out with a nocash footer.
     if (const char* dump = getenv("DS_NAND_DUMP")) {
       if (std::FILE* f = std::fopen(dump, "wb")) {
         std::vector<u8> sec(512);
@@ -415,8 +377,8 @@ bool NDS::prepare_dsi_hle(const bios::UserSettings& user, std::string* err, std:
          (dsi_font_hle ? std::string("; DSperate's own ") + (io::font_table_region(files.font) == 4 ? "Chinese " : io::font_table_region(files.font) == 5 ? "Korean " : "") + "system font"
                        : "; system font from " + dsi_font_path));
   }
-  // What a reset derives from the NAND and firmware (Io::dsi_reset), redone so
-  // this also works on a machine the frontend has already reset.
+  // Redo what Io::dsi_reset derives from the NAND and firmware, so this also
+  // works on a machine the frontend has already reset.
   normalise_touch_calibration();
   io.dsi.console_id = dsi_nand.console_id();
   io.sd.attach_nand(&dsi_nand);
@@ -426,10 +388,8 @@ bool NDS::prepare_dsi_hle(const bios::UserSettings& user, std::string* err, std:
 }
 
 bool NDS::dsi_hle_swi(CpuContext& cpu, u32 number) {
-  // SWI 27h SHA1_Calc(r0 = digest out, r1 = data, r2 = length), watched
-  // only: the launcher hashing the loader cart's header is its launch (see
-  // dsi_loader_watch). Measured on the USA launcher: once per launch, 44
-  // frames before the fade; nothing else in the boot hashes 0x160 bytes.
+  // SWI 27h SHA1_Calc(r0 = digest out, r1 = data, r2 = length), watched only:
+  // the launcher hashing the loader cart's header is its launch signal.
   if (number == 0x27) {
     if (dsi_loader_watch && cart && cpu.which == Cpu::ARM9 && cpu.hot.regs[2] == 0x160 && (cpu.hot.regs[1] >> 24) == 0x02) {
       u8 want[0x160];
@@ -441,8 +401,7 @@ bool NDS::dsi_hle_swi(CpuContext& cpu, u32 number) {
     return false;
   }
   // SWI 22h RSA_Decrypt_Unpad(r0 = key heap, r1 = digest out, r2 = signature):
-  // 1 and the 20-byte digest on success. Seen in EA Sudoku's font load, after
-  // SWI 27h hashed the table header and before SWI 28h compares the two.
+  // returns 1 and the 20-byte digest on success.
   if (number != 0x22 || !dsi_font_hle) return false;
   const u32 sig = cpu.hot.regs[2], dst = cpu.hot.regs[1];
   if ((sig >> 24) != 0x02 || (dst >> 24) != 0x02) return false;   // main RAM only: no reads with side effects
@@ -492,14 +451,9 @@ void NDS::setup_direct_boot_dsi() {
   bus.update_nwram();
   if (!(t.app_flags & 1)) io.spi_tsc.dsi_mode = 0;    // DS-compatibility touchscreen unless the title asks for the CODEC
 
-  // The launcher hand-off (dsi_hle_launch) differs from melonDS's card-mode
-  // direct boot in the places marked `hle` below. Each value was read from a
-  // real launch on the NAND boot path -- TLNC autoload of KS3E and KMGE,
-  // snapshotted at the titles' ARM9 and ARM7 entry points with headless
-  // DS_ENTRY_SNAP -- and the whole list was the same for both titles.
-  // Launcher leftovers the titles re-initialise (NDMA, SD/SDIO host and DS
-  // Wi-Fi state, AES slots 0 and 2 overwritten with junk, a copy of the
-  // loader's jump code at 0x023FEE00/0x0380F600) are not reproduced.
+  // Launcher hand-off (dsi_hle_launch) differs from card-mode direct boot at
+  // the places marked `hle` below; leftovers titles re-initialise anyway
+  // (NDMA, SD/SDIO host, DS Wi-Fi state, AES slots 0/2, loader jump code) aren't reproduced.
   const bool hle = dsi_hle_launch;
 
   // ---- main RAM: header copies, launcher leftovers ----
@@ -512,15 +466,12 @@ void NDS::setup_direct_boot_dsi() {
     for (u32 i = 0; i < 0x14; i += 4) w32(0x02000600 + i, rd32(b + 0x128 + i));    // HWINFO_N
     for (u32 i = 0; i < 0x18; i += 4) w32(0x02FFFD68 + i, rd32(b + 0x13C + i));    // HWINFO_S
     if (hle) {
-      // The launcher clears two stretches of the TWLCFG copy; the second held
-      // the last-launched title ID (0x02000428).
+      // The launcher clears two stretches of TWLCFG; the second held the last-launched title ID.
       for (u32 a = 0x02000407; a <= 0x0200040B; ++a) w8(a, 0);
       for (u32 a = 0x02000420; a <= 0x0200042F; ++a) w8(a, 0);
     }
   }
-  // Wi-Fi board words, from the firmware header's board byte (0x1FD), as
-  // melonDS writes them (it notes they should come from the NAND's wifi
-  // firmware).
+  // Wi-Fi board words, from the firmware header's board byte (0x1FD).
   const u8 board = firmware.size() > 0x1FD ? firmware[0x1FD] : 0;
   w8(0x020005E0, board);
   if (board == 0x01) { w16(0x020005E2, 0xB57E); w32(0x020005E4, 0x00500400); w32(0x020005E8, 0x00500000); w32(0x020005EC, 0x0002E000); }
@@ -553,14 +504,12 @@ void NDS::setup_direct_boot_dsi() {
 
   // ---- what the firmware leaves for a DSi (melonDS FirmwareMem::SetupDirectBoot) ----
   if (firmware.size() >= 0x20000) {   // the DSi firmware image is 128 KB
-    // melonDS writes the three MAC halves to one address (its loop has no
-    // stride); reproduced so the oracle traces agree. The value a title
-    // sees there is the MAC's last two bytes.
     if (hle) {
       // The launcher writes the whole MAC, and its own channel mask (1, 7, 13).
       for (u32 i = 0; i < 6; ++i) w8(0x02FFFCF4 + i, firmware[0x36 + i]);
       w16(0x02FFFCFA, 0x1041);
     } else {
+      // melonDS writes all three MAC halves to the same address (no stride), so only the last two bytes stick.
       for (u32 i = 0; i < 6; i += 2) w16(0x02FFFCF4, static_cast<u16>(firmware[0x36 + i] | (firmware[0x37 + i] << 8)));
       w16(0x02FFFCFA, static_cast<u16>(firmware[0x3C] | (firmware[0x3D] << 8)));   // enabled channels
     }
@@ -580,20 +529,14 @@ void NDS::setup_direct_boot_dsi() {
   } else {
     d.scfg_mc = 0x0001;                              // slot empty, powered off
     spu.write_sndexcnt(0x800F, 0xFFFF);
-    // The header's ARM7 SCFG_EXT bits (0x1B8) over the launcher's base, then
-    // locked: KS3E (0x00040406) enters with 0x13FFFF06, KMGE (0x00040006)
-    // with 0x13FFFB06.
-    d.scfg_ext[1] = (0x93FBFB06 | t.scfg_ext7) & 0x7FFFFFFF;
+    d.scfg_ext[1] = (0x93FBFB06 | t.scfg_ext7) & 0x7FFFFFFF;   // header's ARM7 SCFG_EXT bits over the launcher's base, then locked
     d.scfg_bios = 0x0501;                            // bit 10: the console ID is hidden
-    // The launcher hands over at 67 MHz with the DSP and camera clocks off;
-    // a title that wants 134 MHz switches itself.
-    d.scfg_clock9 = 0x0084;
+    d.scfg_clock9 = 0x0084;                          // launcher hands over at 67 MHz, DSP/camera clocks off
     bus.set_clock9_shift(1);
   }
 
   // CP15, in melonDS's order (control first, so the DTCM window is placed
-  // twice; the end state is what matters). A launcher hand-off ends in the
-  // same state.
+  // twice; only the end state matters).
   auto cp = [&](u32 crn, u32 crm, u32 opc2, u32 v) { cp15_write(*arm9, 0, crn, crm, opc2, v); };
   cp(1, 0, 0, 0x00056078);
   cp(2, 0, 0, 0x0000004A); cp(2, 0, 1, 0x0000004A); cp(3, 0, 0, 0x0000000A);
@@ -611,24 +554,20 @@ void NDS::setup_direct_boot_dsi() {
     arm7->hot.regs[12] = h.arm7_entry; arm7->hot.regs[13] = 0x0380FD80; arm7->hot.regs[14] = h.arm7_entry;
     arm7->bank_r13[0] = 0x0380FFC0; arm7->bank_r13[2] = 0x0380FF80;
   } else {
-    // The launcher's loader jumps from System mode with IRQs masked, on its
-    // own stacks (bank order USR/SYS, FIQ, IRQ, SVC, ABT, UND).
+    // Launcher's loader jumps from System mode with IRQs masked, on its own
+    // stacks (bank order USR/SYS, FIQ, IRQ, SVC, ABT, UND).
     arm9->set_cpsr(0x9F); arm7->set_cpsr(0x9F);
     arm9->hot.regs[13] = arm9->bank_r13[0] = 0x0E003F80; arm9->bank_r13[2] = 0x0E003F7C; arm9->bank_r13[3] = 0x0E003FC0;
     arm9->hot.regs[14] = h.arm9_entry;
     arm7->hot.regs[13] = arm7->bank_r13[0] = 0x03FFFF80; arm7->bank_r13[2] = 0x0380FF7C; arm7->bank_r13[3] = 0x0380FFC0;
     arm7->hot.regs[14] = h.arm7_entry;
 
-    // The launcher's mount table, at the header's parameter
-    // block address (0x1D4): five 0x54-byte entries, then the title's own
-    // image path at +0x3C0. First decoded in dsperate-research
-    // tools/melonds/dsiware_params.py; the entry header words are copied
-    // verbatim, their meaning is not known.
+    // Launcher's mount table at the header's parameter block address
+    // (0x1D4): five 0x54-byte entries, then the title's image path at +0x3C0.
     auto w32_7 = [&](u32 a, u32 v) { bus.dma_write32(Cpu::ARM7, a, v); };
     auto w8_7  = [&](u32 a, u8 v)  { bus.dma_write8(Cpu::ARM7, a, v); };
     const u32 tbl = t.param_block_address;
-    // Either ARM7 WRAM (KS3E 0x03800EA8) or the ARM7's NWRAM window from the
-    // header's MBK map, applied above (KAME 0x037DE050, KAAE 0x037E3C20).
+    // Either ARM7 WRAM or the ARM7's NWRAM window from the header's MBK map, applied above.
     if (tbl >= 0x03000000 && tbl + 0x500 <= 0x0380FC00) {
       for (u32 z = 0; z < 0x500; z += 4) w32_7(tbl + z, 0);
       auto put_str = [&](u32 addr, const char* str) { for (const char* c = str; *c; ++c) w8_7(addr++, static_cast<u8>(*c)); w8_7(addr, 0); };
@@ -644,9 +583,7 @@ void NDS::setup_direct_boot_dsi() {
         {0x00063146, "photo",   "nand2:/photo"},
         {0x00060948, "dataPub", pub},
       };
-      // A title with SD card access (header 0x1B4 bit 3) gets the card's root
-      // as well, whether or not a card is in the slot (captured from KNAE's
-      // launch both ways).
+      // A title with SD card access (header bit 3) gets the card's root too, regardless of slot state.
       if (t.access_control & (1u << 3)) entries.push_back({0x00060049, "sdmc", "/"});
       u32 o = tbl;
       for (const auto& e : entries) { w32_7(o, e.hdr); put_str(o + 4, e.name); put_str(o + 20, e.path); o += 0x54; }
@@ -656,7 +593,7 @@ void NDS::setup_direct_boot_dsi() {
     } else {
       std::fprintf(stderr, "dsi: parameter block address %08x is outside the ARM7's RAM; no mount table\n", tbl);
     }
-    // The locked SCFG_EXT7 and two flag bytes at the top of ARM7 WRAM.
+    // Locked SCFG_EXT7 and two flag bytes at the top of ARM7 WRAM.
     w32_7(0x0380FFC4, d.scfg_ext[1]);
     w8_7(0x0380FFC8, 0x44);
     w8_7(0x0380FFC9, 0xF8);
@@ -671,9 +608,8 @@ void NDS::setup_direct_boot_dsi() {
   arm9->jump(h.arm9_entry, true);
   arm7->jump(h.arm7_entry, true);
   arm9->hot.cycle_budget = 0; arm7->hot.cycle_budget = 0;
-  // melonDS's pending pipeline-fill cycles at the first instruction (its
-  // reset and direct-boot JumpTo costs, measured with trace_melonds
-  // TRACE_CYC=1): the ARM9 starts 34 bus cycles late and the ARM7 15.
+  // melonDS's pending pipeline-fill cycles at reset/direct-boot JumpTo: the
+  // ARM9 starts 34 bus cycles late and the ARM7 15.
   arm9->boot_stall = 136; arm7->boot_stall = 15;
 
   io.exmemcnt = hle ? 0xE88C : 0xE880; bus.update_gba_slot_timings();

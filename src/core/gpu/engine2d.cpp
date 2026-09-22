@@ -2,8 +2,7 @@
 // DSperate - Nintendo DS emulator. Copyright (C) 2026 DSperate contributors.
 //
 // 2D engine: registers and the portable line renderer. Hardware behaviour per
-// GBATEK, with melonDS (GPLv3) used as the reference for the latching and
-// blending corner cases that are verified against real hardware there.
+// GBATEK.
 #include "core/gpu/engine2d.h"
 #include "core/state/state.h"
 #include "core/gpu/vram_map.h"
@@ -19,15 +18,9 @@ namespace ds::gpu {
 
 namespace {
 
-// Census of the change detection that remains: the extended palettes live in
-// VRAM, which the write journal does not cover, so they are validated by
-// comparing the source with the copy taken at conversion time -- once per
-// VRAMCNT remap (vram_remapped), the only event that can change what an
-// extended-palette view reads: no CPU mapping reaches a bank in that mode
-// (Bus::update_vram maps the BG/OBJ/LCDC/ARM7 views only). The standard
-// palettes and OAM are journaled and compare a generation word instead.
-// (The DS_2D_CMPPROBE / DS_2D_CMPFRAME measurement knobs priced the per-line
-// compares and are gone with them.)
+// Extended palettes live in VRAM, outside the write journal, so they're
+// validated against the copy taken at conversion time, once per VRAMCNT
+// remap. Standard palettes and OAM are journaled and compare a generation word.
 inline bool cmp_differs(const void* a, const void* b, size_t n, prof::Counter calls, prof::Counter diff) {
   prof::add(calls, 1);
   const bool d = std::memcmp(a, b, n) != 0;
@@ -93,9 +86,8 @@ u32 Engine2D::read(u32 addr, u32 width) {
 }
 
 // Guest side: keep the read mirror current, then hand the write to the
-// journal. Byte writes outside the byte-addressed registers merge with the
-// mirror into a halfword here, so the journal only ever carries what
-// apply_write handles.
+// journal. Byte writes outside byte-addressed registers merge into a
+// halfword here, so the journal only ever carries what apply_write handles.
 void Engine2D::write(u32 addr, u32 width, u32 value) {
   const u32 r = addr & 0xFFF;
   if (width == 8) {
@@ -106,9 +98,8 @@ void Engine2D::write(u32 addr, u32 width, u32 value) {
       queue(J_REG, r, 8, value & 0xFF);
       return;
     }
-    // BG0HOFS on engine A also scrolls the 3D layer, even with the engine
-    // powered down. Journaled byte-wise (the register is write-only, so the
-    // merge below cannot recover the other byte), applied in apply_write.
+    // BG0HOFS on engine A also scrolls the 3D layer even when powered down;
+    // journaled byte-wise since the write-only register can't be merged.
     if (!num_ && (r == 0x10 || r == 0x11)) queue(J_REG, r, 8, value & 0xFF);
     if (!g_enabled_) return;
     switch (r) {
@@ -137,10 +128,8 @@ void Engine2D::write(u32 addr, u32 width, u32 value) {
   case 0x02: g_dispcnt_ = (g_dispcnt_ & 0x0000FFFF) | (value << 16); if (num_) g_dispcnt_ &= 0xC0B1FFF7; queue(J_REG, r, 16, value); return;
   default: break;
   }
-  // BG0HOFS on engine A scrolls the 3D layer even with the engine powered
-  // down. It is journaled like the rest and applied on the render side
-  // (apply_write), in display-line order, rather than at once: the 3D line
-  // is read where the 2D line is composited, which may be another thread.
+  // BG0HOFS on engine A scrolls the 3D layer even when powered down;
+  // journaled and applied in display-line order like the rest.
   if (!g_enabled_) { if (!num_ && r == 0x10) queue(J_REG, r, 16, value); return; }
   switch (r) {
   case 0x08: case 0x0A: case 0x0C: case 0x0E: g_bgcnt_[(r - 8) / 2] = static_cast<u16>(value); break;
@@ -192,9 +181,8 @@ void Engine2D::apply(u8 kind, u32 addr, u32 width, u32 value) {
   case J_REG: apply_write(addr, width, value); return;
   case J_PAL: std::memcpy(reinterpret_cast<u8*>(pal_.data()) + addr, &value, width / 8); ++pal_gen_; return;
   case J_OAM: {
-    // The sprite lists read attr0's y / type / shape and attr1's size only;
-    // a write that leaves those bits alone (X, tiles, palette, the rotation
-    // parameters -- most of what a game animates) keeps the lists.
+    // Sprite lists read attr0's y/type/shape and attr1's size only; other
+    // bits (most of what a game animates) don't bump oam_geom_gen_.
     u8* dst = reinterpret_cast<u8*>(oam_.data()) + addr;
     const u32 n = width / 8;
     u32 old = 0; std::memcpy(&old, dst, n);
@@ -320,8 +308,7 @@ void Engine2D::update_windows(u32 line) {
 
 void Engine2D::pre_draw(u32 line, bool frame_reset) {
   if (!enabled_) return;
-  // Turning a layer on takes two lines (sprites: one) to show; turning it off
-  // and forcing blank apply at once.
+  // Turning a layer on takes two lines (sprites: one); off/forced-blank is immediate.
   dispcnt_hist_[2] = dispcnt_hist_[1]; dispcnt_hist_[1] = dispcnt_hist_[0]; dispcnt_hist_[0] = dispcnt_;
   layer_enable_ = ((dispcnt_hist_[2] & dispcnt_) >> 8) & 0x1F;
   obj_enable_ = ((dispcnt_hist_[1] & dispcnt_) >> 12) & 1;
@@ -340,8 +327,7 @@ void Engine2D::pre_draw(u32 line, bool frame_reset) {
 
 void Engine2D::post_draw(bool frame_reset) {
   if (!enabled_) return;
-  // BG mosaic height is latched into an internal counter; OBJ mosaic compares
-  // against the live register.
+  // BG mosaic height latches into an internal counter; OBJ mosaic compares live.
   if (frame_reset) { bg_mosaic_ymax_ = bg_mosaic_h_; bg_mosaic_y_ = 0; bg_mosaic_latch_ = true; }
   else if (bg_mosaic_y_ == bg_mosaic_ymax_) { bg_mosaic_ymax_ = bg_mosaic_h_; bg_mosaic_y_ = 0; bg_mosaic_latch_ = true; }
   else { bg_mosaic_y_ = (bg_mosaic_y_ + 1) & 0xF; bg_mosaic_latch_ = false; }
@@ -428,9 +414,8 @@ void Engine2D::debug_dump(u32 line) {
 const Pixel Engine2D::zero_table_[256] = {};
 
 namespace {
-// DS_DEBUG_OUTHASH=1: a hash of each engine's composite output per frame
-// (and per line of frame DS_DEBUG_OUTHASH_FRAME), to find where two builds
-// first diverge in lines the frame dump never shows (display capture input).
+// DS_DEBUG_OUTHASH=1: hash of each engine's composite output per frame
+// (and per line of frame DS_DEBUG_OUTHASH_FRAME).
 u64 g_outhash[2];
 const bool g_outhash_on = std::getenv("DS_DEBUG_OUTHASH") != nullptr;
 const long g_outhash_frame = std::getenv("DS_DEBUG_OUTHASH_FRAME") ? std::atol(std::getenv("DS_DEBUG_OUTHASH_FRAME")) : -1;
@@ -496,36 +481,27 @@ void Engine2D::render_line(u32 line) {
   { DS_PROF(WINDOW); build_window_plane(); apply_sprite_mosaic_x(); }
   line_exported_ = false;
   if (exp_top_ && !num_ && (dispcnt_ & 8) && bg_[0].any) {
-    // The GPU composite wants the resolved planes of every 3D line, whatever
-    // fast path the line would otherwise take (~half the lines of a 3D
-    // scene take the flat one -- the census in the scoping doc).
+    // The GPU composite wants resolved planes for every 3D line.
     { DS_PROF(SELECT); select_layers(); }
     export_planes(line);
     { DS_PROF(EFFECTS); colour_effects(); }
     return;
   }
   if (!effect_possible()) {
-    // No colour effect can touch this line: the planes go straight into
-    // the output, with none of the second-layer bookkeeping. Most lines
-    // are simpler still, so the pass is chosen from what actually
-    // contributes rather than run in full for every line (§5.1).
+    // No colour effect touches this line: skip second-layer bookkeeping and
+    // pick the cheapest applicable pass below.
     prof::add(prof::C_2D_FLAT_LINES, 1);
     DS_PROF(SELECT);
     u32 nlayers = 0;
     for (int n = 0; n < 4; ++n) if (bg_[n].any) ++nlayers;
     const bool objs = (layer_enable_ & 0x10) && num_sprites_ && obj_prio_mask_;
     if (!objs) {
-      // Nothing on the line: the backdrop shows everywhere (windows
-      // inhibit layers, never the backdrop).
+      // Nothing on the line: the backdrop shows everywhere.
       if (nlayers == 0) { prof::add(prof::C_2D_FAST_BACKDROP, 1); out_.fill(std_pal18()[0] | 0xFF000000); return; }
-      // With no windows and no OBJ pixels, a BG that covers the complete line
-      // hides everything below it -- so the select can be skipped and that one
-      // layer resolved directly. It has to be the *topmost* layer with content
-      // though: an opaque layer under a sparse one is not what shows through
-      // the sparse layer's transparent pixels. Walk the planes in the order
-      // select_layers applies them, topmost first -- priority 0..3, and BG0
-      // before BG3 within a priority, since the later select wins -- and let
-      // the first one with content decide.
+      // With no windows and no OBJ pixels, a fully opaque BG that is the
+      // topmost layer with content hides everything below it and can be
+      // resolved directly. Walk planes topmost first (priority 0..3, BG0
+      // before BG3 within a priority) and let the first with content decide.
       if (!(dispcnt_ & 0xE000) && !obj_prio_mask_) {
         int top = -1;
         for (int prio = 0; prio < 4 && top < 0; ++prio)
@@ -542,9 +518,8 @@ void Engine2D::render_line(u32 line) {
     return;
   }
   prof::add(prof::C_2D_EFFECT_LIVE, 1);
-  // A fade over plain layers never reads what is beneath the top pixel, so
-  // neither the second select nor the second gather nor the kind/alpha
-  // records are needed: run the stages that cannot look down instead.
+  // A fade over plain layers never reads beneath the top pixel, so the
+  // second select/gather/kind-alpha records are unneeded.
   if (!needs_second()) {
     prof::add(prof::C_2D_FULL_FADE, 1);
     { DS_PROF(SELECT); select_layers_top(); }
@@ -556,11 +531,8 @@ void Engine2D::render_line(u32 line) {
   { DS_PROF(EFFECTS); colour_effects(); }
 }
 
-// Whether any pixel of the line could be changed by the colour-effects pass:
-// the selected effect with a first target (and, for blending, a second
-// target) among the layers present, or a layer that blends on its own —
-// semi-transparent / bitmap sprites and the 3D layer — over a second
-// target. Conservative: presence is per line, not per pixel.
+// Whether any pixel of the line could be changed by the colour-effects pass.
+// Conservative: presence is checked per line, not per pixel.
 bool Engine2D::effect_possible() const {
   u32 present = L_BACKDROP;
   for (int n = 0; n < 4; ++n) if (bg_[n].any) present |= 1u << n;
@@ -568,17 +540,13 @@ bool Engine2D::effect_possible() const {
   if (objs) present |= L_OBJ;
   const u32 mode = (bldcnt_ >> 6) & 3;
   const bool second = ((bldcnt_ >> 8) & present) != 0;
-  // Identity coefficients make the effect a no-op (the rounding biases
-  // vanish under the channel masks): a fade left enabled at EVY 0, or a
-  // blend at EVA 16 / EVB 0, which games do for whole scenes.
+  // Identity coefficients make the effect a no-op: EVY 0, or EVA 16/EVB 0.
   const bool blend_identity = eva_ == 16 && evb_ == 0;
   const bool mode_noop = (mode == 1 && blend_identity) || (mode >= 2 && evy_ == 0);
   if (mode != 0 && !mode_noop && (bldcnt_ & 0x3F & present) && (mode != 1 || second)) { prof::add(prof::C_2D_FULL_MODE, 1); return true; }
   if (!second) return false;
   if (!num_ && (dispcnt_ & 8) && bg_[0].any) {
-    // The 3D layer blends with what is beneath only where a pixel's alpha
-    // is strictly between 0 and 31; a line of opaque and transparent
-    // pixels only is flat.
+    // 3D blends only where alpha is strictly between 0 and 31.
     if (kern::active::line_has_translucent_3d(line3d_)) { prof::add(prof::C_2D_FULL_3D, 1); return true; }
   }
   if (objs) {
@@ -590,9 +558,8 @@ bool Engine2D::effect_possible() const {
   return false;
 }
 
-// Text (tiled) background. The 33 tile rows covering the line are gathered
-// into index rows (direct VRAM pointers; the map row is one 64-byte run per
-// screen block), then one kernel call resolves them through the palettes and
+// Text (tiled) background: gather the 33 tile rows covering the line into
+// index rows, then one kernel call resolves them through the palettes and
 // writes the row at the scroll offset into the padded plane.
 void Engine2D::draw_bg_text(u32 line, int bg) {
   prof::add(prof::C_2D_BG_TEXT, 1);
@@ -623,14 +590,9 @@ void Engine2D::draw_bg_text(u32 line, int bg) {
     alignas(16) u8 rows[33 * 8]; alignas(16) u16 tiles[33];
     u32 palmask = 0;
     plane.table = std_pal18();
-    // Map entries first: a row of one repeated tile whose row is
-    // transparent (a text layer with nothing on this line, which most HUD
-    // layers are most of the time) is empty, and neither the tile rows
-    // nor the kernel are needed.
-    // A map row is contiguous: 32 entries per screen block, wrapping into the
-    // next block on a wide map. Two memcpys, not thirty-three, and the wrap
-    // is the only place the block can change (DraStic's
-    // setup_tile_map_entries_4bpp_asm costs 38 instructions a line).
+    // Map entries first: an all-transparent row needs neither tile rows nor
+    // the kernel. A map row is contiguous (32 entries per screen block,
+    // wrapping into the next on a wide map), so two memcpys suffice.
     {
       u32 done = 0, mx = (xoff & 0xF8) >> 2, blk = ((xoff & ~7u) & widexmask) ? 1 : 0;
       while (done < 33) {
@@ -656,19 +618,13 @@ void Engine2D::draw_bg_text(u32 line, int bg) {
       if (const u8* p = vv.direct(a, len)) std::memcpy(&row, p, len); else for (u32 i = 0; i < len; ++i) row |= static_cast<u64>(vm.read8(vv, a + i)) << (8 * i);
       if (row == 0) { plane.any = false; prof::add(prof::C_2D_BG_EMPTY, 1); return; }   // repeated blank tile: not even the rows are needed
     }
-    // The rows are accumulated as they are gathered: a line whose tiles are
-    // all blank (different tiles, all index 0 on this row -- most of what a
-    // HUD or a text layer holds) needs neither the kernel nor the extended
-    // palettes, and drops out of the priority select entirely.
-    // A tile row is 4 bytes at a 4-aligned address (8 at 8-aligned for 256
-    // colours) and a block is 16 KB, so a row can never cross one: the block
-    // lookup is an index, without direct()'s crossing test per tile. Split by
-    // depth so the row size, shifts and stores are constants in the loop.
+    // Rows are accumulated as gathered: an all-blank row needs neither the
+    // kernel nor extended palettes. A row never crosses a 16 KB block, so
+    // lookup is an index without direct()'s per-tile crossing test.
     u64 rowacc = 0;
     const u32 amask = vv.addr_mask();
-    // The block pointer is looked up only when the block changes: a tileset
-    // is 16 KB, so one map row's tiles almost always share a block, and the
-    // lookup was one of two dependent loads per tile.
+    // Block pointer looked up only when the block changes: one map row's
+    // tiles almost always share a block.
     u32 last_blk = ~0u; const u8* last_ptr = nullptr;
     auto block_ptr = [&](u32 am) { const u32 b = am / VramView::BLOCK; if (b != last_blk) { last_blk = b; last_ptr = vv.ptr[b]; } return last_ptr; };
     if (c256) {
@@ -701,8 +657,7 @@ void Engine2D::draw_bg_text(u32 line, int bg) {
     if (!c256) plane.any = kern::active::text_row_16(rows, ctl, 33, v);
     else {
       if (extpal) {
-        // Validate (and convert) the extended palettes the row uses; the
-        // slot's 4096 records are contiguous, so one table covers them.
+        // Validate the extended palettes the row uses.
         for (u32 i = 0; i < 16; ++i) if (palmask & (1u << i)) ext_pal18(extslot, i);
         plane.table = extpal18_.data() + extslot * 4096;
       }
@@ -884,10 +839,8 @@ void Engine2D::draw_bg_large(u32 line) {
 // i * pc; with pa = 0x100 and pc = 0 the row is fixed and the texel column is
 // (rx >> 8) + i, so the coordinate masks reduce to a wrap at the bitmap's
 // width (or, with overflow transparent, to the span 0 <= column < width).
-// Each run is contiguous in VRAM and is read a block at a time through the
-// view's direct pointers (an overlapping-bank block falls back to the OR
-// read); the row of a block cannot be split in the middle of a texel since
-// the bitmap base is 16 KB-aligned.
+// Each run is read a block at a time through the view's direct pointers
+// (an overlapping-bank block falls back to the OR read).
 void Engine2D::bitmap_row_degenerate(Layer& plane, u32 base, u32 xmask, u32 ymask, u32 yshift, bool wrap, bool direct, s32 rx, s32 ry) {
   const VramView& vv = bg_vram();
   const VramMap& vm = vram();
@@ -924,11 +877,9 @@ void Engine2D::bitmap_row_degenerate(Layer& plane, u32 base, u32 xmask, u32 ymas
   plane.any = any;
 }
 
-// Tiled rotscale layers (8-bit map entries, or the extended 16-bit ones with
-// flips and a palette number) on the identity matrix: the 33 tile rows
-// covering the line are gathered as the text layer gathers them and go
-// through the same kernel at the sub-tile scroll offset; a tile past the
-// edge of a non-wrapping map is a blank row.
+// Tiled rotscale layers on the identity matrix: gathered like the text
+// layer and run through the same kernel; a tile past a non-wrapping map's
+// edge is a blank row.
 void Engine2D::tile_row_degenerate(Layer& plane, u32 tilemap, u32 tileset, u32 coordmask, u32 yshift, bool wrap, bool map16, bool ext, int bg, s32 rx, s32 ry) {
   const VramView& vv = bg_vram();
   const VramMap& vm = vram();
@@ -966,11 +917,8 @@ void Engine2D::draw_bg_3d() {
   prof::add(prof::C_2D_BG_3D, 1);
   Layer& plane = bg_[0];
   if (!line3d_) { plane.any = false; return; }
-  // Report emptiness the way every other background layer does. A 3D line
-  // with no visible pixel used to be marked present regardless, which inflated
-  // the layer count and cost the line its backdrop-only / one-opaque-layer
-  // fast path in select_layers. Measured over the replays, 22.4 % of Mario &
-  // Luigi's 3D-layer lines and 16.7 % of Meteos's carry nothing at all.
+  // Report emptiness like other layers so an empty 3D line still gets the
+  // fast paths in select_layers.
   plane.any = kern::active::layer16_3d(line3d_, plane.v());
   plane.table = line3d_;
   if (!plane.any) prof::add(prof::C_2D_BG_3D_EMPTY, 1);
@@ -993,11 +941,8 @@ inline void Engine2D::put_sprite_pixel(s32 x, u16 value, bool opaque, u8 attr, u
 void Engine2D::render_sprites(u32 line) {
   if (!enabled_) return;      // the OBJ planes are left as they are
   num_sprites_ = 0; obj_prio_mask_ = 0;
-  // Only the attribute plane needs clearing: every reader of obj_v_ and
-  // obj_alpha_ is gated on OA_OPAQUE in the attribute byte (the selects, the
-  // extended-palette scan, the OBJ alpha in resolve16_full; the mosaic latch
-  // copies the attribute along with them), so stale values there are never
-  // seen. That is ~800 bytes of stores per line per engine saved.
+  // Only the attribute plane needs clearing: obj_v_/obj_alpha_ readers are
+  // gated on OA_OPAQUE.
   obj_attr_.fill(0); obj_win_.fill(0);
   if (!obj_enable_) return;
 
@@ -1006,8 +951,6 @@ void Engine2D::render_sprites(u32 line) {
   static const s32 heights[16] = {8, 8, 16, 8, 16, 8, 32, 8, 32, 16, 32, 8, 64, 32, 64, 8};
 
   if (oam_lists_gen_ != oam_geom_gen_) { oam_lists_gen_ = oam_geom_gen_; rebuild_sprite_lists(oam); }
-  // (A mosaic sprite's candidacy is still its own box; the mosaic only
-  // changes which of its rows is drawn.)
   const LineSprites& ls = line_sprites_[line & 0xFF];
   for (u32 k = 0; k < ls.count; ++k) {
     const int n = ls.idx[k];
@@ -1033,9 +976,8 @@ void Engine2D::render_sprites(u32 line) {
   }
 }
 
-// Candidate lists: every enabled sprite on every line of its (double-size)
-// box, in OAM order. The per-line test in render_sprites stays exact; the
-// list only prunes the 128-entry scan.
+// Candidate lists: every enabled sprite on every line of its box, in OAM
+// order; render_sprites still does the exact per-line test.
 void Engine2D::rebuild_sprite_lists(const u16* oam) {
   static const s32 heights[16] = {8, 8, 16, 8, 16, 8, 32, 8, 32, 16, 32, 8, 64, 32, 64, 8};
   for (auto& l : line_sprites_) l.count = 0;
@@ -1093,8 +1035,7 @@ void Engine2D::draw_sprite_normal(const u16* attr, int w, int h, s32 x, s32 y, b
   if (dispcnt_ & (1 << 4)) { base <<= (dispcnt_ >> 20) & 3; row_stride = (w >> 3) << (c256 ? 6 : 5); }
   else row_stride = 0x400;
   base = (base << 5) + (y >> 3) * row_stride;
-  // The sprite row is decoded tile by tile into indices first (direct VRAM
-  // pointers), then placed with the priority rule per pixel.
+  // Decoded tile by tile into indices first, then placed per pixel.
   u8 idx[64];
   u16 pal_base = 0;
   if (c256) {
@@ -1182,9 +1123,8 @@ void Engine2D::draw_sprite_rotscale(const u16* attr, const u16* oam, int bw, int
   }
 }
 
-// Sprite X mosaic runs over the finished OBJ plane, left to right: a pixel is
-// re-latched at the start of each mosaic cell, whenever mosaic-ness changes
-// between neighbours, or when a higher-priority pixel arrives.
+// Sprite X mosaic runs over the finished OBJ plane, left to right: re-latch
+// at each mosaic cell, on a mosaic-ness change, or a higher-priority pixel.
 void Engine2D::apply_sprite_mosaic_x() {
   const u32 mw = obj_mosaic_w_;
   if (!mw) return;
@@ -1204,12 +1144,9 @@ void Engine2D::build_window_plane() {
   if (!(dispcnt_ & 0xE000)) { win_.fill(0xFF); return; }
   win_.fill(wincnt_[2]);                                     // outside all windows
   if (dispcnt_ & (1 << 15)) for (u32 i = 0; i < 256; ++i) if (obj_win_[i]) win_[i] = wincnt_[3];
-  // Horizontal edges are evaluated per pixel with the same edge rule as the
-  // vertical ones (at x2 the x bit clears, else at x1 it sets; a pixel is
-  // inside while both bits are set), so x2 < x1 wraps and x1 == x2 covers
-  // nothing. Pixels before the first edge keep the x state the previous
-  // line ended with, so a line is at most three runs: [0, first edge) in the
-  // carried state, then the two states the edges leave, in edge order.
+  // Same edge rule as the vertical windows: x2 < x1 wraps, x1 == x2 covers
+  // nothing. A line is at most three runs, carrying the x state in from
+  // the previous line before the first edge.
   auto span = [&](u8 x1, u8 x2, u8& active, u8 val) {
     const u32 e1 = x1 < x2 ? x1 : x2, e2 = x1 < x2 ? x2 : x1;
     const bool st[3] = {(active & 2) != 0, x1 < x2, x1 > x2};
@@ -1256,10 +1193,8 @@ void Engine2D::setup_tables() {
   tables_[T_OBJ_DIRECT] = kern::direct_table();
   tables_[T_OBJ_STD] = tables_[T_OBJ_EXT] = tables_[T_BACKDROP];
   if ((layer_enable_ & 0x10) && num_sprites_) {
-    // Which OBJ palettes the line's opaque paletted sprite pixels use. Eight
-    // attribute bytes at a time: OA_BITMAP (bit 3) and OA_STDPAL (bit 6) are
-    // shifted onto OA_OPAQUE's bit 7 so the three tests are one mask each, and
-    // neither shift can carry into the next byte.
+    // Which OBJ palettes the line's opaque paletted sprite pixels use, eight
+    // attribute bytes at a time.
     bool any_std = false, any_ext = false;
     {
       constexpr u64 OP = 0x8080808080808080ull, BM = 0x0808080808080808ull, SP = 0x4040404040404040ull;
@@ -1291,7 +1226,7 @@ void Engine2D::setup_tables() {
 void Engine2D::select_layers() {
   setup_tables();
   top16_.fill(LV_OPAQUE); top_tid_.fill(T_BACKDROP);
-  second16_.fill(0); second_tid_.fill(T_NONE);   // nothing beneath: colour 0, no layer id (never a blend target), as the reference
+  second16_.fill(0); second_tid_.fill(T_NONE);   // nothing beneath: never a blend target
   const bool objs = (layer_enable_ & 0x10) && num_sprites_;
   const bool no_windows = !(dispcnt_ & 0xE000);
   // Lowest priority first; within a priority BG3..BG0 then OBJ, later wins.
@@ -1317,8 +1252,7 @@ void Engine2D::select_layers() {
 // the three blending paths do: a blend effect, the 3D layer over something,
 // and semi-transparent or bitmap sprites. A fade (brighten/darken) over plain
 // layers never looks below the top pixel, so nothing under it need be
-// resolved -- DraStic's trick of hoisting the decision out of the pixel loop
-// and into which stage runs over the line.
+// resolved.
 bool Engine2D::needs_second() const {
   if (((bldcnt_ >> 6) & 3) == 1) return true;
   if (!num_ && (dispcnt_ & 8) && bg_[0].any && kern::active::line_has_translucent_3d(line3d_)) return true;

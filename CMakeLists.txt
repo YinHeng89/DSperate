@@ -13,19 +13,16 @@ endif()
 
 option(DSPERATE_JIT      "Build the recompiler (AArch64 and ARMv7 hosts)"          ON)
 option(DSPERATE_NEON     "Build NEON renderer kernels (AArch64 or ARMv7+NEON)"    ON)
-option(DSPERATE_A32_SUBSET "Force the ARMv7 NEON subset on an AArch64 host (a test)" OFF)
+option(DSPERATE_A32_SUBSET "Force the ARMv7 NEON subset on an AArch64 host" OFF)
 option(DSPERATE_TESTS    "Build unit tests"                                       ON)
 option(DSPERATE_HEADLESS "Build the headless frontend"                            ON)
 option(DSPERATE_SDL      "Build the SDL2 frontend (off when SDL2 is not found)"   ON)
 option(DSPERATE_WAYLAND  "Build the Wayland dmabuf scanout tier (off when SDL2 has no Wayland)" ON)
-option(DSPERATE_CHEEVOS  "Build RetroAchievements support (rcheevos)"                  ON)
-option(DSPERATE_NET      "Build the Wi-Fi transports (local wireless over the LAN; vendored ENet)" ON)
+option(DSPERATE_CHEEVOS  "Build RetroAchievements support"                  ON)
+option(DSPERATE_NET      "Build the Wi-Fi transports (local wireless over the LAN)" ON)
 
-# Host tiers.  These are two independent questions and the build keeps them
-# apart: the recompiler emits A64 and so needs an AArch64 host, while the
-# renderer kernels need only *a* NEON unit.  A 32-bit ARMv7 host therefore gets
-# vector kernels with the interpreter behind them, which used to be impossible
-# because a single aarch64 test gated both.
+# JIT and NEON kernels are gated separately: an ARMv7 host gets NEON kernels
+# with its own JIT backend, a non-ARM host gets neither.
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
   set(DSPERATE_HOST_AARCH64 ON)
   set(DSPERATE_HOST_ARM32 OFF)
@@ -42,10 +39,8 @@ if(NOT DSPERATE_HOST_AARCH64 AND NOT DSPERATE_HOST_ARM32 AND DSPERATE_JIT)
   set(DSPERATE_JIT OFF)
 endif()
 
-# On ARMv7 the kernels are built from the ARMv7-expressible NEON subset
-# (gpu/neon_compat.h).  ARMv7 NEON is not IEEE-clean for single precision in
-# its default mode, so ask for the VFPv4 unit and full float ABI rather than
-# leaving the compiler to pick a baseline that would quietly change results.
+# ARMv7 NEON isn't IEEE-clean by default; pin VFPv4 + hard-float so results
+# can't silently differ from AArch64.
 if(DSPERATE_HOST_ARM32 AND DSPERATE_NEON)
   include(CheckCXXSourceCompiles)
   set(CMAKE_REQUIRED_FLAGS "-mfpu=neon-vfpv4 -mfloat-abi=hard")
@@ -68,10 +63,8 @@ foreach(cfg RELEASE RELWITHDEBINFO)
   string(REPLACE "-O2" "-O3" CMAKE_CXX_FLAGS_${cfg} "${CMAKE_CXX_FLAGS_${cfg}}")
 endforeach()
 
-# Distro-style hardening. Ubuntu's GCC also injects _FORTIFY_SOURCE=3 at -O2+,
-# which turns short fixed-size memcpys in the pixel loops into __memcpy_chk
-# calls; OFF removes both. Measured on the RG DS 2026-09-07: etody median -17 %,
-# dbori p99 -6 %, nothing worse (docs/perf-audit-2026-09-07-flags-ab.txt).
+# OFF also cancels the distro-injected _FORTIFY_SOURCE, which turns small
+# fixed-size memcpys in the pixel loops into __memcpy_chk calls.
 option(DSPERATE_HARDEN "Build with -fstack-protector and _FORTIFY_SOURCE" OFF)
 if(DSPERATE_HARDEN)
   add_compile_options(-fstack-protector)
@@ -79,10 +72,8 @@ else()
   add_compile_options(-fno-stack-protector -D_FORTIFY_SOURCE=0)
 endif()
 
-# Target-core tuning, e.g. "-mtune=cortex-a55" (scheduling only, binary stays
-# ARMv8.0) or "-mcpu=cortex-a55" (also raises the ISA baseline to v8.2).
-# Applied at link too so the LTO code generation sees it. Measured flat on the
-# A55 (-mtune, -mcpu and -march alone all within noise); left empty on purpose.
+# e.g. "-mtune=cortex-a55" (scheduling only) or "-mcpu=cortex-a55" (also raises
+# the ISA baseline). Passed at link too so LTO codegen sees it.
 set(DSPERATE_TUNE "" CACHE STRING "Extra -mcpu/-mtune options for the target core")
 if(DSPERATE_TUNE)
   separate_arguments(_ds_tune NATIVE_COMMAND "${DSPERATE_TUNE}")
@@ -90,52 +81,27 @@ if(DSPERATE_TUNE)
   add_link_options(${_ds_tune})
 endif()
 
-# Profile-guided optimisation. "generate" instruments the build (atomic
-# counters: the renderer is threaded) and writes the .gcda profile straight
-# into DSPERATE_PGO_DIR -- by default pgo/<arch>/ in the source tree, which is
-# committed, so CI can build with "use" without the ROMs the training needs.
-# -fprofile-prefix-path makes the profile file names relative to the build
-# directory, so the training build and the "use" build need not share one.
-# A profile applies function by function: an edited function loses its
-# profile (a warning suppressed below) and the rest keep theirs, so the
-# committed profile decays gracefully; tools/pgo_refresh.sh regenerates it and
-# checks for the drift that would silently void it -- a different compiler
-# version (the .gcda format is version-checked) or different compile flags
-# (the per-function checksums cover them). Both are recorded in the profile's
-# MANIFEST and compared here in "use" mode.
-# Measured on the RG DS 2026-09-07 (headless, --quantum 0): Spirit Tracks
-# median -7 % / p99 -6 %, Golden Sun -8 % / -9 %, sm64 -9 %, dbori -11 %,
-# and half as many over-budget frames on both save-state scenes; bit-exact.
+# PGO: the profile is committed under pgo/ so "use" builds need no training
+# ROMs. It applies per function (edited functions just lose theirs), but is
+# tied to compiler version and flags, which MANIFEST's fingerprint records.
 set(DSPERATE_PGO "OFF" CACHE STRING "Profile-guided optimisation: OFF | generate | use")
 set_property(CACHE DSPERATE_PGO PROPERTY STRINGS OFF generate use)
-# Where the profile lives. Both the .gcda format and the fingerprint below are
-# tied to the compiler version, so the tree can carry more than one profile per
-# architecture: pgo/<arch>-gcc<version>/ is preferred when it exists and
-# pgo/<arch>/ is the fallback the canonical build uses. That is what lets a
-# downstream distro on another GCC still build with PGO instead of silently
-# dropping to an unprofiled build -- dArkOS packages DSperate with GCC 12.4
-# while CI builds with 13.3. An explicit -DDSPERATE_PGO_DIR still wins.
+# pgo/<arch>-gcc<version>/ wins over pgo/<arch>/ when present, so other GCC
+# versions can carry their own profile.
 set(_ds_pgo_default "${CMAKE_SOURCE_DIR}/pgo/${CMAKE_SYSTEM_PROCESSOR}")
 if(EXISTS "${_ds_pgo_default}-gcc${CMAKE_CXX_COMPILER_VERSION}/MANIFEST")
   set(_ds_pgo_default "${_ds_pgo_default}-gcc${CMAKE_CXX_COMPILER_VERSION}")
 endif()
 set(DSPERATE_PGO_DIR "${_ds_pgo_default}" CACHE PATH "Where the PGO profile (.gcda files and MANIFEST) lives")
 option(DSPERATE_PGO_STRICT "PGO use: warn about every function without a matching profile" OFF)
-# What the profile is valid for. The flags below are the ones that reach the
-# compiler for every object; anything added per target would have to join.
+# Flags every object sees; a flag added per target must be added here too.
 string(TOUPPER "${CMAKE_BUILD_TYPE}" _ds_build_type_uc)
 string(SHA1 _ds_pgo_fingerprint
   "${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION} ${CMAKE_SYSTEM_PROCESSOR} ${CMAKE_BUILD_TYPE} ${CMAKE_CXX_FLAGS} ${CMAKE_CXX_FLAGS_${_ds_build_type_uc}} harden=${DSPERATE_HARDEN} tune=${DSPERATE_TUNE} jit=${DSPERATE_JIT} neon=${DSPERATE_NEON} a32sub=${DSPERATE_A32_SUBSET}")
 set(DSPERATE_PGO_FINGERPRINT "${_ds_pgo_fingerprint}" CACHE INTERNAL "")
 file(WRITE "${CMAKE_BINARY_DIR}/pgo-fingerprint" "${_ds_pgo_fingerprint}\n")
-# A profile made under one checkout still applies under another (the CI
-# runner's /home/runner/work/...): GCC folds the source path into a
-# function's *location* checksum, and a location mismatch is a warning only
-# ("source locations ... have changed") -- the counts are still used. What
-# drops a function's profile is a *control flow* mismatch, the one the
-# refresh script and CI count. (-fprofile-prefix-map does not reach the
-# location checksum in GCC 13; measured: an other-path build performs the
-# same as the in-tree one.)
+# A different checkout path only trips GCC's location checksum (a warning);
+# the counts still apply. Only control-flow mismatches drop a profile.
 if(DSPERATE_PGO STREQUAL "generate")
   add_compile_options(-fprofile-generate=${DSPERATE_PGO_DIR} -fprofile-prefix-path=${CMAKE_BINARY_DIR} -fprofile-update=atomic)
   add_link_options(-fprofile-generate=${DSPERATE_PGO_DIR})
@@ -150,9 +116,9 @@ elseif(DSPERATE_PGO STREQUAL "use")
   endif()
   add_compile_options(-fprofile-use=${DSPERATE_PGO_DIR} -fprofile-prefix-path=${CMAKE_BINARY_DIR} -fprofile-correction)
   if(DSPERATE_PGO_STRICT)
-    add_compile_options(-Wno-error=coverage-mismatch)   # an error by default in GCC; here a warning to count
+    add_compile_options(-Wno-error=coverage-mismatch)
   else()
-    add_compile_options(-Wno-missing-profile -Wno-coverage-mismatch)   # an edited function loses its profile instead of failing the build
+    add_compile_options(-Wno-missing-profile -Wno-coverage-mismatch)
   endif()
 endif()
 
@@ -161,11 +127,9 @@ set(CMAKE_INTERPROCEDURAL_OPTIMIZATION ON)
 add_compile_options(-Wall -Wextra -Wno-unused-parameter)
 
 add_subdirectory(src/core)
-# RetroAchievements.
 if(DSPERATE_CHEEVOS)
   add_subdirectory(src/cheevos)
 endif()
-# Wi-Fi transports (docs/wifi-scoping.md).
 if(DSPERATE_NET)
   add_subdirectory(src/net)
 endif()
@@ -184,11 +148,8 @@ if(DSPERATE_SDL)
     endif()
   endif()
   if(SDL2_FOUND)
-    # The dmabuf tier reads SDL_SysWMinfo's wl member, which SDL_syswm.h only
-    # declares when SDL2 itself was built with its Wayland driver.  The
-    # handheld SDL2s are fbdev/KMSDRM builds with none, so the tier is dropped
-    # there at configure time rather than failing to compile.  libwayland is
-    # never linked either way (wl_dyn.h dlopens it).
+    # SDL_SysWMinfo.info.wl only exists in SDL2 builds with Wayland (handheld
+    # fbdev/KMSDRM builds lack it). libwayland is dlopened, never linked.
     if(DSPERATE_WAYLAND)
       include(CheckCXXSourceCompiles)
       set(CMAKE_REQUIRED_INCLUDES "${SDL2_INCLUDE_DIRS}")

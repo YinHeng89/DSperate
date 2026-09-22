@@ -19,33 +19,27 @@ namespace ds { void (*g_census_access)(bool, u32, bool) = nullptr; }
 
 namespace ds::interp {
 
-// DS_CENSUS=1: count the executed guest instruction stream by shape, to size
-// recompiler work against real denominators.
+// DS_CENSUS=1: count the executed guest instruction stream by shape.
 namespace census {
 
 struct Counts {
   u64 total = 0, arm = 0, thumb = 0;
   u64 cond = 0;                 // ARM, cond != AL
-  u64 cond_csel = 0;            // of those: data-processing, S=0, rd != 15 -> csel candidate
-  u64 cond_dp_s = 0;            // data-processing that also writes flags
-  u64 cond_mem = 0;             // conditional loads/stores and block transfers
-  u64 cond_branch = 0;          // conditional B/BL
+  u64 cond_csel = 0;            // csel candidate: dp, S=0, rd != 15
+  u64 cond_dp_s = 0;            // dp that also writes flags
+  u64 cond_mem = 0;
+  u64 cond_branch = 0;
   u64 cond_other = 0;
-  u64 access = 0;               // single data transfers executed (ARM + Thumb)
-  u64 block = 0, block_regs = 0; // block transfers and the registers they move
-  // Sizing the §A fix: how much of the per-access timing lookup could be
-  // hoisted. `same_page` is an access landing in the same 4 KB timing-table
-  // page as the previous one (the lookup could be reused); `pc_rel` is a
-  // literal-pool load, whose page IS known at translate time.
+  u64 access = 0;               // single data transfers (ARM + Thumb)
+  u64 block = 0, block_regs = 0;
+  // same_page: access in same 4 KB timing-table page as previous.
   u64 same_page = 0, pc_rel = 0, sp_rel = 0;
-  u64 charged = 0, charged_seq = 0;   // every access that runs the cost model
+  u64 charged = 0, charged_seq = 0;
   u32 last_page = 0xFFFFFFFFu;
   u64 mmio = 0;
-  std::map<u32, u64> mmio_hits;       // address -> executions
-  u64 indirect = 0;                   // the dispatcher's denominator
-  // Block transfers crossing a 2 KB page: the recompiler's fast path needs the
-  // whole transfer in one page, so these take a full interpreter fallback.
-  // A burst's first word arrives with seq=false, the rest with seq=true.
+  std::map<u32, u64> mmio_hits;
+  u64 indirect = 0;
+  // Block transfer crossing a 2 KB page forces interpreter fallback.
   u64 straddle = 0;
   u32 burst_page = 0xFFFFFFFFu;
   bool burst_counted = false;
@@ -53,7 +47,6 @@ struct Counts {
 inline Counts& at(bool a9) { static Counts c[2]; return c[a9 ? 0 : 1]; }
 inline bool on() { static const bool v = std::getenv("DS_CENSUS") != nullptr; return v; }
 
-// Called by the transfer handlers with the effective address of each access.
 inline void note_access(bool a9, u32 addr, bool seq) {
   Counts& c = at(a9);
   if ((addr >> 24) == 0x04) { ++c.mmio; ++c.mmio_hits[addr & ~3u]; }
@@ -95,7 +88,7 @@ inline void arm_instr(bool a9, u32 instr) {
     const bool sets_flags = (instr & (1u << 20)) != 0;
     const u32 rd = (instr >> 12) & 0xF;
     const u32 dpop = (instr >> 21) & 0xF;
-    const bool compare = dpop >= 0x8 && dpop <= 0xB;   // TST/TEQ/CMP/CMN: no rd
+    const bool compare = dpop >= 0x8 && dpop <= 0xB;   // TST/TEQ/CMP/CMN
     if (sets_flags || compare) ++c.cond_dp_s; else if (rd != 15) ++c.cond_csel; else ++c.cond_other;
     break;
   }
@@ -172,9 +165,8 @@ void run(CpuContext& cpu) {
   if (census::on() && !g_census_access) g_census_access = &census::note_access;
   const bool dsi = cpu.nds->dsi;
   {
-    // An IRQ taken here (before any instruction: a wake from halt, or one
-    // that landed off-slice) has its vector refill charged after the first
-    // instruction on a DSi, as melonDS's TriggerIRQ leaves it pending.
+    // DSi: an IRQ taken here (wake from halt, or off-slice) has its vector
+    // refill charged after the first instruction, not now.
     const s32 b0 = cpu.hot.cycle_budget;
     cpu.check_irq();
     if (dsi && cpu.hot.cycle_budget != b0) { cpu.defer_cost += b0 - cpu.hot.cycle_budget; cpu.hot.cycle_budget = b0; }
@@ -182,12 +174,8 @@ void run(CpuContext& cpu) {
   if (cpu.halted) { cpu.hot.cycle_budget = -1; return; }
   const bool a9 = cpu.which == Cpu::ARM9;
 
-  // DS_DEBUG_CYCLES=1: budget before every instruction (engine lockstep
-  // debugging). Read outside the loop: a function-local static is an acquire
-  // load and a guard test on every use.
+  // DS_DEBUG_CYCLES=1: log budget before every instruction.
   static const bool debug_cycles = std::getenv("DS_DEBUG_CYCLES") != nullptr;
-  // Each handler charges its own cycles (cpu_cycles.h) at the point melonDS
-  // does; the loop only computes the ARM9 prefetch cost and advances r15.
   while (cpu.hot.cycle_budget > 0) {
     const s32 b_before = cpu.hot.cycle_budget;
     cpu.data_cycles = 0;
@@ -210,11 +198,9 @@ void run(CpuContext& cpu) {
       exec_arm(cpu, instr);
       if (!cpu.jumped) cpu.hot.regs[15] += 4;
     }
-    if (cpu.defer_cost) { cpu.hot.cycle_budget -= cpu.defer_cost; cpu.defer_cost = 0; }   // see CpuContext::defer_cost
+    if (cpu.defer_cost) { cpu.hot.cycle_budget -= cpu.defer_cost; cpu.defer_cost = 0; }
     if (cpu.halted) {
-      // DSi: the halting instruction's cost stays pending until the wake
-      // (melonDS breaks out before adding its Cycles), charged after the
-      // first instruction that runs then.
+      // DSi: the halting instruction's cost stays pending until wake.
       if (dsi) { cpu.defer_cost += b_before - cpu.hot.cycle_budget; cpu.hot.cycle_budget = b_before; }
       cpu.budget_at_halt = cpu.hot.cycle_budget; cpu.hot.cycle_budget = -1; return;
     }

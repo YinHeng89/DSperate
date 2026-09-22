@@ -1,25 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // DSperate - Nintendo DS emulator. Copyright (C) 2026 DSperate contributors.
 //
-// The RetroAchievements session (docs/retroachievements-scoping.md, phase 3):
-// sign in, load a game's achievement set, evaluate it as the emulator runs,
-// and report unlocks. Casual mode only -- hardcore is switched off explicitly
-// at creation and there is no way to turn it on from here.
+// RetroAchievements session: sign in, load a game's achievement set, evaluate
+// it as the emulator runs, report unlocks. Casual mode only.
 //
-// How the threading works, because it is the part that can go wrong quietly:
-//
-//   * `rc_client` itself, the memory reads, and every rcheevos callback run on
-//     the thread that calls frame() -- the emulation thread. Nothing else
-//     touches them.
-//   * HTTP runs on one worker thread, which never touches rc_client or guest
-//     memory. It takes a Request, does the round trip (~270 ms to
-//     retroachievements.org from the RG DS), and posts the response back.
-//   * frame() drains those responses first, invoking the rcheevos callbacks on
-//     the emulation thread, and then calls rc_client_do_frame.
-//
-// That keeps everything rcheevos sees single-threaded and ordered against
-// frames, which is what the one-call-per-frame rule needs
-// (tests/cheevos_memory_test.cpp).
+// Threading: rc_client and rcheevos callbacks run only on the frame() caller
+// (the emulation thread). HTTP runs on one worker thread; frame() drains
+// finished responses before calling rc_client_do_frame.
 #pragma once
 
 #include <condition_variable>
@@ -38,23 +25,15 @@ namespace ds { class NDS; }
 
 namespace ds::cheevos {
 
-// Something the player should be told about. The frontend turns these into
-// toasts; phase 3 prints them.
+// Something the player should be told about (frontend renders as a toast).
 struct Message {
-  enum class Kind : u8 {
-    Unlock,      // an achievement was earned
-    Info,        // signed in, game loaded, reconnected
-    Problem,     // login failed, server error, no achievements for this ROM
-  };
+  enum class Kind : u8 { Unlock, Info, Problem, };
   Kind kind = Kind::Info;
-  std::string text;     // one line, already player-facing
-  std::string detail;   // may be empty
-  u32 points = 0;       // an unlock's value; 0 for everything else, and for
-                        // the 0-point achievements RetroAchievements has
+  std::string text;
+  std::string detail;
+  u32 points = 0;   // unlock value; 0 for non-unlocks and 0-point achievements
 };
 
-// Where the session currently is. The frontend needs this to decide what to
-// draw; it is also the honest answer to "why are there no achievements".
 enum class State : u8 {
   Off,          // not started, or no transport on this device
   SignedOut,
@@ -63,7 +42,7 @@ enum class State : u8 {
   LoadingGame,
   Playing,      // a set is loaded and being evaluated
   NoSet,        // signed in, but RetroAchievements does not know this dump
-  EmptySet,     // the dump is known, but the game has no published achievements yet
+  EmptySet,     // dump known, game has no published achievements yet
 };
 
 class Client {
@@ -73,90 +52,50 @@ public:
   Client(const Client&) = delete;
   Client& operator=(const Client&) = delete;
 
-  // Opens the transport and creates the session. False with a reason in `err`
-  // when there is no usable libcurl, which is an ordinary outcome on some
-  // devices: the caller should report it once and carry on without
-  // achievements, never treat it as fatal.
+  // False with a reason in `err` when there is no usable libcurl; not fatal.
   bool start(std::string& err);
   void shutdown();
 
   State state() const { return state_; }
 
-  // Encore mode: achievements the player has already earned are activated
-  // again, so replaying a game shows them unlocking as it goes. The server
-  // does not credit an unlock twice -- nothing is re-awarded -- so this changes
-  // what DSperate shows, not what the account holds.
-  //
-  // rcheevos evaluates it when a game loads and ignores it while one is
-  // loaded (rc_client.h:77), so set it before load_game(). Kept here as well
-  // as in rc_client so it survives being set before start().
+  // Applies at next load_game(); call before it. rcheevos only reads it at load.
   void set_encore(bool on);
-  // Asks rcheevos rather than reporting our own flag back: the two could
-  // disagree (encore is only evaluated at game load), and the library's answer
-  // is the one that decides what happens.
   bool encore() const;
   const char* transport_name() const;
-  // The player-facing reason the session is not usable, when state() is Off.
   const std::string& unavailable_reason() const { return unavailable_; }
 
-  // Sign-in. Both are asynchronous; watch state() and take_messages(). A
-  // password login yields a token, which is what gets persisted -- the password
-  // is never stored and is cleared from memory as soon as it is sent.
+  // Asynchronous; watch state() and take_messages().
   void sign_in(const std::string& username, const std::string& password);
   void sign_in_with_token(const std::string& username, const std::string& token);
   void sign_out();
   std::string username() const;
-  // The token to persist after a successful sign-in, or empty. See
-  // save_credentials().
   std::string token() const;
 
-  // Binds the session to a running console and a ROM identity. `hash` comes
-  // from rom_hash() (cheevos_hash.h). Asynchronous.
+  // Asynchronous.
   void load_game(NDS& nds, const std::string& hash);
   void unload_game();
   std::string game_title() const;
   u32 game_id() const;
-  // The hash load_game() was given, which is what identifies the dump.
   const std::string& game_hash() const { return hash_; }
 
-  // Once per emulated frame, from the emulation thread, immediately after
-  // NDS::run_frame(). Exactly once -- see the header comment and the test.
+  // Call once per emulated frame, right after NDS::run_frame().
   void frame();
-  // Instead of frame() while emulation is paused, at least once a second, so
-  // the session stays alive without evaluating frozen memory.
+  // Call instead of frame() while paused, at least once a second.
   void idle();
 
-  // Save states, which Casual mode allows -- so achievement progress has to
-  // travel with them. Without this, loading a state leaves the runtime
-  // describing a world that no longer exists: hit counts part-way to an
-  // achievement the player has just rewound past, triggers primed by events
-  // that have been undone.
-  //
-  // serialize() gives false when there is nothing to carry (no set loaded).
-  // deserialize() returns false if the blob does not apply -- a different
-  // game, or a set that has changed since -- and the caller must reset()
-  // instead; that is the safe direction, since a mismatched restore is how a
-  // false unlock happens.
+  // deserialize_progress() returns false on a mismatched blob; caller must
+  // reset() rather than apply it, to avoid a false unlock.
   bool serialize_progress(std::vector<u8>& out) const;
   bool deserialize_progress(const u8* data, size_t size);
-  // Puts the runtime back to how it starts, for a state that carries no
-  // progress at all (one saved before this existed, or by the headless build).
   void reset();
 
   std::vector<Message> take_messages();
 
-  // The loaded set, as the player would see it listed. This is what phase 4's
-  // achievement page is built on, and it is also how you confirm the server
-  // actually recorded an unlock: load the game again and the achievement comes
-  // back `unlocked`, because that state came from RetroAchievements rather than
-  // from this session.
   struct Achievement {
     std::string title, description, progress;
     u32 id = 0, points = 0;
-    bool unlocked = false;      // the *account* holds it -- what the list shows
-    bool active = false;        // armed, i.e. it can trigger now. Normally the
-                                // opposite of unlocked; in encore mode an
-                                // already-earned achievement is both.
+    bool unlocked = false;      // the account holds it
+    bool active = false;        // armed, can trigger now (both true in encore)
     bool unsupported = false;   // a condition reads memory we do not back
   };
   struct Summary {
@@ -166,9 +105,7 @@ public:
   std::vector<Achievement> achievements() const;
   Summary summary() const;
 
-  // Called by rcheevos' completion callbacks, which run on the emulation
-  // thread inside frame(). Public only because those callbacks are free
-  // functions in the implementation; not for the frontend.
+  // Called by rcheevos completion callbacks; public for that reason only.
   void on_signed_in(const std::string& display_name);
   void on_sign_in_failed(const std::string& why);
   void on_game_loaded(const std::string& title, u32 id);
@@ -176,10 +113,7 @@ public:
   void on_empty_set(const std::string& title, u32 id);
   void on_game_failed(const std::string& why);
 
-  // The bodies behind the callbacks rcheevos is given. Typed trampolines with
-  // rcheevos' own signatures live in the implementation and forward here, so
-  // no function pointer is ever cast. Public for the same reason as the on_*
-  // methods above; not for the frontend.
+  // Called by the .cpp's free-function trampolines; public for that reason only.
   void enqueue(Request req, void* callback, void* callback_data);
   void handle_event(const void* event);
   u32 read(u32 address, u8* buffer, u32 num_bytes);
@@ -189,7 +123,6 @@ private:
   void post(Message::Kind kind, std::string text, std::string detail = {}, u32 points = 0);
   void drain_completions();
 
-  // One HTTP round trip, and the rcheevos callback waiting on it.
   struct Job {
     Request req;
     void* callback = nullptr;        // rc_client_server_callback_t
@@ -218,52 +151,26 @@ private:
   bool stop_ = false;
 };
 
-// The token sidecar. Beside the config rather than in dsperate.ini, following
-// the firmware .ovr precedent, and mode 0600 because it is a credential: the
-// token is enough to act as the player on RetroAchievements.
-//
-// The password is never stored. A stale token must fall back to a password
-// sign-in, or a player whose token expires is locked out of their own account
-// with no way back from inside the emulator -- drastic-nano's lesson.
+// Credential file is mode 0600: the token alone is enough to act as the
+// player. Password is never stored.
 struct Credentials {
   std::string username;
   std::string token;
   bool empty() const { return username.empty() || token.empty(); }
 };
-// `dir` is the config directory (Config::dir()). Both return false with a
-// reason in `err`; a missing file is not an error, it is empty credentials.
+// `dir` is the config directory. A missing file yields empty credentials, not an error.
 bool load_credentials(const std::string& dir, Credentials& out, std::string& err);
 bool save_credentials(const std::string& dir, const Credentials& in, std::string& err);
 void clear_credentials(const std::string& dir);
 
-// Credentials the CFW already holds, because the player signed in through its
-// own front end. On ROCKNIX, EmulationStation's sign-in lands in
-// /storage/.config/system/configs/system.cfg as
-// global.retroachievements.username / .token, and RetroArch keeps the same
-// thing as cheevos_username / cheevos_token. Importing it means a player who
-// has already signed in on the device does not have to type a password again on
-// a machine with no keyboard.
-//
-// Only the **token** is ever read. Those files also hold the password in clear
-// text, and we do not want it: the token is all rc_client needs, it can be
-// revoked on its own, and copying somebody's password into a second program is
-// strictly worse than not. Nothing here writes to the CFW's file either -- it
-// is not ours.
-//
-// read_cfw_credentials parses one file, accepting both shapes (`key=value` and
-// `key = "value"`). import_cfw_credentials walks the known locations and
-// reports which one it used in `source`. Both return false when there is
-// nothing usable, which is the ordinary case and not an error.
-// A token file written by something else, named on the command line
-// (--cheevos-token). The format is PPSSPP's, which is what the CFW front ends
-// that log in for you produce: the file holds the token and nothing else, so
-// the username has to come from the config (cheevos.username). Our own
-// two-line "username\ntoken" file is accepted here too, and then it carries
-// its own username.
-//
-// `out.username` is left empty for the bare-token shape; the caller fills it
-// in. Returns false with a reason in `err` when the file cannot be read or
-// holds no token.
+// Credentials the CFW already holds from its own sign-in (ROCKNIX
+// system.cfg, RetroArch retroarch.cfg). Only the token is read; the
+// cleartext password in these files is never touched. Never writes.
+// read_cfw_credentials parses one file; import_cfw_credentials walks the
+// known locations, reporting which one it used in `source`.
+
+// Token file named via --cheevos-token: PPSSPP's token-only format, or our
+// own "username\ntoken" format.
 bool read_token_file(const std::string& path, Credentials& out, std::string& err);
 
 bool read_cfw_credentials(const std::string& path, Credentials& out);

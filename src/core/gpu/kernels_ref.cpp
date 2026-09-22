@@ -413,18 +413,11 @@ void scale_row_grid(const u32* src, const u16* xrun, u32 f, u32 min_run, u32 pit
 }
 
 
-// ---- 3D span stages ------------------------------------------------------------
-// These are Renderer3D::Interp<0> (render3d.cpp) applied to every pixel of a
-// span; the scalar forms here are the specification.
+// ---- 3D span stages ----
 
 void span_factor(s32 xv0, u32 n, s32 xdiff, s32 w0n, s32 w0d, s32 w1d, u32* fac) {
   if (w0d == w1d) {
-    // W constant across the span: the denominator collapses to xdiff*w0d and
-    // the factor is linear in x, so it is generated as a 16.16 ramp with no
-    // division -- DraStic's setup_perspective_steps_w_constant. The rounded
-    // step makes this an approximation of num/den, deliberately; the
-    // reference carries it too so that the portable build and the NEON build
-    // stay identical (frame dumps are compared across hosts).
+    // W constant: factor is linear in x, generated as a 16.16 ramp (approximation of num/den).
     const u32 d = static_cast<u32>(xdiff) * static_cast<u32>(w0d);
     if (d == 0) { for (u32 i = 0; i < n; ++i) fac[i] = 0; return; }
     const u32 step = static_cast<u32>((static_cast<u64>(static_cast<u32>(w0n) << 8) << 16) / d);
@@ -470,7 +463,7 @@ void span_attrs5n(const s32* y0, const s32* y1, const u32* fac, u32 n, u8* vr, u
   }
 }
 
-// One linear attribute at one pixel, exactly as span_attr_linear computes it.
+// One linear attribute at one pixel (as span_attr_linear).
 static inline s32 lin_at(s32 y0, s32 y1, s32 xv, s32 xdiff) {
   if (y0 == y1) return y0;
   if (y0 < y1) return y0 + static_cast<s32>(static_cast<s64>(y1 - y0) * xv / xdiff);

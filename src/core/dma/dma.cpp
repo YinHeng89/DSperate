@@ -16,8 +16,6 @@ namespace ds::dma {
 namespace {
 
 // Main-RAM burst patterns (unit costs in system cycles; 0 ends the pattern).
-// Generated from the run-length description of the hardware behaviour as
-// measured by the melonDS project (GPLv3).
 // `len` is the pattern's period and `prefix` its running sum, so the cost of
 // a run of units can be closed-form instead of walked one at a time.
 struct Burst { u8 data[256]; u32 len; u32 prefix[257]; };
@@ -38,9 +36,7 @@ const Burst WRITE32_N2   = make({{9,1},{4,59}});
 const Burst WRITE32      = make({{9,1},{3,79}});
 
 // Shorter runs than this are left to the per-unit loop: the closed-form set-up
-// costs more than it saves on them, and scenes whose DMA is mostly short runs
-// (sm64) measured ~0.4 % worse without the floor while Golden Sun, whose
-// per-scanline stream runs 128 units, is unaffected by it.
+// costs more than it saves on them.
 constexpr u32 kBulkMin = 16;
 
 const Burst* burst_meta(const u8* t) {
@@ -70,11 +66,7 @@ void Dma::write_cnt(Cpu cpu, int n, u32 v) {
   Channel& c = channel(cpu, n);
   const u32 old = c.cnt;
   c.cnt = v;
-  if ((old & 0x80000000) || !(v & 0x80000000)) {
-    // This path can clear the enable bit without the channel ever starting.
-    update_cart_armed();
-    return;
-  }
+  if ((old & 0x80000000) || !(v & 0x80000000)) { update_cart_armed(); return; }
   c.cur_src = c.src; c.cur_dst = c.dst;
   c.tim_key_src = c.tim_key_dst = ~0u;   // width may have changed: refill the timing cache
   switch (v & 0x00600000) { case 0x00000000: c.dst_inc = 1; break; case 0x00200000: c.dst_inc = -1; break; case 0x00400000: c.dst_inc = 0; break; default: c.dst_inc = 1; break; }
@@ -102,19 +94,16 @@ void Dma::start(Channel& c) {
     prof::add(c.cpu == Cpu::ARM9 && c.start_mode <= MODE9_GXFIFO
                 ? static_cast<prof::Counter>(prof::C_DMA_M_IMM + c.start_mode) : prof::C_DMA_M_ARM7, 1);
   }
-  // A GXFIFO DMA once ran in 112-word chunks so the FIFO level could be
-  // re-observed between them. There is no level any more, so the whole
-  // transfer goes at once.
   c.iter_count = c.rem_count;
   if ((c.cnt & 0x01800000) == 0x01800000) c.cur_src = c.src;
   if ((c.cnt & 0x00600000) == 0x00600000) c.cur_dst = c.dst;
   set_running(c, 2);
   c.in_progress = true;
   c.burst_table = MRAM_DUMMY.data; c.burst_pos = 0;
-  if (!nds_.sched.in_dma()) nds_.sched.preempt(nds_.cpu(c.cpu));   // an immediate start stalls the CPU that issued it (a re-trigger from inside run() is already in the DMA's share)
+  if (!nds_.sched.in_dma()) nds_.sched.preempt(nds_.cpu(c.cpu));   // immediate start stalls the issuing CPU
 }
 
-// melonDS DSi.cpp NDMAModes: the NDMA start-mode number for an old-DMA mode.
+// The NDMA start-mode number for an old-DMA mode.
 u32 Dma::ndma_mode(u32 mode) {
   static const u8 modes9[8] = {0x10, 0x06, 0x07, 0x08, 0x09, 0x04, 0xFF, 0x0A};
   static const u8 modes7[4] = {0x30, 0x26, 0x24, 0xFF};
@@ -185,12 +174,9 @@ u32 Dma::unit_cycles(Channel& c, bool burst_start, bool word) {
   return burst_start ? src_n + dst_n : src_s + dst_s;
 }
 
-// Per-word cost inside a direct-mapped run. A run never leaves its 2 KB page,
-// so it never crosses a 16 KB timing block: the region pair and the n/s costs
-// unit_cycles() looked up for the run's first word hold for the rest of it.
-// What can still vary per word is the main-RAM burst table, which is walked
-// here exactly as unit_cycles() walks it (the table is re-selected to the
-// same table when it wraps). Everything else is one constant per run.
+// Per-word cost inside a direct-mapped run. A run never crosses a 16 KB
+// timing block, so the region pair and n/s costs hold for the whole run;
+// only the main-RAM burst table position varies per word.
 struct Dma::RunCost {
   const u8* table; u32 constant; const Burst* meta;
   [[gnu::always_inline]] u32 next(Channel& c) {
@@ -201,10 +187,8 @@ struct Dma::RunCost {
     return v;
   }
   bool closed_form() const { return !table || (meta && meta->len); }
-  // The cost of the next `n` units, and the burst position they leave behind:
-  // the same cyclic walk next() performs, summed by prefix instead of stepped.
-  // next() consumes table[pos], table[pos+1], ... and restarts at 0 on the
-  // terminator, leaving pos one past the last entry it took.
+  // Cost of the next `n` units and the resulting burst position: next()'s
+  // cyclic walk, summed by prefix instead of stepped.
   u32 bulk(u32 pos, u32 n, u32& end_pos) const {
     if (!table) { end_pos = pos; return constant * n; }
     const u32 P = meta->len, S = meta->prefix[P];
@@ -222,15 +206,12 @@ Dma::RunCost Dma::run_cost(Channel& c, bool word) {
   const bool burst = (c.src_rgn == MAIN && c.dst_rgn != MAIN && c.src_inc > 0) ||
                      (c.dst_rgn == MAIN && c.src_rgn != MAIN && c.dst_inc > 0);
   if (burst) return RunCost{c.burst_table, 0, burst_meta(c.burst_table)};
-  // Not a burst: unit_cycles(c, false, word) is a pure function of the cached
-  // regions/costs for src_inc == dst_inc == 1 (the runs' only shape).
+  // Not a burst: unit_cycles(c, false, word) is a pure function of cached costs here.
   return RunCost{nullptr, unit_cycles(c, false, word), nullptr};
 }
 
 
-// Destination zone of a DMA run, for the census. VRAM is split the way the
-// hardware maps it, because which surface a run feeds is what decides whether
-// the lazy-2D trap has to fire for it.
+// Destination zone of a DMA run, for the census.
 static prof::Counter dma_zone(u32 addr, bool trap) {
   const u32 top = addr >> 24;
   if (top == 0x06) {
@@ -270,9 +251,8 @@ u32 Dma::run_channel_impl(Channel& c, u32 budget) {
   set_running(c, 1);
   u32 used = 0;
   mem::Bus& bus = nds_.bus;
-  // Once a run attempt fails on a destination page (palette, OAM, I/O, a
-  // code-tagged or trapped page), the per-unit path is taken for the rest of
-  // that page without re-walking the page table for every unit.
+  // A failed run attempt on a destination page falls to the per-unit path
+  // for the rest of that page, without re-walking the page table each unit.
   u32 no_run_below = 0;
   u32 loops = 0;                                // C_DMA_LOOP, added once after the loop
   while (c.iter_count > 0 && used < budget) {
@@ -282,29 +262,16 @@ u32 Dma::run_channel_impl(Channel& c, u32 budget) {
     used += cost;
     burst_start = false;
     if (track_progress_) nds_.sched.dma_progress(run_base_ + used);
-    // GXFIFO feed (fixed destination 0x04000400): the word goes straight to
-    // the geometry engine. Through the bus it would be dma_write32 ->
-    // Bus::io_write -> Io::write -> Gpu3D::write -> gxfifo_write, ~150
-    // instructions of dispatch per word, for ~22k words a frame on Dragon
-    // Ball Origins.
+    // GXFIFO feed (fixed destination 0x04000400): straight to the geometry
+    // engine, skipping the bus dispatch path.
     if (word && a9 && c.cur_dst == 0x04000400 && c.dst_inc == 0) {
-      // Run of words from one direct-mapped source page: skip the per-word
-      // page-table walk and loop tests. Exactly what the generic loop below
-      // would do per word (cost, stall check, feed, counters), unrolled over
-      // the page; the FIFO-full stall and the budget still end it per word.
+      // Run of words from one direct-mapped source page, unrolled over the page.
       if (c.src_inc == 1) {
         const u8* p = nds_.cpu(Cpu::ARM9).page_table.read_ptr(c.cur_src);
         if (p) {
           u32 room = (mem::PAGE_SIZE - (c.cur_src & (mem::PAGE_SIZE - 1))) >> 2;
           RunCost rc = run_cost(c, true);
-          // The whole run in one call. gxfifo_dma_burst() is n x the per-word
-          // feed with the FIFO cursors held in registers; it is only that while
-          // no entry can stall, so the run is cut to the words that provably
-          // cannot fill the FIFO (a word carries at most four commands), and
-          // to what the budget covers -- the same closed-form test the
-          // page-to-page run makes, since the per-word loop stops on the unit
-          // that reaches the budget. stalled() is loop-invariant: only a feed
-          // can set it, and a run this short cannot.
+          // Cut to the words that provably cannot fill the FIFO and to the budget.
           if (const u32 cap = nds_.gpu3d.fifo_burst_room(),
                         lim = room < c.iter_count ? room : c.iter_count,
                         n0 = lim < cap ? lim : cap;
@@ -345,19 +312,15 @@ u32 Dma::run_channel_impl(Channel& c, u32 budget) {
       nds_.gpu3d.gxfifo_dma_write(bus.dma_read32(c.cpu, c.cur_src));
     }
     else if (word) {
-      // Run of words between two direct-mapped pages (main RAM, WRAM, VRAM
-      // without a write trap): one page-table walk per end per run instead
-      // of two per word. Same per-word cost, stall check and budget as the
-      // generic path; a code-tagged or trapped destination stays per word.
+      // Run of words between two direct-mapped pages: one page-table walk per
+      // end per run instead of two per word; a code-tagged or trapped
+      // destination stays per word.
       if (c.src_inc == 1 && c.dst_inc == 1 && c.cur_dst >= no_run_below) {
         const u8* ps = nds_.cpu(c.cpu).page_table.read_ptr(c.cur_src);
         bool code = false;
         u8* pd = ps ? nds_.cpu(c.cpu).page_table.write_ptr(c.cur_dst, &code) : nullptr;
-        // A destination page under the lazy-2D write trap: take the trap once
-        // for the run rather than once per word through the bus. The render
-        // catches up before any byte changes, and opens a window in which the
-        // page is plain memory again -- so the run copies at full speed. (A
-        // page still trapped afterwards falls to the per-word path below.)
+        // Lazy-2D write trap: take it once for the run rather than per word.
+        // A page still trapped afterwards falls to the per-word path.
         if (ps && !pd && a9 && (c.cur_dst >> 24) == 0x06) {
           prof::add(prof::C_DMA_VRAM_TRAP, 1); if (prof::enabled) prof::add(dma_zone(c.cur_dst, true), 1);
           nds_.gpu.vram_store_trap(Cpu::ARM9, c.cur_dst);
@@ -370,22 +333,13 @@ u32 Dma::run_channel_impl(Channel& c, u32 budget) {
           RunCost rc = run_cost(c, true);
           prof::add(prof::C_DMA_RUN_SEGS, 1);
           const u32 zdst = c.cur_dst; const u32 z0 = c.iter_count;
-          // The whole run in one copy. The per-unit loop below stops on the unit
-          // whose cost reaches the budget, so this is the same transfer only
-          // while the budget cannot cut the run short; the unit costs are a
-          // cyclic pattern, so both the total and that test are closed-form.
+          // Whole run in one copy while the budget can't cut it short; unit
+          // costs are cyclic so the cut test is closed-form (binary search).
           if (const u32 n = room < c.iter_count ? room : c.iter_count;
               n >= kBulkMin && rc.closed_form()) {
-            // The most units the budget can take: the loop breaks on the one
-            // that reaches it, so every unit up to the last with used < budget
-            // is copied for certain. Costs rise monotonically, so binary search
-            // it -- and the doubling is the one the per-unit path applies, the
-            // tables being in ARM7 system cycles. Anything left over goes round
-            // the outer loop, which charges it through the same table walk.
             const u32 dbl = a9 ? shift9_ : 0;
             u32 lo, tmp;
-            // The budget usually covers the run: test that before searching,
-            // so the common case costs one bulk() rather than log2(n) of them.
+            // Test full-budget first so the common case costs one bulk() call.
             if (used + (rc.bulk(c.burst_pos, n - 1, tmp) << dbl) < budget) {
               lo = n;
             } else {
@@ -425,11 +379,7 @@ u32 Dma::run_channel_impl(Channel& c, u32 budget) {
       bus.dma_write32(c.cpu, c.cur_dst, bus.dma_read32(c.cpu, c.cur_src));
     }
     else {
-      // Halfword run between two direct-mapped pages, the shape of most VRAM
-      // uploads (Golden Sun streams tiles by 16-bit DMA through the display
-      // period): same per-unit cost, stall check and budget as the generic
-      // path, one page-table walk per end per run, and the lazy-2D write trap
-      // taken once for the run rather than per halfword through the bus.
+      // Halfword run between two direct-mapped pages: same pattern as the word run above.
       if (c.src_inc == 1 && c.dst_inc == 1 && c.cur_dst >= no_run_below) {
         const u8* ps = nds_.cpu(c.cpu).page_table.read_ptr(c.cur_src);
         bool code = false;
@@ -446,22 +396,11 @@ u32 Dma::run_channel_impl(Channel& c, u32 budget) {
           RunCost rc = run_cost(c, false);
           prof::add(prof::C_DMA_RUN_SEGS, 1);
           const u32 zdst = c.cur_dst; const u32 z0 = c.iter_count;
-          // The whole run in one copy. The per-unit loop below stops on the unit
-          // whose cost reaches the budget, so this is the same transfer only
-          // while the budget cannot cut the run short; the unit costs are a
-          // cyclic pattern, so both the total and that test are closed-form.
+          // Same closed-form bulk copy as the word-run path above.
           if (const u32 n = room < c.iter_count ? room : c.iter_count;
               n >= kBulkMin && rc.closed_form()) {
-            // The most units the budget can take: the loop breaks on the one
-            // that reaches it, so every unit up to the last with used < budget
-            // is copied for certain. Costs rise monotonically, so binary search
-            // it -- and the doubling is the one the per-unit path applies, the
-            // tables being in ARM7 system cycles. Anything left over goes round
-            // the outer loop, which charges it through the same table walk.
-            const u32 dbl = a9 ? shift9_ : 0;   // as the word path: 2 on a DSi at 134 MHz, not the DS's 1
+            const u32 dbl = a9 ? shift9_ : 0;   // 2 on a DSi at 134 MHz, not the DS's 1
             u32 lo, tmp;
-            // The budget usually covers the run: test that before searching,
-            // so the common case costs one bulk() rather than log2(n) of them.
             if (used + (rc.bulk(c.burst_pos, n - 1, tmp) << dbl) < budget) {
               lo = n;
             } else {
@@ -509,10 +448,8 @@ u32 Dma::run_channel_impl(Channel& c, u32 budget) {
   if (c.rem_count) {
     if (c.iter_count == 0) {
       set_running(c, 0);   // wait for the next trigger
-      // GXFIFO mode is level-triggered: a burst that leaves the FIFO still
-      // below half full (it was near empty) is followed by the next one at
-      // once. Waiting for the engine to drain first can deadlock when the
-      // words so far are an incomplete command (Spirit Tracks' intro).
+      // GXFIFO is level-triggered: re-check immediately rather than waiting
+      // for the engine to drain, which can deadlock on an incomplete command.
       if (c.start_mode == MODE9_GXFIFO) nds_.gpu3d.check_fifo_dma();
     }
     return used;
@@ -533,9 +470,8 @@ u32 Dma::run(Cpu cpu, u32 budget) {
       if (c.running) { run_base_ = used; used += run_channel(c, budget - used); }
     }
     if (nds_.dsi && used < budget && (running_mask_[cpu == Cpu::ARM9 ? 0 : 1] & 0x10)) { nds_.ndma.run_base_ = used; used += nds_.ndma.run(cpu, budget - used); }
-    // A bulk cart transfer re-triggers its channel from inside run_channel
-    // (the next word is there as soon as the last was read): keep going in
-    // this share instead of ending the slice per word.
+    // A bulk cart transfer re-triggers its channel from inside run_channel;
+    // keep going in this share instead of ending the slice per word.
   } while (used < budget && cart_running(cpu));
   return used;
 }

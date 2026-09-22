@@ -29,17 +29,16 @@ std::string stem_of(const std::string& path) {
   return dot == std::string::npos || dot == 0 ? base : base.substr(0, dot);
 }
 
-// The archive's canonical path, for the tag: the sweep needs to find the
-// archive an image came from, and the fallback directory holds images from
-// anywhere.
+// Canonical path for the tag: the sweep must find the archive an image came
+// from, and the fallback directory holds images from anywhere.
 std::string canonical(const std::string& path) {
   char buf[PATH_MAX];
   if (const char* r = realpath(path.c_str(), buf)) return r;
   return path;
 }
 
-// The tag is what the cached image was built from; a match means the file
-// beside it is still that entry's bytes.
+// What the cached image was built from; a match means the file beside it is
+// still that entry's bytes.
 std::string make_tag(const std::string& archive, const struct stat& zip_st, const ZipEntry& e) {
   std::ostringstream o;
   o << "dsperate zip cache 2\n"
@@ -82,8 +81,7 @@ bool file_size(const std::string& path, u64& size) {
   return true;
 }
 
-// Picks the directory the image goes in: beside the archive if that can be
-// written, else the override. `path` comes back as the image path.
+// Beside the archive if writable, else the override. `path` comes back as the image path.
 bool choose_cache(const std::string& zip_path, const std::string& fallback, std::string& path, std::string& err) {
   for (const std::string& dir : {dir_of(zip_path) + "/.dsperate", fallback}) {
     if (dir.empty()) continue;
@@ -107,8 +105,8 @@ u64 remove_entry(const CacheEntry& e) {
   return e.bytes;
 }
 
-// Evicts least-recently-launched images until `incoming` more bytes fit
-// under `max_bytes`. `keep` is never evicted.
+// Evicts least-recently-launched images until `incoming` bytes fit under
+// `max_bytes`. `keep` is never evicted.
 void enforce_cap(const std::string& dir, u64 max_bytes, u64 incoming, const std::string& keep) {
   if (!max_bytes) return;
   std::vector<CacheEntry> all = list_cache(dir);
@@ -151,8 +149,7 @@ std::vector<CacheEntry> list_cache(const std::string& dir) {
 u64 sweep_cache(const std::string& dir) {
   u64 freed = 0;
   for (const CacheEntry& e : list_cache(dir)) {
-    // No tag: an extraction that never finished tagging, or a tag from a
-    // version that did not record the archive. Either way not vouched for.
+    // No tag, or no archive recorded in it: not vouched for.
     if (e.tag.empty() || e.archive.empty() || !exists(e.archive)) freed += remove_entry(e);
   }
   if (DIR* d = opendir(dir.c_str())) {
@@ -188,24 +185,18 @@ std::unique_ptr<RomSource> open_zip(const std::string& path, ZipOpen& how, std::
   err.clear();
   how.chosen.clear(); how.cache_path.clear(); how.extracted = false;
 
-  // The archive itself is mapped, not read: the central directory is at the
-  // end and the payload wherever it is, and the pages come and go with use.
   std::unique_ptr<RomSource> archive = RomSource::map_file(path, err);
   if (!archive) return nullptr;
-  // RomSource pads to a page, but the archive parser wants the exact bytes;
-  // it only ever reads inside `size`, so the first page pointer is enough.
+  // RomSource pads to a page; the parser only reads inside `size`.
   const u8* zip = archive->page(0);
   const size_t size = archive->size();
   ZipEntry e;
   if (!find_rom(zip, size, e, err)) return nullptr;
-  // The cart maps what comes out of here, so a container is no use: a CIA
-  // has to be unwrapped to its SRL first (io/dsi_title_install.h), which the
-  // DSi path does before the cart is ever asked for one.
+  // A CIA must be unwrapped to its SRL first (io/dsi_title_install.h).
   if (e.cia) { err = cia_refusal(e.name); return nullptr; }
   how.chosen = e.name;
 
   if (e.stored()) {
-    // Mapped where it lies. `archive` goes away; the new mapping is its own.
     return RomSource::map_file(path, e.data_off, e.usize, err);
   }
 
@@ -217,12 +208,12 @@ std::unique_ptr<RomSource> open_zip(const std::string& path, ZipOpen& how, std::
   if (!choose_cache(path, how.fallback_dir, image, err)) return nullptr;
   const std::string tag_path = image + ".tag", part = image + ".part";
   how.cache_path = image;
-  sweep_cache(dir_of(image));   // orphans and whatever a previous run left
+  sweep_cache(dir_of(image));
 
   std::string have; u64 have_size = 0;
   const bool fresh = read_file(tag_path, have) && have == tag && file_size(image, have_size) && have_size == e.usize;
   if (!fresh) {
-    std::remove(tag_path.c_str());   // the image is stale until the tag says otherwise
+    std::remove(tag_path.c_str());
     std::remove(image.c_str());
     enforce_cap(dir_of(image), how.max_bytes, e.usize, image);
     FILE* f = std::fopen(part.c_str(), "wb");
@@ -241,7 +232,7 @@ std::unique_ptr<RomSource> open_zip(const std::string& path, ZipOpen& how, std::
     if (!write_file(tag_path, tag)) { err = "cannot write " + tag_path; return nullptr; }
     how.extracted = true;
   }
-  utime(tag_path.c_str(), nullptr);   // the launch stamp the size cap evicts by
+  utime(tag_path.c_str(), nullptr);   // launch stamp for LRU eviction
   archive.reset();
   return RomSource::map_file(image, err);
 }

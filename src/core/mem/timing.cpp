@@ -21,7 +21,7 @@ Timing::Timing()
 }
 
 void Timing::reset() {
-  cost7_ready_ = false;   // the set_region7 calls below rebuild once, at the end
+  cost7_ready_ = false;   // set_region7 calls below rebuild once, at the end
   std::memset(pu_map.get(), 0, 0x100000);
   pu_memo = PuMemo{};
   retime_clear();
@@ -44,8 +44,7 @@ void Timing::reset() {
   set_region7(0x04808000, 0x04810000, REGION_WIFI1, 32, 1, 1);
   set_region7(0x06000000, 0x07000000, REGION_VRAM, 16, 1, 1);
   // CPU table: no PU yet -> nothing cached. One slot per 16 KB bus entry,
-  // stored four times as a word: this runs over a million pages at every
-  // reset, and byte stores made it a visible share of boot.
+  // stored as a word (byte stores here were a visible share of boot time).
   for (u32 g = 0; g < 0x40000; ++g) {
     const u8* b = &bus9_[g * 8];
     u8 slot[8];
@@ -61,9 +60,9 @@ void Timing::reset() {
   ++cpu9_version;
 }
 
-// Mirrors refill_cycles()/fetch_cost9() in cpu_cycles.h: a branch fetch on a
-// cacheable page (0xFF) is a line fill (3), a sequential fetch is a hit (1)
-// unless it starts a line (3); everything else costs the page's code byte.
+// Mirrors refill_cycles()/fetch_cost9() (cpu_cycles.h): branch fetch on a
+// cacheable page (0xFF) is a line fill (3), sequential fetch is a hit (1)
+// unless it starts a line (3); else costs the page's code byte.
 void Timing::build_refill9(u32 first_page, u32 last_page) {
   auto X = [&](u32 p) { const u8 c = cpu9_[p * 8]; return c == 0xFF ? 3u : c; };
   auto Y = [&](u32 p) { const u8 c = cpu9_[p * 8]; return c == 0xFF ? 1u : c; };
@@ -75,14 +74,12 @@ void Timing::build_refill9(u32 first_page, u32 last_page) {
   }
 }
 
-// The ARM7 data cost, evaluated once per (page, translate-time constants)
-// instead of once per access. This mirrors emit_charge_data_body's ARM7 arm
-// in translate.cpp exactly, including its signed maxima; the recompiler's
-// fast path is only taken when this table and that code agree, and the fuzzer
-// checks the two against the interpreter.
+// ARM7 data cost, evaluated once per (page, translate-time constants) instead
+// of per access. Mirrors emit_charge_data_body's ARM7 arm in translate.cpp
+// exactly, including signed maxima; the fuzzer checks the two agree.
 void Timing::build_cost7() {
-  // The distinct code-fetch costs the ARM7 region table produces. Anything
-  // outside this set keeps the inline model (nc7_index returns -1).
+  // Distinct code-fetch costs the ARM7 region table produces; outside this
+  // set keeps the inline model (nc7_index returns -1).
   u32 n = 0;
   for (u32 i = 0; i < NC7_SLOTS; ++i) nc7_values_[i] = 0xFFFFFFFFu;
   for (u32 p = 0; p < 0x20000 && n < NC7_SLOTS; ++p) {
@@ -106,12 +103,10 @@ void Timing::build_cost7() {
   cost7_ready_ = true;
 }
 
-// Fill [first_page, last_page) from the current bus table and nc slots.
-// The 32-byte block depends only on the page's two bus bytes and whether it
-// is main RAM, and consecutive pages nearly always agree, so the block is
-// evaluated once per change of input and copied otherwise: the full rebuild
-// at reset was ~100 ms of boot on the device when every page evaluated the
-// model 32 times.
+// Fill [first_page, last_page). The 32-byte block depends only on the page's
+// two bus bytes and whether it's main RAM, and consecutive pages nearly
+// always agree, so it's evaluated once per change of input and copied
+// otherwise.
 void Timing::build_cost7_range(u32 first_page, u32 last_page) {
   auto smax = [](s32 a, s32 b) { return a > b ? a : b; };
   u8 block[COST7_STRIDE];
@@ -175,40 +170,30 @@ void Timing::set_region7(u32 start, u32 end, Region r, int bus_width, int nonseq
     t[0] = static_cast<u8>(n16); t[1] = static_cast<u8>(s16); t[2] = static_cast<u8>(n32); t[3] = static_cast<u8>(s32);
     regions7_[i] = r;
   }
-  // Keep the precomputed cost table in step. EXMEMCNT retimes the GBA slot
-  // long after reset, and a stale entry is a silent timing divergence.
-  // A code-fetch cost this introduces that is not in the nc slots simply
-  // falls back to the inline model (nc7_index returns -1).
+  // Keep the precomputed cost table in step; a stale entry is a silent
+  // timing divergence. A cost not in the nc slots falls back to the inline
+  // model (nc7_index returns -1).
   if (cost7_ready_) build_cost7_range(first, last);
   stamp.fetch_add(1, std::memory_order_release);
 }
 
-// The TCM windows are baked into the table (4 KB pages; both windows are
-// multiples of 4 KB and aligned to their size): an ITCM page costs 1 for code
-// and data, a DTCM page 1 for data. Both engines then cost an access with one
-// table lookup and the recompiler inherits the interpreter's model exactly.
+// TCM windows are baked into the table (4 KB pages, both windows aligned to
+// their size): an ITCM page costs 1 for code and data, a DTCM page 1 for
+// data, so both engines cost an access with one table lookup.
 void Timing::update_cpu9(const CpuContext& cpu, u32 start, u32 end, bool notify) {
   prof::add(prof::C_TIMING_UPDATE_CPU9, 1);
-  // DS_DEBUG_TIMING=1: log every rebuild (each one also drops every translated block).
-  static const bool debug = std::getenv("DS_DEBUG_TIMING") != nullptr;
+  static const bool debug = std::getenv("DS_DEBUG_TIMING") != nullptr;   // logs every rebuild
   if (debug) std::fprintf(stderr, "[timing] update_cpu9 %08x-%08x ctl %08x dtcm %08x itcm %08x pu %08x/%08x\n", start, end, cpu.cp15_control, cpu.cp15_dtcm, cpu.cp15_itcm, cpu.pu_data_cacheable, cpu.pu_code_cacheable);
-  // Stores ([5..7]): the ARM946E-S data cache does not allocate on write, so
-  // a store to a cacheable page that misses goes out through the write
-  // buffer at bus speed; only the TCMs are free. DS_STORE_BUS=0 keeps the
-  // old pricing (stores as cache hits) for comparison.
-  //
-  // DS only by default (USER DECISION 2026-09-14). The DSi prices stores as
-  // cache hits, as melonDS does: DSi PictoChat's ARM9 builds a heap inside
-  // the main RAM its ARM7 is clearing a chunk per frame, and at bus-priced
-  // stores it reaches its first allocation after the clear has wiped the
-  // heap (NULL, then the ITCM is zeroed). Ore ga Omae's race, which bus
-  // pricing fixed, is a DS one. DS_STORE_BUS=0/1 still forces either way.
+  // Stores ([5..7]): the ARM946E-S data cache doesn't allocate on write, so a
+  // store to a cacheable page that misses goes out at bus speed; only TCMs
+  // are free. DSi prices stores as cache hits instead (DSi PictoChat's boot
+  // heap needs it); DS_STORE_BUS=0/1 forces either way.
   static const int store_bus_env = [] { const char* e = std::getenv("DS_STORE_BUS"); return e ? (std::atoi(e) != 0) : -1; }();
   const bool store_bus = store_bus_env >= 0 ? store_bus_env != 0 : !(cpu.nds && cpu.nds->dsi);
   const u32 first = start >> 12, last = (end == 0xFFFFFFFF) ? 0x100000 : (end >> 12);
   const u32 sh = clock9_shift;
-  // One page's slot. It depends on the 16 KB bus entry, the page's two PU
-  // cacheability bits and whether a TCM covers it.
+  // One page's slot: depends on the 16 KB bus entry, the page's two PU
+  // cacheability bits, and whether a TCM covers it.
   const auto compose = [&](const u8* b, u8 pu, bool tcm_i, bool tcm_d) {
     u8 c[8];
     c[0] = tcm_i ? 1 : (pu & 0x40) ? 0xFF : static_cast<u8>(b[2] << sh);
@@ -221,13 +206,10 @@ void Timing::update_cpu9(const CpuContext& cpu, u32 start, u32 end, bool notify)
     u64 w; std::memcpy(&w, c, 8); return w;
   };
   const auto bus_word = [&](u32 group) { u64 w; std::memcpy(&w, &bus9_[group * 8], 8); return w; };
-  // The walk is by runs, not pages: a full rebuild (a clock change, the PU
-  // switched on) visits a million pages, 27 ns each on a Cortex-A55 as a
-  // per-page compose, and a title launch does several in one frame. The TCMs
-  // are two page intervals (their sizes are powers of two >= 16 KB, aligned);
-  // between their edges a run of pages with the same PU bits and the same bus
-  // entry has one slot, and where the table already holds it with nothing
-  // pending from the page before, whole 16-page blocks are skipped.
+  // Walk is by runs, not pages, since a full rebuild visits a million pages.
+  // TCMs are two page intervals (sizes are powers of two, aligned); between
+  // their edges a run with the same PU bits and bus entry shares one slot,
+  // and whole 16-page blocks are skipped where nothing changed.
   const u64 itcm_end = cpu.itcm_size >> 12;
   const u64 dtcm_lo = cpu.dtcm_mask ? (cpu.dtcm_base >> 12) : 0x100000, dtcm_hi = cpu.dtcm_mask ? ((static_cast<u64>(cpu.dtcm_base) + (~cpu.dtcm_mask + 1ull)) >> 12) : 0x100000;
   const u8* pu_map_p = pu_map.get();
@@ -245,7 +227,7 @@ void Timing::update_cpu9(const CpuContext& cpu, u32 start, u32 end, bool notify)
       const u8 code = static_cast<u8>(W), data = static_cast<u8>(W >> 16);
       const u32 x = code == 0xFF ? 3u : code, y = code == 0xFF ? 1u : code;
       const u32 R = static_cast<u8>(x + y) | (static_cast<u32>(static_cast<u8>(x + x)) << 8) | (static_cast<u32>(static_cast<u8>(x + x)) << 16) | (static_cast<u32>(static_cast<u8>(x)) << 24);   // page k's refill entry when page k+1 has the same slot
-      // The run: pages with this PU byte and this bus entry.
+      // Run: pages with this PU byte and this bus entry.
       const u64 pu8 = 0x0101010101010101ull * pu;
       u32 j = i + 1;
       while (j < seg_end) {
@@ -257,7 +239,6 @@ void Timing::update_cpu9(const CpuContext& cpu, u32 start, u32 end, bool notify)
         u8* slot = &cpu9_[i * 8];
         u64 old_w; std::memcpy(&old_w, slot, 8);
         if (old_w == W && !changed_prev) {
-          // Nothing moves here; skip whole 16-page blocks that hold the slot.
           x_prev = x; y_prev = y;
           while ((i & 15) == 15 && i + 17 <= j) {
             u64 acc = 0;
@@ -269,8 +250,8 @@ void Timing::update_cpu9(const CpuContext& cpu, u32 start, u32 end, bool notify)
         }
         if (old_w != W) std::memcpy(slot, &W, 8);
         const u8 old_code = static_cast<u8>(old_w), old_data = static_cast<u8>(old_w >> 16);
-        // Refill entries, written only where a branch cost moved: page i-1's
-        // entry [2] needs this page's cost, so each page is finished one
+        // Refill entries written only where a branch cost moved: page i-1's
+        // entry [2] needs this page's cost, so each page finishes one
         // iteration late.
         const bool changed = code != old_code;
         if (i > first && (changed || changed_prev)) {
@@ -278,7 +259,7 @@ void Timing::update_cpu9(const CpuContext& cpu, u32 start, u32 end, bool notify)
           else { u8* r = refill + (i - 1) * 4; r[0] = static_cast<u8>(x_prev + y_prev); r[1] = static_cast<u8>(x_prev + x_prev); r[2] = static_cast<u8>(x_prev + x); r[3] = static_cast<u8>(x_prev); }
         }
         x_prev = x; y_prev = y; changed_prev = changed;
-        // Only the bytes a translation can have baked count as a retime.
+        // Only bytes a translation could have baked in count as a retime.
         const u8 f = static_cast<u8>((changed ? RETIME_CODE : 0) | (data != old_data ? RETIME_DATA : 0));
         if (f && (retime_flags_[i] & f) != f) {
           if (!retime_flags_[i]) { if (retime_list_.size() < RETIME_LIST_MAX) retime_list_.push_back(i); else retime_overflow_ = true; }
@@ -287,9 +268,8 @@ void Timing::update_cpu9(const CpuContext& cpu, u32 start, u32 end, bool notify)
       }
     }
   }
-  // The pages at both edges of the range: the last one (its neighbour is
-  // outside the range) and the one before `first` (its entry [2] reads
-  // page `first`, which just changed).
+  // Pages at both edges of the range: the last one, and the one before
+  // `first` (its entry [2] reads page `first`, which just changed).
   if (last > first && changed_prev) build_refill9(last - 1, last);
   if (first) build_refill9(first - 1, first);
   ++cpu9_version;

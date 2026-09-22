@@ -12,7 +12,7 @@
 namespace ds::io {
 
 const u64 kSynthConsoleId = 0x08A1202600000001ull;
-// An eMMC CID in the DSi's layout (serial first, manufacturer last), serial 1.
+// eMMC CID in DSi layout (serial first, manufacturer last), serial 1.
 const u8 kSynthEmmcCid[16] = {0x01, 0x00, 0x00, 0x00, 0x2D, 0x03, 0x4D, 0x30, 0x30, 0x46, 0x50, 0x41, 0x00, 0x00, 0x15, 0x00};
 
 namespace {
@@ -22,8 +22,7 @@ void wr32(u8* p, u32 v) { wr16(p, static_cast<u16>(v)); wr16(p + 2, static_cast<
 u32 rd32(const u8* p) { return static_cast<u32>(p[0] | (p[1] << 8) | (p[2] << 16) | (static_cast<u32>(p[3]) << 24)); }
 
 struct RegionInfo { u8 region, country, mask, language; char letter; const char* serial; };
-// Country codes and language sets as retail consoles of each region carry
-// them (USA read from a dump; the others after GBATEK's tables).
+// Country codes and language sets per region (USA from a dump, rest from GBATEK).
 const RegionInfo kRegions[6] = {
   {0, 0x01, 0x01, 0, 'J', "TJF"},   // Japan
   {1, 0x31, 0x26, 1, 'E', "TW"},    // USA: en fr es
@@ -33,8 +32,7 @@ const RegionInfo kRegions[6] = {
   {5, 0x88, 0x80, 7, 'K', "TKF"},   // Korea
 };
 
-// Every DSi settings file: a SHA-1 of the data (or a signature), version 1, a
-// counter, the data length, the data at 0x88, 0xFF to 16 KB.
+// DSi settings file: SHA-1/signature, version 1, counter, length, data at 0x88, 0xFF-padded to 16 KB.
 std::vector<u8> settings_file(const u8* data, u32 len, bool hashed, u8 counter) {
   std::vector<u8> f(0x4000, 0xFF);
   std::memset(f.data(), 0, 0x88);
@@ -53,10 +51,9 @@ void put_utf16(u8* dst, const std::string& s, u32 max_chars) {
 }  // namespace
 
 DsiRegion dsi_region_for(u32 flags, u8 user_language) {
-  if ((flags & 0x3F) == 0) flags = 0x3F;           // no region bits: treat as region-free
+  if ((flags & 0x3F) == 0) flags = 0x3F;           // no region bits: region-free
   int pick = -1;
-  // The user's language decides among the allowed regions; a region-free
-  // title prefers the USA console for the languages several regions share.
+  // User's language picks among allowed regions; ties favor USA.
   static const int kOrder[6] = {1, 2, 0, 3, 4, 5};
   for (int k : kOrder)
     if ((flags >> k & 1) && (kRegions[k].mask >> user_language & 1)) { pick = k; break; }
@@ -74,16 +71,13 @@ DsiRegion dsi_region_for(u32 flags, u8 user_language) {
 DsiConsoleFiles make_dsi_console_files(const bios::UserSettings& user, const DsiRegion& region, u64 console_id) {
   DsiConsoleFiles out;
 
-  // TWLCFG: the system settings. Offsets from the data start (file 0x88),
-  // laid out as a retail dump's. The RTC offset, alarm and last-launched
-  // title stay zero, as the launcher leaves them in RAM.
+  // TWLCFG, laid out as a retail dump's. RTC offset/alarm/last-launched title stay zero.
   u8 cfg[0x128] = {};
-  wr32(cfg + 0x00, 0x0100000B);                    // flags, as a set-up console has them
+  wr32(cfg + 0x00, 0x0100000B);                    // flags of a set-up console
   cfg[0x05] = region.country;
   cfg[0x06] = region.language;
   wr32(cfg + 0x10, 1);
-  // Touch calibration in the CODEC's ADC units: identity at pixel << 4, the
-  // same mapping the emulated touchscreen reports.
+  // Touch calibration in CODEC ADC units: identity at pixel << 4.
   wr16(cfg + 0x30, 0x20 << 4); wr16(cfg + 0x32, 0x20 << 4); cfg[0x34] = 0x20; cfg[0x35] = 0x20;
   wr16(cfg + 0x36, 0xE0 << 4); wr16(cfg + 0x38, 0xA0 << 4); cfg[0x3A] = 0xE0; cfg[0x3B] = 0xA0;
   cfg[0x3C] = 0x9C; cfg[0x3D] = 0x20; cfg[0x3E] = 0x01; cfg[0x3F] = 0x02;   // unknown, as dumped
@@ -94,8 +88,7 @@ DsiConsoleFiles make_dsi_console_files(const bios::UserSettings& user, const Dsi
   put_utf16(cfg + 0x5E, user.message, 26);
   out.twlcfg = settings_file(cfg, sizeof cfg, true, 1);
 
-  // HWINFO_N: 0x14 console-unique bytes whose meaning is not known; derived
-  // from the console ID so a given console always has the same.
+  // 0x14 console-unique bytes of unknown meaning, derived from the console ID.
   u8 n[0x14] = {};
   u8 id[8], digest[20];
   for (int i = 0; i < 8; ++i) id[i] = static_cast<u8>(console_id >> (8 * i));
@@ -103,7 +96,7 @@ DsiConsoleFiles make_dsi_console_files(const bios::UserSettings& user, const Dsi
   std::memcpy(n + 1, digest, 0x13);
   out.hwinfo_n = settings_file(n, sizeof n, true, 0);
 
-  // HWINFO_S: languages, region, serial number, the launcher's title ID.
+  // HWINFO_S: languages, region, serial number, launcher's title ID.
   u8 s[0x1C] = {};
   wr32(s + 0x00, region.language_mask);
   s[0x08] = region.region;
@@ -136,7 +129,7 @@ bool build_synthetic_nand(NandImage& nand, const u8* bios7i, const std::vector<u
   if (!fs.format(nand, bios7i, &why)) return fail("formatting the NAND: " + why);
   FatVolume& vol = fs.main();
 
-  // The retail top-level directories, and what titles read from them.
+  // Retail top-level directories.
   for (const char* d : {"/sys", "/sys/log", "/title", "/ticket", "/shared1", "/shared2", "/import", "/tmp", "/progress"})
     if (!vol.mkdir(d, &why)) return fail(why);
   auto put = [&](const std::string& path, const std::vector<u8>& data) {
@@ -148,8 +141,8 @@ bool build_synthetic_nand(NandImage& nand, const u8* bios7i, const std::vector<u
   if (!files.font.empty() && !put("/sys/TWLFontTable.dat", files.font)) return fail(why);
   if (fs.photo().valid()) fs.photo().mkdir("/photo", nullptr);
 
-  // The title, where the launcher's mount table points: content 00000000,
-  // and empty saves of the sizes the header gives.
+  // Title layout the launcher's mount table expects: content 00000000, and
+  // empty saves sized from the header.
   char id[9];
   std::snprintf(id, sizeof id, "%08x", rd32(&srl[0x230]));
   char hi[9];

@@ -36,7 +36,7 @@ inline u32 add_flags(CpuContext& cpu, u32 a, u32 b, u32 cin) {
   set_nzcv(cpu, r, wide >> 32, v);
   return r;
 }
-inline u32 sub_flags(CpuContext& cpu, u32 a, u32 b, u32 cin /* 1 = no borrow in */) {
+inline u32 sub_flags(CpuContext& cpu, u32 a, u32 b, u32 cin /* cin=1: no borrow in */) {
   u64 wide = u64{a} + static_cast<u32>(~b) + cin;
   u32 r = static_cast<u32>(wide);
   bool v = ((a ^ b) & (a ^ r)) >> 31;

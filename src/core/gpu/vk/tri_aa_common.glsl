@@ -1,11 +1,8 @@
-// The anti-aliasing pass of the triangle path (1x only): the DS's two-deep
-// pixel stack. Attachments 4-6 hold the pixel UNDERNEATH (colour, attribute,
-// depth record); an opaque edge pixel pushes what it covers down there, a
-// polygon that loses the depth test against an edge pixel may still land
-// underneath, and the final pass (post.comp, DS_FF_AA) blends the two by the
-// edge pixel's coverage. Edge flags and coverage come from the span table
-// (the span pass runs for these frames), exactly as Renderer3D::resolve_span
-// derives them. No hardware depth buffer: the test is the DS's, in here.
+// Anti-aliasing pass of the triangle path (1x only): the DS's two-deep pixel
+// stack. Attachments 4-6 hold the pixel UNDERNEATH; an opaque edge pixel
+// pushes what it covers down there, a polygon that loses the depth test
+// against an edge pixel may still land underneath, and post.comp (DS_FF_AA)
+// blends the two by coverage. Edge flags/coverage come from the span table.
 layout(std430, binding = 1) readonly buffer Verts { GpuVert verts[]; };
 #include "ds_span.glsl"
 layout(input_attachment_index = 0, set = 1, binding = 0) uniform usubpassInput in_col;
@@ -19,19 +16,15 @@ layout(location = 4) out uint o_ucol;
 layout(location = 5) out uint o_uattr;
 layout(location = 6) out uint o_uz;
 
-// Renderer3D::depth_pass: the mode from the polygon (equal-depth with its
-// tolerance, else LESS -- with equal passing for a front-facing polygon over
-// an opaque back-facing pixel).
+// Mode from the polygon: equal-depth with tolerance, else LESS (equal passes for front over opaque back-facing).
 bool ds_depth_pass(GpuPoly p, uint z, uint dz, uint dattr) {
   if ((p.attr & (1u << 14)) != 0u) { uint tol = (pc.f.flags & DS_FF_WBUFFER) != 0u ? 0xFFu : 0x200u; return (dz > z ? dz - z : z - dz) <= tol; }
   bool front = (p.flags & DS_PF_FRONTFACING) != 0u;
   return (front && (dattr & 0x00400010u) == 0x00000010u) ? z <= dz : z < dz;
 }
 
-// This fragment's edge flags (1 left run, 2 right run, 4 top row, 8 bottom
-// row) and coverage, from its polygon's span on this scanline; 0 flags for a
-// pixel the DS span does not reach (the hardware rasteriser's coverage
-// differs a little from the DS's).
+// Edge flags (1 left run, 2 right, 4 top row, 8 bottom) and coverage from
+// this polygon's span on this scanline; 0 flags where the DS span doesn't reach.
 bool aa_inside = true;   // whether the pixel is in its polygon's DS span (aa_edge sets it)
 GpuRow aa_row;           // the row aa_edge found, for shade_row
 uint aa_edge(GpuPoly p, int x, int y, out uint cov) {
@@ -41,9 +34,7 @@ uint aa_edge(GpuPoly p, int x, int y, out uint cov) {
   return e;
 }
 
-// The pixel from its span row: the DS's own X-stage interpolation of depth,
-// colour and texture coordinates (raster_body.glsl does the same), not the
-// hardware's varyings of a polygon that tri.vert grew by a pixel.
+// The pixel from its span row: DS's own X-stage interpolation, not the varyings of the grown polygon tri.vert emits.
 Frag shade_row(GpuPoly p, GpuRow r, int x) {
   Interp ix = row_interp(r);
   interp_set_x(ix, x);
@@ -66,9 +57,9 @@ Frag shade_row(GpuPoly p, GpuRow r, int x) {
   return o;
 }
 
-// The opaque write with the pixel stack: the new pixel on top, the old top
-// pushed underneath when the new one is an edge pixel; a pixel that fails
-// against the top of an edge pixel may take the slot underneath.
+// Opaque write with the pixel stack: new pixel on top, old top pushed
+// underneath if the new one is an edge pixel; a fail against an edge pixel's
+// top may still take the slot underneath.
 struct Stack { uint tcol, tattr, tz, ucol, uattr, uz; };
 Stack stack_load() {
   Stack s;
@@ -80,7 +71,7 @@ void stack_store(Stack s) {
   o_col = s.tcol; o_attr = s.tattr; o_z = s.tz;
   o_ucol = s.ucol; o_uattr = s.uattr; o_uz = s.uz;
 }
-// Returns false when the pixel takes neither slot (the caller discards).
+// false when the pixel takes neither slot (caller discards).
 bool stack_opaque(inout Stack s, GpuPoly p, Frag f, uint edge, uint cov) {
   uint attr = f.polyattr | edge;
   bool push = edge != 0u;

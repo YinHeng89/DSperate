@@ -17,35 +17,18 @@
 
 namespace ds::sdl {
 
-// One window showing some of the DS screens.
-//
-// The screens are drawn as a list of views (which screen goes in which
-// rectangle), so a second Display showing one screen each is a matter of
-// creating two of these — textures belong to a renderer and cannot be shared
-// between windows, which is why the texture lives here and not in the app.
-// The handhelds run SDL's KMSDRM backend, where only one window exists, so
-// one window holds both screens, stacked or side by side.
+// One window showing some of the DS screens, drawn as a list of views
+// (which screen goes in which rectangle). Textures belong to a renderer and
+// can't be shared between windows, so they live here rather than in the app.
 class Display {
 public:
   static constexpr int SCREENS = 2;
 
-  // How the two screens share the window. Every mode keeps the 4:3 screen
-  // aspect; `primary` is the screen shown alone (Single), large (Pip) or
-  // dominant (DominantV/H), and the first one in the stack/row otherwise.
-  //   Vertical    stacked, top over bottom (top=primary first)
-  //   Horizontal  side by side: matches handhelds whose two panels sit
-  //               horizontally in the compositor's canvas, so touch lines up
-  //   Single      one screen fills the window; the other is not drawn
-  //   Pip         one fills the window, the other is an inset in a corner
-  //   DominantV   stacked in DS order, the primary fitted to the width and
-  //               the other `dominant` times its size, both centred
-  //   DominantH   side by side in DS order, the primary fitted to the
-  //               height, the other `dominant` times its size, bottoms aligned
-  // With `dominant_auto` the dominant layouts solve the other way round:
-  // the primary takes the largest whole scale that leaves the secondary
-  // at least `dominant_min` of its size, and the secondary grows into
-  // whatever room is left (up to the primary's size). The screen effects
-  // (grid, chunky cells) come out exact on the primary that way.
+  // How the two screens share the window; `primary` is the screen shown
+  // alone (Single), large (Pip) or dominant (DominantV/H), else first in the
+  // stack/row. DominantV/H: primary fitted to width/height, secondary
+  // `dominant` times its size. With `dominant_auto`, the primary instead
+  // takes the largest whole scale leaving the secondary >= `dominant_min`.
   enum class Mode : u8 { Vertical, Horizontal, Single, Pip, DominantV, DominantH, Count };
   enum class Corner : u8 { TopLeft, TopRight, BottomLeft, BottomRight, Count };
   struct Layout {
@@ -59,14 +42,10 @@ public:
     double pip_alpha = 1.0;      // inset opacity at rest, 0..1 (see set_inset_alpha)
     int    gap = 0;              // video.screen_gap: pixels between the two screens of a pair (negative overlaps)
   };
-  // Forced integer scaling of the full-size views (the ones drawn at the
-  // layout's fit; the PiP inset and the dominant layouts' secondary keep
-  // their ratio to the view they belong to). Under: the largest whole
-  // number of panel pixels per DS pixel that fits, letterboxed. Over: the
-  // smallest that covers, cropped -- centred, so a stacked pair keeps the
-  // edge between the screens; a dual-window screen anchors that edge too
-  // (the top screen its bottom row, the bottom screen its top). A fit that
-  // is already whole is left alone by both.
+  // Forced integer scaling of full-size views (PiP inset / dominant
+  // secondary keep their own ratio). Under: largest whole scale that fits,
+  // letterboxed. Over: smallest that covers, cropped and centred (a stacked
+  // pair keeps its shared edge).
   enum class IntScale : u8 { Off, Under, Over };
   static const char* int_scale_name(IntScale m);
   static bool parse_int_scale(const std::string& s, IntScale& m);
@@ -85,120 +64,68 @@ public:
 
   void draw(const u32* const fb[SCREENS]);
 
-  // Per-scanline scaling. Instead of the core filling a 256x192 framebuffer
-  // that we then rescale to the panel, we hand the core a panel-sized buffer
-  // and it scales each line into place as that line is produced, while the
-  // line is still in L1. The rescale pass then disappears entirely, along
-  // with the cold re-read of the framebuffer that dominated it, and the
-  // present becomes a 1:1 copy.
-  //
-  // The destination has to be the buffer that is actually presented, or the
-  // saving is spent again on a copy: scaling into a panel-sized texture still
-  // leaves SDL_RenderCopy reading 3.6 MB and writing 3.6 MB, where the
-  // framebuffer path's RenderCopy reads only 192 KB. So this mode drops
-  // SDL_Renderer and renders into the window surface, which on Wayland is the
-  // shm buffer SDL commits. That is also the shape the compositor-bypass path
-  // needs, with a dma-heap allocation in place of the shm buffer; doing it
-  // here first measures the scaling win on its own, on the path that ships.
-  //
-  // Renderer-based drawing (draw()) is unavailable while this is on.
-  //
-  // Destination tiers, tried in order at open():
-  //  1. a scanout tier (scanout.h): CMA dma-heap buffers the display samples
-  //     or scans out without a copy. Under Wayland that is DmabufOut, on
-  //     SDL's Wayland surface; under KMSDRM it is DrmOut, page-flipped onto
-  //     the panel's CRTC. DS_DMABUF=0 disables either, =1 requires it
-  //     (fail loud).
-  //  2. window surface: SDL's shm path under a compositor. On KMSDRM this is
-  //     not a software path at all -- SDL has no window framebuffer there, so
-  //     it is a hidden GLES renderer; see display_drm.h.
-  // `grid`: whether the LCD grid applies to this view. A view scaled below
-  // 2x has no room for a lit pixel beside a black seam: the seams the
-  // fractional rule still lands there (one run in four at 1.25x) read as
-  // noise, not a grid. So under the full grid the small screens -- the PiP
-  // inset, the dominant layouts' secondary -- go plain unless a whole panel
-  // cell (chunky, >= 4 px) carries the grid per cell. A dimmed grid is an
-  // overlay rather than a grid and applies from 1x, as it does on the
-  // display-engine tier; under 1x every run would be a seam and the whole
-  // view would only darken, so none gets it. See grid_on().
-  // `xrun_plain`: the nearest map before chunky rewrote it into pairs or
-  // cells, for a page that wants the view's geometry without the effect.
-  // `y_lo`/`y_hi`: the rect rows inside the buffer (see Gpu::ScaleTarget);
-  // px is at row y_lo. Only a view scaled past the panel (integer
-  // overscale) is cropped; then xrun's runs outside the buffer are empty.
+  // Per-scanline scaling: the core scales each line into place as it's
+  // produced, straight into the window surface or a scanout tier's buffer
+  // (dropping SDL_Renderer, since the destination must be what's actually
+  // presented). draw() is unavailable while this is on. Destination tiers
+  // tried in order at open(): (1) a scanout tier (scanout.h) -- DmabufOut
+  // under Wayland, DrmOut under KMSDRM; DS_DMABUF=0/1 disables/requires it;
+  // (2) the window surface (SDL shm under a compositor; on KMSDRM this is
+  // secretly a hidden GLES renderer, see display_drm.h).
+  // `grid`: full grid needs >=2x (or a >=4px chunky cell) to fit a lit pixel
+  // beside a seam, so small views (PiP inset, dominant secondary) go plain;
+  // a dimmed grid applies from 1x instead. See grid_on().
+  // `xrun_plain`: the nearest map before chunky rewrote it into pairs/cells.
+  // `y_lo`/`y_hi`: rect rows inside the buffer; only cropped under integer overscale.
   struct Target { u32* px; u32 pitch; u32 h; const u16* xrun; const u8* seam_w; const u16* lin_sx; const u8* lin_wx; bool grid; const u16* xrun_plain; u32 y_lo = 0, y_hi = 0; };
 
   bool scaling() const { return scaled_; }
-  // Panel rotation on the scanline tiers: 0, 90, 180 or 270, the rotation
-  // that takes the DS layout onto the panel, the same DS_ROTATE the
-  // display-engine tier reads (270 on a panel mounted portrait with its top
-  // at the user's left). The layout, the scaling and everything the frontend
-  // draws work in the logical (unrotated) frame, composed into a cached
-  // staging buffer; present() rotates that into the presented buffer. So the
-  // per-line write no longer lands in the panel directly -- the rotate is
-  // one pass over the frame, 64-byte column stores -- but every scanline
-  // tier (fbdev, kms, dmabuf, the window surface) gets it the same way.
-  // Set before open() (open() also reads DS_ROTATE). No effect on the
-  // SDL_Renderer fallback.
+  // Panel rotation on the scanline tiers (0/90/180/270, same DS_ROTATE the
+  // display-engine tier reads). Drawing works in the logical (unrotated)
+  // frame into a staging buffer; present() rotates that into the presented
+  // buffer as one pass. Set before open() (open() also reads DS_ROTATE). No
+  // effect on the SDL_Renderer fallback.
   void set_rotation(int rot) { rot_wanted_ = rot; }
   int rotation() const { return rot_; }
-  // Chunky: each 2x2 block of DS pixels is drawn as one cell from its top-left
-  // pixel (with the LCD grid, one seam per block). Set before open().
-  // cell: 0 = the 2x2 pair path; N = N panel pixels per cell when N divides
-  // both screen dimensions (else the pair path); -1 = auto: the smallest
-  // N >= 4 that does, up to 16.
+  // Chunky: each 2x2 block of DS pixels drawn as one cell from its top-left
+  // pixel. Set before open(). cell: 0 = 2x2 pair path; N = panel pixels per
+  // cell when N divides both screen dims (else pair path); -1 = auto (smallest N>=4 that does).
   void set_chunky(bool on, int cell = 0) { chunky_ = on; chunky_cell_ = cell; }
   bool chunky() const { return chunky_; }
   // Present through the display engine's scaler layer (display_disp.h) when
-  // the device has one; the DS_ROTATE environment gives the panel rotation.
-  // Set before open(); draw() is then the way to the screen.
+  // available; DS_ROTATE gives the panel rotation. Set before open().
   void set_disp(bool on) { disp_wanted_ = on; }
-  // The LCD grid on the display-engine tier, as the DE's own overlay layer
-  // (DispOut::set_grid): alpha 0..255 of the seams. Set before open().
+  // LCD grid on the display-engine tier, as its overlay layer (DispOut::set_grid). Set before open().
   void set_disp_grid(u8 alpha) { disp_grid_ = alpha; }
   bool disp() const { return disp_ != nullptr; }
-  // Display-engine tier: suspend the scaler's chunky (the divisor) while a
-  // text page -- the pause menu, the loader's notice -- is on the panel, and
-  // put it back after. The page is drawn at canvas resolution and a chunky
-  // divisor would merge its glyphs the way it merges DS pixels. No-op on
-  // the other tiers, where the plain scaling of the page already does this.
+  // Display-engine tier: suspend the scaler's chunky divisor while a text
+  // page (pause menu, loader notice) is on the panel, since it would merge
+  // glyphs the way it merges DS pixels. No-op on the other tiers.
   void set_page(bool on);
-  // On the display-engine tier the effects that survive at DS resolution
-  // (chunky) are applied by the scanline scaler at 1:1 into a DS-sized
-  // buffer that is then rotated as the core's framebuffer would be; the
-  // grid, seams and bilinear need panel pixels and are off there.
+  // On the display-engine tier, chunky is applied by the scanline scaler at
+  // 1:1 then rotated; grid/seams/bilinear need panel pixels and are off there.
   bool effects_at_source() const { return disp_ != nullptr && scaled_; }
-  // Whether chunky applies to `screen`: a view shown smaller than the
-  // screen (the PiP inset, a dominant secondary) is left plain on every
-  // tier, as the grid leaves it.
+  // Chunky is left plain on a view shown smaller than the screen (PiP inset, dominant secondary).
   bool chunky_on(int screen) const { return src_chunky_[screen]; }
-  // The LCD grid's strength, 0..1; the full (black) grid needs room for a
-  // lit pixel beside each seam, a dimmed one is an overlay and does not.
-  void set_grid_strength(double s) { grid_strength_ = s; }
-  // Whether the LCD grid applies to `screen`'s view on the scanline tiers:
-  // drawn as panel cells, or at least 2x for the full grid and 1x for a
-  // dimmed one (see Target::grid).
+  void set_grid_strength(double s) { grid_strength_ = s; }   // 0..1; dimmed grid is an overlay, needs no seam-adjacent room
+  // Whether the LCD grid applies to `screen`'s view: panel cells, or >=2x
+  // for the full grid and >=1x for a dimmed one (see Target::grid).
   bool grid_on(int screen) const {
     if (cells_[screen].x.cells) return true;
     const int need = grid_strength_ >= 1.0 ? 2 : 1;
     for (int i = 0; i < nviews_; ++i) if (views_[i].screen == screen) return views_[i].rect.w >= need * static_cast<int>(SCREEN_W);
     return true;
   }
-  // The GPU present stage (gpu_present.h): on a dma-buf scanout tier, the
-  // core writes 256x192 frames and a compute dispatch lays them out into
-  // the tier's buffer, imported into Vulkan. Replaces the scanline scaler
-  // wherever the import works; falls back to it where it does not. Set
-  // before open().
+  // GPU present stage (gpu_present.h): on a dma-buf scanout tier, a compute
+  // dispatch lays 256x192 frames into the tier's buffer via Vulkan, replacing
+  // the scanline scaler where the import works. Set before open().
   void set_gpu_present(bool on) { gpu_wanted_ = on; }
   bool gpu_present() const { return gpu_ != nullptr; }
   // The frame's hi-res 3D layer for the GPU composite (Gpu::frame_hires): set before draw().
   void set_gpu_layer(u64 handle, size_t bytes, u32 scale, int screen, u64 edge = 0) { gpu_layer_ = handle; gpu_layer_bytes_ = bytes; gpu_layer_scale_ = scale; gpu_layer_screen_ = screen; gpu_layer_edge_ = edge; }
-  // The smooth-3D present filter (video.smooth3d): polygon edges rebuilt at panel resolution from the raster's edge plane.
-  void set_smooth3d(bool on) { smooth3d_ = on; }
-  // Present straight through /dev/fb0 (display_fbdev.h): the scanline path
-  // writes panel-sized frames into fb0's own buffers. Set before open().
+  void set_smooth3d(bool on) { smooth3d_ = on; }   // video.smooth3d: rebuild polygon edges at panel resolution
+  // Present straight through /dev/fb0 (display_fbdev.h). Set before open().
   void set_fbdev(bool on) { fbdev_wanted_ = on; }
-  // The cell map in use for `screen` (null when the pair path is), for the core.
   const void* cell_map(int screen) const { return cells_[screen].x.cells ? &cells_[screen] : nullptr; }
   // Locks the panel-sized texture and fills in one target per screen. False
   // if the lock failed, in which case the caller must fall back to draw().
@@ -207,18 +134,13 @@ public:
   void on_resize() { layout(); build_scale(); margins_dirty_ = true; }
   void toggle_fullscreen();
   bool fullscreen() const { return fullscreen_; }
-  // Switches layout; a windowed window is resized to the new mode's natural
-  // size at the current scale. Ignored on a single-screen (dual-window)
-  // display.
+  // Resizes a windowed window to the new mode's natural size at the current
+  // scale. Ignored on a single-screen (dual-window) display.
   void set_layout(const Layout& l);
   const Layout& current_layout() const { return layout_; }
-  // The secondary's size relative to the primary as placed: Layout::dominant
-  // unless auto chose it. 1 outside the dominant layouts.
-  double dominant_ratio() const;
-  // The inset's opacity for the coming frame, 0..255: the frontend ramps it
-  // between Layout::pip_alpha and opaque while the bottom screen is touched.
-  // Below 255 the inset is blended over the large screen on every tier;
-  // at 255 it is copied, and the exact paths cost nothing extra.
+  double dominant_ratio() const;   // secondary/primary size as placed; 1 outside the dominant layouts
+  // Inset opacity for the coming frame, 0..255 (frontend ramps it between
+  // Layout::pip_alpha and opaque while the bottom screen is touched).
   void set_inset_alpha(u8 a) { inset_alpha_ = a; }
   u8   inset_alpha() const { return inset_alpha_; }
   // dst[i] = dst[i] + (src[i] - dst[i]) * alpha / 255 per channel, alpha
@@ -229,48 +151,34 @@ public:
   // Window point -> pixel in `screen`. False if the point is not on a screen.
   bool map_point(int wx, int wy, int& screen, int& sx, int& sy) const;
 
-  // Renderer output size, which is what map_point's coordinates are in (it
-  // differs from the window size on scaled displays). Note this is NOT
-  // uniformly panel resolution: on the display-engine tier it is the DS-space
-  // canvas the scaler reads. Under a scanline-tier rotation it is the
-  // presented (panel) size, as the pointer events are; map_point() turns
-  // them back into the logical frame. For drawing, ask canvas() instead.
+  // Renderer output size, what map_point's coordinates are in. NOT uniformly
+  // panel resolution: on the display-engine tier it's the DS-space canvas;
+  // under scanline-tier rotation it's the presented (panel) size. For
+  // drawing, ask canvas() instead.
   void output_size(int& w, int& h) const;
 
-  // The whole output buffer, for the frontend's own drawing (the pause menu,
-  // the overlays) in panel pixels rather than DS pixels. Valid between
-  // begin_frame() and present(); draw after finish_views() so an inset does
-  // not land on top of what was drawn. On the display-engine tier it is
-  // instead the overlay layer's own surface -- transparent, cleared on the
-  // first call of a frame, and put on the panel by draw(), so it is valid
-  // there whether or not that tier is scaling.
+  // The whole output buffer for the frontend's own drawing (pause menu,
+  // overlays), in panel pixels. Valid between begin_frame() and present();
+  // draw after finish_views() so an inset doesn't land on top. On the
+  // display-engine tier it's instead the overlay layer's own transparent
+  // surface, valid whether or not that tier is scaling.
   struct CanvasView { u32* px; u32 pitch; int w, h; };
   bool canvas(CanvasView& out) const;
-  // Whether the frontend can draw at panel resolution on this tier. True on
-  // the scanline tiers (the canvas is the frame itself) and on the
-  // display-engine tier when it has its overlay layer (the canvas is then a
-  // transparent image the DE blends over the frame -- the picture under it is
-  // untouched, and anything not drawn shows through). False on the
-  // SDL_Renderer path, which has no buffer of its own and keeps the DS-space
-  // drawing path.
+  // True on the scanline tiers and on the display-engine tier with its
+  // overlay layer; false on SDL_Renderer, which has no buffer of its own.
   bool canvas_capable() const;
 
-  // end_frame() in two halves, so the frontend can draw over the finished
-  // picture: finish_views() copies the insets into place, present() puts it on
-  // the screen. Calling end_frame() does both, and finish_views() is idempotent.
+  // end_frame() in two halves: finish_views() copies insets into place,
+  // present() puts it on screen. finish_views() is idempotent.
   void finish_views();
   void present();
-  // After a present that no further frame follows (the pause menu): make
-  // sure the scanout tier has put it on its way. See ScanoutOut::flush.
+  // After a present with no frame following (the pause menu): make sure the
+  // scanout tier has put it on its way. See ScanoutOut::flush.
   void flush() { if (gpu_ && out_) gpu_->flush(*out_); if (out_) out_->flush(); }
 
-  // Where the frontend drew on the canvas this frame, so it can be cleaned up
-  // before that buffer is used again. The scanout tiers keep several buffers
-  // in rotation and the letterbox outside the views is cleared once per buffer
-  // and then left alone -- which was true while the only things drawn there
-  // were the screens themselves. An overlay drawn on the canvas is not
-  // repainted by the emulator, so without this the previous overlay stays in
-  // the buffers it was drawn into and the rotation shows fragments of it.
+  // Where the frontend drew on the canvas this frame, so a scanout tier's
+  // other buffers get it cleaned up too before reuse (an overlay isn't
+  // repainted by the emulator, so it would otherwise persist as fragments).
   // Rects accumulate into one for the frame; passing nothing is harmless.
   void note_canvas_draw(int x, int y, int w, int h);
   void note_canvas_draw_all() { note_canvas_draw(0, 0, frame_w_, frame_h_); }
@@ -278,26 +186,22 @@ public:
   u32 window_id() const { return win_ ? SDL_GetWindowID(win_) : 0; }
 
   // `direct`: the core scales straight into the window at `rect`. Otherwise
-  // it scales into side_[screen] (an inset that would be overwritten by the
-  // screen under it, or a hidden screen -- the core needs a target for
-  // both), which end_frame() copies into place if `shown`.
+  // into side_[screen] (an inset or hidden screen needs its own target),
+  // which end_frame() copies into place if `shown`.
   struct View { int screen; SDL_Rect rect; bool direct; bool shown; };
-  // Where the two screens go in a w x h output under `l`, in draw order
-  // (later views on top). Shared with the screenshot writer, so a picture
-  // of the layout is laid out exactly as the window is.
+  // Where the two screens go in a w x h output under `l`, draw order (later
+  // on top). Shared with the screenshot writer.
   static void place(const Layout& l, int w, int h, View out[SCREENS], IntScale snap = IntScale::Off);
   static void dominant_auto(const Layout& l, int w, int h, bool across, IntScale snap, double& s, double& s2);
 
 private:
   void layout();
-  // Display-engine tier with chunky: the 1:1 run tables and, when a panel
-  // cell fits, the source-side cell maps (see build_source_scale).
-  void build_source_scale();
+  void build_source_scale();   // display-engine tier w/ chunky: 1:1 run tables and source-side cell maps
   void build_scale();          // pick up the window surface and rebuild the x-map
   bool out_size(int& w, int& h) const;   // renderer output, or the surface in scaled mode (logical under rotation)
-  bool rotated() const { return rot_ == 90 || rot_ == 270; }   // the logical and presented sizes differ
-  // Points the frame at the logical staging buffer under rotation and clears
-  // what the last frame left there; the presented buffer is kept for present().
+  bool rotated() const { return rot_ == 90 || rot_ == 270; }   // logical and presented sizes differ
+  // Points the frame at the logical staging buffer under rotation, clearing
+  // what the last frame left; the presented buffer is kept for present().
   void take_frame(u32* px, u32 stride, int w, int h, int idx, Target out[SCREENS]);
   void rotate_out(u32* dst, u32 dst_pitch) const;
   void clear_margins(u32* px, u32 pitch, int w, int h) const;

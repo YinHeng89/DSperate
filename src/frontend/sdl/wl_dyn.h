@@ -1,19 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // DSperate - Nintendo DS emulator. Copyright (C) 2026 DSperate contributors.
 //
-// Runtime loader for libwayland-client, so the binary carries no Wayland
-// link dependency: handhelds without a compositor run SDL's KMSDRM path and
-// must not fail to start over a missing library. The scheme is SDL's own
-// dynamic-loading pattern: every libwayland *function* we use is a function
-// pointer resolved by dlsym, and a macro maps the real name onto the pointer
-// BEFORE the wayland headers are included, so both the header inlines and
-// the vendored protocol code (src/frontend/sdl/wl/) marshal through the
-// pointers. The interface *data* symbols (wl_surface_interface, ...) are
-// compiled in from wl/wayland-protocol.c -- libwayland marshals by interface
-// content, not identity, so our copies are equivalent.
-//
-// Include this before any wayland header, always. The generated .c files get
-// it force-included by CMake for the same reason.
+// Runtime-loads libwayland-client via dlsym so the binary has no Wayland link
+// dependency. Macros below map each real wl_* name to its resolved pointer;
+// must be included before any wayland header (CMake force-includes it into
+// generated .c files). Interface data symbols are compiled in separately
+// (wl/wayland-protocol.c) since libwayland matches those by content, not identity.
 #pragma once
 
 #include <stdint.h>
@@ -26,18 +18,15 @@ struct wl_interface;
 #ifdef __cplusplus
 namespace ds::sdl::wldyn {
 
-// True once the library is open and every pointer below is resolved. Safe to
-// call repeatedly; failure is sticky and cheap.
-bool load();
-const char* error();   // why load() failed, for the fallback log line
+bool load();   // true once resolved; safe to call repeatedly, failure is sticky
+const char* error();   // why load() failed
 
 } // namespace ds::sdl::wldyn
 
-// The pointers live outside the namespace: the macros below substitute them
-// into vendored C code, which sees this header too (force-included).
+// Outside the namespace so the macros below substitute into vendored C code.
 extern "C" {
 #endif
-union wl_argument;   // forward: the prototype below must not declare it in its parameter list
+union wl_argument;   // forward decl
 extern struct wl_proxy* (*p_wl_proxy_marshal_flags)(struct wl_proxy*, uint32_t opcode, const struct wl_interface*, uint32_t version, uint32_t flags, ...);
 extern struct wl_proxy* (*p_wl_proxy_marshal_array_flags)(struct wl_proxy*, uint32_t opcode, const struct wl_interface*, uint32_t version, uint32_t flags, union wl_argument*);
 extern int              (*p_wl_proxy_add_listener)(struct wl_proxy*, void (**implementation)(void), void* data);
@@ -55,8 +44,7 @@ extern int              (*p_wl_display_get_error)(struct wl_display*);
 }
 #endif
 
-// Map the real names onto the pointers for everything compiled after this
-// header -- the vendored headers' static inlines and the protocol .c files.
+// Map real names onto the pointers for code compiled after this header.
 #define wl_proxy_marshal_flags (*p_wl_proxy_marshal_flags)
 #define wl_proxy_marshal_array_flags (*p_wl_proxy_marshal_array_flags)
 #define wl_proxy_add_listener (*p_wl_proxy_add_listener)

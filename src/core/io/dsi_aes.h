@@ -1,13 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // DSperate - Nintendo DS emulator. Copyright (C) 2026 DSperate contributors.
 //
-// The DSi's AES engine at 0x04004400 (ARM7 only), after melonDS DSi_AES:
-// AES-128 CTR and CCM over 16-byte blocks fed through a 16-word input FIFO
-// and drained from a 16-word output FIFO, four key slots whose normal key is
-// either written directly or derived from a KeyX/KeyY pair, and NDMA start
-// modes 0x2A (input) / 0x2B (output). Blocks are processed synchronously as
-// data arrives, the way melonDS does it: a title that polls AES_CNT's busy
-// bit or the FIFO levels sees the same values at the same instructions.
+// DSi's AES engine at 0x04004400 (ARM7 only): AES-128 CTR/CCM over 16-byte blocks through 16-word
+// input/output FIFOs, four key slots (direct or KeyX/KeyY derived), NDMA modes 0x2A/0x2B. Blocks
+// process synchronously as data arrives.
 #pragma once
 #include "core/types.h"
 
@@ -21,8 +17,7 @@ public:
   void reset();
   template <class S> void sync_state(S& s);
 
-  // Register file, offsets from 0x04004400. All 32-bit; the narrower IV, MAC
-  // and key writes come through with a byte mask.
+  // Register file, offsets from 0x04004400. IV/MAC/key writes come through with a byte mask.
   u32  read_cnt() const;
   void write_cnt(u32 value);
   void write_blkcnt(u32 value);
@@ -34,11 +29,10 @@ public:
   void write_key_x(u32 slot, u32 offset, u32 value, u32 mask);
   void write_key_y(u32 slot, u32 offset, u32 value, u32 mask);
 
-  // NDMA hooks: an ARM7 NDMA run has ended or paused.
   void check_input_dma();
   void check_output_dma();
 
-  // The key scrambler: normal = ROL128((X ^ Y) + C, 42).
+  // Key scrambler: normal = ROL128((X ^ Y) + C, 42).
   static void rol16(u8* v, u32 n);
   static void derive_normal_key(const u8* kx, const u8* ky, u8* out);
 
@@ -51,7 +45,7 @@ private:
     bool full() const { return occupied >= 16; }
     u32 level() const { return occupied; }
     void write(u32 v) { if (full()) return; entries[wr] = v; if (++wr >= 16) wr = 0; ++occupied; }
-    u32 read() {                       // melonDS: an empty FIFO re-reads the last entry
+    u32 read() {                       // an empty FIFO re-reads the last entry
       if (empty()) return entries[(rd == 0 ? 16 : rd) - 1];
       const u32 v = entries[rd]; if (++rd >= 16) rd = 0; --occupied; return v;
     }
@@ -71,8 +65,7 @@ private:
   u8 key_normal_[4][16] = {}, key_x_[4][16] = {}, key_y_[4][16] = {};
   u8 cur_key_[16] = {}, cur_mac_[16] = {}, output_mac_[16] = {};
   bool output_mac_due_ = false;
-  // The running cipher: a tiny-AES-c AES_ctx (176-byte round key + 16-byte
-  // CTR counter) kept as raw bytes so this header needs no view of it.
+  // Running cipher: tiny-AES-c AES_ctx, kept as raw bytes so this header needs no view of it.
   alignas(4) u8 ctx_[192] = {};
 };
 

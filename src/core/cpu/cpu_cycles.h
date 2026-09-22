@@ -1,25 +1,15 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // DSperate - Nintendo DS emulator. Copyright (C) 2026 DSperate contributors.
 //
-// Per-instruction cycle model, shared by the interpreter and the recompiler
-// (which emits the same arithmetic inline and calls the interpreter for the
-// rest). It mirrors melonDS's, the reference our traces are compared against:
+// Per-instruction cycle model, shared by the interpreter and the recompiler.
+// Mirrors melonDS: every instruction pays a code-fetch cost numC (ARM9: the
+// prefetch two ahead, `code_cycles`; ARM7: S for plain instructions, N for
+// ones with an internal cycle or data access). CI adds `internal`; CD/CDI
+// combine numC with data cost numD, overlapping where hardware does.
+// Branches pay the pipeline refill instead (`refill_cycles`, via jump()).
 //
-//  - every instruction pays a code-fetch cost numC. On the ARM9 this is the
-//    cost of the prefetch two instructions ahead (`code_cycles`, computed
-//    before the instruction runs, 0 for the odd halfword of a Thumb pair);
-//    on the ARM7 it is a sequential fetch (S) for plain instructions and a
-//    non-sequential one (N) for instructions with an internal cycle or a data
-//    access;
-//  - CI adds `internal` cycles; CD/CDI combine numC with the data cost numD,
-//    overlapping where the hardware does;
-//  - branches pay the pipeline refill instead (`refill_cycles`, charged by
-//    CpuContext::jump), and nothing else.
-//
-// *Where* an instruction charges matters: the handler calls charge_* at the
-// point melonDS does, which for instructions that may jump is either before
-// the jump (ALU ops, LDR, Thumb hi-register ops: the old pc and state) or
-// after it (LDM, POP: the new pc, state and code region).
+// Charge timing matters: charge_* runs before a jump (old pc/state) for ALU/
+// LDR/hi-reg ops, or after (new pc/state/code region) for LDM/POP.
 #pragma once
 #include "core/cpu/cpu.h"
 #include "core/cpu/cpu_mem.h"
@@ -67,11 +57,8 @@ inline void charge_CDI(CpuContext& cpu) {
   cpu.hot.cycle_budget -= static_cast<s32>(cost);
 }
 
-// A load that just jumped (LDM pc, POP pc). melonDS charges it after JumpTo,
-// which leaves R[15] = target + 2 in Thumb where jump() leaves target + 4, so
-// its `R[15] & 2` test is bit 1 of the target inverted: a word-aligned Thumb
-// target has its second halfword prefetched and numC is 0. (The A64 JIT's
-// branch_indirect_cdi stub already does this.)
+// A load that just jumped (LDM pc, POP pc). melonDS charges with R[15] at
+// target+2 in Thumb where jump() leaves target+4, so `& 2` here is inverted.
 inline void charge_CDI_after_jump(CpuContext& cpu) {
   if (cpu.which == Cpu::ARM9) {
     const s32 numC = (cpu.thumb() && !(cpu.hot.regs[15] & 2)) ? 0 : static_cast<s32>(cpu.code_cycles);
@@ -102,7 +89,7 @@ inline void prefetch_cost9(CpuContext& cpu) {
   const u32 pc = cpu.hot.regs[15];
   if (cpu.thumb() && (pc & 2)) { cpu.code_cycles = 0; return; }
   u8 c = cpu.code_latch ? cpu.code_latch : cpu.timing9[pc >> 12][0];
-  if (cpu.code_latch && pc < cpu.itcm_size) c = 1;   // ITCM fetches are always 1 (melonDS CodeRead32)
+  if (cpu.code_latch && pc < cpu.itcm_size) c = 1;   // ITCM fetches always cost 1
   cpu.code_cycles = (c == 0xFF) ? (!(pc & 0x1F) ? 3 : 1) : c;
 }
 
@@ -114,10 +101,8 @@ inline u32 fetch_cost9(const CpuContext& cpu, u32 addr, bool branch) {
   return c;
 }
 
-// Pipeline refill charged by a jump to `addr` (bit 0 clear) in the given
-// state. `code_after` receives the ARM9 prefetch cost left in `code_cycles`
-// by the refill (the cost of the last fetch it performed), which a
-// post-jump charge (LDM pc, POP pc) uses as numC.
+// Pipeline refill for a jump to `addr`. `code_after` receives the ARM9
+// prefetch cost of the refill's last fetch, used as numC by a post-jump charge.
 inline u32 refill_cycles(const CpuContext& cpu, u32 addr, bool thumb, u32* code_after = nullptr) {
   if (cpu.which == Cpu::ARM9) {
     u32 c, last;

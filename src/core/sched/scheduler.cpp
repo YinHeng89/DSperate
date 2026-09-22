@@ -41,7 +41,6 @@ Scheduler::~Scheduler() {
 }
 
 Scheduler::Scheduler(NDS& nds) : nds_(nds), now_(0) {
-  // Read once: a function-local static costs an acquire load per use.
   if (const char* q = std::getenv("DS_QUANTUM")) { set_quantum(std::atoll(q)); quantum_forced_ = true; }
   debug_slices_ = std::getenv("DS_DEBUG_SLICES") != nullptr;
   idle_survey_ = std::getenv("DS_IDLE_SURVEY") != nullptr;
@@ -50,12 +49,8 @@ Scheduler::Scheduler(NDS& nds) : nds_(nds), now_(0) {
   reset();
 }
 
-// A DSi title can switch the ARM9 between 134 and 67 MHz in the middle of its
-// slice. melonDS rescales ARM9Timestamp at the write (>> old shift, << new:
-// the sub-system-cycle part is dropped) and the target with it; the cycles
-// the switching instruction still has to add were priced under the old clock
-// and go on unscaled. Here the ARM9's slice is re-expressed in the new core
-// cycles: the system cycles it has consumed so far, and the whole slice.
+// DSi: ARM9 clock can switch 134/67 MHz mid-slice. Rescales ARM9Timestamp at
+// the write (sub-system-cycle part dropped) and re-expresses the slice in the new core cycles.
 void Scheduler::set_clock9_shift(u32 timing_shift) {
   const u32 ns = timing_shift - 1;
   CpuContext& a9 = nds_.cpu(Cpu::ARM9);
@@ -88,14 +83,11 @@ void Scheduler::reset() {
   next_id_ = EVENT_COUNT;
 }
 
-// `next_` caches the earliest armed deadline so the per-slice loop scans the
+// `next_` caches the earliest armed deadline so the slice loop scans the
 // table only when an event is actually due (or after a cancel).
 void Scheduler::schedule(EventId id, u64 at, EventFn fn, u32 param) {
   const u32 i = static_cast<u32>(id);
-  // Only a *live* next event can be pushed later and leave next_ stale. An
-  // event rescheduling itself from its own handler is already disarmed, and
-  // fire_due rescans when the pass ends -- rescanning here would double it.
-  const bool was_next = (armed_ & (1u << i)) && next_id_ == i;
+  const bool was_next = (armed_ & (1u << i)) && next_id_ == i;   // only a live next event can be pushed later and leave next_ stale
   at_[i] = at; fn_[i] = fn; param_[i] = param;
   armed_ |= 1u << i;
   if (soft_mask_ & (1u << i)) { if (at < next_soft(i)) next_soft(i) = at; return; }   // soft: fired when due, never a deadline (see soft_mask_)
@@ -119,7 +111,6 @@ void Scheduler::run_soft_timers(Cpu cpu) {
   if (!(soft_mask_ & (0xFu << first))) return;
   const u64 t = now();
   bool fired = false;
-  // Timer by timer, each caught up fully, as RunTimers runs RunTimer(0..3).
   for (u32 i = first; i < first + 4; ++i) {
     while ((armed_ & (1u << i)) && at_[i] <= t) {
       armed_ &= ~(1u << i);
@@ -138,10 +129,7 @@ void Scheduler::cancel(EventId id) {
   if (next_id_ == i) rescan();
 }
 
-// Earliest armed deadline and which event owns it. Only the armed events are
-// visited; `next_id_` lets schedule() and cancel() tell "the one that defines
-// next_" from "one that merely ties with it", which the old time comparison
-// could not.
+// Earliest armed deadline and which event owns it.
 void Scheduler::rescan() {
   u64 best = std::numeric_limits<u64>::max();
   u32 best_id = EVENT_COUNT;
@@ -155,52 +143,26 @@ void Scheduler::rescan() {
   next_id_ = best_id;
 }
 
-// A CPU counts as idle when it is halted, or awake but provably going nowhere.
-// Skipping is only safe while nothing else can change what the loop reads:
-// the sibling CPU must be idle too, no DMA may be running, and the geometry
-// engine must be quiet. The slice still ends at the next scheduled event, so
-// whatever the loop waits for is delivered on time.
+// A CPU counts as idle when halted, or awake but provably going nowhere.
+// Requires the sibling CPU idle too, no DMA running, and GX quiet; the slice
+// still ends at the next scheduled event.
 bool Scheduler::machine_idle(bool& skip9, bool& skip7) const {
   skip9 = skip7 = false;
   if (!idle_skip_) return both_idle();
-  // Swap-wait mode: nothing below is worth its cost unless the game has issued
-  // a swap and is waiting for VBlank to perform it -- one load decides that
-  // before the PC ring, the body walk or the DMA probes are touched, so a
-  // scene that never waits this way pays only this test per slice.
+  // Swap-wait mode: skip the PC ring/body walk/DMA probes unless a swap is pending.
   const bool gx_only = idle_skip_ == 1;
   if (gx_only && !nds_.gpu3d.swap_pending()) return both_idle();
   CpuContext& a9 = const_cast<CpuContext&>(nds_.cpu(Cpu::ARM9));
   CpuContext& a7 = const_cast<CpuContext&>(nds_.cpu(Cpu::ARM7));
-  // The GX veto is gone (2026-09-20). It asked whether the geometry engine had
-  // anything queued, which mattered when a queued command had a cycle cost, a
-  // FIFO level the guest could observe and a stall behind it. Phase 1 removed
-  // all three: a logged command consumes no emulated time and is replayed at
-  // VBlank or by the read that observes it, so a non-empty log says nothing
-  // about whether the machine can advance. The loop analyser still decides --
-  // it rejects a poll of any port with a side effect, which is what kept this
-  // safe in the first place.
-  //
-  // Measured on what it was turning away (DS_IDLE_SURVEY): sm64 721,368
-  // slices the analyser accepts, mlbis 414,818, dbori 26,909, Golden Sun 1,688
-  // -- 100 % and 92.6 % of the whole opportunity for the first two.
-  //
-  // The DMA veto STAYS. It is not the same kind of rule: DMA is driven from
-  // inside run_cpu, so a skipped slice does not advance a transfer, and
-  // dropping this one would stall a DMA the idle loop may be waiting on.
-  // Restoring hardware behaviour there needs a helper that advances the
-  // ARM9's DMA without running the CPU -- see the plan.
-  // The DMA veto now applies only to the DSi, where a9_dma_iter_ hands the
-  // slice back mid-transfer and has no meaning when no CPU ran. Elsewhere a
-  // skipped slice advances the channel itself (advance_dma_only).
+  // A pending GX command doesn't veto: logged commands cost no time. DMA vetoes
+  // on DSi only (a9_dma_iter_ needs a CPU to have run); elsewhere advance_dma_only
+  // keeps a skipped channel moving.
   bool vetoed = false;
   if (dsi_ && (nds_.dma.any_running(Cpu::ARM9) || nds_.dma.any_running(Cpu::ARM7))) { prof::add(prof::C_IDLE_NO_DMA, 1); vetoed = true; }
-  else if (prof::enabled && !nds_.gpu3d.idle()) prof::add(prof::C_IDLE_NO_GX, 1);   // counted, no longer vetoed
+  else if (prof::enabled && !nds_.gpu3d.idle()) prof::add(prof::C_IDLE_NO_GX, 1);   // counted, not vetoed
   if (vetoed) {
-    // DS_IDLE_SURVEY: run the analysis anyway, purely to count what these two
-    // vetoes are turning away, and undo the one piece of state it touches.
-    // in_idle_loop writes only its own verdict cache, which a later call would
-    // have filled identically; the PC ring steers future decisions, so it is
-    // restored. The answer is still `false` either way.
+    // DS_IDLE_SURVEY: run the analysis anyway to count what the veto turns
+    // away, restoring the PC ring after so the survey doesn't affect real decisions.
     if (!idle_survey_) return false;
     prof::add(prof::C_IDLE_SURVEY_SEEN, 1);
     u32 ring[2][8]; std::memcpy(ring, idle_pc_ring_, sizeof ring);
@@ -214,18 +176,15 @@ bool Scheduler::machine_idle(bool& skip9, bool& skip7) const {
   return idle_analyse(skip9, skip7, false);
 }
 
-// Everything after the DMA and GX vetoes: the PC pre-filter and the loop
-// analysis. `survey` sends the rejections to the shadow counters so a survey
-// pass cannot pollute the real ones.
+// PC pre-filter plus the loop analysis. `survey` sends rejections to shadow
+// counters so a survey pass cannot pollute the real ones.
 bool Scheduler::idle_analyse(bool& skip9, bool& skip7, bool survey) const {
   const bool gx_only = idle_skip_ == 1;
   CpuContext& a9 = const_cast<CpuContext&>(nds_.cpu(Cpu::ARM9));
   CpuContext& a7 = const_cast<CpuContext&>(nds_.cpu(Cpu::ARM7));
   CpuContext* cpus[2] = {&a9, &a7};
-  // Pre-filter: analysing costs a body walk, so only look at a CPU that came
-  // back to the same instruction it left on -- what a spinning CPU does.
-  // Both slots are refreshed before any early return, so a rejection on one
-  // CPU cannot leave the other's filter stale.
+  // Pre-filter: a spinning CPU comes back to the same PC it left on. Both
+  // slots refresh before any early return, so one CPU's rejection can't leave the other stale.
   bool repeated[2];
   for (int i = 0; i < 2; ++i) {
     const u32 pc = cpus[i]->hot.regs[15];
@@ -286,8 +245,8 @@ void Scheduler::count_slice(bool skipped, s64 slice) const {
   if (nds_.dma.any_running(Cpu::ARM9) || nds_.dma.any_running(Cpu::ARM7)) prof::add(prof::C_SLICES_DMA, 1);
   if (skipped) prof::add(prof::C_SLICES_SKIPPED, 1);
 
-  // Cycle-weighted halt state: slice counts hide it, because the slices where
-  // a CPU is awake are the ones the quantum keeps short.
+  // Cycle-weighted halt state: plain slice counts hide it since awake-CPU
+  // slices are the ones the quantum keeps short.
   const u64 cyc = static_cast<u64>(slice);
   prof::add(prof::C_CYC_TOTAL, cyc);
   if (a9.halted && a7.halted) prof::add(prof::C_CYC_BOTH_HALTED, cyc);
@@ -375,29 +334,19 @@ void Scheduler::count_slice(bool skipped, s64 slice) const {
   }
 }
 
-// Every armed event at or before now_, in table order, repeated until none
-// is left: a handler may schedule an event (its own, or one earlier in the
-// table) at a time the CPUs have already overshot — a timer with a period
-// shorter than a slice does — and a single pass would leave it armed in the
-// past, where run_until(next_deadline()) can never reach it.
+// Fires every armed event at or before now_, repeated until none left: a
+// handler may reschedule an event already overshot (timer period shorter
+// than a slice), which one pass would leave armed in the past.
 void Scheduler::fire_due() {
-  // Soft (timer) events are stepped from the CPU's own position, overshoot
-  // included: melonDS's RunTimers(1) runs after the ARM7 slice with cycles
-  // = ARM7Timestamp - TimerTimestamp, so an overflow the ARM7 ran past is
-  // seen at this slice end, not the next. ARM7 timers are ids 6..9.
+  // Soft (timer) events step from the CPU's own position, overshoot
+  // included. ARM7 timers are ids 6..9.
   const u64 lim7 = arm7_debt_ < 0 ? now_ + static_cast<u64>(-arm7_debt_) : now_;
   while (now_ >= next_ || now_ >= next_soft9_ || lim7 >= next_soft7_) {
-    // One walk of the armed set, not one to fire and one to rescan: the pass
-    // starts with next_ empty and folds in every event it steps over, while
-    // schedule() folds in every event a handler arms (it keeps next_ current
-    // against whatever minimum stands). Both leave next_ the true minimum.
     next_ = std::numeric_limits<u64>::max();
     next_soft9_ = next_soft7_ = std::numeric_limits<u64>::max();
     next_id_ = EVENT_COUNT;
-    // Ascending id order, i.e. table order, as when this walked the array.
-    // `armed_` is re-read after every handler so an event the handler arms at
-    // a higher id still fires in this pass, and one it arms at a lower id
-    // waits for the next -- exactly what the array walk did.
+    // Ascending id order; `armed_` re-read after every handler so an event
+    // armed at a higher id fires this pass, a lower one waits for the next.
     for (u32 m = armed_; m; ) {
       const u32 i = static_cast<u32>(__builtin_ctz(m));
       const u32 bit = 1u << i;
@@ -406,13 +355,11 @@ void Scheduler::fire_due() {
         armed_ &= ~bit;
         firing_at_ = at_[i];
         if (debug_slices_) std::fprintf(stderr, "[fire] t %llu event %u at %llu\n", (unsigned long long)now_, i, (unsigned long long)at_[i]);
-        // The two scanline handlers and the SPU account for themselves (the
-        // SPU is one event per sample, ~540 a frame, with its own stage).
+        // The two scanline handlers and the SPU account for themselves.
         if (i == static_cast<u32>(EventId::HBlank) || i == static_cast<u32>(EventId::VBlank_Scanline) || i == static_cast<u32>(EventId::Spu)) fn_[i](nds_, param_[i]);
         else if (!prof::enabled) fn_[i](nds_, param_[i]);   // may schedule: next_ is kept current by schedule()
         else {
-          // Per event id as well as in the EVENTS stage, so the stage can be
-          // split by what fired (printed by the destructor).
+          // Per event id as well as in the EVENTS stage (destructor prints it).
           const auto t0 = std::chrono::steady_clock::now();
           fn_[i](nds_, param_[i]);
           const u64 el = static_cast<u64>((std::chrono::steady_clock::now() - t0).count());
@@ -429,13 +376,9 @@ void Scheduler::fire_due() {
   }
 }
 
-// One CPU's share of a slice: a running DMA goes first (the CPU is stalled),
-// then the CPU runs; a DMA it starts preempts it and the loop hands the
-// remaining budget to the DMA before the CPU continues.
-// DSi: the instruction that started the DMA has driven the budget below the
-// zero preempt() set; that cost is handed back so the DMA starts at the
-// instruction's start time, and charged after the CPU's next instruction
-// (CpuContext::defer_cost), as melonDS's pending Cycles are.
+// DSi: the instruction that started a DMA drove the budget below the zero
+// preempt() set; hand that cost back so the DMA starts at the instruction's
+// start time, charged after the CPU's next instruction (CpuContext::defer_cost).
 void Scheduler::defer_preempt_cost(CpuContext& cpu) {
   if (!dsi_ || cpu.yielded || cpu.hot.cycle_budget >= 0) return;
   const s32 over = -cpu.hot.cycle_budget;
@@ -443,13 +386,9 @@ void Scheduler::defer_preempt_cost(CpuContext& cpu) {
   cpu.defer_cost += over;
 }
 
-// A skipped CPU still has to let its DMA advance. On hardware a transfer runs
-// while the core is halted; here DMA is driven from inside run_cpu, so a
-// skipped slice froze it -- which is why machine_idle vetoed the skip whenever
-// a channel was running, and why dbori kept 245 k of its idle opportunity
-// behind that veto. This is the same call run_cpu makes, with the CPU left
-// alone. DSi keeps the veto instead: its ARM9 DMA hands the slice back through
-// a9_dma_iter_, which has no meaning when no CPU ran.
+// A skipped CPU still lets its DMA advance (DMA is driven from inside
+// run_cpu). DSi instead keeps the machine_idle DMA veto, since a9_dma_iter_
+// has no meaning when no CPU ran.
 void Scheduler::advance_dma_only(CpuContext& cpu) {
   const Cpu which = cpu.which;
   if (!nds_.dma.any_running(which)) return;
@@ -466,17 +405,11 @@ void Scheduler::run_cpu(CpuContext& cpu, RunFn run) {
       const s32 b0 = cpu.hot.cycle_budget;
       { DS_PROF(DMA); in_dma_ = true; dma_used_ = 0; cpu.hot.cycle_budget -= static_cast<s32>(nds_.dma.run(which, static_cast<u32>(cpu.hot.cycle_budget))); in_dma_ = false; dma_used_ = 0; }
       if (dsi_ && which == Cpu::ARM9 && cpu.hot.cycle_budget != b0) { a9_dma_iter_ = true; return; }   // see a9_dma_iter_ (a DMA that could not move is not an iteration)
-      // DSi ARM7: melonDS re-enters its DMAs until the ARM7 reaches the target
-      // (while (ARM7Timestamp < target) { RunNDMAs(1) ... }). A share that
-      // moved and left budget is one pass of a multi-channel hand-off (AES
-      // NDMA in/out ping-pong); returning here banks the rest as ARM7 debt
-      // and the ARM7 falls behind the ARM9 for the whole transfer.
+      // DSi ARM7: re-enter until the DMA reaches its target (multi-channel
+      // hand-off, e.g. AES NDMA ping-pong); else it falls behind for the whole transfer.
       if (dsi_ && cpu.hot.cycle_budget > 0 && cpu.hot.cycle_budget != b0 && nds_.dma.any_running(which)) continue;
       if (cpu.hot.cycle_budget <= 0 || nds_.dma.any_running(which)) return;
-      // The DMA ended mid-phase and the CPU resumes now: an IRQ its DMA raised
-      // is off-slice (Io::update_irq), taken after this CPU's next instruction
-      // (melonDS resumes from Halt(2) straight into Execute, which checks IRQs
-      // only after an instruction). The phase-start conversion has passed.
+      // DMA ended mid-phase: an IRQ it raised is taken after this CPU's next instruction, not immediately.
       if (cpu.irq_offline) { cpu.irq_skip_once = !cpu.halted; cpu.irq_offline = false; }
     }
     {
@@ -502,14 +435,11 @@ void Scheduler::run_cpu(CpuContext& cpu, RunFn run) {
 }
 
 #if DSPERATE_JIT
-// ---- native slice loop ----------------------------------------------------------
+// ---- native slice loop ----
 //
-// run_until / run_cpu / jit::run cut at the points where translated code is
-// entered, written as one straight-line sequence per slice with two resume
-// points at the top (the in-order core mispredicts jump tables and indirect
-// calls; the common path here is a handful of well-predicted branches). The
-// order of operations is exactly the one of run_until below; the strict
-// slice diff and the JIT-vs-JIT frame diff check it.
+// run_until/run_cpu/jit::run flattened into one straight-line sequence per
+// slice, cut where translated code is entered, with two resume points at the
+// top. Order of operations matches run_until below exactly.
 
 namespace {
 enum { SL_BEGIN, SL_A9, SL_A7 };
@@ -620,7 +550,7 @@ a9_done:
   }
 a7_done:
   {
-    if (nds_.dsi_soft_reset_pending) nds_.dsi_soft_reset();   // see run_until_impl
+    if (nds_.dsi_soft_reset_pending) nds_.dsi_soft_reset();   // BPTWL soft reset mid-slice
     const s64 consumed7 = (a7.halted || sl_.skip7) ? sl_.budget7 : (sl_.budget7 - a7.hot.cycle_budget);
     arm7_debt_ -= consumed7 * 2;
   }
@@ -696,7 +626,7 @@ u64 Scheduler::run_until_impl(u64 until, bool until_frame) {
     running_ = &a9; running_start_budget_ = budget9_; running_shift_ = 0; running_rshift_ = dsi_ ? shift9_ + 1 : 0; running_base_ = now_; running_carry_ = static_cast<u64>(arm9_carry_);
     if (skip9) advance_dma_only(a9); else run_cpu(a9, nds_.run_arm9);
     // A halted CPU consumes exactly the slice; a running one may overshoot,
-    // and the overshoot is real time (it carries into the next slice).
+    // which carries into the next slice.
     const bool full9 = (a9.halted || skip9) && !a9_dma_iter_;
     const bool dma_iter = a9_dma_iter_; a9_dma_iter_ = false;
     s64 ran9 = full9 ? slice : ticks9(budget9_ - a9.hot.cycle_budget);
@@ -704,9 +634,8 @@ u64 Scheduler::run_until_impl(u64 until, bool until_frame) {
     if (ran9 <= 0) ran9 = dma_iter ? 0 : 1;   // see above
     running_ = nullptr; running_rshift_ = 0;
 
-    // The ARM7 runs at half clock and must cover the same span of time. Its
-    // overshoot and the odd ARM9 cycle are carried in arm7_debt_, the way
-    // melonDS carries absolute timestamps, so it neither gains nor loses time.
+    // The ARM7 runs at half clock and must cover the same span of time; its
+    // overshoot and the odd ARM9 cycle are carried in arm7_debt_.
     arm7_debt_ += ran9;
     const s32 budget7 = static_cast<s32>(arm7_debt_ / 2);
     if (budget7 > 0) {
@@ -716,9 +645,8 @@ u64 Scheduler::run_until_impl(u64 until, bool until_frame) {
       running_ = &a7; running_start_budget_ = budget7; running_shift_ = 1; running_rshift_ = 0;
       running_base_ = dsi_ ? static_cast<u64>(static_cast<s64>(now_) + ran9 - arm7_debt_) : now_;
       if (skip7) advance_dma_only(a7); else run_cpu(a7, nds_.run_arm7);
-      // A BPTWL soft reset halted the ARM7 mid-slice (Io::bptwl_write). Reset
-      // as its run returns, as melonDS does at the end of ARM7::Execute; the
-      // ARM7 is un-halted with a zero budget, so the slice counts as run.
+      // A BPTWL soft reset halted the ARM7 mid-slice; handled as its run
+      // returns, un-halted with a zero budget so the slice counts as run.
       if (nds_.dsi_soft_reset_pending) nds_.dsi_soft_reset();
       const s64 consumed7 = (a7.halted || skip7) ? budget7 : (budget7 - a7.hot.cycle_budget);
       arm7_debt_ -= consumed7 * 2;
@@ -736,26 +664,10 @@ u64 Scheduler::run_until_impl(u64 until, bool until_frame) {
 
 template <class S> void Scheduler::sync_state(S& s) {
   s.begin("SCHD");
-  // The event arrays grew with the DSi's events (FORMAT_VERSION 3: the two
-  // grid events, the SD/MMC and SDIO transfers, the Wi-Fi module's timer, the
-  // camera's two and the card slots' power-off timers).
-  //
-  // The version-2 reader that used to stand here is gone with
-  // OLDEST_READABLE_VERSION 4. It is worth recording why it was delicate: a
-  // version-2 file carried 20 events until Wifi was added (2026-09-07) and 21
-  // after, both written as version 2, so the count had to be recovered from
-  // the chunk's remaining size. Reading 21 from a 20-event file shifted every
-  // param_ by two entries -- the ARM7's Timer1 fired as Timer3 once and never
-  // rescheduled, the sound driver lost its tick, and the state ran silent and
-  // 1.5 ms a frame lighter than it should (found 2026-09-16 on the st-intro
-  // and gsdd-phase2 scenes). A format version that does not move when the
-  // layout does costs more than the bump it saves.
   static_assert(EVENT_COUNT == 29, "EVENT_COUNT changed: add a save-state version");
   s.fields(now_, arm7_debt_, armed_);
   s.fields(at_, param_);
-  // The idle-skip pre-filter: whether a slice is skipped depends on the
-  // recent slice-start PCs, so the ring is part of the timing.
-  s.fields(idle_pc_ring_, idle_pc_pos_);
+  s.fields(idle_pc_ring_, idle_pc_pos_);   // idle-skip pre-filter is part of the timing
   s.fields(arm9_carry_);   // appended: DS states leave it 0
   s.end();
   if constexpr (S::reading) {

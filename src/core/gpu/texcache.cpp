@@ -11,8 +11,7 @@ namespace ds::gpu {
 
 namespace {
 
-// Copy / compare a view range through the block table, chunked over the
-// unique-bank blocks; bytes in overlapping-bank blocks go through the OR read.
+// Chunked over unique-bank blocks; overlapping-bank bytes go through the OR read.
 void view_copy(const VramMap& vm, const VramView& v, u32 addr, u32 len, u8* dst) {
   while (len) {
     const u32 a = addr & v.addr_mask();
@@ -43,8 +42,7 @@ TextureCache::TextureCache() { verify_ = std::getenv("DS_TEXCACHE_VERIFY") != nu
 TextureCache::~TextureCache() { if (verify_) std::fprintf(stderr, "[texcache] verify: %u gated validations, all agreed with the compare\n", gate_hits_); }
 
 u64 TextureCache::key(u32 fmt, u32 base, u32 width, u32 height, u32 texpal, u32 alpha0) {
-  // fmt 3 bits, base 19 bits (8-byte units: 16), width/height 3 bits each as
-  // log2-8, texpal 13 bits, alpha0 1 bit.
+  // bits: fmt:3 base>>3:16 lw:3 lh:3 texpal:13 alpha0:1
   u32 lw = 0, lh = 0;
   while ((8u << lw) < width) ++lw;
   while ((8u << lh) < height) ++lh;
@@ -56,8 +54,7 @@ void TextureCache::begin_frame(u64 frame) {
   frame_ = frame;
   decodes_ = 0;
   if (bytes_ <= BUDGET_BYTES) return;
-  // Over budget: drop what the previous frame did not use; if that is not
-  // enough, everything older than this frame goes.
+  // Over budget: drop unused-last-frame entries first, then anything stale.
   for (int pass = 0; pass < 2 && bytes_ > BUDGET_BYTES; ++pass) {
     for (auto it = entries_.begin(); it != entries_.end();) {
       const bool stale = pass == 0 ? (it->second.used + 1 < frame) : (it->second.used < frame);
@@ -122,8 +119,6 @@ void TextureCache::stamp(const VramMap& vm, Entry& e) const {
 }
 
 bool TextureCache::unchanged(const VramMap& vm, Entry& e) {
-  // The gate (texcache.h): no remap since the last validation, or none that
-  // moved the banks behind the ranges or made one of them CPU-writable.
   bool compare = vm.generation() != e.gen;
   if (compare) {
     u32 banks = 0; u64 sig = 0;
@@ -145,10 +140,7 @@ bool TextureCache::unchanged(const VramMap& vm, Entry& e) {
   return true;
 }
 
-// The decoders reproduce Renderer3D::texture_sample texel for texel (that
-// function stays the specification; the frame-dump comparison between the
-// NEON build, which samples the cache, and the reference build, which calls
-// the sampler, is what checks them against each other).
+// Mirrors Renderer3D::texture_sample.
 void TextureCache::decode(const VramMap& vm, Entry& e) {
   ++e.version;
   const VramView& tv = vm.texture; const VramView& pv = vm.texpal;
@@ -217,8 +209,6 @@ void TextureCache::decode(const VramMap& vm, Entry& e) {
       }
       out[i] = pack(colour, alpha);
     }
-    // Texels: the block rows of the whole texture; palette info: half that,
-    // in slot 1; palette: the range the blocks referenced.
     const u32 tex_bytes = n / 4;
     src(base & 0x7FFFF, tex_bytes, false);
     const u32 s1 = 0x20000 + (((base & 0x7FFFF) & 0x1FFFC) >> 1) + ((base & 0x7FFFF) >= 0x40000 ? 0x10000 : 0);
@@ -235,10 +225,6 @@ void TextureCache::decode(const VramMap& vm, Entry& e) {
     src(base, n * 2, false);
     break;
   }
-  // Whether any texel is fully transparent -- once per decode, so the GPU
-  // raster can treat a texture that MAY carry alpha 0 (its format allows it)
-  // but does not as the opaque texture it is: the depth prepass shades only
-  // the polygons this is true for.
   bool transparent = false;
   for (u32 i = 0; i < n && !transparent; ++i) transparent = ((out[i] >> 16) & 0x1Fu) == 0u;
   e.transparent = transparent;

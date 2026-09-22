@@ -1,16 +1,12 @@
-// DSi SD/MMC host and the eMMC (NAND) device behind it.
+// DSi SD/MMC host and the eMMC (NAND) device behind it. Port of melonDS's
+// DSi_SD.cpp (GPL-3.0-or-later, melonDS team).
 //
-// A port of melonDS's DSi_SD.cpp: the SDMMC host at 0x04004800-0x040049FF
-// with its command/response registers, the two 16-bit data FIFOs and the
-// 32-bit one they drain into, the IRQ/card-IRQ masks, and an MMC device on
-// port 1 holding the NAND. Port 0 is the SD card slot: empty ("no card"), or
-// the card dsi_sd_card.h builds from a host folder. The same controller, instance 1, is the SDIO host at
-// 0x04004A00 with the Atheros Wi-Fi module on its port 0 (melonDS DSi_NWifi).
+// SDMMC host at 0x04004800-0x040049FF: command/response registers, two 16-bit data FIFOs
+// draining into a 32-bit one, IRQ/card-IRQ masks, an MMC device on port 1 holding the NAND.
+// Port 0 is the SD card slot. Instance 1 of the same controller is the SDIO host at 0x04004A00
+// with the Atheros Wi-Fi module on its port 0.
 //
-// The guest sees *raw* eMMC sectors here. The NAND's AES-CTR lives in
-// software above this host -- melonDS's NANDImage only decrypts for its own
-// host-side FAT view, never on the path the guest reads -- so nothing in
-// this file encrypts anything.
+// The guest sees *raw* eMMC sectors; AES-CTR decryption happens in software above this host.
 
 #ifndef DS_CORE_IO_DSI_SD_H
 #define DS_CORE_IO_DSI_SD_H
@@ -32,7 +28,7 @@ struct NDS;
 
 namespace ds::io {
 
-// MMC commands the DSi's SDK and boot code issue (melonDS MMCCommand).
+// MMC commands the DSi's SDK and boot code issue.
 enum class MmcCmd : u32 {
   Reset = 0, GetOcr = 1, AllGetCid = 2, GetRca = 3, SdioOpCond = 5, Switch = 6,
   Select = 7, SetVoltage = 8, GetCsd = 9, GetCid = 10, StopTransmission = 12,
@@ -54,19 +50,15 @@ class BlockStorage {
   virtual void read(u64 addr, u32 len, u8* out) = 0;
   virtual void write(u64 addr, u32 len, const u8* in) = 0;
   virtual void flush() {}
-  virtual const u8* cid() const = 0;   // the 16-byte card ID the device reports
+  virtual const u8* cid() const = 0;   // 16-byte card ID the device reports
 };
 
-// A NAND image backed by a real nand.bin. The image carries a 0x40-byte
-// nocash footer holding the eMMC CID and the console ID; without it we cannot
-// key anything, so the open fails loudly.
+// A NAND image backed by a real nand.bin. Carries a 0x40-byte nocash footer holding the eMMC
+// CID and console ID; without it, open fails.
 //
-// The dump is opened read-only and every guest write lands in memory, one
-// 512-byte sector at a time, overlaid on the file for later reads: a dump is
-// a file the user cannot regenerate (docs/dsiware-scoping.md 2.3). What
-// persists is pulled back out of the written sectors as files. `write_through`
-// is for the melonDS comparisons, which diff the written image on disk (run
-// them on a copy).
+// The dump opens read-only; guest writes land in memory, one 512-byte sector at a time,
+// overlaid on the file for later reads. `write_through` writes sectors straight to the file
+// instead, for diffing against a copy.
 class NandImage : public BlockStorage {
  public:
   ~NandImage();
@@ -75,9 +67,7 @@ class NandImage : public BlockStorage {
   NandImage& operator=(const NandImage&) = delete;
 
   bool open(const std::string& path, bool write_through = false);
-  // An image with no file behind it: every sector reads zero until written,
-  // and writes are held in memory like a dump's. What a synthesised NAND is
-  // built on (dsi_nand_synth.h).
+  // No file behind it: sectors read zero until written; writes held in memory like a dump's.
   void create_in_memory(u64 length, const u8 cid[16], u64 console_id);
   void close();
   bool valid() const { return file_ != nullptr || in_memory_; }
@@ -85,20 +75,14 @@ class NandImage : public BlockStorage {
   bool write_through() const { return write_through_; }
   // Sectors written this session and held in memory (empty under write_through).
   const std::unordered_map<u64, std::array<u8, 512>>& written_sectors() const { return written_; }
-  // What changed since the image was ready. For a dump that is every written
-  // sector; an image built in memory calls mark_baseline() once built (and
-  // once its saves are imported), so only the session's own writes count.
+  // Before mark_baseline(), every written sector counts as changed; after, only writes since.
   void mark_baseline() { baseline_ = true; changed_.clear(); }
   bool changed(u64 sector) const { return baseline_ ? changed_.count(sector) != 0 : written_.count(sector) != 0; }
   bool any_changed() const { return baseline_ ? !changed_.empty() : !written_.empty(); }
 
-  // Save states (docs/dsiware-scoping.md 2.5). A state carries the sectors
-  // written since the state base and the base's identity, and loads only onto
-  // the same base. The base is the image as the session built it before any
-  // saves went in: the dump as opened with its titles hidden or one installed,
-  // or the synthesised NAND. mark_state_base() fixes it; unmarked, the base is
-  // the file (or nothing, in memory) and every written sector is carried.
-  // Imported saves come after the base, so a state brings its own back.
+  // Save states carry sectors written since the state base, loading only onto that same base.
+  // mark_state_base() fixes the base to the image's current contents; unmarked, the base is the
+  // file (or nothing, in memory) and every written sector is carried.
   void mark_state_base();
   bool state_base_marked() const { return state_base_; }
   u64 state_identity() const { return state_id_; }   // 0: no image
@@ -108,9 +92,8 @@ class NandImage : public BlockStorage {
     std::vector<u8> data;       // 512 bytes per sector
   };
   StateDelta state_delta() const;
-  // Back to the base, then the delta's sectors over it. The caller has
-  // checked the identity. Counts as a write (`writes`), so what the loaded
-  // sectors hold is carried out again like the guest's own writes.
+  // Restores the base, then applies the delta's sectors over it. Caller must check identity
+  // first. Counts as a write (`writes`).
   void apply_state_delta(const StateDelta& d);
 
   u64 console_id() const { return console_id_; }
@@ -122,12 +105,10 @@ class NandImage : public BlockStorage {
   void write(u64 addr, u32 len, const u8* in) override;
   void flush() override;
   const u8* cid() const override { return cid_; }
-  // The same, for the emulator's own filesystem work (NandFs): not counted,
-  // not logged, so the guest's access record stays the guest's.
+  // Same as read/write, for the emulator's own filesystem work: not counted, not logged.
   void peek(u64 addr, u32 len, u8* out);
   void poke(u64 addr, u32 len, const u8* in);
 
-  // Access counters, for the melonDS gate's "nand: N block reads/writes" line.
   u64 reads = 0, writes = 0;
 
  private:
@@ -147,8 +128,7 @@ class NandImage : public BlockStorage {
   std::unordered_map<u64, std::array<u8, 512>> written_;   // sector index -> contents
   std::unordered_set<u64> changed_;                         // written since mark_baseline()
   bool baseline_ = false;
-  // What each sector written since mark_state_base() held at the base: its
-  // written contents, or nothing (the file's, or zero).
+  // Per sector written since mark_state_base(): contents at the base (nullopt: file's, or zero).
   std::unordered_map<u64, std::optional<std::array<u8, 512>>> since_base_;
   bool state_base_ = false;
   u64 state_id_ = 0;
@@ -158,7 +138,7 @@ class NandImage : public BlockStorage {
 class SdHost;
 class NWifi;
 
-// A device on one of a host's two ports (melonDS DSi_SDDevice).
+// A device on one of a host's two ports.
 class SdDevice {
  public:
   virtual ~SdDevice() = default;
@@ -170,8 +150,8 @@ class SdDevice {
   bool read_only = false;
 };
 
-// A storage device: the eMMC on port 1 or the SD card on port 0. melonDS's
-// DSi_MMCStorage, whose SD card differs in three commands (CMD1, CMD3, ACMD41).
+// A storage device: the eMMC on port 1 or the SD card on port 0. The SD card
+// differs in three commands (CMD1, CMD3, ACMD41).
 class MmcStorage : public SdDevice {
  public:
   MmcStorage(NDS& nds, SdHost& host, BlockStorage& storage, bool sd_card)
@@ -207,18 +187,17 @@ class MmcStorage : public SdDevice {
 class SdHost {
  public:
   // num 0: the SDMMC host (0x04004800, NAND on port 1); 1: the SDIO host
-  // (0x04004A00, Wi-Fi on port 0). melonDS DSi_SDHost::Num.
+  // (0x04004A00, Wi-Fi on port 0).
   SdHost(NDS& nds, u32 num);
   ~SdHost();
   NWifi* nwifi() { return wifi_.get(); }
-  void set_card_irq();   // a device's IRQ line changed (melonDS SetCardIRQ)
+  void set_card_irq();   // a device's IRQ line changed
   u32 num() const { return num_; }
 
   void reset();
   void attach_nand(NandImage* nand);
   bool has_nand() const { return storage_ != nullptr; }
-  // The SD card in the slot (host 0, port 0), or none. `read_only` clears the
-  // writable bit and drops writes.
+  // `read_only` clears the writable bit and drops writes.
   void attach_sd(BlockStorage* card, bool read_only = false);
   bool has_sd() const { return card_ != nullptr; }
 
@@ -235,7 +214,6 @@ class SdHost {
   u32  data_tx(u8* data, u32 len);
   u32  transferrable_len(u32 len) const;
 
-  // Scheduler callbacks (Event_DSi_SDMMCTransfer / SDIOTransfer's two function ids).
   static void ev_transfer_mmc(NDS& nds, u32 param);
   static void ev_transfer_sdio(NDS& nds, u32 param);
   void schedule_transfer(u32 which);
@@ -259,7 +237,6 @@ class SdHost {
   u32 irq2_main() const;
   u32 irq2_data1() const;
 
-  // melonDS's FIFO<u16,0x100> / FIFO<u32,0x80>, as plain ring buffers.
   template <typename T, u32 N>
   struct Fifo {
     T buf[N] = {};

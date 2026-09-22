@@ -1,17 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // DSperate - Nintendo DS emulator. Copyright (C) 2026 DSperate contributors.
 //
-// The DS Wi-Fi block (ARM7, 0x04800000-0x0480FFFF): the register file, the
-// 8 KB frame RAM, the baseband and RF register indirection, the transceiver
-// power state machine, the 8 us timer with its beacon and command counters,
-// and the TX/RX frame engine with Nintendo's local-multiplayer CMD / reply /
-// ack sequencing. A port of melonDS's Wifi.cpp and WifiAP.cpp, kept close to
-// it on purpose: trace_melonds is the oracle for this block.
+// DS Wi-Fi block (ARM7, 0x04800000-0x0480FFFF): register file, 8 KB frame
+// RAM, baseband/RF register indirection, transceiver power state machine,
+// 8 us timer, TX/RX frame engine with Nintendo's local-multiplayer CMD/
+// reply/ack sequencing. Port of melonDS's Wifi.cpp/WifiAP.cpp
+// (GPL-3.0-or-later, melonDS team).
 //
-// Frames leave through an MpTransport (other emulators) and, when none is
-// engaged in multiplayer, through the emulated access point to a NetDriver
-// (the host network). With neither set the radio is a DS alone in a room.
-// docs/wifi-scoping.md has the whole picture.
+// Frames leave through an MpTransport (other emulators) or, outside
+// multiplayer, the emulated access point to a NetDriver (host network).
 #pragma once
 
 #include "core/types.h"
@@ -34,50 +31,32 @@ public:
 
   // POWCNT2 bit 1 or W_POWER_US changed: start or stop the 8 us timer.
   void update_power_on();
-  void us_timer();                  // the scheduler event body
+  void us_timer();
 
   // Outside world. Null means nobody is listening.
   void set_transport(MpTransport* mp) { mp_ = mp; }
   void set_net_driver(NetDriver* net) { net_ = net; }
-  // How many frames the radio has actually put on the air: past the channel
-  // check in tx_send_frame, so a real channel was tuned and something was
-  // sent. This is what "the game is looking for someone to talk to" looks
-  // like from outside, and a frontend waiting to scan for a session wants
-  // the first one of these.
-  //
-  // NOT the radio having power (`on_`): the DS firmware powers the Wi-Fi
-  // block during its own boot, long before any game asks for it, so a
-  // frontend keying on that fires while the console is still starting up.
-  // Learned the hard way. Diagnostic only -- it is not in the save state,
-  // and nothing in the machine reads it. docs/wifi-scoping.md.
+  // Frames actually put on the air, not just radio power-on. Diagnostic
+  // only; not in save state.
   u32 tx_frames() const { return tx_frames_; }
   MpTransport* transport() const { return mp_; }
-  // The SSID the emulated access point beacons under. Probe requests that
-  // name another SSID are answered with that name, so a firmware configured
-  // for any open network still associates.
+  // SSID the emulated AP beacons under; probes naming another SSID are
+  // answered with that name so any-open-network firmware still associates.
   void set_ap_name(const std::string& name) { ap_.name = name; }
 
-  // How many times this console, as MP host, has synced a client (an
-  // association it answered). A test harness keys scripted input on it.
-  u32 host_syncs() const { return host_syncs_; }
-  // Whether this console is in a local-wireless (MP) exchange right now, as
-  // either end: the host that armed its beacon slot, or a client that has an
-  // association. A frontend needs it to tell a Download Play child program
-  // booting from the firmware apart from a Slot-1 card launch, which look
-  // identical from the display side (both fade both engines to white).
-  // Cleared by a deauth, a host that vanishes, and reset.
+  u32 host_syncs() const { return host_syncs_; }   // times this console, as MP host, synced a client
+  // In a local-wireless exchange now, as host (armed beacon slot) or client
+  // (has an association). Distinguishes Download Play from a Slot-1 launch.
   bool mp_active() const { return is_mp_ || is_mp_client_; }
-  void trace_frame(int frame);      // frontend hook: a "# frame N" marker in the register trace
+  void trace_frame(int frame);
   const u8* mac() const { return reinterpret_cast<const u8*>(&io_[W_MACAddr0 / 2]); }
   const u8* bssid() const { return reinterpret_cast<const u8*>(&io_[W_BSSID0 / 2]); }
 
-  // Save state: three pieces at the positions the IO chunk has always had
-  // them (registers; the timer; the engine, appended).
   template <class S> void sync_state_regs(S& s);
   template <class S> void sync_state_timer(S& s);
   template <class S> void sync_state_engine(S& s);
 
-  // Register offsets (melonDS Wifi.h names).
+  // Register offsets.
   enum : u32 {
     W_ID = 0x000, W_ModeReset = 0x004, W_ModeWEP = 0x006, W_TXStatCnt = 0x008, W_IF = 0x010, W_IE = 0x012,
     W_MACAddr0 = 0x018, W_MACAddr1 = 0x01A, W_MACAddr2 = 0x01C, W_BSSID0 = 0x020, W_BSSID1 = 0x022, W_BSSID2 = 0x024,
@@ -106,7 +85,7 @@ public:
   };
 
 private:
-  static constexpr int kTimerInterval = 8;                        // us per event (melonDS kTimerInterval)
+  static constexpr int kTimerInterval = 8;                        // us per event
   static constexpr u32 kTimeCheckMask = ~u32(kTimerInterval - 1);
 
   NDS& nds_;
@@ -126,7 +105,7 @@ private:
 
   // ---- timer ----
   bool on_ = false;
-  u32  tx_frames_ = 0;         // frames actually transmitted; see tx_frames()
+  u32  tx_frames_ = 0;
   s32  timer_err_ = 0;
   u64  us_timestamp_ = 0, us_counter_ = 0, us_compare_ = 0;
   s32  us_until_power_on_ = 0;
@@ -155,8 +134,8 @@ private:
   u16 mp_last_seqno_ = 0xFFFF;
   bool is_mp_ = false, is_mp_client_ = false;
   u32  host_syncs_ = 0;
-  int  last_rx_type_ = 0;            // trace only: which check_rx delivered the frame in rx_buffer_
-  bool no_peek_ = false;            // DS_WIFI_NO_PEEK: never fetch host frames early; pace only at next_sync
+  int  last_rx_type_ = 0;            // trace only: which check_rx delivered the frame
+  bool no_peek_ = false;            // DS_WIFI_NO_PEEK: never fetch host frames early
   u64 next_sync_ = 0, rx_timestamp_ = 0;
 
   // ---- the emulated access point (melonDS WifiAP) ----

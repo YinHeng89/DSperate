@@ -7,23 +7,17 @@
 
 namespace ds::sdl {
 
-// Microphone straight from ALSA, bypassing the session's sound server. On
-// the handhelds SDL's capture goes through PipeWire, whose only "source" is
-// a monitor of the speaker: the game hears itself and nothing else. The
-// codec's own capture PCM is free even while PipeWire holds playback, so it
-// is opened directly (DS_MIC_DEV, default plughw:0,0 -- the plug layer does
-// the mono/rate conversion). libasound is dlopen'd; without it, or without
-// the device, open() fails and the SDL path is used.
+// Microphone via direct ALSA, bypassing SDL/PipeWire: on the handhelds
+// PipeWire's only capture "source" is a monitor of the speaker. DS_MIC_DEV
+// selects the ALSA device (default plughw:0,0). libasound is dlopen'd; on
+// failure open() returns false and the SDL path is used.
 class MicAlsa {
 public:
-  bool open(u32 rate, const char* device = nullptr);   // device: ALSA name; null/empty = DS_MIC_DEV or plughw:0,0
+  bool open(u32 rate, const char* device = nullptr);   // null/empty device = DS_MIC_DEV or plughw:0,0
   void close();
   bool active() const { return pcm_ != nullptr; }
-  // True when the capture PCM opened but rejected our parameters. The device
-  // is there and busy or restricted; letting SDL open it too would only poke
-  // the same codec a second time (on the handhelds the capture and playback
-  // substreams share a DAI, and a second failed setup can leave the playback
-  // stream not consuming), so the SDL fallback is skipped in that case.
+  // True if the PCM opened but rejected our params: device is busy/restricted,
+  // so the SDL fallback (which would hit the same codec) is skipped too.
   bool rejected() const { return rejected_; }
   void capture(std::vector<s16>& out);   // everything available, non-blocking
 

@@ -1,12 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // DSperate - Nintendo DS emulator. Copyright (C) 2026 DSperate contributors.
 //
-// Minimal AArch64 instruction encoder for the recompiler. Encodings follow the
-// Arm Architecture Reference Manual (A64 ISA); only the forms the translator
-// and the runtime stubs use are provided. Register operands are plain numbers
-// 0-31; the W/X width is chosen by the `sf` argument of each method or by the
-// method name. Register 31 means SP in address/add-sub-immediate forms and
-// ZR everywhere else, as in the architecture.
+// Minimal AArch64 instruction encoder for the recompiler; only the forms the
+// translator and runtime stubs use. Registers are plain numbers 0-31; W/X
+// width is chosen by each method's `sf` argument or its name. Register 31
+// means SP in address/add-sub-immediate forms and ZR everywhere else.
 #pragma once
 #include "core/types.h"
 
@@ -39,9 +37,7 @@ inline bool encode_logical_imm32(u32 v, u32& n, u32& immr, u32& imms) {
   if (ones == 0 || ones == e) return false;
   // A rotated run of ones has exactly one 0->1 transition around the
   // element; its position is where the run starts, and the rotation is
-  // what moves a run starting at bit 0 there. (The previous form tried all
-  // e rotations, and most values asked about are not encodable, so it ran
-  // the whole search to say no -- 9 % of translation time.)
+  // what moves a run starting at bit 0 there.
   const u32 below = ((elem << 1) | (elem >> (e - 1))) & emask;   // each bit's lower neighbour
   const u32 starts = elem & ~below;
   if (__builtin_popcount(starts) != 1) return false;
@@ -79,7 +75,6 @@ public:
   void movz(u32 rd, u32 imm16, u32 shift = 0, bool sf = false) { emit((sf ? 0xD2800000u : 0x52800000u) | ((shift / 16) << 21) | (imm16 << 5) | rd); }
   void movk(u32 rd, u32 imm16, u32 shift = 0, bool sf = false) { emit((sf ? 0xF2800000u : 0x72800000u) | ((shift / 16) << 21) | (imm16 << 5) | rd); }
   void movn(u32 rd, u32 imm16, u32 shift = 0, bool sf = false) { emit((sf ? 0x92800000u : 0x12800000u) | ((shift / 16) << 21) | (imm16 << 5) | rd); }
-  // Load a 32-bit constant in the fewest instructions.
   void mov_imm(u32 rd, u32 v) {
     u32 n, immr, imms;
     if ((v & 0xFFFF0000) == 0) { movz(rd, v & 0xFFFF); return; }
@@ -106,8 +101,6 @@ public:
   void cmp_imm(u32 rn, u32 imm, bool sf = false) { subs_imm(ZR, rn, imm, sf); }
   void cmn_imm(u32 rn, u32 imm, bool sf = false) { adds_imm(ZR, rn, imm, sf); }
   static bool is_addsub_imm(u32 v) { return v < 0x1000 || ((v & 0xFFF) == 0 && (v >> 12) < 0x1000); }
-  // Add or subtract an arbitrary 32-bit constant using `tmp` when needed.
-  // (The negated-immediate form is only used when flags are not wanted.)
   void add_imm_any(u32 rd, u32 rn, u32 v, u32 tmp, bool s = false) {
     if (is_addsub_imm(v)) { addsub_imm(0, s, rd, rn, v, false); return; }
     if (!s && is_addsub_imm(0u - v)) { addsub_imm(1, s, rd, rn, 0u - v, false); return; }
@@ -118,7 +111,6 @@ public:
     if (!s && is_addsub_imm(0u - v)) { addsub_imm(0, s, rd, rn, 0u - v, false); return; }
     mov_imm(tmp, v); addsub_reg(1, s, rd, rn, tmp, LSL, 0, false);
   }
-  // Generic add/sub register form with explicit flag selection.
   void add_sub(bool sub, bool s, u32 rd, u32 rn, u32 rm) { addsub_reg(sub ? 1 : 0, s, rd, rn, rm, LSL, 0, false); }
   void add_reg(u32 rd, u32 rn, u32 rm, Shift sh = LSL, u32 amt = 0, bool sf = false) { addsub_reg(0, false, rd, rn, rm, sh, amt, sf); }
   void sub_reg(u32 rd, u32 rn, u32 rm, Shift sh = LSL, u32 amt = 0, bool sf = false) { addsub_reg(1, false, rd, rn, rm, sh, amt, sf); }
@@ -147,7 +139,6 @@ public:
   bool orr_imm(u32 rd, u32 rn, u32 v) { return logical_imm(1, rd, rn, v); }
   bool eor_imm(u32 rd, u32 rn, u32 v) { return logical_imm(2, rd, rn, v); }
   bool tst_imm(u32 rn, u32 v) { return logical_imm(3, ZR, rn, v); }
-  // 64-bit logical immediates for the few masks the runtime needs (tags).
   void and_imm64(u32 rd, u32 rn, u32 n, u32 immr, u32 imms) { emit(0x92000000u | (n << 22) | (immr << 16) | (imms << 10) | (rn << 5) | rd); }
   void and_imm_any(u32 rd, u32 rn, u32 v, u32 tmp) { if (!and_imm(rd, rn, v)) { mov_imm(tmp, v); and_reg(rd, rn, tmp); } }
   void orr_imm_any(u32 rd, u32 rn, u32 v, u32 tmp) { if (!orr_imm(rd, rn, v)) { mov_imm(tmp, v); orr_reg(rd, rn, tmp); } }
@@ -208,7 +199,7 @@ public:
   void brk(u32 imm = 0) { emit(0xD4200000u | (imm << 5)); }
 
   // ---- loads / stores -------------------------------------------------------
-  // Unsigned scaled immediate offset (offset must be a multiple of the access size).
+  // Unsigned scaled immediate offset (must be a multiple of the access size).
   void ldr_w(u32 rt, u32 rn, u32 off = 0)   { ldst_uimm(0xB9400000u, rt, rn, off, 4); }
   void str_w(u32 rt, u32 rn, u32 off = 0)   { ldst_uimm(0xB9000000u, rt, rn, off, 4); }
   void ldr_x(u32 rt, u32 rn, u32 off = 0)   { ldst_uimm(0xF9400000u, rt, rn, off, 8); }
@@ -260,12 +251,9 @@ public:
   // Forward branches: emit a placeholder, patch when the target is known.
   struct Label { size_t pos = 0; bool bound = false; };
   struct Fixup { size_t at; u32 kind; u32 rt_or_cond; u32 bit; };
-  // Kinds: 0 = b, 1 = b.cond, 2 = cbz, 3 = cbnz, 4 = tbz, 5 = tbnz (cbz/cbnz 32-bit only)
   size_t b_fwd() { size_t at = pos_; emit(0x14000000u); return at; }
   size_t bl_fwd() { size_t at = pos_; emit(0x94000000u); return at; }
-  // Literal data in the instruction stream (read by a stub through x30).
   void word(u32 v) { emit(v); }
-  // Resolve the branch at `at` (any kind above, b/bl included) to an absolute target.
   static void patch_rel(u8* at, const u8* target) {
     u32 w; std::memcpy(&w, at, 4);
     const s64 delta = target - at;
@@ -286,7 +274,6 @@ public:
   size_t cbnz_fwd(u32 rt, bool sf = false) { size_t at = pos_; emit((sf ? 0xB5000000u : 0x35000000u) | rt); return at; }
   size_t tbz_fwd(u32 rt, u32 bit) { size_t at = pos_; emit(0x36000000u | ((bit >> 5) << 31) | ((bit & 31) << 19) | rt); return at; }
   size_t tbnz_fwd(u32 rt, u32 bit) { size_t at = pos_; emit(0x37000000u | ((bit >> 5) << 31) | ((bit & 31) << 19) | rt); return at; }
-  // Resolve a forward branch emitted at `at` to the current position.
   void bind(size_t at) { bind_to(at, pos_); }
   void bind_to(size_t at, size_t target) {
     u32 w; std::memcpy(&w, base_ + at, 4);

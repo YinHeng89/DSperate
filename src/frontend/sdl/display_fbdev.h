@@ -1,36 +1,15 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // DSperate - Nintendo DS emulator. Copyright (C) 2026 DSperate contributors.
 //
-// Direct fbdev scanout: the panel through /dev/fb0, for devices whose SDL2
-// has no KMSDRM or Wayland driver at all.
-//
-// Why this tier exists: spruceOS runs the Anbernic H700 line (RG35XX Plus/
-// H/SP, RG40XX, RG28XX, RG34XX, RGCubeXX) on BaseOS, which ships no libdrm,
-// no libgbm and no Wayland. The only SDL2 that reaches those panels is a
-// mali-fbdev build, and its one video driver is Mali EGL over fbdev: no
-// window framebuffer, so SDL_GetWindowSurface and the software renderer
-// both end in a hidden GLES upload and a blocking eglSwapBuffers -- the
-// same trap display_drm.h describes for KMSDRM, and the same one the A30
-// needed display_disp.h to escape.
-//
-// So, as on KMSDRM, we do not present through SDL. The scanline path writes
-// panel-sized frames straight into fb0's memory, which is triple-buffered
-// inside its virtual height, and the present is one FBIOPAN_DISPLAY. SDL is
-// kept for the window (on its headless driver, so no EGL surface ever
-// touches fb0 -- main.cpp arranges that before SDL_Init, exactly as for the
-// display-engine tier), the events and the pad.
-//
-// The waiting: FBIOPAN_DISPLAY blocks until the refresh on the Allwinner
-// fb drivers (measured on the A30; checked once here, with FBIO_WAITFORVSYNC
-// and then the clock as fallbacks). With vsync on, the pan runs on a
-// presenter thread and begin_frame() blocks only when all three buffers
-// are spoken for -- displayed, latched for the next refresh, and drawn --
-// which is the display's pacing, felt before the frame's emulation. There
-// is no vsync-off mode: the pan itself waits for the refresh on these
-// drivers, so pans always come from the thread and --no-vsync is a no-op.
-//
-// Fails open() cleanly where fb0 is not 32 bpp, not 0xAARRGGBB, or cannot
-// hold two panel-sized buffers; Display then takes SDL's own paths.
+// Direct fbdev scanout through /dev/fb0, for devices whose SDL2 has no
+// KMSDRM or Wayland driver (e.g. spruceOS mali-fbdev on Anbernic H700): its
+// only path is Mali EGL over fbdev, which forces a blocking eglSwapBuffers
+// even through SDL_GetWindowSurface or the software renderer. We write
+// scanline frames straight into fb0 (triple-buffered) and present with
+// FBIOPAN_DISPLAY; SDL is kept only for the window/events/pad. The pan
+// itself blocks for the refresh on these drivers, so --no-vsync is a no-op.
+// open() fails cleanly if fb0 isn't 32bpp ARGB8888 or can't hold two panel
+// buffers, and Display falls back to SDL's own paths.
 #pragma once
 
 #include "core/types.h"
@@ -50,17 +29,14 @@ class FbdevOut : public ScanoutOut {
 public:
   static constexpr int MAX_BUFS = 3;
 
-  // True when /dev/fb0 opens read-write and describes a 32 bpp panel.
-  // Cheap, cached; safe to call before SDL_Init.
+  // True if /dev/fb0 opens read-write and describes a 32bpp panel. Cheap,
+  // cached; safe to call before SDL_Init.
   static bool available();
 
-  // Takes the panel's size from fb0 and resizes `win` to it, so the layout
-  // and the buffers agree (the window lives on a headless driver and has
-  // no size of its own worth keeping). False leaves nothing changed.
+  // Resizes `win` to fb0's panel size (window has no size of its own on the
+  // headless driver). False leaves nothing changed.
   bool open(SDL_Window* win, bool vsync);
 
-  // The window's size is not the truth here, the panel's is: a configure
-  // on the headless driver (a fullscreen toggle) is simply re-asserted.
   bool reopen(SDL_Window* win, int w, int h) override;
   void close() override;
 

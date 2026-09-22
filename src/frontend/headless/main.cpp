@@ -1,11 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // DSperate - Nintendo DS emulator. Copyright (C) 2026 DSperate contributors.
 //
-// Headless frontend: boots the BIOS/firmware (and optionally a ROM), runs N frames,
-// optionally writing per-CPU instruction traces in the shared trace format:
-//   <pc> <instr> <cpsr> r0 .. r14     (hex, one line per instruction)
-// and/or dumping raw framebuffers (--dump-frames) for tools/compare_frames.py
-// and the SPU output (--dump-audio, raw s16 stereo at 32768 Hz).
+// Headless frontend: boots the BIOS/firmware (and optionally a ROM), runs N
+// frames, optionally tracing instructions or dumping frames/audio.
 #include "core/nds.h"
 #include "core/pc_sampler.h"
 #include "core/mem/fastmem_census.h"
@@ -49,9 +46,7 @@
 namespace {
 
 
-// DS_STATE_DEBUG=1: the per-CPU cycle-accounting state and the timing-table
-// rows under each PC, printed where a state is written and after one is
-// loaded, so a timing drift after a load can be attributed.
+// DS_STATE_DEBUG=1: dump per-CPU cycle-accounting state around state save/load.
 void dump_cpu_timing(ds::NDS& nds, const char* when) {
   if (!std::getenv("DS_STATE_DEBUG")) return;
   for (ds::Cpu w : {ds::Cpu::ARM9, ds::Cpu::ARM7}) {
@@ -80,10 +75,8 @@ std::vector<ds::u8> slurp_file(const char* path) {
   std::fclose(f);
   return v;
 }
-// Spin-loop collapse: a poll loop repeats its exact state every iteration until
-// the polled value changes, so a line identical to one of the last 32 emitted
-// lines is dropped. Both tracers apply the same rule, so traces stay comparable
-// while shrinking by orders of magnitude.
+// Spin-loop collapse: a line identical to one of the last 32 emitted lines is
+// dropped, so a poll loop's repeated state doesn't bloat the trace.
 struct TraceState {
   FILE* out[2] = {nullptr, nullptr};
   unsigned long long count[2] = {0, 0};
@@ -100,10 +93,8 @@ struct TraceState {
 void trace_cb(ds::CpuContext& cpu, ds::u32 instr, void* user) {
   auto* t = static_cast<TraceState*>(user);
   const int i = static_cast<int>(cpu.which);
-  // DS_WATCH7=<hex offset into ARM7 WRAM>: polled once per traced instruction,
-  // so a change is attributed to the instruction that follows it. The DS_WATCH
-  // page trap only sees CPU accesses through the slow path; this sees the byte
-  // change however it happened.
+  // DS_WATCH7=<hex offset into ARM7 WRAM>: polled per traced instruction, so it
+  // catches a byte change made any way (not just the slow path DS_WATCH traps).
   {
     static const char* w7 = std::getenv("DS_WATCH7");
     static const ds::u32 woff = w7 ? (ds::u32)std::strtoul(w7, nullptr, 16) : 0;
@@ -142,12 +133,8 @@ void trace_cb(ds::CpuContext& cpu, ds::u32 instr, void* user) {
   for (int r = 0; r < 15; ++r) std::fprintf(t->out[i], " %08x", cpu.hot.regs[r]);
   std::fputc('\n', t->out[i]);
 }
-// DS_ENTRY_SNAP=<dir>:<arm9 pc>:<arm7 pc> (hex): each time a CPU is about to
-// run the instruction at its PC (at most 4 times each), write the machine's
-// state into <dir>/<cpu>_<n>/ -- the raw memory buffers, the serialised device
-// state and a readable summary. Built to capture what the DSi launcher leaves
-// behind for a title at its entry point, to diff against a direct boot of the
-// same title; any run that reaches a known PC can use it.
+// DS_ENTRY_SNAP=<dir>:<arm9 pc>:<arm7 pc> (hex): on hitting each PC (at most 4
+// times each), dump machine state to <dir>/<cpu>_<n>/.
 struct EntrySnap {
   std::string dir;
   ds::u32 pc[2] = {0, 0};
@@ -205,8 +192,7 @@ void entry_snap_cb(ds::CpuContext& cpu, ds::u32, void* user) {
   write_blob(d + "/itcm.bin", n.bus.itcm.get(), ds::mem::Bus::ITCM_SIZE);
   write_blob(d + "/dtcm.bin", n.bus.dtcm.get(), ds::mem::Bus::DTCM_SIZE);
   for (int b = 0; b < 3; ++b) write_blob(d + "/nwram" + char('a' + b) + ".bin", n.bus.nwram[b].get(), ds::mem::Bus::NWRAM_BANK_SIZE);
-  // Every device's serialised state, chunk-tagged as in a save state (the
-  // memory buffers are in the files above, so the bus chunk is left out).
+  // Bus chunk left out: its memory buffers are already in the files above.
   { ds::state::Writer w; n.sched.sync_state(w); n.io.sync_state(w); n.arm9->sync_state(w); n.arm7->sync_state(w); n.dma.sync_state(w);
     write_blob(d + "/devices.bin", w.data().data(), w.data().size()); }
   { ds::state::Writer w; n.io.aes.sync_state(w); write_blob(d + "/aes.bin", w.data().data(), w.data().size()); }
@@ -251,7 +237,7 @@ void entry_snap_cb(ds::CpuContext& cpu, ds::u32, void* user) {
 } // namespace
 
 int main(int argc, char** argv) {
-  ds::mem::fmc::init();   // before any Bus exists: the census counts page-table churn from reset on
+  ds::mem::fmc::init();   // before any Bus exists: counts page-table churn from reset on
   bool subpixel = false, shape = false; int scaled_n = 0; const char* scaled_path = nullptr;
   const char *rom = nullptr, *bios9 = nullptr, *bios7 = nullptr, *fw = nullptr, *trace = nullptr, *dump = nullptr, *dump_audio = nullptr, *replay = nullptr, *save = nullptr;
   const char* load_state = nullptr; const char* save_state_path = nullptr; int save_state_at = -1;
@@ -260,9 +246,7 @@ int main(int argc, char** argv) {
   bool frameskip_capture = false;
   int stats_from = 0;   // --stats-from N: first frame counted in the timing statistics
   const char* pc_profile = nullptr;
-  // A whole 1800-frame dump is ~708 MB, so a window can be selected: the
-  // frame-budget report below names the frames worth looking at.
-  int dump_from = 0, dump_count = 0;
+  int dump_from = 0, dump_count = 0;   // --dump-from/--dump-count: window of a large dump
   int frames = 60; bool direct = false;
 #if DSPERATE_JIT
   bool jit9 = true, jit7 = true;
@@ -275,9 +259,7 @@ int main(int argc, char** argv) {
   bool rtc_host = false;              // --rtc-host: free-running clock seeded from the wall
   const char* fw_override = nullptr;  // --firmware-override: sidecar of changed firmware pages
   bool no_aa = false;
-  // The GPU 3D raster. --gpu-raster draws with it; --gpu-ab draws every frame
-  // BOTH ways and compares, which is the gate on the shader being right.
-  bool gpu_raster = false, gpu_ab = false;
+  bool gpu_raster = false, gpu_ab = false;   // --gpu-ab: draw every frame both ways and compare
   const char* gpu_ab_dump = nullptr;
   bool gpu_gate = false, gpu_coverage = false, gpu_defer = false;
   int cpu_oc = 0;   // jit::CpuOc: 0 off, 1 overclock, 2 underclock
@@ -287,26 +269,20 @@ int main(int argc, char** argv) {
   int dsi_mode = -1;                   // -1 auto
   bool list_cheats = false;
   std::vector<std::string> enable_cheats;   // names (or #index) to switch on
-  // Local wireless over the LAN (docs/wifi-scoping.md): host a session or
-  // join one, and pace the run to real time, which the MP protocol's
-  // wall-clock windows need.
   const char* lan_host = nullptr;      // --lan-host NAME: host as NAME
   const char* lan_join = nullptr;      // --lan-join ADDR: join the session at ADDR
   const char* lan_name = "DSperate";   // --lan-name NAME: our player name when joining
   bool netplay = false;                // --netplay: join a session heard on the LAN within 2.5 s, else host one
-  // --internet [WHERE]: the emulated access point reaches the real network
-  // through the user-mode stack. WHERE is the DNS: host, wiimmfi (default) or
-  // an address. Exclusive with local wireless, as on the SDL frontend.
+  // --internet [WHERE]: DNS host, wiimmfi (default) or address; excludes local wireless.
   bool internet = false;
   const char* dns_arg = nullptr;
-  // --tap-after-sync F:x,y[:N[:R]]: as MP host, F frames after a client is
-  // synced, touch (x,y) for N frames, R times 60 frames apart (a Download
-  // Play host's "Cut Off", which is only there while the guest is listed).
+  // --tap-after-sync F:x,y[:N[:R]]: as MP host, F frames after client sync,
+  // touch (x,y) for N frames, R times 60 frames apart (Download Play "Cut Off").
   int tas_after = -1, tas_x = 0, tas_y = 0, tas_n = 8, tas_rep = 1; long tas_frame = -1; ds::u32 tas_seen = 0;
   int lan_players = 16;
   struct Touch { int frame, x, y, n; };
   double mic_tone_hz = 0;
-  std::vector<Touch> touches;          // --touch F:x,y[:N]: press (x,y) from frame F for N frames (default 10), as trace_melonds --touch
+  std::vector<Touch> touches;          // --touch F:x,y[:N]: press (x,y) from frame F for N frames (default 10)
   bool pace = false;                   // --pace: sleep to 60 frames a second
   for (int i = 1; i < argc; ++i) {
     auto arg = [&](const char* name) { return !std::strcmp(argv[i], name) && i + 1 < argc; };
@@ -328,7 +304,7 @@ int main(int argc, char** argv) {
     else if (arg("--firmware")) fw = argv[++i];
     else if (arg("--bios9i")) bios9i = argv[++i];            // the DSi BIOS pair (64 KB each): needed for DSi mode
     else if (arg("--bios7i")) bios7i = argv[++i];
-    else if (arg("--dsi-boot")) dsi_boot = argv[++i];        // tools/dsi_nand.py bootblobs output: the console data a DSi title starts with
+    else if (arg("--dsi-boot")) dsi_boot = argv[++i];        // console data a DSi title starts with
     else if (flag("--dsi-nand-boot")) dsi_nand_boot = true;   // boot the NAND (boot2 -> launcher) instead of direct-booting the ROM
     else if (arg("--dsi-tmd")) dsi_tmd = argv[++i];           // the title's signed DSi TMD for --dsi-install (default: <file>.tmd beside it)
     else if (flag("--dsi-autoload")) dsi_autoload = true;
@@ -336,16 +312,16 @@ int main(int argc, char** argv) {
     else if (flag("--dsi-hle-launch")) dsi_hle = true;         // with --direct: start the DSiWare ROM as the DSi launcher hands a title over, not in card mode
     else if (arg("--dsi-font")) dsi_font = argv[++i];         // with --dsi-hle-launch and no --dsi-nand: the console's /sys/TWLFontTable.dat instead of DSperate's own font
     else if (arg("--user-name")) user.nickname = argv[++i];   // generated firmware / DSi settings: the owner's nickname
-    else if (arg("--user-language")) user.language = static_cast<ds::u8>(std::atoi(argv[++i]));   // 0 ja 1 en 2 fr 3 de 4 it 5 es 6 zh 7 ko       // with --dsi-install: the launcher starts that title (TLNC) instead of showing the menu
+    else if (arg("--user-language")) user.language = static_cast<ds::u8>(std::atoi(argv[++i]));   // 0 ja 1 en 2 fr 3 de 4 it 5 es 6 zh 7 ko
     else if (flag("--dsi-offline")) dsi_offline = true;        // --dsi-install never downloads the TMD from Nintendo's update CDN
     else if (flag("--dsi-hide-installed")) dsi_hide_installed = true;   // hide the dump's own DSiWare for this session (the dump is untouched)
     else if (arg("--dsi-install")) dsi_install = argv[++i];   // a DSiWare .nds/.cia put into the session's NAND (not the dump) unless its title ID is already installed
     else if (arg("--dsi-persist")) dsi_persist = argv[++i];   // carry DSi saves (<CODE>.pub/.prv/.bnr), the system sidecar (nand.ovr) and photos (photos/) in and out of DIR
     else if (flag("--dsi-nand-write")) dsi_nand_write = true;   // write the guest's NAND writes into the file (for diffing against melonDS; use a copy). Default: held in memory
     else if (arg("--dsi-nand")) dsi_nand = argv[++i];        // a real nand.bin (nocash footer): the eMMC behind the SD/MMC host, and the console ID
-    else if (arg("--dsi-sd")) dsi_sd = argv[++i];
+    else if (arg("--dsi-sd")) dsi_sd = argv[++i];   // host folder as the DSi's SD card; synced back at exit
     else if (arg("--dsi-shortcuts")) dsi_shortcuts = argv[++i];                                         // with --dsi-nand: a .dspr.nds shortcut in DIR for each installed DSiWare title, then exit
-    else if (arg("--dsi-shortcuts-clear")) { dsi_shortcuts = argv[++i]; dsi_shortcuts_on = false; }   // remove every .dspr.nds in DIR, then exit            // a host folder as the DSi's SD card; the guest's changes are synced back into it at exit
+    else if (arg("--dsi-shortcuts-clear")) { dsi_shortcuts = argv[++i]; dsi_shortcuts_on = false; }   // remove every .dspr.nds in DIR, then exit
     else if (flag("--dsi")) dsi_mode = 1;                    // force the DSi machine (default: a DSi-capable header with the DSi BIOS loaded)
     else if (flag("--no-dsi")) dsi_mode = 0;
     else if (arg("--trace")) trace = argv[++i];
@@ -353,7 +329,7 @@ int main(int argc, char** argv) {
     else if (arg("--dump-frames")) dump = argv[++i];
     else if (flag("--enhanced") || flag("--shape")) shape = true;            // video.aa = enhanced: edge shaping on top of the hardware picture (Gpu::set_shape); only a scaled dump shows it
     else if (flag("--subpixel")) subpixel = true;                            // sub-pixel polygon edges (Gpu::set_subpixel), hardware AA off as video.aa = smooth has it; only a scaled dump shows them
-    else if (arg("--dump-scaled")) { scaled_n = std::atoi(argv[++i]); scaled_path = argv[++i]; }   // N FILE: both screens through the scanline scaler at Nx, raw BGRA, the --dump-from/--dump-count window
+    else if (arg("--dump-scaled")) { scaled_n = std::atoi(argv[++i]); scaled_path = argv[++i]; }   // N FILE: both screens through the scanline scaler at Nx, raw BGRA
     else if (arg("--dump-from")) dump_from = std::atoi(argv[++i]);    // first frame to dump
     else if (arg("--dump-count")) dump_count = std::atoi(argv[++i]);  // how many (0 = to the end)
     else if (arg("--dump-audio")) dump_audio = argv[++i];   // raw s16 stereo, 32768 Hz
@@ -373,33 +349,23 @@ int main(int argc, char** argv) {
     else if (flag("--gpu-gate")) gpu_gate = true;                            // count what the GPU feature gate WOULD take, drawing nothing differently (needs no GPU)
     else if (flag("--gpu-raster")) gpu_raster = true;                        // rasterise 3D on the GPU (Vulkan compute) where the frame allows it
     else if (flag("--gpu-ab")) { gpu_raster = true; gpu_ab = true; }         // draw every frame both ways and report the differences
-    else if (arg("--gpu-ab-dump")) { gpu_ab_dump = argv[++i]; gpu_raster = gpu_ab = true; }  // PREFIX: write the differing frames as PREFIX-cpu.bin / PREFIX-gpu.bin for tools/compare_frames.py
+    else if (arg("--gpu-ab-dump")) { gpu_ab_dump = argv[++i]; gpu_raster = gpu_ab = true; }  // PREFIX: write the differing frames as PREFIX-cpu.bin / PREFIX-gpu.bin
     else if (flag("--cpu-oc")) cpu_oc = 1;                                   // INEXACT: JIT data accesses priced as main RAM at translate time; see jit::set_cpu_oc
     else if (flag("--cpu-uc")) cpu_oc = 2;                                   // INEXACT: --cpu-oc's underclock tier (stores and the ARM7 at main RAM's bus cost)
-    // Split A/B knobs: the bundled flag above is three separate changes.
-
     else if (!std::strcmp(argv[i], "--jit9")) { jit9 = true; jit7 = false; }  // recompile the ARM9 only
     else if (!std::strcmp(argv[i], "--jit7")) { jit9 = false; jit7 = true; }
     else if (arg("--load-state")) load_state = argv[++i];                   // restore a save state before running
     else if (arg("--frameskip")) frameskip = std::atoi(argv[++i]);          // skip drawing N of every N+1 frames (Gpu::set_frame_skip); a dump of a skipped frame is stale
     else if (flag("--frameskip-capture")) frameskip_capture = true;          // INEXACT: skip frames that display-capture too
     else if (arg("--hide-screen")) hide_screen = argv[++i];                 // top | bottom: the engine on it skips its drawing (Gpu::set_screen_visible); its half of the dump goes stale
-    // Frames before N are run but left out of the statistics. A --load-state
-    // starts cold: every translated block was dropped with the old run, the
-    // texture cache is empty and the host caches hold the loader's data, so
-    // the first frames are slow in a way the scene never is. Warm up, then
-    // measure. Applies to the frame_ms/work_ms series, not to DS_PROFILE
-    // counters, which accumulate from frame 0 either way.
+    // Frames before N run but are excluded from frame_ms/work_ms stats (cold
+    // caches after --load-state); DS_PROFILE counters accumulate from frame 0.
     else if (arg("--stats-from")) stats_from = std::atoi(argv[++i]);
-    else if (arg("--pc-profile")) pc_profile = argv[++i];                   // a sampling profile of every thread from --stats-from on (core/pc_sampler.h; tools/pc_profile.py)
+    else if (arg("--pc-profile")) pc_profile = argv[++i];                   // a sampling profile of every thread from --stats-from on
     else if (arg("--save-state-at")) { save_state_at = std::atoi(argv[++i]); save_state_path = std::strchr(argv[i], ':'); if (save_state_path) ++save_state_path; }   // N:path -- write after N frames (0 = at once)
     else rom = argv[i];
   }
-  // A replay is recorded under direct boot (the SDL frontend has no other
-  // mode), so replaying without --direct boots the firmware instead and the
-  // inputs land in its setup wizard -- a run that looks fast because it draws
-  // nothing. The frame count and cycle total are identical either way, so
-  // there is no other sign it happened.
+  // Without --direct, replay inputs land in the firmware setup wizard instead.
   if (replay && !direct)
     std::fprintf(stderr, "warning: --replay without --direct boots the firmware, not the ROM;"
                          " the replay will not reproduce the recorded session\n");
@@ -420,7 +386,7 @@ int main(int argc, char** argv) {
   {
     std::string err;
     if (!nds.load_bios(bios9 ? bios9 : "", bios7 ? bios7 : "", fw ? fw : "", user, &err)) { std::fprintf(stderr, "bios: %s\n", err.c_str()); return 1; }
-    if (lan_host || lan_join || netplay) { std::random_device rd; nds.set_wifi_mac_suffix(rd() & 0xFFFFFF); }   // a MAC of our own: see NDS::set_wifi_mac_suffix
+    if (lan_host || lan_join || netplay) { std::random_device rd; nds.set_wifi_mac_suffix(rd() & 0xFFFFFF); }
   }
   if (!nds.bios_native) std::fprintf(stderr, "note: --bios9/--bios7 %s; using the built-in FreeBIOS (direct boot only, timing is not Nintendo's)\n", bios9 ? "not found" : "not given");
   {
@@ -441,7 +407,7 @@ int main(int argc, char** argv) {
       std::fprintf(stderr, "dsi sd: %s, %d files and %d folders on a %llu MB FAT%d card\n", dsi_sd, r.files, r.dirs,
                    static_cast<unsigned long long>(nds.dsi_sd.length() >> 20), nds.dsi_sd.fat_bits());
       for (const std::string& n : r.notes) std::fprintf(stderr, "dsi sd: %s\n", n.c_str());
-      // DS_SD_DUMP=<file>: the card as built, as an image (melonDS's DSiSDCard for the oracle).
+      // DS_SD_DUMP=<file>: the card as built, as an image.
       if (const char* d = std::getenv("DS_SD_DUMP"); d && !nds.dsi_sd.dump(d)) { std::fprintf(stderr, "dsi sd: cannot write %s\n", d); return 1; }
     }
     if (dsi_hide_installed && nds.dsi_nand.valid()) {
@@ -457,7 +423,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "dsi install: %.4s: already installed on the NAND\n", reinterpret_cast<const char*>(&srl[0x0C]));
         dsi_title_lo = lo;
       } else {
-        // The signed TMD: the CIA's own, the --dsi-persist cache, the update CDN, or a file beside the ROM.
+        // The signed TMD, tried in order: the CIA's own, the --dsi-persist cache, the update CDN, or a file beside the ROM.
         std::string beside = dsi_tmd ? dsi_tmd : std::string(dsi_install);
         if (!dsi_tmd) { const size_t dot = beside.find_last_of('.'), slash = beside.find_last_of('/'); beside = (dot != std::string::npos && (slash == std::string::npos || dot > slash) ? beside.substr(0, dot) : beside) + ".tmd"; }
         const std::string cache = dsi_persist ? std::string(dsi_persist) + "/" + std::string(reinterpret_cast<const char*>(&srl[0x0C]), 4) + ".tmd" : std::string();
@@ -506,10 +472,8 @@ int main(int argc, char** argv) {
     else if (!err.empty()) std::fprintf(stderr, "firmware override: warning: %s\n", err.c_str());
   }
   nds.reset();
-  // After reset(), which clears the RTC.
-  if (rtc_host) nds.io.start_rtc_clock();
-  // A zipped ROM may be inflated to disk on first use; say so, since on an
-  // SD card that is seconds to a minute.
+  if (rtc_host) nds.io.start_rtc_clock();   // after reset(), which clears the RTC
+  // A zipped ROM may be inflated to disk on first use (slow on an SD card).
   nds.rom_progress = [](void*, ds::u64 done, ds::u64 total) {
     static ds::u64 last = ~0ull;
     const ds::u64 pct = total ? done * 100 / total : 100;
@@ -517,8 +481,7 @@ int main(int argc, char** argv) {
     if (done == total) std::fputc('\n', stderr);
   };
   if (rom && ds::io::is_shortcut_name(rom)) {
-    // A NAND title shortcut (io/dsi_nand_launch.h): the title comes out of --dsi-nand
-    // and is handed over, as --dsi-hle-launch does for a ROM file.
+    // NAND title shortcut: title comes from --dsi-nand, handed over as --dsi-hle-launch does for a ROM file.
     ds::io::NandShortcut sc;
     std::string err;
     if (!ds::io::read_shortcut(rom, sc)) { std::fprintf(stderr, "%s: not a NAND title shortcut\n", rom); return 1; }
@@ -527,8 +490,6 @@ int main(int argc, char** argv) {
     dsi_hle = true;
     dsi_mode = 1;
   } else if (rom && !nds.load_rom(rom)) { std::fprintf(stderr, "could not read %s\n", rom); return 1; }
-  // Console type: the DSi machine for a DSi-capable header when the DSi BIOS
-  // pair is loaded (or on request), decided before the reset that builds it.
   {
     const bool capable = nds.cart && nds.cart->dsi_capable();
     const bool want = dsi_mode == 1 || (dsi_mode == -1 && capable && nds.bios_native_dsi);
@@ -542,7 +503,7 @@ int main(int argc, char** argv) {
         if (dsi_font) nds.dsi_font_path = dsi_font;
         if (!nds.prepare_dsi_hle(user, &why, &made)) { std::fprintf(stderr, "dsi: %s\n", why.c_str()); return 1; }
         for (const std::string& m : made) std::fprintf(stderr, "dsi: %s\n", m.c_str());
-        if (dsi_persist && nds.dsi_nand_synthetic) {   // the dump path imported above, before the NAND existed here
+        if (dsi_persist && nds.dsi_nand_synthetic) {
           const std::string d = dsi_persist;
           const ds::io::NandPersistReport r = ds::io::nand_import(nds.dsi_nand, nds.bus.bios7i.get(), {d, "", d + "/photos"});
           nds.dsi_nand.mark_baseline();
@@ -563,7 +524,6 @@ int main(int argc, char** argv) {
   nds.gpu3d.renderer().set_aa(!no_aa && !subpixel);   // the SDL frontend's video.aa = smooth: never with the hardware blend
   nds.gpu.set_subpixel(subpixel);
   nds.gpu.set_shape(shape && !subpixel);
-  // --dump-scaled: a panel-sized target per screen, as the SDL frontend's scanline tiers set one.
   std::vector<ds::u32> scaled_px[2]; std::vector<ds::u16> scaled_xrun; FILE* scaled_out = nullptr;
   if (scaled_n > 0 && scaled_path) {
     const ds::u32 W = ds::SCREEN_W * scaled_n, H = ds::SCREEN_H * scaled_n;
@@ -580,9 +540,7 @@ int main(int argc, char** argv) {
   nds.gpu3d.renderer().set_gpu_gate_dryrun(gpu_gate);
   nds.gpu3d.renderer().set_coverage_probe(gpu_coverage);
   if (gpu_raster) {
-    // Report either way and carry on. A device without Vulkan running this
-    // harness should still run the scene -- on the CPU, saying so -- rather
-    // than fail, because the same command line is used on all four devices.
+    // A device without Vulkan falls back to the CPU raster rather than failing.
     std::string why;
     const bool on = nds.gpu3d.renderer().set_gpu_raster(true, &why);
     if (on) std::fprintf(stderr, "gpu raster: %u completion bands (DS_VK_BANDS)\n",
@@ -603,8 +561,7 @@ int main(int argc, char** argv) {
   if (rom && cheat_db) {
     ds::cheat::GameCheats found;
     std::string err;
-    // From the loaded cart, so a zipped ROM is looked up by the game's header
-    // rather than the archive's first 512 bytes.
+    // From the loaded cart, so a zipped ROM is looked up by the game's header.
     ds::u8 header[512] = {};
     if (nds.cart) nds.cart->rom_read(0, header, sizeof header);
     if (!ds::cheat::load_for_header(cheat_db, header, found, err)) {
@@ -624,9 +581,7 @@ int main(int argc, char** argv) {
         return 0;
       }
       nds.cheats.codes = std::move(found.codes);
-      // Enabling by name matches the whole name; "#N" is the index the
-      // listing printed, which is the way to reach one of the many codes
-      // whose names are duplicated within a game.
+      // "#N" is the listing's index -- needed since names can repeat within a game.
       for (const std::string& want : enable_cheats) {
         bool hit = false;
         if (want.size() > 1 && want[0] == '#') {
@@ -650,7 +605,7 @@ int main(int argc, char** argv) {
       std::fprintf(stderr, "dsi: %08x is not installed on the NAND; its image path names content 00000000\n", lo);
     std::fprintf(stderr, "dsi: launcher hand-off for %08x, content %08x\n", lo, nds.dsi_hle_content_id);
   }
-  if ((rom && direct) || (nds.dsi && nds.dsi_nand_boot)) nds.setup_direct_boot();   // a NAND boot needs no ROM
+  if ((rom && direct) || (nds.dsi && nds.dsi_nand_boot)) nds.setup_direct_boot();
   if (dsi_autoload) {
     const ds::u32 lo = dsi_autoload_id ? static_cast<ds::u32>(dsi_autoload_id) : dsi_title_lo;
     const ds::u32 hi = dsi_autoload_id ? static_cast<ds::u32>(dsi_autoload_id >> 32) : 0x00030004;
@@ -658,9 +613,7 @@ int main(int argc, char** argv) {
     nds.dsi_autoload(lo, hi);
     std::fprintf(stderr, "dsi: autoload %08x%08x (TLNC)\n", hi, lo);
   }
-  // A recording made with a save present only replays if the save is there:
-  // the game otherwise stops to create one. Loaded in the same place the SDL
-  // frontend loads it, and never written back -- this is a harness.
+  // Never written back -- this is a harness.
   if (save && nds.cart) {
     if (FILE* f = std::fopen(save, "rb")) {
       std::vector<ds::u8> data;
@@ -676,8 +629,8 @@ int main(int argc, char** argv) {
   }
 #if DSPERATE_JIT
   if ((jit9 || jit7) && !ds::jit::attach(nds, jit9, jit7)) return 1;
-  // As the SDL frontend's cpu_tuning_for: on a DSi NAND boot underclock waits for the DSi Menu to start its
-  // title (NDS::dsi_title_running), and PictoChat (HNE?) and Download Play (HND?) run with neither tier.
+  // DSi NAND boot: underclock waits for dsi_title_running; PictoChat/Download
+  // Play (HNE?/HND?) run with neither tier.
   const auto cpu_oc_wanted = [&]() -> int {
     if (cpu_oc == 0 || !nds.dsi || !nds.dsi_nand_boot) return cpu_oc;
     if (!nds.dsi_title_running) return cpu_oc == 2 ? 0 : cpu_oc;
@@ -714,13 +667,7 @@ int main(int argc, char** argv) {
   const int trace_from = trace_start ? std::atoi(trace_start) : 0;
   const char* trace_end_s = std::getenv("TRACE_END_FRAME");     // stop tracing at this frame (0 = never)
   const int trace_end = trace_end_s ? std::atoi(trace_end_s) : 0;
-  // Per-frame host times. Whole-process wall clock on the device turned out to
-  // spread 13 % run to run at a flat temperature, which buries any change
-  // worth measuring; the median frame rejects the transient stalls that cause
-  // it, and p90 still shows them if they matter.
-  // DS_WATCHDOG=<seconds>: a frame that makes no progress for that long is a
-  // hang; dump the display/raster hand-off state and abort, so the state is
-  // in the log instead of needing a debugger on the stuck process.
+  // DS_WATCHDOG=<seconds>: no progress for that long dumps state and aborts.
   std::atomic<bool> wd_stop{false};
   std::thread wd;
   if (const char* w = std::getenv("DS_WATCHDOG")) {
@@ -746,7 +693,7 @@ int main(int argc, char** argv) {
     if (bytes.empty() || !nds.load_state(r, err)) { std::fprintf(stderr, "cannot load state %s: %s\n", load_state, bytes.empty() ? "unreadable" : err.c_str()); return 1; }
     std::fprintf(stderr, "state: loaded %s (frame %llu)\n", load_state, static_cast<unsigned long long>(nds.frame_count));
     dump_cpu_timing(nds, "load");
-    // A replay continues from the state's frame, not from the log's start.
+    // replay continues from the state's frame, not the log's start
     if (log.reading()) { ds::input::Frame f; for (ds::u64 k = 0; k < nds.frame_count && log.read(f); ++k) {} }
   }
   auto write_state = [&](int after) {
@@ -785,7 +732,7 @@ int main(int argc, char** argv) {
   if (internet) {
     if (lan_host || lan_join || netplay) { std::fprintf(stderr, "net: --internet is not local wireless; pick one\n"); return 1; }
     auto dns = ds::net::SlirpDriver::Dns::Custom;
-    ds::u32 dns_addr = 0xB23E2BD4;   // 178.62.43.212, Wiimmfi's resolver; see the SDL frontend
+    ds::u32 dns_addr = 0xB23E2BD4;   // 178.62.43.212, Wiimmfi's resolver
     const std::string where = dns_arg ? dns_arg : "wiimmfi";
     if (where == "host") { dns = ds::net::SlirpDriver::Dns::Host; dns_addr = 0; }
     else if (where != "wiimmfi") {
@@ -810,7 +757,7 @@ int main(int argc, char** argv) {
     if (i == stats_from && ds::mem::fmc::on()) ds::mem::fmc::set_counting(true);
     static const bool fm_verify = std::getenv("DS_FASTMEM_VERIFY") != nullptr;
     if (fm_verify && nds.bus.arena_ && i > 0 && !nds.bus.fastmem_verify(nds.frame_count)) return 1;
-    if (pace) {   // the DS's 59.83 Hz, from the run's start so sleep jitter does not accumulate
+    if (pace) {   // the DS's 59.83 Hz, timed from the run's start so sleep jitter doesn't accumulate
       const auto due = pace_start + std::chrono::microseconds(static_cast<long long>(i * 1000000.0 / 59.8261));
       std::this_thread::sleep_until(due);
     }
@@ -824,9 +771,8 @@ int main(int argc, char** argv) {
       else { nds.setup_direct_boot(); std::fprintf(stderr, "reboot: direct boot at frame %d\n", i); }
     }
     const auto t0 = std::chrono::steady_clock::now();
-    // The recompiler's trace emission is armed from the first frame: turning
-    // it on later drops every translated block at that frame, which changes
-    // the run being traced. TRACE_START_FRAME only gates the callback.
+    // Armed from frame 0 regardless of TRACE_START_FRAME: arming later drops
+    // every translated block at that frame, changing the run.
 #if DSPERATE_JIT
     if (trace && i == 0) ds::jit::set_trace(true);
 #endif
@@ -842,11 +788,10 @@ int main(int argc, char** argv) {
     }
     if (trace && i == trace_from) { nds.trace = trace_cb; nds.trace_user = &ts; }
     if (trace && trace_end && i == trace_end) { nds.trace = nullptr; nds.trace_user = nullptr; }
-    nds.io.wifi.trace_frame(i);   // "# frame N" in the Wi-Fi trace, to align it with --trace
+    nds.io.wifi.trace_frame(i);   // "# frame N" in the Wi-Fi trace, aligns it with --trace
     if (log.reading()) { ds::input::Frame in; if (log.read(in)) ds::input::apply(nds, in); }
     if (mic_tone_hz > 0) {
-      // 1600 samples a frame (~95.7 kHz): finer than the DSi's 47.6 kHz clock.
-      static std::vector<ds::s16> tone(1600);
+      static std::vector<ds::s16> tone(1600);   // ~95.7 kHz, finer than the DSi's 47.6 kHz mic clock
       static const double amp = std::getenv("DS_MIC_TONE_AMP") ? std::atof(std::getenv("DS_MIC_TONE_AMP")) : 8000.0;
       static double phase = 0;
       const double step = 2 * 3.14159265358979 * mic_tone_hz / (tone.size() * 59.8261);
@@ -866,21 +811,17 @@ int main(int argc, char** argv) {
         else if (k / cycle < tas_rep) nds.io.set_touch(0, 0, false);
       }
     }
-    // The core takes the decision one frame ahead (the 3D raster for a frame
-    // runs during the frame before it), so this asks for frame i + 1.
+    // The 3D raster for frame i+1 runs during frame i, so this decides ahead.
     if (frameskip > 0) {
-      // Same rule as the SDL frontend: skip and draw in whole display periods
-      // (Gpu::display_phase_period), the limit counting periods rather than
-      // frames. Here as a fixed pattern.
+      // Skip/draw in whole display periods (display_phase_period), as a fixed pattern.
       const int period = nds.gpu.display_phase_period();
       const int skip = frameskip * period;
       const int cycle = skip + period;
       nds.gpu.set_frame_skip(skip > 0 && static_cast<int>((i + 1) % cycle) < skip);
     }
 #if DSPERATE_NET
-    if (lan && pace && !std::getenv("DS_NO_SLICE")) {   // DS_NO_SLICE=1: the plain per-frame pacer, for A/B
-      // Spread the frame across its period in 1 ms slices so a peer's CMD is
-      // answered within a slice, not after this frame's sleep (wifi-scoping).
+    if (lan && pace && !std::getenv("DS_NO_SLICE")) {   // DS_NO_SLICE=1: plain per-frame pacer
+      // Spread the frame in 1 ms slices so a peer's CMD is answered promptly.
       const auto frame_end = pace_start + std::chrono::microseconds(static_cast<long long>((i + 1) * 1000000.0 / 59.8261));
       constexpr ds::u64 slice = ds::ARM9_CLOCK_HZ / 1000;
       constexpr int slices = static_cast<int>(ds::CYCLES_PER_FRAME / slice) + 1;
@@ -888,8 +829,7 @@ int main(int argc, char** argv) {
         std::this_thread::sleep_until(frame_end - std::chrono::microseconds(static_cast<long long>(16700.0 * (slices - k) / slices)));
     } else
 #endif
-    // DS_DSI_SOFT_RESET_AT=<frame>: request the BPTWL soft reset before that
-    // frame, as a guest write of 1 to register 0x11 does (Io::bptwl_write).
+    // DS_DSI_SOFT_RESET_AT=<frame>: BPTWL soft reset (like a guest write of 1 to reg 0x11).
     if (static const int sr = std::getenv("DS_DSI_SOFT_RESET_AT") ? std::atoi(std::getenv("DS_DSI_SOFT_RESET_AT")) : -1; nds.dsi && i == sr) {
       nds.dsi_soft_reset_pending = true;
       nds.cpu(ds::Cpu::ARM7).halted = true;
@@ -909,7 +849,7 @@ int main(int argc, char** argv) {
       std::fprintf(stderr, " %08x a7", a9.cpsr);
       for (int r = 0; r < 16; ++r) std::fprintf(stderr, " %08x", a7.regs[r]);
       std::fprintf(stderr, " %08x\n", a7.cpsr);
-      static const char* dumpf = std::getenv("DS_FRAME_DUMP");   // "<frame>:<path>": write main RAM (16 MB on a DSi) + WRAM + DTCM after that frame
+      static const char* dumpf = std::getenv("DS_FRAME_DUMP");   // "<frame>:<path>": write main RAM + WRAM + DTCM after that frame
       if (dumpf && std::atoi(dumpf) == i) {
         FILE* f = std::fopen(std::strchr(dumpf, ':') + 1, "wb");
         std::fwrite(nds.bus.main_ram.get(), 1, nds.bus.main_ram_size(), f); std::fwrite(nds.bus.shared_wram.get(), 1, 32u << 10, f);
@@ -932,20 +872,11 @@ int main(int argc, char** argv) {
 #endif
     if (i >= stats_from) {
       frame_ms.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
-      // DS_FRAME_SERIES=<path>: the run-order series ("ms polygons raster_ns gx_ns" per line),
-      // for the shape of a tail -- alternation, bursts -- rather than its size.
+      // DS_FRAME_SERIES=<path>: run-order series, "ms polygons raster_ns" per line.
       static FILE* series = [] { const char* p = std::getenv("DS_FRAME_SERIES"); return p ? std::fopen(p, "w") : nullptr; }();
-      // ms polygons raster_ns(serial, last synced frame)
       if (series) std::fprintf(series, "%.3f %u %llu\n", frame_ms.back(), nds.gpu3d.render_polygon_count(),
                                (unsigned long long)nds.gpu3d.last_raster_ns());
     }
-    // The console has switched itself off. On a firmware boot that is the
-    // firmware leaving its settings pages, with the pages it wrote already in
-    // the image, so this is the moment to put them on disk -- and then to
-    // start the console again, which is what the hardware's power button
-    // would do next. A cart session is left alone: a game is not expected to
-    // reach here, and quitting a benchmark on one stray write would be worse
-    // than running on.
 #if DSPERATE_JIT
     if ((jit9 || jit7) && cpu_oc != 0 && cpu_oc_wanted() != cpu_oc_applied) {
       cpu_oc_applied = cpu_oc_wanted();
@@ -957,6 +888,7 @@ int main(int argc, char** argv) {
 #endif
     if (nds.exit_requested) { std::fprintf(stderr, "exit requested at frame %d: ending the run\n", i); break; }
     if (nds.power_off) {
+      // No cart: firmware settings-pages exit, save and reboot as power would.
       std::fprintf(stderr, "power off at frame %d%s\n", i, nds.cart ? "" : "; saving settings and rebooting");
       if (!nds.cart) {
         if (fw_override) {
@@ -966,7 +898,7 @@ int main(int argc, char** argv) {
 #if DSPERATE_JIT
         if (jit9 || jit7) ds::jit::flush_all();
 #endif
-        nds.reset();          // clears power_off, and re-seeds the clock if --rtc-host
+        nds.reset();   // clears power_off, re-seeds the clock if --rtc-host
       } else {
         nds.power_off = false;
       }
@@ -1004,7 +936,7 @@ int main(int argc, char** argv) {
   if (lan) std::fprintf(stderr, "lan: reply/host waits %u, total %.1f ms, max %.1f ms, timeouts %u\n", lan->wait_count(), lan->wait_total_ms(), lan->wait_max_ms(), lan->wait_timeouts());
 #endif
   ds::interp::census_report(nds.frame_count);
-  if (std::getenv("DS_STATE_DUMP")) {   // what each CPU is waiting on at the end of the run
+  if (std::getenv("DS_STATE_DUMP")) {
     for (int c = 0; c < 2; ++c) {
       const ds::Cpu cpu = c == 0 ? ds::Cpu::ARM9 : ds::Cpu::ARM7;
       const auto& ci = nds.io.cpu_io[c];
@@ -1064,14 +996,10 @@ int main(int argc, char** argv) {
                    double(g.wait_line_ns) / n / 1e6, double(g.wait_frame_ns) / n / 1e6,
                    double(g.wait_forced_ns) / n / 1e6, double(g.wait_forced_n) / n);
 
-      // Why frames did not go to the GPU: the gate (per reason, above), the
-      // identical-frame path (nothing drawn at all), and the upload's own
-      // refusals, per reason.
       std::fprintf(stderr, "gpu raster: %llu frames kept by the identical-frame path; %llu refused at upload%s\n",
                    (unsigned long long)g.kept, (unsigned long long)g.failed, g.failed ? ":" : "");
       for (const auto& f : g.fails) if (f.why) std::fprintf(stderr, "gpu raster:   %-40s %llu frames\n", f.why, (unsigned long long)f.n);
-      // GPU time per pass (DS_VK_TIMING=1), per frame.
-      { ds::u64 pns[5], pf = 0;
+      { ds::u64 pns[5], pf = 0;   // DS_VK_TIMING=1
         if (nds.gpu3d.renderer().gpu_pass_times(pns, &pf) && pf) {
           const double k = 1.0 / (double(pf) * 1e6);
           std::fprintf(stderr, "gpu raster: GPU time per frame -- span %.3f ms, bin %.3f, visibility %.3f, raster %.3f, final pass %.3f (total %.3f, %llu frames stamped)\n",

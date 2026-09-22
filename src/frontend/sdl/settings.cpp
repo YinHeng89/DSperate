@@ -15,62 +15,40 @@ using T = Setting::Type;
 
 const Choice kOnOff[]   = {{"false", "OFF"}, {"true", "ON"}};
 const Choice kSkipMode[] = {{"adaptive", "ADAPTIVE"}, {"fixed", "FIXED"}};
-// emu.cpu_tuning. Config::load turns an old emu.cpu_oc and a "true" into these.
 const Choice kCpuOc[] = {{"false", "OFF"}, {"underclock", "UNDERCLOCK"}, {"overclock", "OVERCLOCK"}};
-// The rates a panel comes in, plus the console's own and no limiter at all.
-// "auto" is the default and the only one that plays a game at the speed it was
-// written for; 60 is 0.29 % fast, which is what a player means by "60 fps"
-// and what lines up with a 60 Hz panel.
+// Panel-typical rates, plus the console's own (auto, the default) and no limit.
 const Choice kLimiter[] = {{"auto", "CONSOLE (59.8)"}, {"30", "30"}, {"60", "60"}, {"120", "120"},
                            {"144", "144"}, {"240", "240"}, {"off", "UNLIMITED"}};
 const Choice kIntScale[] = {{"off", "OFF"}, {"under", "UNDER"}, {"over", "OVER"}};
-// 3D edges. "true"/"false" are the old boolean and read as accurate/off, and "smooth" is the older sub-pixel
-// mode, still read from a file but no longer offered here -- enhanced supersedes it (aa_mode in main.cpp).
 const Choice kAa[]       = {{"off", "OFF"}, {"accurate", "ACCURATE"}, {"enhanced", "ENHANCED"}};
 const Choice kIntRes[]   = {{"1", "1X"}, {"2", "2X"}, {"3", "3X"}, {"4", "4X"}};
 const Choice kSeam[]     = {{"dark", "DARK"}, {"blend", "BLEND"}, {"blend_linear", "BLEND LINEAR"}};
-// The file's own words on the left. "mean" is the ordinary cell and reads as
-// DEFAULT; the rest are named for what they do rather than how they do it.
 const Choice kChunky[]   = {{"false", "OFF"}, {"mean", "DEFAULT"}, {"extreme", "ADAPTIVE"},
                             {"mode", "COMMON"}, {"tl", "FIRST"}, {"min", "DARKEST"}, {"max", "LIGHTEST"}};
 const Choice kScreen[]   = {{"top", "TOP"}, {"bottom", "BOTTOM"}};
-// GBATEK's order, which is what the firmware stores.
+// GBATEK's order, matching the firmware.
 const Choice kColour[]   = {{"0", "GREY"}, {"1", "BROWN"}, {"2", "RED"}, {"3", "PINK"},
                             {"4", "ORANGE"}, {"5", "YELLOW"}, {"6", "LIME"}, {"7", "GREEN"},
                             {"8", "DARK GREEN"}, {"9", "TURQUOISE"}, {"10", "BLUE"}, {"11", "DARK BLUE"},
                             {"12", "PURPLE"}, {"13", "VIOLET"}, {"14", "MAGENTA"}, {"15", "DARK PINK"}};
-// The firmware stores the month as a number; the menu names it, because
-// "BIRTHDAY MONTH 11" takes a moment to read and "NOVEMBER" does not.
 const Choice kMonth[]    = {{"1", "JANUARY"}, {"2", "FEBRUARY"}, {"3", "MARCH"}, {"4", "APRIL"},
                             {"5", "MAY"}, {"6", "JUNE"}, {"7", "JULY"}, {"8", "AUGUST"},
                             {"9", "SEPTEMBER"}, {"10", "OCTOBER"}, {"11", "NOVEMBER"}, {"12", "DECEMBER"}};
-// Local wireless, as one row. AUTO is --netplay (join a session heard on the
-// LAN, else host one); HOST and GUEST are the same scan with the decision
-// already made, so a console meant to be the second one cannot quietly become
-// the session everyone joins. The address form stays a command-line flag:
-// a pick row has nowhere to put one, and discovery finds hosts on its own.
+// AUTO is --netplay (join if heard, else host); HOST/GUEST fix the role up
+// front. Join address stays a command-line flag; discovery finds hosts itself.
 const Choice kNetMode[]  = {{"off", "OFF"}, {"auto", "AUTO"}, {"host", "HOST"}, {"guest", "GUEST"},
                             {"internet", "INTERNET"}};
-// Where the game's DNS queries go once it is on the internet. Two values
-// here; the config takes a third form, a plain address, which a pick row has
-// nowhere to put (the same reason the LAN join address stayed a flag).
-//
-// WIIMMFI is the default because it is the only thing a DS can still reach:
-// Nintendo WFC was switched off in 2014, so HOST -- the host's own resolver,
-// which is what a real DS would have used -- resolves the game's servers to
-// nothing. HOST is there for a private server or a local test.
+// A plain-address DNS form also exists in the config but has nowhere in a
+// pick row. WIIMMFI is default since Nintendo WFC is gone; HOST resolves to
+// nothing unless pointed at a private server.
 const Choice kWifiDns[]  = {{"wiimmfi", "WIIMMFI"}, {"host", "HOST"}};
 const Choice kLanguage[] = {{"0", "JAPANESE"}, {"1", "ENGLISH"}, {"2", "FRENCH"},
                             {"3", "GERMAN"}, {"4", "ITALIAN"}, {"5", "SPANISH"}};
-// A checkbox: the same two values as kOnOff, drawn as a box. Rows that are
-// members of a set rather than switches read better that way.
 const Choice kCheck[]    = {{"false", "[ ]"}, {"true", "[X]"}};
-// Display::mode_name's words, in Display::Mode order.
 const Choice kLayout[]   = {{"vertical", "VERTICAL"}, {"horizontal", "HORIZONTAL"}, {"single", "SINGLE"},
                             {"pip", "PIP"}, {"dominant_v", "DOMINANT V"}, {"dominant_h", "DOMINANT H"}};
 const Choice kCorner[]   = {{"tl", "TOP LEFT"}, {"tr", "TOP RIGHT"}, {"bl", "BOTTOM LEFT"}, {"br", "BOTTOM RIGHT"}};
 
-// Shorthand for the common shapes, so a table row reads as its own contents.
 constexpr Setting boolean(const char* k, const char* l, const char* def, u8 f, Dep d, const char* n) {
   return Setting{k, l, T::Bool, kOnOff, 2, 0, 0, 0, nullptr, nullptr, nullptr, def, f, d, n};
 }
@@ -108,26 +86,17 @@ const Setting kEmuSettings[] = {
           "SHORTER LOADING SCREENS. GAMES THAT RACE THE CARD CAN MISBEHAVE"),
   pick("emu.limiter", "FRAME LIMITER", kLimiter, 7, "auto", FlagLive, Dep::NetSession,
        "THE RATE THE GAME IS HELD TO. CONSOLE IS THE ONE THE GAME WAS WRITTEN FOR"),
-  // A whole percent in the file ("100"), as --speed and the frontend read it --
-  // not a percent row, which keeps a 0..1 fraction: that showed the default as
-  // 10000% and wrote 1 (one percent) for what it displayed as 100%.
+  // Whole percent in the file ("100"), so not a Percent row (0..1 fraction).
   number("emu.speed", "GAME SPEED", 25, 400, 5, "100", FlagLive, Dep::NetSession,
          "HOW FAST THE GAME RUNS AGAINST THE LIMITER", nullptr, nullptr, "%"),
-  // From 2: "1X" is real time, which is what not fast-forwarding already is.
-  // A multiple of real time, not of the limiter: it is a floor, so holding
-  // fast forward on a 240 Hz limiter never slows the game down to it.
-  // UNLIMITED uncaps whatever the limiter says, which is why it is still
-  // here now that the limiter has an UNLIMITED of its own -- a 60 Hz game
-  // with a fast forward that goes as fast as the machine will.
+  // Multiple of real time (a floor), not of the limiter, so it never slows
+  // the game below this even on a fast limiter.
   number("emu.ff_speed", "FAST FORWARD SPEED", 2, 16, 1, "0", FlagLive, Dep::NetSession,
          "AT LEAST THIS MANY TIMES REAL TIME WHILE FAST FORWARD IS HELD", "0", "UNLIMITED", "X"),
   number("emu.ff_skip", "FAST FORWARD SKIP", 0, 9, 1, "3", FlagLive, Dep::NetSession,
          "WHILE FAST FORWARDING, SHOW ONE FRAME IN THIS MANY PLUS ONE"),
-  // The one audio row, and it lives here rather than on an audio page of its
-  // own: a page for a single row is not worth the depth it adds. AUTO holds
-  // the default and raises it only when the machine is keeping up and still
-  // ran the queue dry -- a deeper buffer answers a hitch, never a machine
-  // that cannot keep up at all. docs/audio-buffer-scoping.md.
+  // AUTO raises the buffer only when the machine keeps up yet still ran dry
+  // (a hitch, not a machine too slow to keep up at all).
   number("audio.buffer_size", "AUDIO BUFFER", 20, 200, 10, "auto", FlagLive, Dep::None,
          "SOUND HELD AHEAD. LOWER IS LESS DELAY, LESS SLACK BEFORE A LATE FRAME IS HEARD",
          "auto", "AUTO", " MS"),
@@ -135,18 +104,10 @@ const Setting kEmuSettings[] = {
           "SAVE A STATE WHEN THE EMULATOR EXITS, TO RESUME FROM"),
   boolean("emu.autoload", "AUTOLOAD ON START", "false", FlagRestart, Dep::None,
           "WHEN A GAME STARTS, RESUME FROM ITS AUTOSAVED STATE IF THERE IS ONE"),
-  // Applied when the NAND is opened, so only a new DSi session sees it.
   boolean("emu.dsi_hide_installed", "HIDE NAND DSIWARE", "false", FlagRestart, Dep::None,
           "DSI MENU: HIDE THE NAND DUMP'S OWN TITLES. THE DUMP IS NOT CHANGED"),
-  // Live: switching it writes or clears the .dspr.nds files at once.
   boolean("emu.dsi_nand_shortcuts", "DSI NAND LINKS", "false", FlagLive, Dep::ShortcutsPath,
           "GAME LIST ENTRIES THAT START THE NAND'S DSIWARE WITHOUT THE DSI MENU"),
-  // Live, and it was not always: it used to need a restart because the MAC was
-  // only randomized into the firmware image for a run that asked for a session,
-  // and two instances sharing a dump's MAC is the fault that made PictoChat
-  // drop its own messages. The MAC is settled every run now, so the radio can
-  // go up and come down whenever -- a Pokemon player can trade and then carry
-  // on playing. docs/wifi-scoping.md.
   pick("net.mode", "NETWORK FEATURES", kNetMode, 5, "off", FlagLive, Dep::Net,
        "LOCAL WIRELESS, OR INTERNET. AUTO JOINS A SESSION, ELSE HOSTS ONE"),
   pick("wifi.dns", "DNS", kWifiDns, 2, "wiimmfi", FlagRestart, Dep::NetInternet,
@@ -177,12 +138,8 @@ const Setting kVideoSettings[] = {
           "SHOW THE GPU 3D LAYER A FRAME LATE SO NOTHING WAITS FOR IT. ADDS A FRAME OF LAG"),
   pick("video.internal_res", "GPU 3D RESOLUTION", kIntRes, 4, "1", FlagRestart, Dep::GpuRaster,
        "DRAW 3D AT A MULTIPLE OF THE DS'S RESOLUTION. 2X COSTS MOST OF A FRAME ON HEAVY SCENES"),
-  // The present stage reopens with the display (Host::reopen), like the
-  // scaler effects above it. On by default (ca91e83), as the config says.
   boolean("video.gpu_present", "GPU PRESENT", "true", FlagDeferred, Dep::None,
           "SCALE AND LAY OUT THE SCREENS ON THE GPU. NEEDS VULKAN AND A DIRECT-TO-PANEL DISPLAY"),
-  // Live: the raster flips a flag and the present stage reads the edge plane
-  // when it is handed one.
   boolean("video.smooth3d", "SMOOTH 3D EDGES", "false", FlagLive, Dep::GpuPath,
           "REBUILD POLYGON EDGES AT PANEL RESOLUTION FROM THE DS'S OWN COVERAGE. 2D STAYS SHARP"),
   boolean("video.fps", "FPS COUNTER", "false", FlagLive, Dep::None,
@@ -208,8 +165,6 @@ const Setting kLayoutSettings[] = {
           "THE SMALLER SCREEN'S SIZE. AUTO FITS WHOLE PIXELS", "auto", "AUTO"),
   percent("video.dominant_threshold", "DOMINANT THRESHOLD", 10, 99, 5, "0.25", FlagDeferred, Dep::DominantThreshold,
           "THE SMALLEST SECONDARY AUTO WILL ACCEPT"),
-  // What the layout hotkeys step through, one box per layout. Live: the
-  // hotkeys read the list when pressed, and nothing on screen moves.
   check("video.layout_cycle.vertical", "CYCLE VERTICAL", "true", FlagLive, Dep::OneWindow,
         "THE LAYOUT HOTKEYS STEP THROUGH THE TICKED LAYOUTS"),
   check("video.layout_cycle.horizontal", "CYCLE HORIZONTAL", "true", FlagLive, Dep::OneWindow,
@@ -225,9 +180,8 @@ const Setting kLayoutSettings[] = {
   end(),
 };
 
-// [user]: what a game sees as the console's owner. Every row is restart-only,
-// because these are baked into the generated firmware when it is built at
-// boot -- and with a real dump none of them are read at all.
+// [user]: what a game sees as the console's owner. Restart-only: baked into
+// generated firmware at boot; unused with a real dump.
 const Setting kUserSettings[] = {
   text("user.nickname", "NICKNAME", 10, "DSperate", FlagRestart,
        "WHAT GAMES CALL YOU"),
@@ -256,18 +210,15 @@ bool truthy(const std::string& v) {
   return v == "1" || v == "true" || v == "yes" || v == "on";
 }
 
-// A percent row keeps a 0..1 double in the file. Rounded to the nearest whole
-// percent so that stepping and displaying agree: a value that showed 50 must
-// come back as 50 after a write, or a row would creep every time it was moved.
+// Percent rows keep a 0..1 double in the file; round to the nearest whole
+// percent so display and re-stepped values agree.
 int percent_of(const std::string& v) {
   return static_cast<int>(std::lround(std::atof(v.c_str()) * 100.0));
 }
 std::string percent_str(int p) {
   char buf[16];
-  // Two decimals is enough for whole percents and keeps the file readable.
   std::snprintf(buf, sizeof buf, "%.2f", p / 100.0);
-  // Trim the trailing zeros a round number leaves behind ("0.50" -> "0.5").
-  std::string s = buf;
+  std::string s = buf;   // trim trailing zeros: "0.50" -> "0.5"
   if (s.find('.') != std::string::npos) {
     while (!s.empty() && s.back() == '0') s.pop_back();
     if (!s.empty() && s.back() == '.') s.pop_back();
@@ -278,8 +229,7 @@ std::string percent_str(int p) {
 int choice_index(const Setting& s, const std::string& v) {
   for (int i = 0; i < s.nchoices; ++i) {
     if (v == s.choices[i].value) return i;
-    // Booleans are written half a dozen ways in a hand-edited file.
-    if (s.type == T::Bool && truthy(v) == truthy(s.choices[i].value)) return i;
+    if (s.type == T::Bool && truthy(v) == truthy(s.choices[i].value)) return i;   // tolerate hand-edited variants
   }
   return -1;
 }
@@ -299,9 +249,7 @@ std::string default_value(const Setting& s) {
 }
 
 std::string display_value(const Setting& s, const std::string& value) {
-  // An unset text field shows the default the firmware would be built with,
-  // not "--": the console does have a name, and "--" would suggest otherwise.
-  // Only a field the player has actually emptied reads as empty.
+  // Unset text shows the firmware's default, not "--"; only an explicitly emptied field reads as empty.
   if (s.type == T::Text) {
     const std::string v = value.empty() ? default_value(s) : value;
     return v.empty() ? "--" : v;
@@ -312,10 +260,7 @@ std::string display_value(const Setting& s, const std::string& value) {
   case T::Bool:
   case T::Pick: {
     const int i = choice_index(s, v);
-    // A value the table does not know is shown as it stands rather than
-    // silently redrawn as something else: the file said it, and the player
-    // should see what the file said.
-    return i >= 0 ? s.choices[i].label : v;
+    return i >= 0 ? s.choices[i].label : v;   // unknown value: show as-is, not silently remapped
   }
   case T::Int:
     if (s.sentinel_value && v == s.sentinel_value) return s.sentinel_label;
@@ -334,9 +279,7 @@ std::string step_value(const Setting& s, const std::string& value, int dir, cons
   if (s.type == T::Bool || s.type == T::Pick) {
     int i = choice_index(s, v);
     if (i < 0) i = 0;
-    // Wraps: these lists are short, and a two-entry one has to wrap to be
-    // usable at all. Skips anything the tier does not offer, and gives up
-    // rather than looping if nothing is allowed.
+    // Wraps (lists are short); skips choices the tier disallows; gives up if none are allowed.
     for (int n = 0; n < s.nchoices; ++n) {
       i = (i + (dir > 0 ? 1 : s.nchoices - 1)) % s.nchoices;
       if (host.value_allowed(s, s.choices[i].value)) return s.choices[i].value;
@@ -344,9 +287,7 @@ std::string step_value(const Setting& s, const std::string& value, int dir, cons
     return v;
   }
   const bool at_sentinel = s.sentinel_value && v == s.sentinel_value;
-  if (at_sentinel) {
-    // The sentinel sits one step below the range: down from it does nothing,
-    // up from it lands on lo.
+  if (at_sentinel) {   // sentinel sits one step below lo: down is a no-op, up lands on lo
     if (dir <= 0) return v;
     return s.type == T::Percent ? percent_str(s.lo) : std::to_string(s.lo);
   }
@@ -357,8 +298,6 @@ std::string step_value(const Setting& s, const std::string& value, int dir, cons
     next = s.lo;
   }
   if (next > s.hi) next = s.hi;
-  // A value the file already held outside the menu's range is stepped from
-  // where it is and clamped in, rather than jumped to an end.
   return s.type == T::Percent ? percent_str(next) : std::to_string(next);
 }
 

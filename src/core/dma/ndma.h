@@ -9,13 +9,11 @@ namespace ds { struct NDS; }
 
 namespace ds::dma {
 
-// The DSi's "new" DMA: four channels per CPU at 0x04004100, 32-bit words
-// only, with block/total counts, a fill mode and its own start-mode
-// numbering. Modelled on melonDS DSi_NDMA (Start, Run9/Run7, WriteCnt); the
-// sub-block timer and round-robin arbitration are not (melonDS does not
-// either). A running channel stalls its CPU like the old DMA: Dma::run hands
-// the CPU's share to run() after the old channels, and the running bits sit
-// in Dma's masks (bits 4-7) so the scheduler's one-load test still works.
+// DSi "new" DMA: four channels per CPU at 0x04004100, 32-bit words only,
+// with block/total counts, a fill mode and its own start-mode numbering.
+// Sub-block timer and round-robin arbitration are not modelled. Stalls its
+// CPU like the old DMA; Dma::run hands the CPU's share to run() after the
+// old channels, running bits sit in Dma's masks (bits 4-7).
 class Ndma {
 public:
   explicit Ndma(NDS& nds);
@@ -26,8 +24,8 @@ public:
   u32  read(Cpu cpu, u32 addr) const;
   void write(Cpu cpu, u32 addr, u32 v);
 
-  // Start modes in NDMA numbering (melonDS's; the old DMA modes translate
-  // through Dma::ndma_mode). ARM7 channels carry 0x20.
+  // Start modes in NDMA numbering (old DMA modes translate through
+  // Dma::ndma_mode). ARM7 channels carry 0x20.
   static constexpr u32 MODE_IMMEDIATE = 0x10;
   void check(Cpu cpu, u32 mode);     // start channels waiting on `mode`
   void stop(Cpu cpu, u32 mode);      // clear the enable of channels in `mode`

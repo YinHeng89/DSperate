@@ -1,14 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // DSperate - Nintendo DS emulator. Copyright (C) 2026 DSperate contributors.
 //
-// Minimal A32 (ARM state, ARMv7-A) instruction encoder for the recompiler.
-// Encodings follow the Arm Architecture Reference Manual (ARMv7-A/R, A8);
-// only the forms the translator and the runtime stubs use are provided.
-// Every instruction takes a condition (default AL); register operands are
-// plain numbers 0-15. ARM state, never Thumb-2: fixed 4-byte words keep the
-// literal-argument stubs, the entry patch and the fixups trivial, and
-// predication needs no IT bookkeeping. C helpers are Thumb-2 on the
-// handheld toolchains: call them with `blx <reg>`, never `bl`.
+// Minimal A32 (ARM state, ARMv7-A) instruction encoder for the recompiler;
+// only the forms the translator and runtime stubs use. Every instruction
+// takes a condition (default AL); registers are plain numbers 0-15. Always
+// ARM state, never Thumb-2. C helpers are Thumb-2 on the handheld
+// toolchains: call them with `blx <reg>`, never `bl`.
 #pragma once
 #include "core/types.h"
 
@@ -53,16 +50,13 @@ public:
   static u32 read(const u8* at) { u32 w; std::memcpy(&w, at, 4); return w; }
 
   // ---- data processing ------------------------------------------------------
-  // Immediate form: `imm12` already encoded (encode_imm12).
   void dp_imm(DpOp op, bool s, u32 rd, u32 rn, u32 imm12, Cond c = AL) {
     emit((c << 28) | (1u << 25) | (op << 21) | (s ? (1u << 20) : 0) | (rn << 16) | (rd << 12) | imm12);
   }
-  // Register form with an immediate shift.
   void dp_reg(DpOp op, bool s, u32 rd, u32 rn, u32 rm, Shift sh = LSL, u32 amt = 0, Cond c = AL) {
     assert(amt < 32);
     emit((c << 28) | (op << 21) | (s ? (1u << 20) : 0) | (rn << 16) | (rd << 12) | (amt << 7) | (sh << 5) | rm);
   }
-  // Register form with a register shift amount.
   void dp_regshift(DpOp op, bool s, u32 rd, u32 rn, u32 rm, Shift sh, u32 rs, Cond c = AL) {
     emit((c << 28) | (op << 21) | (s ? (1u << 20) : 0) | (rn << 16) | (rd << 12) | (rs << 8) | (sh << 5) | (1u << 4) | rm);
   }
@@ -72,7 +66,6 @@ public:
   void mvn(u32 rd, u32 rm, Cond c = AL) { dp_reg(MVN, false, rd, 0, rm, LSL, 0, c); }
   void movw(u32 rd, u32 imm16, Cond c = AL) { emit((c << 28) | 0x03000000u | ((imm16 >> 12) << 16) | (rd << 12) | (imm16 & 0xFFF)); }
   void movt(u32 rd, u32 imm16, Cond c = AL) { emit((c << 28) | 0x03400000u | ((imm16 >> 12) << 16) | (rd << 12) | (imm16 & 0xFFF)); }
-  // Load a 32-bit constant in the fewest instructions (1 or 2).
   void mov_imm(u32 rd, u32 v, Cond c = AL) {
     u32 i;
     if (encode_imm12(v, i)) { dp_imm(MOV, false, rd, 0, i, c); return; }
@@ -91,8 +84,6 @@ public:
   void asr_reg(u32 rd, u32 rm, u32 rs, Cond c = AL) { dp_regshift(MOV, false, rd, 0, rm, ASR, rs, c); }
   void ror_reg(u32 rd, u32 rm, u32 rs, Cond c = AL) { dp_regshift(MOV, false, rd, 0, rm, ROR, rs, c); }
 
-  // add/sub with a constant: one instruction when it encodes (either sign),
-  // else through `tmp`.
   void add_imm(u32 rd, u32 rn, u32 v, u32 tmp, bool s = false, Cond c = AL) {
     u32 i;
     if (encode_imm12(v, i)) { dp_imm(ADD, s, rd, rn, i, c); return; }
@@ -107,7 +98,6 @@ public:
   void orr_reg(u32 rd, u32 rn, u32 rm, Shift sh = LSL, u32 amt = 0, Cond c = AL) { dp_reg(ORR, false, rd, rn, rm, sh, amt, c); }
   void eor_reg(u32 rd, u32 rn, u32 rm, Shift sh = LSL, u32 amt = 0, Cond c = AL) { dp_reg(EOR, false, rd, rn, rm, sh, amt, c); }
   void bic_reg(u32 rd, u32 rn, u32 rm, Shift sh = LSL, u32 amt = 0, Cond c = AL) { dp_reg(BIC, false, rd, rn, rm, sh, amt, c); }
-  // Logical with a constant: false when it does not encode (caller uses a temp).
   bool and_imm(u32 rd, u32 rn, u32 v, Cond c = AL) { u32 i; if (encode_imm12(v, i)) { dp_imm(AND, false, rd, rn, i, c); return true; } if (encode_imm12(~v, i)) { dp_imm(BIC, false, rd, rn, i, c); return true; } return false; }
   bool orr_imm(u32 rd, u32 rn, u32 v, Cond c = AL) { u32 i; if (!encode_imm12(v, i)) return false; dp_imm(ORR, false, rd, rn, i, c); return true; }
   bool eor_imm(u32 rd, u32 rn, u32 v, Cond c = AL) { u32 i; if (!encode_imm12(v, i)) return false; dp_imm(EOR, false, rd, rn, i, c); return true; }
@@ -134,38 +124,35 @@ public:
   void smull(u32 rdlo, u32 rdhi, u32 rn, u32 rm, bool s = false, Cond c = AL) { emit((c << 28) | 0x00C00090u | (s ? (1u << 20) : 0) | (rdhi << 16) | (rdlo << 12) | (rm << 8) | rn); }
   void umlal(u32 rdlo, u32 rdhi, u32 rn, u32 rm, bool s = false, Cond c = AL) { emit((c << 28) | 0x00A00090u | (s ? (1u << 20) : 0) | (rdhi << 16) | (rdlo << 12) | (rm << 8) | rn); }
   void smlal(u32 rdlo, u32 rdhi, u32 rn, u32 rm, bool s = false, Cond c = AL) { emit((c << 28) | 0x00E00090u | (s ? (1u << 20) : 0) | (rdhi << 16) | (rdlo << 12) | (rm << 8) | rn); }
-  // v5TE halfword multiplies (x, y select the top halves of rn, rm). The
-  // accumulating forms set Q on overflow, as the guest's do.
+  // v5TE halfword multiplies (x, y select top halves of rn, rm); accumulating
+  // forms set Q on overflow.
   void smla_xy(u32 rd, u32 rn, u32 rm, u32 ra, bool x, bool y, Cond c = AL) { emit((c << 28) | 0x01000080u | (rd << 16) | (ra << 12) | (rm << 8) | (y ? 0x40u : 0) | (x ? 0x20u : 0) | rn); }
   void smul_xy(u32 rd, u32 rn, u32 rm, bool x, bool y, Cond c = AL) { emit((c << 28) | 0x01600080u | (rd << 16) | (rm << 8) | (y ? 0x40u : 0) | (x ? 0x20u : 0) | rn); }
   void smlaw_y(u32 rd, u32 rn, u32 rm, u32 ra, bool y, Cond c = AL) { emit((c << 28) | 0x01200080u | (rd << 16) | (ra << 12) | (rm << 8) | (y ? 0x40u : 0) | rn); }
   void smulw_y(u32 rd, u32 rn, u32 rm, bool y, Cond c = AL) { emit((c << 28) | 0x012000A0u | (rd << 16) | (rm << 8) | (y ? 0x40u : 0) | rn); }
 
   // ---- loads / stores -------------------------------------------------------------
-  // Word/byte with an immediate offset (-4095..4095), pre-indexed, no writeback.
+  // Word/byte, immediate offset (-4095..4095), pre-indexed, no writeback.
   void ldr(u32 rt, u32 rn, s32 off, Cond c = AL) { ldst_imm(true, false, rt, rn, off, c); }
   void str(u32 rt, u32 rn, s32 off, Cond c = AL) { ldst_imm(false, false, rt, rn, off, c); }
   void ldrb(u32 rt, u32 rn, s32 off, Cond c = AL) { ldst_imm(true, true, rt, rn, off, c); }
   void strb(u32 rt, u32 rn, s32 off, Cond c = AL) { ldst_imm(false, true, rt, rn, off, c); }
-  // Word/byte with a register offset (optionally shifted).
   void ldr_reg(u32 rt, u32 rn, u32 rm, Shift sh = LSL, u32 amt = 0, Cond c = AL) { ldst_reg(true, false, rt, rn, rm, sh, amt, c); }
   void str_reg(u32 rt, u32 rn, u32 rm, Shift sh = LSL, u32 amt = 0, Cond c = AL) { ldst_reg(false, false, rt, rn, rm, sh, amt, c); }
   void ldrb_reg(u32 rt, u32 rn, u32 rm, Shift sh = LSL, u32 amt = 0, Cond c = AL) { ldst_reg(true, true, rt, rn, rm, sh, amt, c); }
   void strb_reg(u32 rt, u32 rn, u32 rm, Shift sh = LSL, u32 amt = 0, Cond c = AL) { ldst_reg(false, true, rt, rn, rm, sh, amt, c); }
-  // Halfword / signed forms with an immediate offset (-255..255).
+  // Halfword/signed forms, immediate offset (-255..255).
   void ldrh(u32 rt, u32 rn, s32 off, Cond c = AL) { ldst_h(true, 1, 1, rt, rn, off, c); }
   void strh(u32 rt, u32 rn, s32 off, Cond c = AL) { ldst_h(false, 1, 1, rt, rn, off, c); }
   void ldrsb(u32 rt, u32 rn, s32 off, Cond c = AL) { ldst_h(true, 1, 0, rt, rn, off, c); }
   void ldrsh(u32 rt, u32 rn, s32 off, Cond c = AL) { ldst_h(true, 1, 1, rt, rn, off, c, true); }
-  // Halfword / signed forms with a register offset (no shift).
   void ldrh_reg(u32 rt, u32 rn, u32 rm, Cond c = AL) { ldst_h_reg(true, 0b01, rt, rn, rm, c); }
   void strh_reg(u32 rt, u32 rn, u32 rm, Cond c = AL) { ldst_h_reg(false, 0b01, rt, rn, rm, c); }
   void ldrsb_reg(u32 rt, u32 rn, u32 rm, Cond c = AL) { ldst_h_reg(true, 0b10, rt, rn, rm, c); }
   void ldrsh_reg(u32 rt, u32 rn, u32 rm, Cond c = AL) { ldst_h_reg(true, 0b11, rt, rn, rm, c); }
-  // ldrd/strd: rt even, rt+1 implied; immediate offset (-255..255), 8-byte aligned address.
+  // ldrd/strd: rt even, rt+1 implied; offset (-255..255), 8-byte aligned address.
   void ldrd(u32 rt, u32 rn, s32 off, Cond c = AL) { assert((rt & 1) == 0); ldst_h(false, 1, 0, rt, rn, off, c); }
   void strd(u32 rt, u32 rn, s32 off, Cond c = AL) { assert((rt & 1) == 0); ldst_h(false, 1, 1, rt, rn, off, c, true); }
-  // Multiple: `mask` of registers; push/pop use the full-descending stack forms.
   void push(u32 mask, Cond c = AL) { emit((c << 28) | 0x092D0000u | mask); }
   void pop(u32 mask, Cond c = AL) { emit((c << 28) | 0x08BD0000u | mask); }
   void ldm(u32 rn, u32 mask, bool wb = false, Cond c = AL) { emit((c << 28) | 0x08900000u | (wb ? (1u << 21) : 0) | (rn << 16) | mask); }
@@ -176,7 +163,7 @@ public:
   void msr_apsr_nzcvq(u32 rn, Cond c = AL) { emit((c << 28) | 0x0128F000u | rn); }   // mask = f (bits 31:24)
 
   // ---- branches -----------------------------------------------------------------------
-  // Relative branch to an absolute target (must be within +-32 MB of here).
+  // Relative branch, target within +-32 MB.
   void b(const void* target, Cond c = AL) { emit((c << 28) | 0x0A000000u | rel24(target)); }
   void bl(const void* target, Cond c = AL) { emit((c << 28) | 0x0B000000u | rel24(target)); }
   void bx(u32 rm, Cond c = AL) { emit((c << 28) | 0x012FFF10u | rm); }
@@ -208,8 +195,6 @@ private:
   void ldst_reg(bool load, bool byte, u32 rt, u32 rn, u32 rm, Shift sh, u32 amt, Cond c) {
     emit((c << 28) | 0x07800000u | (byte ? (1u << 22) : 0) | (load ? (1u << 20) : 0) | (rn << 16) | (rt << 12) | (amt << 7) | (sh << 5) | rm);
   }
-  // Extra load/store (halfword, signed, dual): op2 = {S,H}: ldrh 0b01 (L=1), ldrsb 0b10 (L=1),
-  // ldrsh 0b11 (L=1); ldrd 0b10 (L=0), strd 0b11 (L=0), strh 0b01 (L=0).
   void ldst_h(bool load, u32 h_or_d, u32 second, u32 rt, u32 rn, s32 off, Cond c, bool sh_form = false) {
     assert(off > -256 && off < 256);
     const u32 u = off >= 0 ? 1u : 0u, a = static_cast<u32>(off >= 0 ? off : -off);

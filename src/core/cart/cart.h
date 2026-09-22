@@ -29,11 +29,8 @@ struct Header {
 };
 static_assert(sizeof(Header) == 0x160, "NDS header layout");
 
-// The DSi extension of the header, ROM bytes 0x180..0x377 (GBATEK "DSi
-// cartridge header"). Read for every ROM and consulted only when the header's
-// unit_code has bit 1 (DSi-capable). Header::reserved2 (0x1C) is the DSi
-// crypto flags byte: bit 0 = has ARM9i/ARM7i, bit 1 = modcrypted, bit 4 =
-// debug (dev key).
+// DSi extension of the header, ROM bytes 0x180..0x377 (GBATEK "DSi cartridge
+// header"); consulted only when unit_code has bit 1 (DSi-capable).
 struct TwlHeader {
   u32 mbk[12];                                  // 0x180: MBK1-5 slot maps, MBK6-8 ARM9 windows, MBK6-8 ARM7 windows, MBK9 (with WRAMCNT in the top byte)
   u32 region_flags;                             // 0x1B0
@@ -57,9 +54,7 @@ struct TwlHeader {
 };
 static_assert(sizeof(TwlHeader) == 0x378 - 0x180, "TWL header layout");
 
-// Detect: the game code is not in the save list and no save file named the
-// chip, so the chip is still unknown -- see Cart::spi_detect.
-enum class SaveType : u8 { None, EepromTiny, Eeprom, Flash, Detect };
+enum class SaveType : u8 { None, EepromTiny, Eeprom, Flash, Detect };  // Detect: chip still unknown
 
 // Retail Slot-1 cartridge: ROM reads through the KEY1/KEY2 command protocol,
 // and the save chip on the AUXSPI bus.
@@ -73,8 +68,7 @@ public:
   const Header& header() const { return header_; }
   const TwlHeader& twl() const { return twl_; }
   bool dsi_capable() const { return (header_.unit_code & 2) != 0; }   // unit_code: 0 DS, 2 DS+DSi, 3 DSi only
-  // Bounded reads of the image, wherever it lives (see rom_source.h); past
-  // the end the bytes are 0xFF, as on a card.
+  // Bounded reads of the image; past the end the bytes are 0xFF, as on a card.
   void rom_read(u32 addr, u8* dst, u32 n) const { rom_->read(addr, dst, n); }
   u32  rom_read32_at(u32 addr) const { return rom_->read32(addr); }
   u32 rom_size() const { return rom_->size(); }          // bytes in the image
@@ -94,34 +88,22 @@ public:
   u8   spi_transfer(u8 v);
   std::vector<u8>& sram() { return sram_; }
   SaveType save_type() const { return save_type_; }
-  // Whether the save list (save_list.inc) names this game's chip. When it
-  // does not -- a ROM hack that changed its game code, homebrew -- the chip
-  // follows the size of the save file load_save is given, or, with no file,
-  // is detected from the game's first save access. Such a chip is also
-  // lenient where a wrong guess would destroy data: FLASH programs overwrite
-  // rather than AND (an EEPROM game never erases first) and grow to fit an
-  // address past the end.
+  // Whether save_list.inc names this game's chip. When it doesn't, the chip
+  // follows the save file's size, or is detected from the first save access,
+  // and is lenient where a wrong guess would destroy data (FLASH programs
+  // overwrite rather than AND, and grow to fit an address past the end).
   bool save_type_listed() const { return listed_; }
-  // Loads a battery save file's bytes into the chip. A DeSmuME .dsv footer is
-  // dropped first. `fitted` is false when the file is not the chip's size:
-  // the part that fits was loaded, and the next write replaces the file with
-  // one of the chip's size, so the caller should keep the original.
+  // `fitted` is false when the file isn't the chip's size: the part that fits
+  // was loaded, and the next write replaces the file, so keep the original.
   struct SaveLoad { bool fitted; u32 chip_bytes; };
   SaveLoad load_save(const u8* data, size_t n);
   bool sram_dirty() const { return sram_dirty_; }
-  // Bumped on every save-chip write; the frontend flushes once it stops moving.
-  u32  sram_writes() const { return sram_writes_; }
+  u32  sram_writes() const { return sram_writes_; }   // bumped on every chip write
   void clear_sram_dirty() { sram_dirty_ = false; }
 
-  // The loader cart's launch signal. A read at the cart's own arm9_rom_offset
-  // only ever happens when the firmware's menu launches the card: the header
-  // is read once at boot by the plain `00` command, and no `B7` read in an
-  // ordinary session goes near it. So the first one is unambiguously "the
-  // player launched the card". The DS firmware never gets that far -- it fades
-  // to white and leaves the cart bus alone -- so the SDL frontend watches the
-  // fade instead; this stays for a loader that does read its own binary.
-  // Sticky until cleared, and deliberately not in the save state:
-  // it describes what the frontend is waiting for, not the machine.
+  // A `B7` read at the cart's own arm9_rom_offset, which only happens when
+  // the firmware's menu launches the card. Sticky until cleared; not in the
+  // save state (describes what the frontend is waiting for, not the machine).
   bool launch_read() const { return launch_read_; }
   void clear_launch_read() { launch_read_ = false; }
 
@@ -136,9 +118,7 @@ public:
 private:
   NDS& nds_;
   std::unique_ptr<RomSource> rom_;
-  // The page the last block read was in: rom_read32 stays pointer
-  // arithmetic and only asks the source when the address leaves it.
-  u32 page_base_ = 0xFFFFFFFFu; const u8* page_ = nullptr;
+  u32 page_base_ = 0xFFFFFFFFu; const u8* page_ = nullptr;   // last page rom_read32 fetched
   Header header_{};
   TwlHeader twl_{};
   u32 chip_id_ = 0;
@@ -156,9 +136,8 @@ private:
   void key1_apply_keycode(u32* keycode, u32 mod);
 
   SaveType save_type_ = SaveType::None;
-  // Infrared carts (game code 'I???': Pokémon HG/SS, B/W, B2/W2, Walk with
-  // Me): the AUXSPI bus reaches the IR chip first; its first byte is a
-  // command, 0x00 = pass the rest through to the save chip, 0x08 = ID (0xAA).
+  // Infrared carts (game code 'I???'): AUXSPI reaches the IR chip first; its
+  // first byte is a command, 0x00 = pass through to save chip, 0x08 = ID (0xAA).
   bool ir_cart_ = false; u8 ir_cmd_ = 0; u32 ir_pos_ = 0;
   std::vector<u8> sram_;
   bool sram_dirty_ = false;
@@ -169,25 +148,19 @@ private:
   u8 spi_chip(u8 v);    // the byte to the chip the save type names
 
   bool listed_ = true;
-  // SaveType::Detect: the transaction so far (command byte first), capped;
-  // not in the save state, so a state taken mid-transaction drops it.
-  std::vector<u8> detect_buf_;
+  std::vector<u8> detect_buf_;   // SaveType::Detect transaction so far; not saved to state
   u8 spi_detect(u8 v);
   void detect_release();
   void set_chip(SaveType type, u32 bytes);
   void fit_flash(u32 addr);
 };
 
-// Save type per game code (a small list; default is 64 KB EEPROM).
+// Save type per game code; default is 64 KB EEPROM.
 SaveType save_type_for(u32 game_code, u32& size);
-// The chip a save file of `bytes` bytes came from, or None for a size no
-// chip has.
+// The chip a save file of `bytes` bytes came from, or None.
 SaveType save_type_for_size(u32 bytes);
-
-// Whether the save-type database (save_list.inc) carries this game code at
-// all. save_type_for() answers for every code, falling back to the commonest
-// chip, so it cannot be used to ask the question. Used to pick the real game
-// out of a multi-ROM zip -- see zip.h.
+// Whether save_list.inc carries this game code (save_type_for always
+// answers, falling back to the default, so can't be used for this).
 bool known_game_code(u32 game_code);
 
 } // namespace ds::cart

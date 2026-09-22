@@ -1,13 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // DSperate - Nintendo DS emulator. Copyright (C) 2026 DSperate contributors.
 //
-// NEON twins of kernels_ref.cpp. Same names, same signatures, bit-identical
-// output (tests/kernels_test.cpp, run under qemu-aarch64, diffs them).
+// NEON twins of kernels_ref.cpp. Same names, same signatures, bit-identical output.
 //
-// Conventions: 18-bit colour records stay packed in u32 lanes (R 0-5, G 8-13,
-// B 16-21) and channel maths is done on the masked lanes the way the scalar
-// code does it; byte planes (ids, kinds, masks) are handled 16 at a time and
-// widened to u32 lane masks where they gate colour lanes.
+// 18-bit colour records stay packed in u32 lanes (R 0-5, G 8-13, B 16-21);
+// byte planes (ids, kinds, masks) are handled 16 at a time, widened to u32
+// lane masks where they gate colour lanes.
 #include "core/gpu/kernels.h"
 #include "core/div64.h"
 
@@ -22,8 +20,7 @@ namespace {
 
 // u8x16 mask -> four u32x4 lane masks.
 struct Mask4 { uint32x4_t m[4]; };
-// Sign-extending, so a 0xFF byte mask becomes an all-ones lane mask (values
-// below 0x80, such as alphas, widen unchanged).
+// Sign-extending: 0xFF becomes an all-ones lane mask; values below 0x80 (e.g. alphas) widen unchanged.
 inline Mask4 widen(uint8x16_t m8) {
   const int8x16_t s = vreinterpretq_s8_u8(m8);
   const int16x8_t lo = vmovl_s8(vget_low_s8(s)), hi = vmovl_s8(vget_high_s8(s));
@@ -35,9 +32,8 @@ inline uint8x16_t narrow(uint32x4_t a, uint32x4_t b, uint32x4_t c, uint32x4_t d)
   return vcombine_u8(vmovn_u16(vcombine_u16(vmovn_u32(a), vmovn_u32(b))), vmovn_u16(vcombine_u16(vmovn_u32(c), vmovn_u32(d))));
 }
 
-// Sixteen direct-colour words -> records, the arithmetic form of
-// direct_colour(): each 5-bit field becomes a byte plane (x2, bit 15 dropped)
-// and the planes are interleaved out with the alpha byte.
+// Arithmetic form of direct_colour(), 16 words: each 5-bit field becomes a
+// byte plane (x2, bit 15 dropped), interleaved out with the alpha byte.
 inline void direct16(const u16* v, Pixel* out) {
   const uint16x8_t lo = vld1q_u16(v), hi = vld1q_u16(v + 8);
   const uint8x16_t m = vdupq_n_u8(0x3E);
@@ -50,9 +46,8 @@ inline void direct16(const u16* v, Pixel* out) {
 }
 
 // Blend of two records with per-lane weights, 4 pixels. R and B share one
-// multiply chain (each field reaches at most 63*32+16 < 2^11, so they do not
-// meet); after the shift a field is at most 126, so its bit 6 is the
-// overflow flag that selects the 0x3F clamp.
+// multiply chain (fields cap at 63*32+16 < 2^11, so they don't meet); after
+// the shift a field is at most 126, so bit 6 is the overflow flag for the 0x3F clamp.
 inline uint32x4_t blend4(uint32x4_t a, uint32x4_t b, uint32x4_t ea, uint32x4_t eb, u32 round_r, u32 shift) {
   const uint32x4_t mrb = vdupq_n_u32(0x3F003F), mg = vdupq_n_u32(0x3F00);
   uint32x4_t rb = vmlaq_u32(vmlaq_u32(vdupq_n_u32(round_r * 0x010001), vandq_u32(a, mrb), ea), vandq_u32(b, mrb), eb);
@@ -84,14 +79,10 @@ inline uint32x4_t darken4(uint32x4_t v, u32 factor, u32 bias) {
   return vorrq_u32(vorrq_u32(vsubq_u32(rb, drb), vsubq_u32(g, dg)), vdupq_n_u32(0xFF000000));
 }
 
-// The same maths on byte planes, 16 pixels a call: a record's r g b bytes
-// are deinterleaved by ld4 into planes, the products live in 16-bit lanes and
-// come back through a narrowing shift. Per-lane weights are bytes, so the
-// bitmap-sprite and 3D blends (whose weights vary per pixel) cost the same as
-// the fixed EVA/EVB blend. Inputs are the 6-bit fields (the caller masks).
-//
-// blend: (a*ea + b*eb + 2^(shift-1)) >> shift, clamped to 63. After the shift
-// a field is at most 126, so it fits the byte and the clamp is one min.
+// Same maths on byte planes, 16 pixels a call, via ld4 deinterleave. Per-lane
+// byte weights mean bitmap-sprite/3D blends (per-pixel weight) cost the same
+// as the fixed EVA/EVB blend. Inputs are 6-bit fields (caller masks).
+// (a*ea + b*eb + 2^(shift-1)) >> shift, clamped to 63.
 template <int shift>
 inline uint8x16_t blend16(uint8x16_t a, uint8x16_t b, uint8x16_t ea, uint8x16_t eb) {
   const uint16x8_t rnd = vdupq_n_u16(1u << (shift - 1));
@@ -99,8 +90,7 @@ inline uint8x16_t blend16(uint8x16_t a, uint8x16_t b, uint8x16_t ea, uint8x16_t 
   const uint16x8_t hi = compat::mlal_high_u8(compat::mlal_high_u8(rnd, a, ea), b, eb);
   return vminq_u8(vcombine_u8(vshrn_n_u16(lo, shift), vshrn_n_u16(hi, shift)), vdupq_n_u8(63));
 }
-// c + (((63 - c) * factor + bias) >> 4): the scalar's & 0x3F after the shift
-// is a no-op there (the shifted term is at most 63), and so is dropped.
+// c + (((63 - c) * factor + bias) >> 4); scalar's & 0x3F after shift is a no-op here, dropped.
 inline uint8x16_t brighten16(uint8x16_t c, uint8x8_t factor, u16 bias) {
   const uint8x16_t inv = vsubq_u8(vdupq_n_u8(63), c);
   const uint16x8_t lo = vmlal_u8(vdupq_n_u16(bias), vget_low_u8(inv), factor);
@@ -141,17 +131,13 @@ void composite_line(u32 bldcnt, u32 eva, u32 evb, u32 evy, const Pixel* top, con
   for (u32 i = 0; i < 256; i += 16) {
     const uint8x16_t kind = vld1q_u8(top_kind + i);
     const uint8x16_t t2hit = vtstq_u8(vld1q_u8(second_id + i), v_t2);
-    // With no effect selected the first-target mask is empty (v_t1 = 0), so
-    // `fx` only gates the three effect cases.
+    // No effect selected -> v_t1 = 0, so t1hit/fx is empty.
     const uint8x16_t t1hit = vandq_u8(vtstq_u8(vld1q_u8(top_id + i), v_t1), vtstq_u8(vld1q_u8(win + i), vdupq_n_u8(0x20)));
     const uint8x16_t is_bitmap = vceqq_u8(kind, vdupq_n_u8(K_OBJ_BITMAP));
     const uint8x16_t objblend = vandq_u8(vorrq_u8(vceqq_u8(kind, vdupq_n_u8(K_OBJ_SEMI)), is_bitmap), t2hit);
     const uint8x16_t blend3d = vandq_u8(vceqq_u8(kind, vdupq_n_u8(K_3D)), t2hit);
     const uint8x16_t fx = vbicq_u8(vbicq_u8(t1hit, objblend), blend3d);
-    // The records as byte planes; lanes no effect touches pass through as
-    // they are (bytes 0-2 whole, alpha 0xFF).
-    // Most blocks of most lines blend nothing: copy through, whole records
-    // with the alpha byte forced -- no de-interleave for a copy.
+    // Most blocks blend nothing: copy through whole records, no de-interleave.
     if (compat::maxv_u8(vorrq_u8(vorrq_u8(objblend, blend3d), fx)) == 0) {
       const uint32x4_t alpha = vdupq_n_u32(0xFF000000);
       for (u32 k = 0; k < 16; k += 4) vst1q_u32(out + i + k, vorrq_u32(vld1q_u32(top + i + k), alpha));
@@ -224,8 +210,7 @@ inline void pal16_row(uint8x8_t idx, const uint8x16x4_t& table, Pixel* px) {
 
 
 namespace {
-// The priority rule on 16 plane entries: `opq` marks the sprite's opaque
-// pixels, `valid` the lanes inside the row; colour lanes come from `col`.
+// Priority rule on 16 plane entries; `opq` marks opaque sprite pixels, `valid` the lanes inside the row.
 inline void obj_plot16(uint8x16_t opq, uint8x16_t valid, uint16x8_t v0, uint16x8_t v1, u8 attr, u8 alpha, u16* px, u8* oattr, u8* oalpha) {
   const uint8x16_t old = vld1q_u8(oattr);
   const uint8x16_t old_opaque = vtstq_u8(old, vdupq_n_u8(OA_OPAQUE));
@@ -247,9 +232,7 @@ const uint8x16_t kLane16 = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15
 
 
 
-// One gather per pixel instead of two, and the id table lookup vectorised.
-// The table pointer is hoisted per 16 pixels when the ids agree, as resolve16
-// does: a line is usually long runs of one layer.
+// Table pointer hoisted per 16 pixels when ids agree (lines are usually long runs of one layer).
 void resolve16_top(const u16* top, const u8* top_tid, const Pixel* const* tables, const Pixel* line3d,
                    Pixel* top_px, u8* top_id) {
   static const u8 id_tab[16] = {L_BG0, L_BG1, L_BG2, L_BG3, L_OBJ, L_OBJ, L_OBJ, L_BACKDROP, 0, 0, 0, 0, 0, 0, 0, 0};
@@ -311,10 +294,8 @@ void resolve16_full(const u16* top, const u8* top_tid, const u16* second, const 
     }
     vst1q_u8(top_kind + i, kind);
     vst1q_u8(top_alpha + i, al);
-    // Layer ids normally occur in runs.  Hoist both table pointers when the
-    // whole block is uniform, avoiding two pointer-table loads per pixel.
-    // The 3D override must remain per-pixel, so it disables only the top
-    // lookup hoist when BG0 is the selected layer.
+    // Hoist both table pointers when the block is uniform; the 3D override
+    // stays per-pixel by disabling the top hoist when BG0 is selected.
     const u8 t0 = top_tid[i], s0 = second_tid[i];
     const bool top_run = compat::uniform_u8_mem(top_tid + i) && !(line3d && t0 == T_BG0);
     const bool second_run = compat::uniform_u8_mem(second_tid + i);
@@ -367,12 +348,8 @@ bool layer16_3d(const u32* line3d, u16* v) {
 }
 
 namespace {
-// Two text tiles (16 pixels) from their 16 index bytes and the two control
-// bytes, each broadcast over its tile's lanes: the flip is a per-half byte
-// reverse selected by ctl bit 4, the palette term comes from ctl bits 0-3
-// (`pal_shift` 4 for 16-colour tiles, 8 for extended 256-colour ones, or
-// none), and index 0 is transparent. No general register enters the loop:
-// the old one-tile form spent three GPR->SIMD dups per eight pixels.
+// Two text tiles (16 pixels): flip is a per-half byte reverse gated by ctl
+// bit 4, palette from ctl bits 0-3 (pal_shift 4/8/none), index 0 transparent.
 template <int pal_shift>
 [[gnu::always_inline]] inline uint8x16_t text_pair(uint8x16_t idx, const u8* ctl, u16* v) {
   const uint8x8_t c2 = vreinterpret_u8_u16(vld1_dup_u16(reinterpret_cast<const u16*>(ctl)));   // [c0 c1 c0 c1 ..]
@@ -471,10 +448,8 @@ inline void merge16(uint8x16_t m8, uint16x8_t v0, uint16x8_t v1, uint8x16_t tid,
 }
 }
 
-// The selects step 32 pixels and never test the mask: a `vmaxvq` + branch is
-// a vector-to-scalar readback, which on an in-order core costs more than the
-// merge it skips even on a line that is mostly transparent (measured on the
-// A55: -17 % at every density, and -22 % with the wider step).
+// Never tests the mask before merging: a vmaxvq + branch readback costs more
+// than the merge it would skip, even on a mostly-transparent line.
 void select16_nowin(const u16* v, u8 tid, u16* top, u8* top_tid, u16* second, u8* second_tid) {
   const uint8x16_t vtid = vdupq_n_u8(tid);
   for (u32 i = 0; i < 256; i += 16)
@@ -550,8 +525,7 @@ void select16_obj_flat(const u16* v, const u8* attr, const u8* win, u32 prio, u1
 }
 
 void resolve16(const u16* top, const u8* top_tid, const Pixel* const* tables, Pixel* out) {
-  // A gather; runs of one table are the common case, so the table pointer
-  // is hoisted per 16 pixels when the ids agree.
+  // Table pointer hoisted per 16 pixels when ids agree (runs of one table are the common case).
   for (u32 i = 0; i < 256; i += 16) {
     if (compat::uniform_u8_mem(top_tid + i)) {
       const Pixel* tab = tables[top_tid[i]];
@@ -563,16 +537,10 @@ void resolve16(const u16* top, const u8* top_tid, const Pixel* const* tables, Pi
   }
 }
 
-// One layer through one table: a gather with nothing to dispatch on. Eight
-// independent loads per iteration, which is what keeps an in-order core busy
-// through the load latency; the address arithmetic vectorises around them.
 void resolve16_one(const u16* v, const Pixel* table, Pixel* out) {
   if (table == direct_table()) { for (u32 i = 0; i < 256; i += 16) direct16(v + i, out + i); return; }
-  // Scalar on purpose: the indices come straight from `v` as two 64-bit
-  // loads, eight independent table loads are in flight per iteration, and
-  // nothing crosses between the vector and general register files (the
-  // previous form stored the indices to the stack and reloaded them, which
-  // the A55 does not forward, then inserted each entry lane by lane).
+  // Scalar on purpose: eight independent table loads in flight per iteration keeps an
+  // in-order core busy through load latency; nothing crosses the vector/GPR boundary.
   for (u32 i = 0; i < 256; i += 8) {
     u64 a, b; std::memcpy(&a, v + i, 8); std::memcpy(&b, v + i + 4, 8);
     Pixel o[8];
@@ -584,8 +552,7 @@ void resolve16_one(const u16* v, const Pixel* table, Pixel* out) {
   }
 }
 
-// Sixteen texels a step, then eight, then scalar: the runs start and end at
-// wrap or overflow boundaries, so nothing may be written past n.
+// 16 texels a step, then 8, then scalar: nothing may be written past n.
 bool bmp_row_8(const u8* idx, u32 n, u16* v) {
   const uint16x8_t op = vdupq_n_u16(0x8000);
   uint8x16_t acc = vdupq_n_u8(0);
@@ -662,10 +629,7 @@ void expand_colours(u32* dst) {
   for (u32 i = 0; i < 256; i += 4) vst1q_u32(dst + i, expand4(vld1q_u32(dst + i)));
 }
 
-// Byte planes: the 6-bit fields, the master brightness in 16-bit lanes, the
-// 6 -> 8 expansion as (c << 2) | (c >> 4) per plane, and the planes stored in
-// 0xAARRGGBB order (b g r 0xFF) by one st4 -- no channel is shifted through
-// a 32-bit word.
+// 6->8 expansion: (c<<2)|(c>>4) per plane, stored 0xAARRGGBB order by one st4.
 void output_line(const Pixel* src, u16 reg, u32* dst) {
   const u32 mode = reg >> 14;
   u32 factor = reg & 0x1F;
@@ -687,8 +651,7 @@ void output_line(const Pixel* src, u16 reg, u32* dst) {
   }
 }
 
-// BGR555 in: each 5-bit field is narrowed to a byte plane already doubled
-// (the 18-bit record's channel), then the same brightness and expansion.
+// BGR555 in: 5-bit fields narrowed to already-doubled byte planes, then the same brightness and expansion.
 void output_vram_line(const u16* src, u16 reg, u32* dst) {
   const u32 mode = reg >> 14;
   u32 factor = reg & 0x1F;
@@ -740,11 +703,8 @@ void capture_a15(const Pixel* src, u32 n, u16* dst) {
   }
 }
 
-// The blend in 16-bit lanes off 8-bit sources: each product is at most
-// 31 * 16, both terms plus the rounding bias fit a halfword, so one
-// multiply-long and one multiply-accumulate-long per channel per eight
-// pixels do the arithmetic. The per-source alpha becomes a byte mask
-// applied to the channels before the multiply (aa and ab are 0 or 1).
+// Blend in 16-bit lanes: each product is at most 31*16, so both terms plus
+// rounding bias fit a halfword. Per-source alpha becomes a 0/1 byte mask applied before the multiply.
 void capture_blend(const Pixel* srca, const u16* srcb, u32 n, u32 eva, u32 evb, u16* dst) {
   const uint8x16_t v1f = vdupq_n_u8(0x1F);
   const uint8x8_t va8 = vdup_n_u8(static_cast<u8>(eva)), vb8 = vdup_n_u8(static_cast<u8>(evb));
@@ -820,9 +780,7 @@ void scale_row_straddle(const u32* src, const u32* seam, const u8* w, const u16*
   }
 }
 
-// (a * 256 + b * w - a * w + 128) >> 8 per byte, in 16-bit lanes: the
-// intermediate wraps but the true value is at most 255 * 256 + 128, so the
-// wrapped sum is exact. Each pixel's weight is spread over its four bytes.
+// (a*256 + b*w - a*w + 128) >> 8 per byte; intermediate wraps but true value <= 255*256+128, so exact.
 void blend_line_w(const u32* a, const u32* b, const u8* w, u32* out) {
   const uint8x8_t k128 = vdup_n_u8(128);
   for (u32 i = 0; i < 256; i += 4) {
@@ -839,8 +797,7 @@ void blend_line_w(const u32* a, const u32* b, const u8* w, u32* out) {
   }
 }
 
-// Four pixels a step, a as va, b as vb, the four weights already spread over
-// their bytes in wlo/whi: the blend_line_w arithmetic.
+// blend_line_w arithmetic, four pixels a step (weights pre-spread in wlo/whi).
 static inline uint32x4_t lerp4(uint8x16_t va, uint8x16_t vb, uint8x8_t wlo, uint8x8_t whi) {
   const uint8x8_t k128 = vdup_n_u8(128);
   uint16x8_t tlo = vshll_n_u8(vget_low_u8(va), 8), thi = vshll_n_u8(vget_high_u8(va), 8);
@@ -856,9 +813,7 @@ static inline void spread_w4(uint8x8_t w4, uint8x8_t& wlo, uint8x8_t& whi) {
   wlo = z2.val[0]; whi = z2.val[1];
 }
 
-// The gather is four two-pixel loads (src[s], src[s+1] as one 64-bit lane
-// pair), zipped so that the four left pixels land in one register and the
-// four right ones in another.
+// Four two-pixel loads (src[s], src[s+1]), zipped so left pixels land in one register, right in another.
 void lerp_row_gather(const u32* src, const u16* sx, const u8* wx, u32 n, u32* out) {
   u32 x = 0;
   for (; x + 4 <= n; x += 4) {
@@ -956,14 +911,10 @@ void scale_row_grid(const u32* src, const u16* xrun, u32 f, u32 min_run, u32 pit
 }
 
 
-// ---- 3D span stages ------------------------------------------------------------
-// Four pixels per step (the buffers are 256 wide, so rounding `n` up is safe).
-// Divisions: a correctly rounded f64 quotient of two u32 values, truncated, is
-// the exact integer quotient (the error is below num * 2^-53 < 1/den), so
-// the f64 divide reproduces the reference's integer division with no fix-up.
-// On an ARMv7 host there is no vector f64 at all, so compat::udiv_exact takes
-// the quotients a lane at a time on the scalar VFP unit -- same values, and
-// the one shim in the set with a cost worth watching in a span-heavy profile.
+// ---- 3D span stages ----
+// Four pixels per step (buffers are 256 wide, rounding n up is safe). A
+// correctly-rounded f64 quotient of two u32s, truncated, is the exact integer
+// quotient, so the f64 divide reproduces integer division with no fix-up.
 
 namespace {
 using compat::udiv_exact;   // f64 quotient on A64, scalar VFP lanes on ARMv7
@@ -974,21 +925,16 @@ inline int32x4_t mul_hi8_add(int32x4_t base, uint32x4_t d, uint32x4_t f) {   // 
 }
 const int32x4_t kLane = {0, 1, 2, 3};
 
-// The attribute kernels' multiply, when it fits: base + ((d * f) >> 8) with
-// d * f < 2^32 is the same number whether the product is formed in 64 bits or
-// in 32, and the 32-bit form is one instruction where the 64-bit one is six --
-// on ARMv7 the high half has to be split out and narrowed back by hand, which
-// the A30 profile put at 6 % of a heavy frame's raster (2026-09-15).
+// base + ((d*f)>>8): same result in 32 or 64 bits when d*f < 2^32; the 32-bit
+// form is one instruction, the 64-bit one six on ARMv7.
 [[gnu::always_inline]] inline int32x4_t mul8_add(int32x4_t base, uint32x4_t d, uint32x4_t f, bool narrow) {
   if (narrow) return vaddq_s32(base, vreinterpretq_s32_u32(vshrq_n_u32(vmulq_u32(d, f), 8)));
   return mul_hi8_add(base, d, f);
 }
 
 #if defined(__arm__)
-// The largest factor in fac[0, n) -- only those: the entries past n are the
-// slack the kernels write over and hold whatever an earlier span left. Only
-// run when the caller could not bound the factors: on the A30 the scan cost
-// as much as the narrow multiply saved (2026-09-15).
+// Largest factor in fac[0, n) only; entries past n are slack the kernels
+// overwrite and may hold a prior span's data.
 inline u32 fac_max(const u32* fac, u32 n) {
   uint32x4_t acc = vdupq_n_u32(0);
   u32 i = 0;
@@ -999,19 +945,12 @@ inline u32 fac_max(const u32* fac, u32 n) {
 #endif
 
 // Whether every product the attribute kernels form over this span fits 32
-// bits. A factor above 256 only comes from a perspective numerator that
-// wrapped (garbage W); with all of them at most 256, 256 - f is too, and an
-// endpoint difference below 2^24 keeps d * f below 2^32. Colours (9 bits) and
-// texture coordinates (s16) always pass; the wide path stays for the rest.
-//
-// ARMv7 only. On the RG DS Plus (Cortex-A55, AArch64) the 64-bit form is
-// already one instruction and the narrow one measured flat to slower (with
-// the edge and factor changes in render3d.cpp: nsmb +3.8 %, sm64 +3.4 %,
-// 2026-09-15), so AArch64 keeps the wide multiply and never scans.
+// bits: factor <= 256 (above only from a wrapped perspective numerator) and
+// endpoint difference < 2^24 keeps d*f < 2^32. ARMv7 only: AArch64's 64-bit
+// form is already one instruction and never scans.
 #if defined(__arm__)
 inline bool narrow_ok(u32 fmax, u32 dmax) { return fmax <= 256 && dmax < (1u << 24); }
-// The bound to test: the caller's when it gave one, otherwise the scan -- and
-// no scan at all when no attribute can narrow anyway.
+// The caller's bound when given, else the scan (skipped when nothing can narrow).
 inline u32 fac_bound_of(const u32* fac, u32 n, u32 fmax, u32 dmax) {
   if (fmax <= 256 || dmax >= (1u << 24)) return fmax;
   return fac_max(fac, n);
@@ -1020,13 +959,8 @@ inline u32 fac_bound_of(const u32* fac, u32 n, u32 fmax, u32 dmax) {
 }
 
 void span_factor(s32 xv0, u32 n, s32 xdiff, s32 w0n, s32 w0d, s32 w1d, u32* fac) {
-  // num and den are both linear in xv, so they step by a constant instead of
-  // being multiplied out per pixel. The quotient is a blend factor that stays
-  // inside 8 bits for real content, so one Newton step leaves the estimate
-  // within a small fraction of 1 and the two correction rounds land it
-  // exactly; lanes where that cannot be shown are collected in a vector and
-  // the whole span redone exactly -- once per span, not a scalar readback
-  // once per four pixels.
+  // num/den are linear in xv, so they step by a constant. Lanes the Newton
+  // estimate can't prove exact are collected and the span redone exactly once (not per-pixel).
   const int32x4_t x0 = vaddq_s32(vdupq_n_s32(xv0), kLane);
   uint32x4_t num = vshlq_n_u32(vreinterpretq_u32_s32(vmulq_s32(x0, vdupq_n_s32(w0n))), 8);
   const uint32x4_t dnum = vdupq_n_u32(static_cast<u32>(w0n * 4) << 8);
@@ -1035,16 +969,9 @@ void span_factor(s32 xv0, u32 n, s32 xdiff, s32 w0n, s32 w0d, s32 w1d, u32* fac)
   uint32x4_t bad = vdupq_n_u32(0);
   uint32x4_t den;
   if (w0d == w1d) {
-    // W does not vary across the span, so the denominator collapses to the
-    // constant xdiff*w0d and the factor num/den is *linear in x*. DraStic's
-    // render_polygon_setup_perspective_steps_w_constant_asm exploits that
-    // fully: it multiplies an iota vector by the span's step once and the
-    // inner loop is a single add, with no division anywhere. This is that.
-    //
-    // The step is held in 16.16, so the ramp accumulates a rounded step and
-    // drifts from the exact quotient by up to a couple of units over a long
-    // span. That is a deliberate departure from bit-exactness -- see
-    // docs/techniques/02 and the measurements in the commit.
+    // W constant: denominator collapses to xdiff*w0d, factor is linear in x
+    // -- a step ramp, no division. Step held in 16.16, so the ramp can drift
+    // a couple units from exact over a long span (deliberate).
     const u32 dscalar = static_cast<u32>(xdiff) * static_cast<u32>(w0d);
     if (dscalar == 0) {
       const uint32x4_t z = vdupq_n_u32(0);
@@ -1115,8 +1042,7 @@ void span_attr_persp(s32 y0, s32 y1, const u32* fac, u32 n, s32* out, u32 fmax) 
 }
 
 namespace {
-// Endpoint constants for attributes [k0, k1): the base, |y1 - y0|, direction
-// and flatness, and the largest difference (for narrow_ok).
+// Endpoint constants for attributes [k0, k1): base, |y1-y0|, direction, flatness, max diff (for narrow_ok).
 struct AttrSet {
   int32x4_t base[5]; uint32x4_t d[5]; bool up[5], flat[5];
   u32 dmax = 0;
@@ -1132,9 +1058,7 @@ struct AttrSet {
   }
 };
 
-// The five attributes in one pass over the span: `fac` is loaded once per
-// four pixels instead of once per attribute, and the endpoint constants for
-// all five stay in registers.
+// fac loaded once per four pixels instead of once per attribute; endpoint constants stay in registers.
 template <bool narrow>
 void span_attrs5_body(const AttrSet& a, const u32* fac, u32 n, s32* const* out) {
   const uint32x4_t k256 = vdupq_n_u32(256);
@@ -1148,12 +1072,7 @@ void span_attrs5_body(const AttrSet& a, const u32* fac, u32 n, s32* const* out) 
   }
 }
 
-// The same interpolation, narrowed as it is stored: colour to the 6-bit
-// channel the shader reads and texture coordinates to the s16 the sampler
-// truncates to. Eight pixels a step, so the stores are whole vectors and the
-// span buffers are a third of the size.
-// s and t only: three of the five attribute chains, and three of the five
-// stores per eight pixels, go with the colour.
+// Narrowed on store: colour to 6-bit channel, texcoords to s16. s and t only (colour chains skipped).
 template <bool narrow>
 void span_attrs2n_body(const AttrSet& a, const u32* fac, u32 n, s16* sc, s16* tc) {
   const uint32x4_t k256 = vdupq_n_u32(256);
@@ -1214,7 +1133,7 @@ void span_attrs5n(const s32* y0, const s32* y1, const u32* fac, u32 n, u8* vr, u
   else span_attrs5n_body<false>(a, fac, n, vr, vg, vb, sc, tc);
 }
 #else
-// AArch64: the kernels as they were before the ARMv7 narrow path (fmax unused).
+// AArch64: pre-narrow-path form (fmax unused).
 void span_attr_persp(s32 y0, s32 y1, const u32* fac, u32 n, s32* out, u32) {
   if (y0 == y1) { const int32x4_t v = vdupq_n_s32(y0); for (u32 i = 0; i < n; i += 4) vst1q_s32(out + i, v); return; }
   const bool up = y0 < y1;
@@ -1250,12 +1169,7 @@ void span_attrs5(const s32* y0, const s32* y1, const u32* fac, u32 n, s32* const
   }
 }
 
-// The same interpolation, narrowed as it is stored: colour to the 6-bit
-// channel the shader reads and texture coordinates to the s16 the sampler
-// truncates to. Eight pixels a step, so the stores are whole vectors and the
-// span buffers are a third of the size.
-// s and t only: three of the five attribute chains, and three of the five
-// stores per eight pixels, go with the colour.
+// Narrowed on store: colour to 6-bit channel, texcoords to s16. s and t only.
 void span_attrs2n(const s32* y0, const s32* y1, const u32* fac, u32 n, s16* sc, s16* tc, u32) {
   const uint32x4_t k256 = vdupq_n_u32(256);
   int32x4_t base[2]; uint32x4_t d[2]; bool up[2], flat[2];
@@ -1311,9 +1225,8 @@ void span_attrs5n(const s32* y0, const s32* y1, const u32* fac, u32 n, u8* vr, u
 }
 #endif
 
-// Linear interpolation of one attribute over four pixels, the vector form of
-// span_attr_linear's body: q = d * xv / xdiff by the reciprocal, with the
-// same one-compare fix-up, and xv mirrored when the endpoints descend.
+// Vector form of span_attr_linear's body: q = d*xv/xdiff by reciprocal, same
+// one-compare fix-up, xv mirrored when endpoints descend.
 struct LinAttr {
   int32x4_t base;
   uint32x4_t d;
@@ -1337,10 +1250,8 @@ struct LinAttr {
   }
 };
 
-// The reciprocal span_attr_linear derives per call. Hoisted here because the
-// fused kernels need it once for all five attributes, not once each: it is a
-// 64-bit division, and five of them per span was the cost this kernel exists
-// to remove.
+// Hoisted: fused kernels need this once for all five attributes, not once
+// each (each is a 64-bit division this kernel exists to avoid repeating).
 static inline u32 lin_recip(s32 xdiff) {
   return xdiff >= 2 ? recip_ceil32(static_cast<u32>(xdiff)) : 0;
 }
@@ -1398,9 +1309,7 @@ void span_attr_linear(s32 y0, s32 y1, s32 xv0, u32 n, s32 xdiff, s32* out) {
   const int32x4_t base = vdupq_n_s32(up ? y0 : y1);
   const uint32x4_t d = vdupq_n_u32(static_cast<u32>(up ? y1 - y0 : y0 - y1));
   const int32x4_t vxdiff = vdupq_n_s32(xdiff);
-  // d * f / xdiff with the product below 2^32: q = (n * ceil(2^32 / xdiff)) >> 32
-  // is exact or one too many; the compare q * xdiff > n fixes it. xdiff == 1
-  // (reciprocal would not fit) divides by nothing.
+  // q = (n * ceil(2^32/xdiff)) >> 32 is exact or one too many; q*xdiff > n fixes it.
   const u32 m = lin_recip(xdiff);
   const uint32x4_t vm = vdupq_n_u32(m), vxd = vreinterpretq_u32_s32(vxdiff);
   for (u32 i = 0; i < n; i += 4) {
@@ -1439,10 +1348,7 @@ void span_z_const(s32 z, u32 n, s32* out) {
 }
 
 void clear_image_run(const u16* col, const u16* dep, u32 n, u32 polyid, u32* color, u32* depth, u32* attr) {
-  // Sixteen pixels a step as byte planes (r g b a, then st4), the 5-bit
-  // channel to 6 bits as c * 2 + (c != 0) in 16-bit lanes; the depth and
-  // attribute words widened from the depth row. Exactly n are written, so
-  // the tail is scalar.
+  // 16 pixels a step as byte planes; 5-bit channel to 6 bits as c*2+(c!=0). Exactly n written, tail scalar.
   const uint16x8_t m5 = vdupq_n_u16(0x1F), one16 = vdupq_n_u16(1), bit15 = vdupq_n_u16(0x8000);
   const uint32x4_t vpid = vdupq_n_u32(polyid), v1ff = vdupq_n_u32(0x1FF);
   auto c6 = [&](uint16x8_t c5) { return vaddq_u16(vshlq_n_u16(c5, 1), vandq_u16(vtstq_u16(c5, c5), one16)); };
@@ -1474,9 +1380,8 @@ void clear_image_run(const u16* col, const u16* dep, u32 n, u32 polyid, u32* col
   }
 }
 
-// One instantiation per depth mode: the test is decided once per span, not
-// once per four pixels inside the loop. `under` names the lower layer as a
-// candidate where the top pixel carries edge flags; off, only bit 0 is set.
+// One instantiation per depth mode: test decided once per span, not per four
+// pixels. `under` marks the lower layer a candidate when the top pixel carries edge flags.
 template <int mode, bool under>
 static u32 depth_candidates_m(const s32* z, const u32* dstz, const u32* dstattr, u32 n, u8* pass) {
   const uint32x4_t one = vdupq_n_u32(1), two = vdupq_n_u32(2);

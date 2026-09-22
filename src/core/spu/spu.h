@@ -9,24 +9,16 @@
 namespace ds { struct NDS; }
 namespace ds::spu {
 
-// Sound unit (ARM7 side, registers 0x04000400-0x0400051F).
-//
-// Sixteen channels (PCM8 / PCM16 / IMA-ADPCM on all, PSG square on 8-13,
-// noise on 14-15), each stepping its own 16-bit timer at the SPU clock, a
-// mixer producing one stereo sample every 2048 ARM9 cycles (32.768 kHz), and
-// two capture units writing the mixer output back to ARM7 memory. Samples
-// are fetched through a 32-byte per-channel FIFO like the hardware does
-// (16-byte bursts, never from the ARM7 BIOS). The integer arithmetic and its
-// truncation points follow melonDS so the output can be compared sample for
-// sample.
-//
-// Output is interleaved s16 stereo at 32768 Hz in a ring the frontend
-// drains; the oldest samples are overwritten when nobody drains it.
+// Sound unit (ARM7 side, registers 0x04000400-0x0400051F). 16 channels
+// (PCM8/PCM16/IMA-ADPCM on all, PSG square on 8-13, noise on 14-15) mixed
+// every 2048 ARM9 cycles (32.768 kHz) into two capture units and an output
+// ring; per-channel sample fetch goes through a 32-byte FIFO (16-byte
+// bursts). Integer arithmetic and truncation follow melonDS bit-for-bit.
 class Spu {
 public:
   explicit Spu(NDS& nds) : nds_(nds) {}
   void reset();
-  template <class S> void sync_state(S& s);   // after catch_up(); the output ring is dropped
+  template <class S> void sync_state(S& s);   // call after catch_up(); output ring not saved
 
   static bool owns_reg(u32 addr) { return addr >= 0x04000400 && addr < 0x04000520; }
   u32  read(u32 addr, u32 width);
@@ -34,50 +26,32 @@ public:
 
   void set_powcnt2(u16 v) { catch_up(); muted_ = !(v & 1); }
 
-  // Mix every sample whose nominal time is <= `t`. Samples are produced in
-  // batches (DS_SPU_BATCH, default 16) from one scheduler event, so anything
-  // that observes or changes SPU state between events calls this first: the
-  // register paths do, and the result is sample-for-sample what one event
-  // per sample produced. Capture forces a batch of one, since it writes RAM.
+  // Mixes every sample due by `t`; call before any register access that
+  // observes/changes SPU state between events. Capture forces batch size 1.
   void run_to(u64 t) { while (mix_at_ <= t) { mix(); mix_at_ += mix_period_; } }
   // DSi SNDEXCNT (0x04004700, via Io::dsi_write): bit 15 I2S enable, 14 mute,
-  // 13 selects 47.6 kHz output (only while disabled), bits 0-3 the NITRO/DSP
-  // mix ratio. The DSi ignores SOUNDBIAS. melonDS DSi_I2S::WriteSndExCnt.
+  // 13 selects 47.6 kHz output (only while disabled), bits 0-3 NITRO/DSP mix
+  // ratio. DSi ignores SOUNDBIAS.
   void write_sndexcnt(u16 value, u16 mask);
-  // What the mixer actually produces, from the clock and the mix period
-  // rather than from the nominal name of the rate. The SPU emits one sample
-  // every mix_period_ ARM9 cycles, so the DS runs at 67027964 / 2048 =
-  // 32728.5 Hz -- *not* the 32768 its "32.768 kHz" name suggests, which is
-  // 1207 ppm away. The DSi's high-rate mode is 67027964 / 1408 = 47605.1.
-  //
-  // The difference is small and it is not nothing: it is a fixed ratio error
-  // on everything the frontend resamples, and before this was derived the
-  // rate control sat at -1200 ppm for entire runs holding the queue against
-  // it -- correcting our own constant while it was documented as the host's
-  // crystal (docs/frame-pacing-scoping.md). Anything converting the stream
-  // wants the exact one; SAMPLE_RATE is a name, good for asking a device for
-  // a rate it will recognise and for sizing a mic buffer, not for a ratio.
+  // Real mixer rate (not the nominal 32768 Hz): 67027964/2048 = 32728.5 Hz,
+  // or 47605.1 Hz in DSi high-rate mode. Use for stream conversion.
   double output_rate_hz() const { return static_cast<double>(ARM9_CLOCK_HZ) / mix_period_; }
   u32  output_rate() const { return static_cast<u32>(output_rate_hz() + 0.5); }
   void set_apply_bias(bool on) { apply_bias_ = on; }
   void catch_up();
 
-  // Output ring (stereo frames). `take` copies up to `max_frames` frames into
-  // `dst` (2 * frames s16) and returns the count.
+  // Output ring (stereo frames). `take` copies up to `max_frames` into `dst`
+  // (2 * frames s16) and returns the count.
   size_t available() const { return (wr_ - rd_) & (RING_FRAMES - 1); }
   size_t take(s16* dst, size_t max_frames);
   void   drain() { rd_ = wr_; }
-  // Frames the ring dropped because nobody took them for half a second: a
-  // frontend that stopped draining, or a fast forward outrunning the ring.
-  // Not saved in a state and not read by the core -- a statistic only.
-  u64    ring_overruns() const { return overruns_; }
+  u64    ring_overruns() const { return overruns_; }   // stat only, not saved
 
-  // The nominal name of the DS rate, not the rate: the mixer produces
-  // 32728.5 Hz (output_rate_hz()). Use this to ask a device for a rate it
-  // will recognise, or to size a buffer; never as the input of a conversion.
+  // Nominal DS rate; actual is output_rate_hz(). For device/buffer sizing,
+  // never as a conversion input.
   static constexpr u32 SAMPLE_RATE = 32768;
   static constexpr u32 MIX_PERIOD  = 2048;      // ARM9 cycles per output sample
-  static constexpr u32 MIX_PERIOD_47K = 1408;   // the DSi's 47605 Hz (melonDS: 704 ARM7 cycles)
+  static constexpr u32 MIX_PERIOD_47K = 1408;   // DSi's 47605 Hz
   static constexpr u32 TIMER_STEP  = 512;       // channel timer ticks per output sample (mix period / 4)
 
   // Exposed for the tests.

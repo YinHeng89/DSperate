@@ -1,9 +1,8 @@
 #version 450
-// The ordered tail in the anti-aliasing pass: tri_tail.frag's rules on the
-// two-deep pixel stack. A translucent pixel that passes against the top
-// blends into the top and, where the top is an edge pixel, into the slot
-// underneath as well (Renderer3D::resolve_span); one that fails against the
-// top of an edge pixel may blend underneath alone. Shadows stay on top.
+// The ordered tail in the AA pass: tri_tail.frag's rules on the two-deep
+// pixel stack. A pass against the top blends into the top and, on an edge
+// pixel, into the slot underneath too; a fail against the top of an edge
+// pixel may still blend underneath alone. Shadows stay on top.
 #extension GL_GOOGLE_include_directive : require
 #define DS_GLSL 1
 #define DS_AA_PASS 1
@@ -11,8 +10,7 @@
 #include "tri_frag_common.glsl"
 #include "tri_aa_common.glsl"
 
-// plot_translucent on one slot: the blend, the id rule, the attribute merge,
-// the optional depth write. Returns false when the equal-id rule skips it.
+// Blend, id rule, attribute merge, optional depth write on one slot; false if the equal-id rule skips it.
 bool blend_slot(inout uint dcol, inout uint dattr, inout uint dz, GpuPoly p, Frag f) {
   uint attr = (f.polyattr & 0xE0F0u) | ((f.polyattr >> 8) & 0xFF0000u) | (1u << 22) | (dattr & 0xFF001F0Fu);
   bool same;

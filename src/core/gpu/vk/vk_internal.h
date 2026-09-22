@@ -1,13 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // DSperate - Nintendo DS emulator. Copyright (C) 2026 DSperate contributors.
 #pragma once
-// The backend's view of the Vulkan context: the dispatch table and the handles
-// vk_raster.cpp needs to build a pipeline. Not part of vk_device.h, which the
-// rest of the emulator includes and which must stay free of vulkan.h.
-//
-// Everything is resolved through vkGetInstanceProcAddr (vk_device.cpp), so
-// nothing in the binary links against libvulkan and a device with no driver is
-// an ordinary outcome rather than a failure to start.
+// The backend's view of the Vulkan context: dispatch table and handles
+// vk_raster.cpp needs. Kept out of vk_device.h, which must stay free of
+// vulkan.h. All functions resolved through vkGetInstanceProcAddr, so nothing
+// links against libvulkan and a driverless machine is not a failure to start.
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
 
@@ -55,7 +52,7 @@ struct Api {
 #undef F
 };
 
-// What Device hands the backend. Lifetime is the Device's.
+// What Device hands the backend; lifetime is the Device's.
 struct DeviceInternal {
   const Api*       api = nullptr;
   VkDevice         dev = VK_NULL_HANDLE;

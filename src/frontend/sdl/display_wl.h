@@ -1,26 +1,16 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // DSperate - Nintendo DS emulator. Copyright (C) 2026 DSperate contributors.
 //
-// Dmabuf presentation onto SDL's own Wayland window.
+// Dmabuf presentation onto SDL's own Wayland window: frames render straight
+// into CMA dma-heap buffers submitted via zwp_linux_dmabuf_v1, avoiding the
+// shm copy and texture upload of SDL's window surface path. The compositor
+// samples zero-copy, or (fullscreen/opaque/untransformed) scans out directly.
 //
-// The scanline-scaling path writes panel-sized frames; SDL's window surface
-// then costs a shm copy on commit, and the compositor a texture upload when
-// it composites us. This backend removes both: frames are rendered straight
-// into CMA dma-heap buffers (physically contiguous, scannable) submitted via
-// zwp_linux_dmabuf_v1. The compositor samples them zero-copy when it
-// composites -- and when the surface is fullscreen, opaque and untransformed,
-// wlroots lifts the buffer onto a hardware plane and its per-frame work
-// drops to a flip (verified on-device: both RG DS boards' panels, VOP2 plane
-// state showing our fb). We never choose between those tiers; the compositor
-// does, per frame.
-//
-// SDL keeps everything else: the window, xdg-shell, fullscreen handling and
-// input. We fetch its wl_display/wl_surface via SDL_SysWMinfo and only take
-// over what gets attached. Our globals live on a private event queue so our
+// SDL keeps the window, xdg-shell, fullscreen and input; we take wl_display/
+// wl_surface via SDL_SysWMinfo and use a private event queue so our
 // dispatching and SDL's event pump never touch each other's handlers.
 //
-// libwayland is dlopen'd (wl_dyn.h): on a device without it, or without a
-// compositor, open() fails cleanly and Display falls back to the SDL paths.
+// libwayland is dlopen'd (wl_dyn.h); open() fails cleanly if unavailable.
 #pragma once
 
 #include "core/types.h"
@@ -43,19 +33,15 @@ namespace ds::sdl {
 
 class DmabufOut : public ScanoutOut {
 public:
-  static constexpr int BUFS = 5;   // the array; nbufs_ is the count in use (default 4; 5 under the GPU present stage, whose frame is committed one present later and would otherwise cost the run-ahead a buffer)
-  static constexpr int DEFAULT_BUFS = 4;   // one on screen, two queued, one being drawn: two frames of run-ahead, so a heavy/light pair (Spirit Tracks, Golden Sun) is served from two vblank slots
+  static constexpr int BUFS = 5;           // nbufs_ is the count in use; 5 needed under GPU present
+  static constexpr int DEFAULT_BUFS = 4;   // two frames of run-ahead
 
-  // False if any precondition is missing (no libwayland, not the wayland
-  // video driver, no dmabuf global, CMA allocation failed); the caller logs
-  // and uses another path. w/h is the buffer size in pixels.
+  // False if any precondition is missing; caller falls back to another path.
+  // w/h is the buffer size in pixels.
   //
-  // `output_index` >= 0 asks the compositor to fullscreen this window on
-  // that output (registry advertisement order). SDL cannot: Wayland has no
-  // client-side window positions, so SDL's display-index parameters are
-  // no-ops there and the request must go through the window's own
-  // xdg_toplevel. Without it a dual-window layout lands wherever the
-  // compositor pleases -- and a mis-placed surface can never scan out.
+  // `output_index` >= 0 asks the compositor to fullscreen on that output
+  // (registry order): Wayland has no client-side window positions, so this
+  // must go through the window's xdg_toplevel rather than SDL.
   bool open(SDL_Window* win, int w, int h, int output_index = -1);
 
   bool reopen(SDL_Window* win, int w, int h) override { const int o = output_index_; close(); return open(win, w, h, o); }
@@ -68,9 +54,8 @@ public:
   void set_bufs(int n) { nbufs_ = n < 2 ? 2 : n > BUFS ? BUFS : n; }
   int current() const override { return cur_; }
 
-  // Pixels of a free buffer to render the next frame into (blocks on the
-  // compositor if all are pending, which is the vsync). Null on protocol
-  // error; the caller falls back.
+  // Pixels of a free buffer (blocks on the compositor if all pending: vsync).
+  // Null on protocol error; caller falls back.
   u32* begin_frame() override;
   bool dmabuf_plane(int buf, DmabufPlane& out) const override;
   void set_gpu_writes(bool on) override { gpu_writes_ = on; }
@@ -92,13 +77,13 @@ private:
 
   struct wl_display* dpy_ = nullptr;      // SDL's; not ours to destroy
   struct wl_surface* surf_ = nullptr;     // SDL's; not ours to destroy
-  struct wl_event_queue* q_ = nullptr;    // the process-wide globals' queue
+  struct wl_event_queue* q_ = nullptr;
   Buf bufs_[BUFS];
   int nbufs_ = DEFAULT_BUFS;
   bool gpu_writes_ = false;
   int cur_ = -1;
   int w_ = 0, h_ = 0;
-  int output_index_ = -1;                 // the open() argument, for reopen()
+  int output_index_ = -1;                 // saved open() arg, for reopen()
   bool dead_ = false;                     // protocol error; stop submitting
 };
 

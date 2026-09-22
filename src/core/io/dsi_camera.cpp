@@ -11,8 +11,8 @@
 namespace ds::io {
 
 namespace {
-// melonDS DSi_CamModule: the camera IRQ marks camera VBlank; each scanline
-// takes about 3173 ARM7 cycles. Ours are scheduler ticks (x2).
+// The camera IRQ marks camera VBlank; each scanline takes ~3173 ARM7
+// cycles. Values are scheduler ticks (x2).
 constexpr u64 IRQ_INTERVAL = 2234248;
 constexpr u64 SCANLINE_TIME = 3173;
 constexpr u64 TRANSFER_START = IRQ_INTERVAL - SCANLINE_TIME * 480;
@@ -29,7 +29,7 @@ void DsiCamera::reset() {
   clocks_cnt_ = 0; standby_cnt_ = 0x4029; misc_cnt_ = 0;
   mcu_addr_ = 0;
   mcu_.fill(0);
-  mcu_[0x2104] = 3;   // preview mode (melonDS: checkme)
+  mcu_[0x2104] = 3;   // preview mode
   internal_y_ = transfer_y_ = 0;
   std::fill(frame_.begin(), frame_.end(), 0u);
 }
@@ -173,7 +173,7 @@ void DsiCamModule::reset() {
   cur_buf_ = 0;
   buffer_num_lines_ = 0;
   cur_cam_ = nullptr;
-  // Not a camera reset: melonDS resets the sensors through the I2C host.
+  // Not a camera reset; sensors are reset separately through the I2C host.
   nds_.sched.cancel(EventId::CamTransfer);
   nds_.sched.schedule(EventId::CamIrq, nds_.sched.now() + IRQ_INTERVAL * 2, irq_event, 0);
 }
@@ -194,7 +194,7 @@ void DsiCamModule::irq() {
     cur_cam_ = cam;
     nds_.sched.schedule(EventId::CamTransfer, nds_.sched.event_base7() + TRANSFER_START * 2, transfer_event, 0);
   }
-  // Periodic: from the nominal time (melonDS ScheduleEvent periodic).
+  // Periodic: reschedule from the nominal time, not the actual firing time.
   nds_.sched.schedule(EventId::CamIrq, nds_.sched.event_time() + IRQ_INTERVAL * 2, irq_event, 0);
 }
 
@@ -254,7 +254,7 @@ void DsiCamModule::transfer_scanline(u32 line) {
   const bool done = cur_cam_ ? cur_cam_->transfer_done() : true;
   if ((done || line_last) && buffer_num_lines_ > 0) { buffer_num_lines_ = 0; swap_pixel_buffers(); }
   if (done) { transferring_ = false; return; }
-  // Non-periodic, from an event handler: melonDS bases it on the ARM7's clock.
+  // Non-periodic: based on the ARM7's clock, not this event's firing time.
   nds_.sched.schedule(EventId::CamTransfer, nds_.sched.event_base7() + delay * 2, transfer_event, line + 1);
 }
 

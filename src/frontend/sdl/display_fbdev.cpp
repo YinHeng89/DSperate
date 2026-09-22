@@ -50,8 +50,8 @@ bool FbdevOut::available() {
 
 void FbdevOut::fit_window(SDL_Window* win) const {
   if (!win) return;
-  // A fullscreen window ignores SDL_SetWindowSize, and on the headless
-  // driver fullscreen means its made-up desktop mode, not the panel.
+  // A fullscreen window ignores SDL_SetWindowSize; the headless driver's
+  // fullscreen is a made-up desktop mode, not the panel.
   if (SDL_GetWindowFlags(win) & (SDL_WINDOW_FULLSCREEN | SDL_WINDOW_FULLSCREEN_DESKTOP)) SDL_SetWindowFullscreen(win, 0);
   int w = 0, h = 0;
   SDL_GetWindowSize(win, &w, &h);
@@ -65,8 +65,8 @@ bool FbdevOut::open(SDL_Window* win, bool vsync) {
   if (ioctl(fd_, FBIOGET_VSCREENINFO, &var_) != 0) { std::perror("fbdev: FBIOGET_VSCREENINFO"); close(); return false; }
   if (!is_argb8888(var_)) { std::fprintf(stderr, "fbdev: fb0 is not ARGB8888\n"); close(); return false; }
 
-  // Ask for three panels of virtual height so the pan has somewhere to go;
-  // a driver that refuses keeps whatever it had, and two is still a tier.
+  // Ask for three panels of virtual height; a driver that refuses keeps
+  // whatever it had, and two is still a usable tier.
   if (var_.yres_virtual < var_.yres * MAX_BUFS) {
     fb_var_screeninfo want = var_;
     want.yres_virtual = var_.yres * MAX_BUFS;
@@ -94,12 +94,8 @@ bool FbdevOut::open(SDL_Window* win, bool vsync) {
   map_ = static_cast<u8*>(m);
   std::memset(map_, 0, buf_bytes_ * static_cast<size_t>(bufs_));
 
-  // The presenter thread runs whichever way vsync was asked for. On the
-  // Allwinner fb driver FBIOPAN_DISPLAY blocks until the refresh, so a pan
-  // from end_frame() is a vsync wait on the emulation thread whether we
-  // wanted one or not (measured on the RG35XX SP: 9.2 ms a frame of present
-  // in that mode against 0.03 with the thread). With the thread the wait is
-  // off the emulation's path and the newest frame is what gets latched.
+  // Presenter thread always runs: FBIOPAN_DISPLAY blocks for the refresh, so
+  // panning from end_frame() directly would stall emulation regardless.
   if (!vsync) std::fprintf(stderr, "fbdev: --no-vsync has no effect on this tier (the pan waits for the refresh; presenting from a thread)\n");
   vsync_ = true;
   cur_ = -1; dead_ = false;
@@ -125,8 +121,8 @@ void FbdevOut::close() {
     thread_.join();
   }
   if (map_) {
-    // Leave the panel showing the first buffer so whatever draws fb0 next
-    // (the launcher) is not stuck on a pan offset it does not expect.
+    // Leave the panel on buffer 0 so whatever draws fb0 next isn't stuck on
+    // an unexpected pan offset.
     if (fd_ >= 0) { var_.yoffset = 0; ioctl(fd_, FBIOPAN_DISPLAY, &var_); }
     munmap(map_, map_len_);
     map_ = nullptr;
@@ -140,8 +136,7 @@ u32* FbdevOut::begin_frame() {
   if (fd_ < 0 || dead_ || cur_ >= 0) return nullptr;
   int buf = 0;
   if (thread_.joinable()) {
-    // Any buffer not on the panel, not latched for the coming refresh and
-    // not already drawn and waiting. With three, that is the pacing wait.
+    // Any buffer that's neither shown, latched, nor drawn-and-waiting.
     std::unique_lock<std::mutex> lk(mu_);
     cv_.wait(lk, [this] { if (dead_) return true; for (int b = 0; b < bufs_; ++b) if (b != displayed_ && b != latched_ && b != pending_) return true; return false; });
     if (dead_) return nullptr;
@@ -203,9 +198,7 @@ void FbdevOut::wait_vsync() {
 }
 
 void FbdevOut::presenter() {
-  // One pan per refresh: take the newest drawn frame, pan to it, wait for
-  // the refresh, and only then is the buffer it replaced free again. The
-  // ioctls run outside the lock so a post never waits on them.
+  // One pan per refresh; ioctls run outside the lock so a post never waits.
   raise_presenter_priority("fbdev: presenter priority");
   std::unique_lock<std::mutex> lk(mu_);
   for (;;) {

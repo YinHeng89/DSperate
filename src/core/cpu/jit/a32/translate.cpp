@@ -1,46 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // DSperate - Nintendo DS emulator. Copyright (C) 2026 DSperate contributors.
 //
-// ARMv7 (A32) block translator. Semantics follow the interpreter
-// (interp_arm.cpp / interp_thumb.cpp) instruction for instruction, including
-// its cycle model (cpu_cycles.h); the block shape (block_shape.h), the budget
-// test points and the static link are the AArch64 backend's, so its frame
-// hashes are this one's oracle.
-//
-// What is different from a64/translate.cpp, and why:
-//
-//  - Guest registers are not all pinned. r0-r3 and sp live in r4-r8 (every
-//    block and stub agrees; convention.h); the others live in memory and a
-//    per-block cache (RegCache) keeps them in r0-r3/r12 while the block
-//    runs: loaded on first read, written back before anything that can
-//    observe memory (a stub call, the block end, a leave path). Slot choice
-//    is LRU by instruction and deterministic, so a translation stays a pure
-//    function of (key, guest bytes, timing stamp, CPU) as park-and-revive
-//    requires.
-//  - Guest NZCV (and Q) live in the host APSR, and the guest is a subset of
-//    the host: a data-processing instruction is the guest's own encoding
-//    with the register fields substituted -- shifter carry-out, RRX,
-//    register-specified shifts and the v5TE multiplies are native, so the
-//    flag-merge sequences of the A64 backend do not exist here.
-//  - Conditional instructions are predicated, not branched around: the body
-//    and its extra cycles carry the guest condition; the fetch cost is
-//    charged ahead of the condition, as on A64 (`charged_ahead_`).
-//  - A32 has no flag-neutral test, so the budget check saves and restores
-//    the APSR when the flag-liveness pass says NZCV are live at that point.
-//
-//  - Memory instructions: the fast path probes the page table, tests the
-//    entry (bracketed with mrs/msr only when the flags are live after the
-//    instruction), does the access on the host-aligned address with the
-//    guest's rotate or extend, looks the data cost up and charges it. The
-//    cold path calls the slow helper, charges, polls and rejoins. Cache
-//    rule for every cold path: it is emitted in the cache state of the
-//    branch point and reconciles to the hot path's end state by reloading
-//    that state's slots, so the hot path may evict freely after the branch.
-//
-// Phase 2, step 2: data processing, multiplies (plain, long, DSP), MRS, CLZ,
-// static branches, CP15 no-ops, single loads/stores and same-page LDM/STM
-// inline; indirect branches, LDM with pc, MSR and everything rarer go
-// through the fallback stub, which is the interpreter.
+// ARMv7 (A32) block translator; semantics and cycle model mirror the interpreter,
+// block shape and budget points match a64 (whose frame hashes are the oracle).
+// Guest r0-r3/sp are pinned in r4-r8; others go through an LRU RegCache (host
+// r0-r3/r12), written back before anything can observe memory. Guest NZCVQ lives
+// in host APSR; conditionals are predicated. Rare ops go to the fallback stub.
 #include "core/cpu/jit/jit_internal.h"
 #include "core/cpu/jit/a32/convention.h"
 #include "core/cpu/jit/a32/emit.h"
@@ -72,7 +37,6 @@ constexpr u32 OFF_TIMING7 = offsetof(CpuContext, timing7);
 constexpr u32 OFF_COST7   = offsetof(CpuContext, cost7);
 static_assert(OFF_COST7 < 4096, "CpuContext timing pointers must be reachable from r11");
 
-// Flag bits for the liveness pass.
 constexpr u32 F_N = 8, F_Z = 4, F_C = 2, F_V = 1, F_ALL = 15;
 
 inline u32 rotr(u32 v, u32 n) { n &= 31; return n ? (v >> n) | (v << (32 - n)) : v; }
@@ -95,10 +59,7 @@ struct FlagUse { u32 reads, writes; };
 using shape::mcr_is_nop;
 using shape::msr_inline;
 
-// What this backend hands to the interpreter. The liveness pass treats these
-// as reading every flag (the stub syncs the APSR to memory), so the two must
-// agree exactly: a block whose entry flags the pass calls dead skips the
-// APSR save around the budget test.
+// Must agree with the liveness pass, which treats these as reading every flag.
 bool arm_needs_fallback(u32 instr, bool a9) {
   const u32 cond = instr >> 28;
   if (cond == 0xF) return !(((instr >> 25) & 7) == 5 && a9) && ((instr >> 24) & 0xF7) != 0x55;   // BLX imm (ARM9) and PLD inline
@@ -139,8 +100,7 @@ bool arm_needs_fallback(u32 instr, bool a9) {
   }
 }
 
-// `paired`: the previous instruction of the block is a BL prefix, so a BL/BLX
-// suffix has a static target.
+// `paired`: previous instruction is a BL prefix (static BL/BLX suffix target).
 bool thumb_needs_fallback(u16 instr, bool a9, bool paired) {
   switch (arm::decode_thumb(instr)) {
   case TOp::HiRegOp: case TOp::ShiftImm: case TOp::AddSubReg: case TOp::AddSubImm3: case TOp::MovCmpAddSubImm8: case TOp::Alu:
@@ -182,11 +142,11 @@ FlagUse arm_flag_use(u32 instr, bool a9) {
     break;
   }
   case AOp::Mul: case AOp::Mla: case AOp::Umull: case AOp::Umlal: case AOp::Smull: case AOp::Smlal:
-    if (s) u.writes = F_N | F_Z;   // the ARM7 also clears C; claiming less written is the safe side
+    if (s) u.writes = F_N | F_Z;   // ARM7 also clears C; under-claiming writes is safe
     break;
   case AOp::Mrs: u.reads = F_ALL; break;
   case AOp::MsrReg: case AOp::MsrImm:
-    u.reads = F_ALL;                                   // the mode-change path syncs CPSR through the interpreter
+    u.reads = F_ALL;                                   // mode-change path syncs CPSR via the interpreter
     if (instr & (1u << 19)) u.writes = F_ALL;          // f field
     break;
   case AOp::B: case AOp::Bl: case AOp::Bx: case AOp::BlxReg: case AOp::Clz: case AOp::Pld: case AOp::Mcr:
@@ -224,13 +184,8 @@ FlagUse thumb_flag_use(u16 instr, bool a9, bool paired) {
 
 struct Instr { u32 addr; u32 raw; u32 live_out; bool fallback; };
 
-// ---- the register cache ---------------------------------------------------------------
-// Guest registers that are not pinned live in JitHot::regs; a slot holds one
-// of them for the rest of the block, or until the slot is needed. A slot is
-// `dirty` when the block has written it. Slots used by the current
-// instruction are locked so that allocating the next operand cannot evict
-// one already chosen (at most five are ever needed at once). Temporaries
-// come from the same pool.
+// ---- register cache ----
+// Slots used by the current instruction are locked against eviction.
 class RegCache {
 public:
   static constexpr u32 NSLOT = 5, NONE = 0xFF;
@@ -241,7 +196,6 @@ public:
   explicit RegCache(Emitter*& cur) : cur_(cur) {}
 
   void begin_instr() { ++tick_; locked_ = 0; }
-  // Host register holding guest `g`, loading it first if it is not cached.
   u32 read(u32 g) {
     assert(g < 15);
     if (const u32 h = pinned_host(g); h != 0xFF) return h;
@@ -254,9 +208,7 @@ public:
     }
     return use(s);
   }
-  // Host register to write guest `g` into. `keep_old`: the instruction reads
-  // the old value first, or may not execute (predicated), so the slot must
-  // start out holding it.
+  // `keep_old`: the old value must be loaded (read-modify or predicated write).
   u32 write(u32 g, bool keep_old) {
     assert(g < 15);
     if (const u32 h = pinned_host(g); h != 0xFF) return h;
@@ -269,7 +221,6 @@ public:
     slots_[s].dirty = true;
     return use(s);
   }
-  // A temporary for the current instruction.
   u32 temp() {
     const int s = alloc();
     slots_[s].guest = NONE;
@@ -287,14 +238,11 @@ public:
     for (u32 s = 0; s < NSLOT; ++s) if (HOST[s] == host) return static_cast<int>(s);
     return -1;
   }
-  // Load every cached slot from memory: a cold path rejoining the hot path
-  // after the helpers may have clobbered the slot registers.
+  // For a cold path rejoining after helpers clobbered the slot registers.
   void reload() {
     for (u32 s = 0; s < NSLOT; ++s)
       if (slots_[s].guest != NONE) cur_->ldr(HOST[s], R_CTX, off_reg(slots_[s].guest));
   }
-  // Write every dirty slot back and forget everything: before a stub call,
-  // the block end, or any point where memory must hold the guest state.
   void flush() {
     for (u32 s = 0; s < NSLOT; ++s) {
       if (slots_[s].guest != NONE && slots_[s].dirty) cur_->str(HOST[s], R_CTX, off_reg(slots_[s].guest));
@@ -302,7 +250,7 @@ public:
     }
     locked_ = 0;
   }
-  // Write dirty slots back without forgetting: a cold path that leaves.
+  // Write back without forgetting: a cold path that leaves.
   void writeback() {
     for (u32 s = 0; s < NSLOT; ++s)
       if (slots_[s].guest != NONE && slots_[s].dirty) cur_->str(HOST[s], R_CTX, off_reg(slots_[s].guest));
@@ -320,8 +268,6 @@ private:
     return -1;
   }
   u32 use(int s) { slots_[s].last = tick_; locked_ |= 1u << s; return HOST[s]; }
-  // A free unlocked slot (lowest first), else the least recently used
-  // unlocked one, written back if dirty.
   int alloc() {
     for (u32 s = 0; s < NSLOT; ++s) if (!(locked_ & (1u << s)) && slots_[s].guest == NONE) return static_cast<int>(s);
     int best = -1;
@@ -342,7 +288,6 @@ private:
 
 class Translator {
 public:
-  // The cold-section scratch is reused across translations (see a64).
   static u8* cold_scratch() {
     static thread_local std::unique_ptr<u8[]> buf;
     if (!buf) buf.reset(new u8[COLD_CAP]);
@@ -364,9 +309,9 @@ private:
   std::vector<Instr> instrs_;
   u32 pc_ = 0;
   u32 live_ = F_ALL;
-  Cond cond_ = AL;           // condition of the instruction being emitted (predication)
-  u32 pending_ = 0;          // static cycles not yet subtracted from the budget
-  u32 charged_ahead_ = 0;    // cycles already charged before a conditional instruction's body
+  Cond cond_ = AL;           // predication of the current instruction
+  u32 pending_ = 0;          // static cycles not yet charged
+  u32 charged_ahead_ = 0;    // charged before a conditional body
   bool ended_ = false;
   const u8* t7_ = nullptr;
   u32 code_region7_ = 0;
@@ -378,8 +323,7 @@ private:
   Emitter* cur_;
   RegCache cache_;
   struct Fix { size_t at; bool at_cold; size_t target; bool target_cold; const void* abs; };
-  // Fastmem sites of this block (see Runtime::fm_blocks): hot offsets of the
-  // accesses that may fault, the patch site, the cold resume (cold-relative).
+  // Hot offsets of faulting access and patch site; resume is cold-relative.
   struct FmSiteRel { u32 fault; u32 patch; u32 resume_cold; u64 guest; };
   std::vector<FmSiteRel> fm_sites_;
   u32 fm_faults_[4] = {};
@@ -390,7 +334,7 @@ private:
   bool in_cold() const { return cur_ == &cold_; }
   u32 step() const { return thumb_ ? 2 : 4; }
 
-  // ---- hot / cold sections ------------------------------------------------------------
+  // ---- hot / cold sections ----
   void call_stub(const u8* stub) {
     if (!in_cold()) { hot_.bl(stub); return; }
     fixes_.push_back({cold_.bl_fwd(), true, 0, false, stub});
@@ -427,19 +371,17 @@ private:
     return true;
   }
 
-  // ---- decoding -------------------------------------------------------------------------
+  // ---- decoding ----
   u32 fetch(u32 addr) {
     if (u8* p = cpu_.page_table.read_ptr(addr)) {
       if (thumb_) { u16 v; std::memcpy(&v, p, 2); return v; }
       u32 v; std::memcpy(&v, p, 4); return v;
     }
-    // Code the page table does not map (the DSi ARM7 BIOS) is read as the
-    // interpreter fetches it (Bus::fetch), not as data: a data read of the BIOS
-    // from outside it answers the protection's 0xFFFFFFFF.
+    // Unmapped code (DSi ARM7 BIOS): fetch via the bus like the interpreter.
     return cpu_.nds->bus.fetch(cpu_.which, addr, thumb_ ? 16 : 32);
   }
 
-  // ---- cycles ----------------------------------------------------------------------------
+  // ---- cycles ----
   void note_dep(u32 addr, u8 kind) const {
     const u32 page = addr >> 12;
     for (u32 i = 0; i < blk_.ndep; ++i) if (blk_.dep_page[i] == page) { blk_.dep_kind[i] |= kind; return; }
@@ -456,9 +398,7 @@ private:
     return t7_[thumb_ ? 1 : 3];
   }
   u32 numC_nonseq7() const { return t7_[thumb_ ? 0 : 2]; }
-  // The whole CD/CDI charge for a data cost known at translate time (a
-  // pc-relative literal, or every access under --cpu-oc); mirrors the
-  // run-time formulas below.
+  // CD/CDI charge for a translate-time data cost; mirrors emit_charge.
   u32 const_charge(u32 nd, bool cdi) const {
     const s32 d = static_cast<s32>(nd);
     if (a9_) { const s32 nc = static_cast<s32>(numC(pc_)); return max3(nc + d - 6, nc, d); }
@@ -467,14 +407,10 @@ private:
     const s32 ncx = nc + (cdi ? 1 : 0);
     return max3(ncx, d, d + ncx - 3);
   }
-  // --cpu-oc: the translate-time price of a data access of this width
-  // (a9_: main RAM's cached LOAD entry for loads and stores alike; ARM7: its
-  // WRAM entry). Same rule as the A64 backend; the reasoning is there.
+  // --cpu-oc: translate-time price of a data access of this width.
   u32 oc_data_cost(bool word, bool seq, bool store) const {
     if (rt().cpu_oc == CpuOc::Underclock) {
-      // The first cut (see jit::set_cpu_oc): bus-priced main RAM for ARM9
-      // stores and the whole ARM7. From the bus table, not timing9's store
-      // entry, which a DSi prices as a cache hit (Timing::update_cpu9).
+      // ARM9 stores bus-priced: timing9's store entry is a cache hit on DSi.
       if (a9_) return store ? cpu_.nds->bus.timing().bus9_data(0x02000000u, word, seq) : cpu_.timing9[0x02000000u >> 12][seq ? 3 : (word ? 2 : 1)];
       return cpu_.timing7[0x02000000u >> 15][seq ? (word ? 3 : 1) : (word ? 2 : 0)];
     }
@@ -482,16 +418,13 @@ private:
     if (a9_) return cpu_.timing9[0x02000000u >> 12][seq ? 3 : (word ? 2 : 1)];
     return cpu_.timing7[0x03800000u >> 15][seq ? (word ? 3 : 1) : (word ? 2 : 0)];
   }
-  // Slot in mem::Timing's precomputed ARM7 cost table for a single access
-  // with these translate-time constants, or -1 when the table does not cover
-  // this block's code-fetch cost (the instruction then stays a fallback).
+  // Slot in mem::Timing's ARM7 cost table, or -1 if not covered (use fallback).
   int cost7_slot(bool cdi, bool word) const {
     if (a9_) return -1;
     const int ni = cpu_.nds->bus.timing().nc7_index(numC_nonseq7());
     if (ni < 0) return -1;
     return static_cast<int>(mem::Timing::cost7_offset(code_region7_ == 0x02, cdi, static_cast<u32>(ni), word));
   }
-  // An ARM7 single access this translation cannot price from the table.
   bool needs_fallback_cost7(u32 raw) const {
     if (a9_) return false;
     if (thumb_) {
@@ -515,8 +448,7 @@ private:
     if (charged_ahead_) { const u32 k = std::min(c, charged_ahead_); c -= k; charged_ahead_ -= k; }
     pending_ += c;
   }
-  // Subtract the pending cycles, predicated on the current instruction's
-  // condition (a conditional instruction's extra cycles beyond the fetch).
+  // Predicated on cond_.
   void flush_pending() {
     if (!pending_) return;
     u32 i;
@@ -529,8 +461,7 @@ private:
     }
     pending_ = 0;
   }
-  // Leave with `exit_key` when the budget is exhausted. The test clobbers
-  // NZCV: when the guest flags are live here they ride in a temporary.
+  // The test clobbers NZCV; live guest flags are parked in a temp.
   void emit_budget_check(u32 exit_key, bool flags_live) {
     assert(!in_cold());
     u32 t = 0;
@@ -547,10 +478,8 @@ private:
     if (flags_live) cache_.release(t);
   }
 
-  // ---- helpers: fallback, trace -----------------------------------------------------------
-  // Run this instruction through the interpreter (it evaluates the condition
-  // itself and charges its own cycles). The stub polls, returns when the
-  // instruction did not jump and dispatches when it did.
+  // ---- helpers ----
+  // The interpreter evaluates the condition and charges its own cycles.
   void emit_fallback(u32 instr, bool always_jumps) {
     cache_.flush();
     flush_pending();
@@ -568,15 +497,14 @@ private:
     e().word(static_cast<u32>(reinterpret_cast<uintptr_t>(fn)));
   }
 
-  // ---- operands -----------------------------------------------------------------------------
+  // ---- operands ----
   u32 pc_const(u32 value) {
     const u32 t = cache_.temp();
     e().mov_imm(t, value);
     return t;
   }
   u32 reg_read(u32 r, u32 pc_value) { return r == 15 ? pc_const(pc_value) : cache_.read(r); }
-  // A slot register that is neither of two others (cold paths, where every
-  // slot register but the named ones is free).
+  // Cold paths only: assumes every other slot register is free.
   static u32 free_reg_except(u32 a, u32 b) {
     for (u32 r : RegCache::HOST) if (r != a && r != b) return r;
     return SCRATCH4;
@@ -586,7 +514,7 @@ private:
     return SCRATCH4;
   }
 
-  // ---- memory -----------------------------------------------------------------------------------
+  // ---- memory ----
   enum class Mem { Ld32, Ld16, Ld8, Ld16S, Ld8S, St32, St16, St8 };
   static bool is_load(Mem m) { return m <= Mem::Ld8S; }
   static bool is_word(Mem m) { return m == Mem::Ld32 || m == Mem::St32; }
@@ -597,15 +525,7 @@ private:
     default: return 2;
     }
   }
-  // The guest flags around a flag-clobbering test sequence: saved into a
-  // temporary when live, restored by `flags_end` (the cold path restores
-  // them itself from the same register).
-  // DS_JIT_MEMPROBE: see the field's comment in jit_internal.h. The duplicate
-  // page-table walk of a single load or store, as on A64 (lsr, table load,
-  // base shift, no branches), plus this host's own share of it: the mrs/msr
-  // bracket the walk needs while guest flags are live (the msr writes back
-  // the value just read). Everything lands in `en`, which the real walk
-  // overwrites before anything reads it.
+  // DS_JIT_MEMPROBE: emit a dead duplicate page-table walk (en is overwritten later).
   bool memprobe_on() const {
     const int c = rt().memprobe;
     return c == 1 || (c == 9 && a9_) || (c == 7 && !a9_);
@@ -617,10 +537,9 @@ private:
     e().ldr_reg(en, R_PT, en, LSL, 2);
     e().dp_reg(MOV, false, en, 0, en, LSL, 2);
   }
-  // ---- fastmem (Runtime::fm_blocks; JitCpu::fm_region) ----
+  // ---- fastmem ----
   bool fm_fast() const { return jc_.fastmem && !rt().fm_is_slow(fm_key(a9_, pc_, thumb_)); }
-  // en = the region base for `a` (host = en + a). The table load is the
-  // patch site; returns its hot offset. No flags touched.
+  // en = region base (host = en + a); returns the patch site. Flag-neutral.
   size_t fm_region(u32 a, u32 en) {
     e().lsr_imm(en, a, 26);
     const size_t at = hot_.size();
@@ -628,10 +547,8 @@ private:
     return at;
   }
   void fm_fault_here() { assert(fm_nfaults_ < 4); fm_faults_[fm_nfaults_++] = static_cast<u32>(hot_.size()); }
-  // The page entry of `a` -> en, with no other register and no flags: on a
-  // fastmem CPU r10 holds the region table, so the page table's address is
-  // a translate-time constant and the x4 index is folded in by two
-  // `add lsr #10` (4 * (a >> 11) plus 2 * bit 10) and an alignment mask.
+  // Page entry of `a` -> en; flag-neutral. Fastmem: R_PT is the region table,
+  // so the page table is a constant and the x4 index is two `add lsr #10` + mask.
   void emit_entry_load(u32 a, u32 en) {
     if (!jc_.fastmem) {
       e().lsr_imm(en, a, mem::PAGE_SHIFT);
@@ -644,11 +561,8 @@ private:
     e().and_imm(en, en, ~3u);
     e().ldr(en, en, 0);
   }
-  // The cold walk of a fastmem site: en = the biased host base from the
-  // table, then back to the hot instruction after the patch site. Guest
-  // flags are held in host lr across the tests (lr is free between stub
-  // calls). Failures leave with the flags restored and go to `fail_to` (a
-  // cold offset), or fall through right after the walk when it is ~0.
+  // Cold walk for a faulted fastmem site; resumes after the patch site. Guest
+  // flags ride in lr. Failure goes to `fail_to`, or falls through if ~0.
   void fm_cold_walk(u32 a, u32 en, size_t patch, bool store, size_t fail_to) {
     assert(in_cold());
     const u32 resume = static_cast<u32>(cold_.size());
@@ -678,9 +592,7 @@ private:
     e().msr_apsr_nzcvq(f);
     cache_.release(f);
   }
-  // Data cost of one access at `a` into `c`, through the raw timing table
-  // (`t` is a temporary). ARM9 entries are 8 bytes (loads [1..3], stores
-  // [5..7]); ARM7 entries are 4 bytes.
+  // ARM9 entries are 8 bytes (loads [1..3], stores [5..7]); ARM7 4.
   void emit_data_cost(u32 a, u32 c, u32 t, bool word, bool seq, bool store) {
     const u32 k = a9_ ? ((store ? 4 : 0) + (seq ? 3 : (word ? 2 : 1))) : (seq ? (word ? 3 : 1) : (word ? 2 : 0));
     e().ldr(t, R_CTX, a9_ ? OFF_TIMING9 : OFF_TIMING7);
@@ -688,7 +600,6 @@ private:
     e().add_reg(c, t, c, LSL, a9_ ? 3 : 2);
     e().ldrb(c, c, k);
   }
-  // The ARM7 single-access cost from the precomputed table (cost7_slot >= 0).
   void emit_cost7(u32 a, u32 c, u32 t, int slot) {
     e().ldr(t, R_CTX, OFF_COST7);
     e().lsr_imm(c, a, 15);
@@ -701,9 +612,7 @@ private:
     e().dp_reg(BIC, false, tmp, tmp, tmp, ASR, 31);
     e().add_reg(t, t, tmp);
   }
-  // Charge a CD / CDI instruction with data cost `c` at address `a`; `t0`
-  // and `t1` are temporaries (the ARM7 needs both and clobbers `c`). Every
-  // instruction here is flag-neutral.
+  // Flag-neutral.
   void emit_charge(u32 c, u32 a, u32 t0, u32 t1, bool cdi) {
     if (a9_) {
       // cost = max(nc + nd - 6, nc, nd), nd >= 1: nc <= 1 -> nd; nc <= 6 -> max(nc, nd); else nc + max(nd - 6, 0)
@@ -715,12 +624,8 @@ private:
       e().sub_reg(R_BUDGET, R_BUDGET, t0);
       return;
     }
-    // ARM7 (cpu_cycles.h charge_CD / charge_CDI): the one dynamic input is
-    // whether the data is in main RAM. Costs add when data and code share
-    // that region (cost = d + k), overlap into a max when they do not
-    // (cost = max(x, d + y, x + d + y - 3)); which of the two applies is
-    // data_main != code_main, and x, y, k are translate-time constants.
-    // Both candidates are computed and a mask selects; `a` is used up.
+    // ARM7 charge_CD/CDI: d + k if data_main == code_main, else
+    // max(x, d + y, x + d + y - 3); both computed, mask selects. Clobbers `a`.
     const u32 nc = numC_nonseq7();
     const bool code_main = code_region7_ == 0x02;
     const u32 k = nc + ((cdi && !code_main) ? 1 : 0);
@@ -728,25 +633,24 @@ private:
     e().lsr_imm(t0, a, 24);
     e().sub_imm(t0, t0, 2, t1);
     e().clz(t0, t0);
-    e().lsr_imm(t0, t0, 5);                                   // t0 = data_main (0/1)
-    if (code_main) e().eor_imm(t0, t0, 1);                    // t0 = 1 when the max form applies
-    e().add_imm(a, c, y, a);                                  // a = d + y
+    e().lsr_imm(t0, t0, 5);                                   // data_main
+    if (code_main) e().eor_imm(t0, t0, 1);                    // 1: max form
+    e().add_imm(a, c, y, a);
     e().sub_imm(t1, a, x, t1);                                // t1 = max(d + y, x)
     e().dp_reg(BIC, false, t1, t1, t1, ASR, 31);
     e().add_imm(t1, t1, x, t1);
     if (x >= 3) e().add_imm(a, a, x - 3, a); else e().sub_imm(a, a, 3 - x, a);   // a = x + d + y - 3
-    e().sub_reg(a, a, t1);                                    // t1 = max(t1, a)
+    e().sub_reg(a, a, t1);
     e().dp_reg(BIC, false, a, a, a, ASR, 31);
     e().add_reg(t1, t1, a);
-    e().add_imm(c, c, k, a);                                  // c = d + k (the add form)
+    e().add_imm(c, c, k, a);                                  // add form
     e().sub_reg(t1, t1, c);
-    e().dp_imm(RSB, false, t0, t0, 0);                        // t0 = 0 / -1
+    e().dp_imm(RSB, false, t0, t0, 0);
     e().and_reg(t1, t1, t0);
     e().add_reg(c, c, t1);
     e().sub_reg(R_BUDGET, R_BUDGET, c);
   }
-  // Slow-path epilogue: the helper returned the aligned raw value in `v`;
-  // reproduce the rotation / extension in place (`addr`, `tmp` scratch).
+  // Helper returns the aligned raw value; apply rotation / extension.
   void emit_load_post(Mem m, u32 v, u32 addr, u32 tmp) {
     switch (m) {
     case Mem::Ld32: e().lsl_imm(tmp, addr, 3); e().ror_reg(v, v, tmp); break;
@@ -759,7 +663,7 @@ private:
     default: break;
     }
   }
-  // r1 = a, r2 = data (0xFF: none), through r3 when the two cross.
+  // r1 = a, r2 = data (0xFF: none); r3 scratch.
   void emit_slow_args(u32 a, u32 data) {
     if (data == 0xFF) { if (a != 1) e().mov(1, a); return; }
     if (a == 1 && data == 2) return;
@@ -770,11 +674,8 @@ private:
     if (data != 2) e().mov(2, data);
   }
 
-  // One load or store at the address in `a` (a locked temporary; the base
-  // writeback, if any, is already in its slot). Stores take the data in
-  // `data`; loads write guest `rd`. `const_nd` >= 0: the data cost is a
-  // translate-time constant (a pc-relative literal's page, or --cpu-oc) and
-  // joins the static cycles.
+  // `a`: locked temp, base writeback already done. `const_nd` >= 0: data cost
+  // known at translate time (pc-relative literal, --cpu-oc).
   void emit_single(Mem m, u32 a, u32 data, u32 rd, bool cdi, int const_nd = -1) {
     const bool load = is_load(m), word = is_word(m);
     if (rt().cpu_oc != CpuOc::Off && const_nd < 0) const_nd = static_cast<int>(oc_data_cost(word, false, !load));
@@ -783,10 +684,7 @@ private:
     flush_pending();
     const int slot7 = const_cost ? -1 : cost7_slot(cdi, word);
     assert(a9_ || const_cost || slot7 >= 0);
-    // ---- hot path ----
-    // Fastmem: region base, add, access -- no walk, no flags. An access the
-    // view refuses faults into the cold walk (fm_cold_walk), which resumes
-    // at the `add` with the table's base.
+    // Fastmem: no walk; a refused access faults into fm_cold_walk.
     const bool fast = fm_fast();
     const u32 f = fast ? 0xFFu : flags_begin();
     const u32 en = cache_.temp();
@@ -802,7 +700,7 @@ private:
       fail.push_back(e().b_fwd(EQ));
       flags_end(f);
     }
-    e().add_reg(en, en, a);                            // host address (base is 4-aligned)
+    e().add_reg(en, en, a);
     u32 d = 0;
     if (load) d = cache_.write(rd, false);
     auto site = [&] { if (fast) fm_fault_here(); };
@@ -816,7 +714,7 @@ private:
     case Mem::Ld8S: site(); e().ldrsb(d, en, 0); break;
     case Mem::Ld16S:
       e().and_imm(en, en, ~1u); site(); e().ldrsh(d, en, 0);
-      if (!a9_) { e().and_imm(en, a, 1); e().lsl_imm(en, en, 3); e().asr_reg(d, d, en); }   // odd: the signed high byte
+      if (!a9_) { e().and_imm(en, a, 1); e().lsl_imm(en, en, 3); e().asr_reg(d, d, en); }   // odd: signed high byte
       break;
     case Mem::St32: e().and_imm(en, en, ~3u); site(); e().str(data, en, 0); break;
     case Mem::St16: e().and_imm(en, en, ~1u); site(); e().strh(data, en, 0); break;
@@ -831,12 +729,11 @@ private:
     cache_.release(en);
     const size_t join = hot_.size();
     const RegCache::State s1 = cache_.save();
-    if (fast) {   // the walk first; its failures fall through into the helper path below
+    if (fast) {   // walk failures fall through into the helper path
       cold_begin({});
       fm_cold_walk(a, en, patch, !load, ~size_t{0});
       cur_ = &hot_;
     }
-    // ---- cold path: the helper, then the same tail, then rejoin ----
     cold_begin(fail);
     if (f != 0xFF) e().msr_apsr_nzcvq(f);
     cache_.restore(s0);
@@ -858,10 +755,8 @@ private:
     cold_end_jump(join);
   }
 
-  // Multi-register transfer, fast path in one 2 KB page; the cold path is
-  // the interpreter, so rn must still hold its old value there: the
-  // writeback value waits in `t_w` (a locked temp; 0xFF: it equals `a`) and
-  // reaches rn after the transfer. `a` = start address (a locked temp).
+  // Fast path within one 2 KB page. Cold path is the interpreter, so rn keeps its
+  // old value until after the transfer; writeback value in `t_w` (0xFF: equals `a`).
   void emit_block_transfer(u32 instr, u32 list, bool load, bool writeback, u32 rn, u32 a, u32 t_w, u32 pc_store_value, bool interwork_pc = false) {
     const u32 n = static_cast<u32>(__builtin_popcount(list));
     const bool pc_in_list = load && (list & 0x8000);
@@ -874,10 +769,7 @@ private:
     e().eor_reg(e2, e2, a);
     e().dp_reg(MOV, true, e2, 0, e2, LSR, mem::PAGE_SHIFT);
     fail.push_back(e().b_fwd(NE));
-    // Fastmem: the region load instead of the walk. Every word is on one 2 KB
-    // page, so one 4 KB view page with one protection; a probe of the first
-    // byte (read, and for a store the same byte written back) faults before
-    // the register cache emits anything, so the fallback's state is s0.
+    // Fastmem: first-byte probe faults before any cache emission, so fallback state is s0.
     const bool fast = fm_fast();
     size_t patch = 0;
     if (fast) {
@@ -892,7 +784,7 @@ private:
     }
     cache_.release(e2);
     e().add_reg(en, en, a);
-    e().and_imm(en, en, ~3u);                          // each word access is aligned; the base may not be (Thumb)
+    e().and_imm(en, en, ~3u);                          // Thumb base may be unaligned
     if (fast) {
       fm_fault_here();
       e().ldrb(R_LR, en, 0);
@@ -936,10 +828,9 @@ private:
     }
     if (t_w != 0xFF) cache_.release(t_w);
     cache_.release(en);
-    // cost: N + (n - 1) S from the page's entry (--cpu-oc: main RAM's, at translate time)
+    // cost: N + (n - 1) S
     if (pc_in_list) {
-      // The interpreter charges the CDI cost after the jump: the stub does
-      // it from the new pc/state (numD, data address).
+      // CDI cost depends on the post-jump pc: charged by the stub.
       const u32 c = cache_.temp(), t = cache_.temp();
       if (rt().cpu_oc != CpuOc::Off) e().mov_imm(c, oc_data_cost(true, false, false) + (n - 1) * oc_data_cost(true, true, false));
       else {
@@ -956,7 +847,7 @@ private:
       emit_branch_indirect(hpc, interwork_pc, true, c, a);
       cold_begin(fail);
       if (f != 0xFF) e().msr_apsr_nzcvq(f);
-      const size_t fb = cold_.size();                 // walk failures enter here, flags already restored
+      const size_t fb = cold_.size();                 // walk failures enter here
       cache_.restore(s0);
       emit_fallback(instr, true);
       cold_end();
@@ -987,7 +878,7 @@ private:
     const RegCache::State s1 = cache_.save();
     cold_begin(fail);
     if (f != 0xFF) e().msr_apsr_nzcvq(f);
-    const size_t fb = cold_.size();                   // walk failures enter here, flags already restored
+    const size_t fb = cold_.size();                   // walk failures enter here
     cache_.restore(s0);
     emit_fallback(instr, false);
     cache_.restore(s1);
@@ -996,10 +887,8 @@ private:
     if (fast) { cold_begin({}); fm_cold_walk(a, en, patch, !load, fb); cur_ = &hot_; }
   }
 
-  // Effective address of a single transfer into a fresh temporary. The base
-  // writeback goes to rn's slot right away, so the cold path's state has it
-  // (a load into rn then overwrites it, as the guest does). A store's data
-  // register is copied first when the writeback would clobber it.
+  // Base writeback goes to rn's slot immediately so the cold path sees it; a load
+  // into rn then overwrites it, as on hardware.
   u32 emit_ea(u32 rn, bool off_imm, u32 off_val, u32 off_host, Shift sh, u32 amt, bool pre, bool up, bool wb, u32& data) {
     const u32 base = reg_read(rn, pc_ + 8);
     const u32 a = cache_.temp();
@@ -1019,11 +908,11 @@ private:
     return a;
   }
 
-  // ---- branches -------------------------------------------------------------------------------
+  // ---- branches ----
   void emit_branch_static(u32 target, bool to_thumb, bool refill) {
     assert(cond_ == AL);
     if (refill) {
-      if (a9_) {   // the pages refill_cycles reads (cpu_cycles.h)
+      if (a9_) {   // the pages refill_cycles reads
         if (!to_thumb) { note_dep(target, mem::Timing::RETIME_CODE); note_dep(target + 4, mem::Timing::RETIME_CODE); }
         else if (target & 2) { note_dep(target - 2, mem::Timing::RETIME_CODE); note_dep(target + 2, mem::Timing::RETIME_CODE); }
         else note_dep(target, mem::Timing::RETIME_CODE);
@@ -1042,9 +931,7 @@ private:
     if (blk_.nsucc < 4) blk_.succ[blk_.nsucc++] = make_key(target, to_thumb);
     ended_ = true;
   }
-  // Move `n` values into r0.. (dst[i] <- src[i]) with every other slot
-  // register free (the cache is flushed): cycles go through a scratch that
-  // is none of the sources.
+  // Parallel move dst[i] <- src[i]; cache must be flushed (cycles use a free slot).
   void emit_permute(const u32* dst, const u32* src, u32 n) {
     u32 d[3], sr[3];
     for (u32 i = 0; i < n; ++i) { d[i] = dst[i]; sr[i] = src[i]; }
@@ -1061,18 +948,15 @@ private:
         pending[i] = false; --left; progress = true;
       }
       if (progress || !left) continue;
-      u32 scratch = SCRATCH4;                       // break a cycle: park one source in a register no move touches
+      u32 scratch = SCRATCH4;                       // break a cycle
       for (u32 r : RegCache::HOST) { bool used = false; for (u32 j = 0; j < n; ++j) if (sr[j] == r || d[j] == r) used = true; if (!used) { scratch = r; break; } }
       for (u32 i = 0; i < n; ++i) if (pending[i]) { e().mov(scratch, sr[i]); sr[i] = scratch; break; }
     }
   }
-  // Indirect branch; `htarget` holds the address (any host register). With
-  // `interwork` bit 0 selects the state, otherwise the current state is
-  // kept. `cdi`: an LDM/POP that loaded pc -- `hnumd` and `haddr` carry the
-  // post-jump charge's inputs. Ends the block.
+  // `cdi`: LDM/POP to pc; `hnumd`/`haddr` feed the stub's post-jump charge.
   void emit_branch_indirect(u32 htarget, bool interwork, bool cdi = false, u32 hnumd = 0, u32 haddr = 0) {
     assert(cond_ == AL);
-    cache_.flush();                                 // stores only: the temporaries keep their values
+    cache_.flush();                                 // temps keep their values
     flush_pending();
     if (cdi) { const u32 d[3] = {0, 1, 2}, sr[3] = {htarget, hnumd, haddr}; emit_permute(d, sr, 3); }
     else if (htarget != SCRATCH0) e().mov(SCRATCH0, htarget);
@@ -1083,9 +967,6 @@ private:
     jump_stub(cdi ? jc_.branch_indirect_cdi : jc_.branch_indirect);
     ended_ = true;
   }
-  // A conditional static branch: both arms end the block. `taken` emits the
-  // lr write (if any) and the branch; the fall-through arm charges numC and
-  // links to the next instruction.
   template <class Taken>
   void emit_branch_cond(u32 cond, Taken taken) {
     assert(cond_ == AL);
@@ -1101,8 +982,8 @@ private:
     emit_branch_static(pc_ + step(), thumb_, false);
   }
 
-  // ---- multiplies -----------------------------------------------------------------------------
-  // ARM7: 1..4 internal cycles from the magnitude of rs (signed: of rs ^ (rs >> 31)).
+  // ---- multiplies ----
+  // ARM7: 1..4 internal cycles by magnitude of rs (signed: rs ^ (rs >> 31)).
   void emit_mul_cycles7(u32 hrs, bool signed_op, u32 extra) {
     const u32 t = cache_.temp(), u = cache_.temp();
     if (signed_op) e().eor_reg(t, hrs, hrs, ASR, 31, cond_); else e().mov(t, hrs, cond_);
@@ -1117,9 +998,8 @@ private:
     cache_.release(t);
     cache_.release(u);
   }
-  // Multiplies that set flags leave C alone on the ARM9 and clear it on the
-  // ARM7 (melonDS); the host leaves it alone. Never predicated: the multiply
-  // has rewritten N and Z by now (translate_arm uses the branch form).
+  // Flag-setting multiplies clear C on ARM7 only. Never predicated: N,Z already
+  // rewritten (translate_arm branches around instead).
   bool mul_clears_c(u32 instr) const { return !a9_ && (instr & (1u << 20)) && (live_ & F_C); }
   void emit_clear_c() {
     if (a9_ || !(live_ & F_C)) return;
@@ -1131,7 +1011,7 @@ private:
     cache_.release(t);
   }
 
-  // ---- drivers ----------------------------------------------------------------------------------
+  // ---- drivers ----
   void translate_arm(u32 instr, bool fb);
   void translate_thumb(u16 instr, bool fb);
   void arm_data_processing(u32 instr, AOp op);
@@ -1147,17 +1027,12 @@ private:
   void thumb_stm_ldm(u16 instr);
 };
 
-// MSR CPSR_<fields>, Rm / #imm. Inline when the mode stays the same and the
-// CPU is not in user mode (both tested at run time); the control field then
-// only moves I and F, the other fields merge into the memory copy, and the
-// flags field sets the APSR. Everything else runs through the interpreter on
-// the cold path. T is never written (as in the interpreter). The cache is
-// flushed first: the poll after an I write and the cold fallback both need
-// memory current, and MSR is rare.
+// Inline unless user mode or a mode change (run-time tests; cold path interprets).
+// Control field moves I/F only; T is never written.
 void Translator::arm_msr(u32 instr, AOp op) {
   const u32 fields = (instr >> 16) & 0xF;
   cache_.flush();
-  flush_pending();                 // the cold path charges through the interpreter; numC is charged after the tests
+  flush_pending();                 // numC is charged after the tests (cold path charges its own)
   u32 wv;
   if (op == AOp::MsrImm) { wv = cache_.temp(); e().mov_imm(wv, rotr(instr & 0xFF, ((instr >> 8) & 0xF) * 2)); }
   else wv = cache_.read(instr & 0xF);
@@ -1169,14 +1044,14 @@ void Translator::arm_msr(u32 instr, AOp op) {
   const RegCache::State s0 = cache_.save();
   if (tests) {
     f = cache_.temp();
-    e().mrs_apsr(f);                              // the interpreter path must see the guest flags
+    e().mrs_apsr(f);
     e().ldr(t2, R_CTX, OFF_CPSR);
     e().tst_imm(t2, 0xF);
-    fail.push_back(e().b_fwd(EQ));                // user mode: flags only (interpreter)
+    fail.push_back(e().b_fwd(EQ));                // user mode
     if (fields & 1) {
       e().eor_reg(t3, t2, wv);
       e().tst_imm(t3, 0x1F);
-      fail.push_back(e().b_fwd(NE));              // mode change: bank switch (interpreter)
+      fail.push_back(e().b_fwd(NE));              // mode change
     }
     e().msr_apsr_nzcvq(f);
   } else if (mem_mask) e().ldr(t2, R_CTX, OFF_CPSR);
@@ -1186,7 +1061,7 @@ void Translator::arm_msr(u32 instr, AOp op) {
     if (mem_mask == 0xC0) { e().ubfx(t3, wv, 6, 2); e().bfi(t2, t3, 6, 2); }
     else {
       e().mov_imm(t3, mem_mask);
-      e().dp_reg(BIC, false, t2, t2, t3);        // clear the fields, then merge the new bits
+      e().dp_reg(BIC, false, t2, t2, t3);
       e().and_reg(t3, wv, t3);
       e().orr_reg(t2, t2, t3);
     }
@@ -1208,7 +1083,7 @@ void Translator::arm_msr(u32 instr, AOp op) {
   cold_end_jump(join);
 }
 
-// ---- memory instructions ------------------------------------------------------------------------
+// ---- memory instructions ----
 
 void Translator::arm_ldr_str(u32 instr, AOp op) {
   const bool l = instr & (1u << 20), b = instr & (1u << 22);
@@ -1222,7 +1097,7 @@ void Translator::arm_ldr_str(u32 instr, AOp op) {
   else a = emit_ea(rn, false, 0, cache_.read(instr & 0xF), static_cast<Shift>((instr >> 5) & 3), (instr >> 7) & 0x1F, p, u, writeback, data);
   int const_nd = -1;
   if (l && a9_ && !b && op == AOp::LdrStrImm && rn == 15 && !writeback) {
-    // ldr rd, [pc, #imm]: the literal's page, hence its N32 cost, is known now.
+    // ldr rd, [pc, #imm]: the literal's N32 cost is known now.
     const u32 addr = u ? pc_ + 8 + (instr & 0xFFF) : pc_ + 8 - (instr & 0xFFF);
     note_dep(addr, mem::Timing::RETIME_DATA);
     const_nd = cpu_.timing9[addr >> 12][2];
@@ -1259,7 +1134,7 @@ void Translator::arm_ldm_stm(u32 instr, bool load) {
   else   { if (p) e().sub_imm(a, hb, n * 4, a); else e().sub_imm(a, hb, n * 4 - 4, a); }
   e().and_imm(a, a, ~3u);
   u32 t_w = 0xFF;
-  if (w && !(!u && p)) {                               // stmdb/ldmdb rn!: the writeback value is the start address
+  if (w && !(!u && p)) {                               // db!: writeback = start address, no t_w
     t_w = cache_.temp();
     if (u) e().add_imm(t_w, hb, n * 4, t_w); else e().sub_imm(t_w, hb, n * 4, t_w);
   }
@@ -1333,17 +1208,17 @@ void Translator::thumb_push_pop(u16 instr) {
   const u32 sp = pinned_host(13);
   const u32 a = cache_.temp();
   if (pop) {
-    if (r) list |= 0x8000;   // pc
+    if (r) list |= 0x8000;
     const u32 n = static_cast<u32>(__builtin_popcount(list));
     e().mov(a, sp);
     const u32 t_w = cache_.temp();
-    e().add_imm(t_w, sp, n * 4, t_w);                     // POP always writes back; sp is never in a Thumb list
+    e().add_imm(t_w, sp, n * 4, t_w);
     emit_block_transfer(instr, list, true, true, 13, a, t_w, 0, a9_);
   } else {
     if (r) list |= 0x4000;
     const u32 n = static_cast<u32>(__builtin_popcount(list));
     e().sub_imm(a, sp, n * 4, a);
-    emit_block_transfer(instr, list, false, true, 13, a, 0xFF, 0);   // writeback value = start address
+    emit_block_transfer(instr, list, false, true, 13, a, 0xFF, 0);   // writeback = start address
   }
   if (!ended_) cache_.release(a);
 }
@@ -1362,11 +1237,10 @@ void Translator::thumb_stm_ldm(u16 instr) {
   cache_.release(a);
 }
 
-// ---- ARM ---------------------------------------------------------------------------------------
+// ---- ARM ----
 
-// The guest word with its register fields substituted: shifter, carry-out and
-// flags are the host's own. Operands are read before the destination is
-// claimed so a fresh destination slot never evicts one of them.
+// Emitted natively (host shifter/carry match). Operands are read before the
+// destination is claimed so it can't evict them.
 void Translator::arm_data_processing(u32 instr, AOp op) {
   const u32 opcode = (instr >> 21) & 0xF;
   const bool s = instr & (1u << 20);
@@ -1384,7 +1258,7 @@ void Translator::arm_data_processing(u32 instr, AOp op) {
   const u32 hd = test ? 0 : cache_.write(rd, cond_ != AL);
   const DpOp dop = static_cast<DpOp>(opcode);
   const Shift sh = static_cast<Shift>((instr >> 5) & 3);
-  flush_pending();   // before the body: a predicated charge after an S instruction would see the new flags
+  flush_pending();   // before the body: an S body rewrites the predicating flags
   if (op == AOp::DpImm) e().dp_imm(dop, s, hd, hn, instr & 0xFFF, cond_);
   else if (op == AOp::DpImmShift) e().dp_reg(dop, s, hd, hn, hm, sh, (instr >> 7) & 0x1F, cond_);
   else e().dp_regshift(dop, s, hd, hn, hm, sh, hs, cond_);
@@ -1419,8 +1293,7 @@ void Translator::arm_multiply(u32 instr, AOp op) {
   if (s) emit_clear_c();
 }
 
-// v5TE halfword multiplies, ARM9 only: native, Q included (the APSR carries
-// the guest Q, convention.h). Cost is charge_C.
+// ARM9 only; native, host APSR carries guest Q. Cost is charge_C.
 void Translator::arm_dsp_multiply(u32 instr, AOp op) {
   const u32 rd = (instr >> 16) & 0xF, rn = (instr >> 12) & 0xF, rs = (instr >> 8) & 0xF, rm = instr & 0xF;
   const bool x = instr & (1u << 5), y = instr & (1u << 6);
@@ -1456,11 +1329,9 @@ void Translator::translate_arm(u32 instr, bool fb) {
   const AOp op = arm::decode_arm(instr);
 
   if (fb) {
-    // The helper evaluates the condition itself. Jumps are possible for
-    // PC-destination forms, exceptions and coprocessor/MSR side effects.
     bool always = false;
     switch (op) {
-    case AOp::Swi: break;   // not a sure jump: NDS::dsi_hle_swi can answer one without the exception
+    case AOp::Swi: break;   // DSi HLE may service it without the exception
     case AOp::Bkpt: case AOp::Undefined: case AOp::Cdp: case AOp::Ldc: case AOp::Stc:
     case AOp::Bx: case AOp::BlxReg:
       always = cond == 0xE; break;
@@ -1500,10 +1371,8 @@ void Translator::translate_arm(u32 instr, bool fb) {
     return;
   }
 
-  // Memory and MSR: a data-dependent cost (or an interpreter cold path), so
-  // a conditional form branches around the body (cache empty on both arms)
-  // and the skipped arm charges numC; a body that ends the block (LDM pc)
-  // links the skipped arm to the next instruction.
+  // Memory and MSR (dynamic cost / interpreter cold path): conditional forms branch
+  // around the body with the cache empty on both arms; the skipped arm charges numC.
   switch (op) {
   case AOp::LdrStrImm: case AOp::LdrStrReg: case AOp::LdrStrHImm: case AOp::LdrStrHReg: case AOp::Ldm: case AOp::Stm:
   case AOp::MsrReg: case AOp::MsrImm: {
@@ -1511,9 +1380,7 @@ void Translator::translate_arm(u32 instr, bool fb) {
     if (cond != 0xE) {
       cache_.flush(); flush_pending();
       skip = hot_.b_fwd(invert(static_cast<Cond>(cond)));
-      // The body's cold path is the interpreter, which evaluates the
-      // condition again: the flags it reads must survive the page tests
-      // even when nothing after the instruction reads them.
+      // The interpreter cold path re-evaluates the condition.
       live_ |= cond_reads(cond);
     }
     switch (op) {
@@ -1545,12 +1412,8 @@ void Translator::translate_arm(u32 instr, bool fb) {
   default: break;
   }
 
-  // Everything below is a predicated body whose cost is numC plus static
-  // or register-dependent extras: numC is charged before the condition,
-  // the extras inside it and ahead of the body (an S body rewrites the
-  // flags the predication reads). The one body that cannot be predicated
-  // -- an ARM7 multiply that must clear C after setting N,Z -- is branched
-  // around instead, with the cache empty on both arms.
+  // Predicated bodies: numC charged unconditionally, extras predicated and ahead
+  // of the body. ARM7 flag-setting multiplies (must clear C) branch instead.
   const bool conditional = cond != 0xE;
   bool branch_form = false;
   size_t skip = 0;
@@ -1595,7 +1458,7 @@ void Translator::translate_arm(u32 instr, bool fb) {
     break;
   }
   case AOp::Pld: add_pending(numC(pc_)); break;
-  case AOp::Mcr: add_pending(numC(pc_) + 2); break;      // ignored cache operation: charge_CI(2)
+  case AOp::Mcr: add_pending(numC(pc_) + 2); break;      // charge_CI(2)
   case AOp::SmlaXY: case AOp::SmulXY: case AOp::SmlawY: case AOp::SmulwY:
     arm_dsp_multiply(instr, op);
     break;
@@ -1610,7 +1473,7 @@ void Translator::translate_arm(u32 instr, bool fb) {
   cond_ = AL;
 }
 
-// ---- Thumb ---------------------------------------------------------------------------------------
+// ---- Thumb ----
 
 void Translator::thumb_alu(u16 instr) {
   const u32 rs = (instr >> 3) & 7, rd = instr & 7;
@@ -1658,10 +1521,10 @@ void Translator::translate_thumb(u16 instr, bool fb) {
   if (fb) {
     bool always = false;
     switch (op) {
-    case TOp::Swi: break;   // not a sure jump: NDS::dsi_hle_swi can answer one without the exception
+    case TOp::Swi: break;   // DSi HLE may service it without the exception
     case TOp::Bkpt: case TOp::Undefined: case TOp::BxBlx: case TOp::BlSuffix: case TOp::BlxSuffix:
       always = true; break;
-    case TOp::HiRegOp: always = true; break;          // only the pc-destination forms reach here
+    case TOp::HiRegOp: always = true; break;          // only pc-destination forms reach here
     case TOp::PushPop: always = (instr & (1 << 11)) && (instr & (1 << 8)); break;
     case TOp::StmLdm: always = false; break;
     default: break;
@@ -1674,7 +1537,7 @@ void Translator::translate_thumb(u16 instr, bool fb) {
     const u32 type = (instr >> 11) & 3, amt = (instr >> 6) & 0x1F, rs = (instr >> 3) & 7, rd = instr & 7;
     add_pending(numC(pc_));
     const u32 hs = cache_.read(rs), hd = cache_.write(rd, false);
-    e().dp_reg(MOV, true, hd, 0, hs, static_cast<Shift>(type), amt);   // LSR/ASR #0 encode #32, as the guest
+    e().dp_reg(MOV, true, hd, 0, hs, static_cast<Shift>(type), amt);   // LSR/ASR #0 = #32, as the guest
     return;
   }
   case TOp::AddSubReg: {
@@ -1705,7 +1568,7 @@ void Translator::translate_thumb(u16 instr, bool fb) {
   case TOp::Alu: thumb_alu(instr); return;
   case TOp::HiRegOp: {
     const u32 rd = (instr & 7) | ((instr >> 4) & 8), rs = (instr >> 3) & 0xF;
-    add_pending(numC(pc_));             // charged before a jump too (melonDS T_ADD_HIREG)
+    add_pending(numC(pc_));             // charged before a jump too
     switch ((instr >> 8) & 3) {
     case 0: {
       const u32 b = reg_read(rs, pc_ + 4);
@@ -1789,15 +1652,14 @@ void Translator::translate_thumb(u16 instr, bool fb) {
   }
 }
 
-// ---- block driver ------------------------------------------------------------------------------------
+// ---- block driver ----
 
 bool Translator::run() {
   const u32 start = key_pc(key_);
   if (!a9_) { t7_ = cpu_.timing7[start >> 15]; code_region7_ = start >> 24; }
   blk_.ndep = 0;
-  blk_.dep_overflow = rt().cpu_oc != CpuOc::Off;   // main RAM's costs baked into every access: dies on any retime
+  blk_.dep_overflow = rt().cpu_oc != CpuOc::Off;   // main RAM costs baked in: invalidate on any retime
 
-  // Decode the straight-line run.
   u32 addr = start;
   for (u32 i = 0; i < MAX_INSTRS; ++i) {
     const u32 raw = fetch(addr);
@@ -1807,12 +1669,10 @@ bool Translator::run() {
     const bool ends = thumb_ ? shape::thumb_ends_block(static_cast<u16>(raw)) : shape::arm_ends_block(raw, a9_);
     addr += step();
     if (ends) break;
-    if (!cpu_.page_table.read_ptr(addr)) break;   // do not walk into unmapped space
+    if (!cpu_.page_table.read_ptr(addr)) break;
   }
 
-  // Backward flag liveness: which flags each instruction leaves live, and
-  // whether the block reads flags before writing them (the entry test then
-  // keeps them across its `tst`).
+  // Backward flag liveness.
   u32 live = F_ALL;
   for (size_t i = instrs_.size(); i-- > 0;) {
     instrs_[i].live_out = live;
@@ -1838,8 +1698,7 @@ bool Translator::run() {
     rt().stats.instrs_translated++;
     if (ended_) break;
     if (rt().strict) {
-      // The interpreter tests the budget before every instruction; reproduce
-      // that so the two engines interleave identically (verification mode).
+      // Match the interpreter's per-instruction budget test.
       cache_.flush();
       flush_pending();
       emit_budget_check(make_key(in.addr + step(), thumb_), in.live_out != 0);

@@ -28,10 +28,9 @@ std::vector<DrmOut*> g_outs;
 
 constexpr u32 FMT_XRGB8888 = 0x34325258;   // 'XR24'; the core writes 0xAARRGGBB and we are opaque
 
-// SDL's DRM fd. The union member is behind SDL_VIDEO_DRIVER_KMSDRM, which is
-// a property of the SDL build our *headers* came from and not of the runtime
-// library, so fall back to the union's byte view -- the layout
-// (int dev_index; int drm_fd; struct gbm_device*) is part of SDL's ABI.
+// The union member is gated on SDL_VIDEO_DRIVER_KMSDRM from our headers, not
+// the runtime library, so fall back to the byte view: SDL's ABI layout is
+// (int dev_index; int drm_fd; struct gbm_device*).
 int sdl_drm_fd(SDL_Window* win) {
   SDL_SysWMinfo wm;
   SDL_VERSION(&wm.version);
@@ -49,9 +48,8 @@ int sdl_drm_fd(SDL_Window* win) {
 } // namespace
 
 bool DrmOut::alloc_buf(Buf& b) {
-  // The import is the probe: a heap the kernel hands out but the display
-  // controller cannot scan (system memory without an IOMMU) fails ADDFB2,
-  // and dmaheap moves on to the next one.
+  // The import is the probe: a heap the display controller can't scan
+  // (system memory without an IOMMU) fails ADDFB2, and dmaheap tries the next.
   const size_t bytes = static_cast<size_t>(w_) * h_ * 4;
   b.fd = dmaheap::alloc(bytes, [&](int fd) {
     drmu::prime_handle ph = {};
@@ -95,7 +93,6 @@ bool DrmOut::open(SDL_Window* win, int w, int h, int display_index) {
   display_ = display_index;
   w_ = w; h_ = h;
 
-  // Resources, then the connectors, in the order SDL enumerated its displays.
   drmu::mode_card_res res = {};
   if (ioctl(fd_, drmu::IOCTL_MODE_GETRESOURCES, &res) < 0) { std::perror("drm: GETRESOURCES"); return false; }
   std::vector<u32> conns(res.count_connectors), crtcs(res.count_crtcs), encs(res.count_encoders);
@@ -122,9 +119,8 @@ bool DrmOut::open(SDL_Window* win, int w, int h, int display_index) {
     if (seen++ != display_index) continue;
 
     conn_ = c;
-    // The mode must be the one the window is the size of: a page flip's
-    // framebuffer has to cover the CRTC, so a windowed (sub-panel) window
-    // cannot use this tier at all.
+    // A page flip's framebuffer must cover the CRTC, so only a mode matching
+    // the window's exact size works -- no windowed (sub-panel) use here.
     for (const drmu::mode_modeinfo& m : modes)
       if (m.hdisplay == w && m.vdisplay == h) { mode = m; found = true; break; }
     if (!found) {
@@ -132,7 +128,6 @@ bool DrmOut::open(SDL_Window* win, int w, int h, int display_index) {
                    display_index, w, h, modes[0].hdisplay, modes[0].vdisplay);
       return false;
     }
-    // The CRTC the connector's encoder is already wired to, else any free one.
     drmu::mode_get_encoder ge = {};
     ge.encoder_id = gc.encoder_id ? gc.encoder_id : (gc.count_encoders ? cencs[0] : 0);
     if (ge.encoder_id && ioctl(fd_, drmu::IOCTL_MODE_GETENCODER, &ge) == 0 && ge.crtc_id) crtc_ = ge.crtc_id;
@@ -144,10 +139,8 @@ bool DrmOut::open(SDL_Window* win, int w, int h, int display_index) {
   for (int i = 0; i < nbufs_; ++i)
     if (!alloc_buf(bufs_[i])) { close(); return false; }
 
-  // Take the CRTC over with our first buffer. A modeset rather than a flip
-  // because SDL's KMSDRM only modesets on its first GL swap, which in
-  // scanline mode never happens -- the CRTC may still be showing whatever
-  // the console left behind.
+  // A modeset, not a flip: SDL's KMSDRM only modesets on its first GL swap,
+  // which never happens in scanline mode.
   drmu::mode_crtc sc = {};
   sc.crtc_id = crtc_;
   sc.fb_id = bufs_[0].fb;
@@ -169,8 +162,7 @@ bool DrmOut::open(SDL_Window* win, int w, int h, int display_index) {
 
 void DrmOut::close() {
   if (fd_ >= 0) {
-    // Let an outstanding flip retire before its buffer is unmapped; a
-    // queued one is flipped on that retire and drained in turn.
+    // Let an outstanding flip retire before its buffer is unmapped.
     while (pending_ >= 0 && !dead_)
       if (!pump(fd_, true)) break;
     for (Buf& b : bufs_) drop_buf(b);
@@ -187,7 +179,6 @@ void DrmOut::retire() {
   if (on_screen_ >= 0) bufs_[on_screen_].busy = false;
   on_screen_ = pending_;
   pending_ = -1;
-  // The CRTC is free for one flip again: the frame that waited goes now.
   if (queued_ >= 0) { const int q = queued_; queued_ = -1; if (!flip(q)) dead_ = true; }
 }
 
@@ -202,9 +193,7 @@ bool DrmOut::flip(int i) {
   return true;
 }
 
-// One read drains whatever is queued; each flip-complete carries the
-// submitting DrmOut as its user_data, which is how a completion finds its
-// owner on a shared fd.
+// Each flip-complete event carries its submitting DrmOut as user_data.
 bool DrmOut::pump(int fd, bool block) {
   pollfd p = {fd, POLLIN, 0};
   const int r = poll(&p, 1, block ? 1000 : 0);
@@ -246,12 +235,10 @@ u32* DrmOut::begin_frame() {
     for (int i = 0; i < nbufs_; ++i)
       if (!bufs_[i].busy) {
         cur_ = i;
-        // CPU writes into a dmabuf are bracketed; see dmaheap::sync_begin_write.
         if (!gpu_writes_) dmaheap::sync_begin_write(bufs_[i].fd);
         return bufs_[i].px;
       }
-    // On screen, pending and queued: the emulation is a frame ahead of the
-    // panel, and this wait is the vsync.
+    // All three taken: this wait is the vsync.
     if (pending_ < 0) { std::fprintf(stderr, "drm: no free buffer\n"); dead_ = true; return nullptr; }
     if (!pump(fd_, true) || dead_) { dead_ = true; return nullptr; }
   }
@@ -261,18 +248,15 @@ void DrmOut::end_frame() {
   if (dead_ || cur_ < 0) return;
   const int i = cur_;
   cur_ = -1;
-  // Everything drawn this frame has to reach memory before the display
-  // controller scans the buffer out.
   if (!gpu_writes_) dmaheap::sync_end_write(bufs_[i].fd);
   bufs_[i].busy = true;
   if (pending_ >= 0) { queued_ = i; return; }   // one flip per CRTC at a time; retire() issues this one
   if (!flip(i)) dead_ = true;
 }
 
-// A queued flip is only issued when the pending one retires, and that
-// retire is only noticed from begin_frame(). Between frames that is the
-// pacing; after a one-off present with no frame behind it, it is a picture
-// that never arrives. Wait the pending flip out here so the queued one goes.
+// A queued flip only issues when the pending one retires, which is only
+// noticed from begin_frame(); wait it out here so a one-off present isn't
+// left stranded with no next frame to notice the retire.
 void DrmOut::flush() {
   while (queued_ >= 0 && pending_ >= 0 && !dead_)
     if (!pump(fd_, true)) { dead_ = true; return; }

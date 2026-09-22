@@ -1,13 +1,9 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 #
-# Networking: the transports behind the Wi-Fi block's MpTransport and
-# NetDriver (core/io/wifi_transport.h). A library of its own so the core
-# stays socket-free and so a frontend picks it up only when built with
-# DSPERATE_NET. docs/wifi-scoping.md.
+# Networking: transports behind the Wi-Fi block's MpTransport/NetDriver.
+# Own library so the core stays socket-free; pulled in only with DSPERATE_NET.
 #
-# enet/ is vendored (enet/README.md). Its own CMake probes these before
-# building; the same probes here, so unix.c compiles the way upstream means
-# it to on every tier (glibc 2.23 on the A30 has all of them).
+# enet/ is vendored; probe for what its unix.c needs, per upstream's CMake.
 include(CheckFunctionExists)
 include(CheckStructHasMember)
 include(CheckTypeSize)
@@ -37,9 +33,8 @@ endforeach()
 # Third-party C: not ours to fix warnings in.
 target_compile_options(dsperate_enet PRIVATE -w)
 
-# slirp/ is vendored too (slirp/README.md), with our own glib shim beside it
-# in slirp/glib -- libslirp's sources #include <glib.h> and that directory is
-# what they find. Upstream builds with meson; this is the same source list.
+# slirp/ is vendored, with a glib shim in slirp/glib (libslirp sources
+# #include <glib.h> and find it there). Source list matches upstream's meson build.
 set(SLIRP_DIR ${CMAKE_CURRENT_SOURCE_DIR}/slirp)
 add_library(dsperate_slirp STATIC
   ${CMAKE_CURRENT_SOURCE_DIR}/slirp/arp_table.c
@@ -76,9 +71,8 @@ add_library(dsperate_slirp STATIC
   ${SLIRP_DIR}/glib/glib.c)
 target_include_directories(dsperate_slirp PUBLIC ${SLIRP_DIR} PRIVATE ${SLIRP_DIR}/glib)
 set_target_properties(dsperate_slirp PROPERTIES C_STANDARD 99 C_EXTENSIONS ON)
-# Third-party C: not ours to fix warnings in. Note -w hides nothing the
-# linker needs -- a missing shim symbol still fails the link, which is how
-# this copy is checked (slirp/README.md).
+# Third-party C: not ours to fix warnings in. -w doesn't hide a missing
+# shim symbol -- that still fails the link.
 target_compile_options(dsperate_slirp PRIVATE -w)
 
 add_library(dsperate_net STATIC

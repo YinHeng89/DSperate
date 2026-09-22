@@ -29,8 +29,7 @@ template <class S> void DsiDsp::sync_state(S& s) {
 template void DsiDsp::sync_state<state::Writer>(state::Writer&);
 template void DsiDsp::sync_state<state::Reader>(state::Reader&);
 
-// melonDS runs the core from here on (and schedules its catch-up event, which
-// cuts slices); say so once rather than diverge silently.
+// Log once when the (unmodelled) core would start, rather than diverge silently.
 void DsiDsp::note_core_state() {
   static bool warned = false;
   if (warned) return;
@@ -40,8 +39,7 @@ void DsiDsp::note_core_state() {
   }
 }
 
-// PSTS: bit 9 (semaphore IRQ) is the only sticky bit; the write FIFO is
-// always empty; bits 10-15 (core ports) stay clear with no core.
+// Bit 9 (semaphore IRQ) is the only sticky bit; write FIFO always empty; bits 10-15 clear.
 u16 DsiDsp::psts() const {
   u16 r = static_cast<u16>((psts_ & (1u << 9)) | (1u << 8));
   if (rd_fifo_.full()) r |= 1u << 5;
@@ -127,7 +125,7 @@ void DsiDsp::write16(u32 addr, u16 value) {
   case 0x00: pdata_write(value); break;
   case 0x04: padr_ = value; break;
   case 0x08:
-    // melonDS (HLE) starts a ucode -- or Teakra -- when bit 0 falls; no core here.
+    // Bit 0 falling would start the core; no core here.
     if ((pcfg_ & 1) && !(value & 1) && !nds_.dsi_dsp_started) {
       nds_.dsi_dsp_started = true;
       std::fprintf(stderr, "[dsp] DSP start requested (PCFG bit 0 released) -- no core\n");

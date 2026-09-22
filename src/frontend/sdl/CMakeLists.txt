@@ -2,30 +2,22 @@
 add_executable(dsperate main.cpp config.cpp display.cpp audio.cpp input.cpp menu.cpp settings.cpp lid.cpp mic_alsa.cpp loader_cart.cpp dmaheap.cpp
   display_drm.cpp display_disp.cpp display_fbdev.cpp)
 target_link_libraries(dsperate PRIVATE dsperate_core ${SDL2_LIBRARIES} ${CMAKE_DL_LIBS})
-# --version: the tag and commit, restamped on every build (cmake/version.cmake).
-# Its own translation unit, so a new commit recompiles nothing else.
+# Restamped on every build; its own translation unit so a commit recompiles nothing else.
 set(_ds_version_cpp ${CMAKE_CURRENT_BINARY_DIR}/version.cpp)
 add_custom_target(dsperate_version
   COMMAND ${CMAKE_COMMAND} -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${_ds_version_cpp} -DDSPERATE_VERSION=${DSPERATE_VERSION} -P ${CMAKE_SOURCE_DIR}/cmake/version.cmake
   BYPRODUCTS ${_ds_version_cpp} VERBATIM)
 target_sources(dsperate PRIVATE ${_ds_version_cpp})
 add_dependencies(dsperate dsperate_version)
-# RetroAchievements, when it is built at all. The frontend is the only consumer;
-# with DSPERATE_CHEEVOS off the macro is undefined and main.cpp compiles as it
-# did before any of this existed.
 if(DSPERATE_CHEEVOS)
   target_link_libraries(dsperate PRIVATE dsperate_cheevos)
   target_compile_definitions(dsperate PRIVATE DSPERATE_CHEEVOS=1)
 endif()
 target_include_directories(dsperate PRIVATE ${SDL2_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/../../..)
-# The Wayland dmabuf tier (DSPERATE_WAYLAND, decided at the top level): the
-# real DmabufOut with the vendored protocol code, or a stub whose open() says
-# no so Display takes the paths it would have taken at runtime anyway.
 if(DSPERATE_WAYLAND)
   target_sources(dsperate PRIVATE display_wl.cpp wl_dyn.cpp wl/wayland-protocol.c wl/linux-dmabuf-v1.c wl/xdg-shell.c)
   target_compile_definitions(dsperate PRIVATE DSPERATE_WAYLAND=1)
-  # The vendored protocol code must marshal through the dlopen'd pointers, so
-  # the macro layer is force-included (see wl/README.md); no linked wayland.
+  # Vendored protocol code marshals through dlopen'd pointers; force-include the macro layer, no linked wayland.
   set_source_files_properties(wl/wayland-protocol.c wl/linux-dmabuf-v1.c wl/xdg-shell.c PROPERTIES
     COMPILE_OPTIONS "-include;${CMAKE_CURRENT_SOURCE_DIR}/wl_dyn.h;-I${CMAKE_CURRENT_SOURCE_DIR}/wl")
 else()
@@ -35,9 +27,6 @@ if(DSPERATE_NET)
   target_link_libraries(dsperate PRIVATE dsperate_net)
   target_compile_definitions(dsperate PRIVATE DSPERATE_NET=1)
 endif()
-# The GPU present stage (gpu_present.cpp): real when the core was built with
-# the Vulkan device layer, a stub whose open() declines otherwise. Its SPIR-V
-# is tracked beside the shader (tools/gen_shaders.sh) and linked with .incbin.
 target_sources(dsperate PRIVATE gpu_present.cpp)
 if(DSPERATE_VULKAN AND DSPERATE_VULKAN_INCLUDE)
   target_include_directories(dsperate PRIVATE ${DSPERATE_VULKAN_INCLUDE})

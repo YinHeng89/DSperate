@@ -29,9 +29,7 @@ uint32_t g_tid[kMaxSamples];
 std::atomic<size_t> g_n{0};
 std::atomic<bool> g_active{false};
 
-// Per-thread CPU time over the sampled window: /proc/self/task/<tid>/stat at
-// the first activation and at write. Sample counts give each thread's share;
-// these give the absolute CPU, which the tick-bound sampler cannot promise.
+// utime+stime per thread at first activation and at write, for absolute CPU.
 struct TaskTime { long tid; unsigned long long ticks; };
 constexpr size_t kMaxTasks = 64;
 TaskTime g_t0[kMaxTasks];
@@ -124,7 +122,7 @@ bool start() {
 }
 
 void set_active(bool on) {
-  if (on && !g_window_started) {   // once: the raster bench toggles this around every render
+  if (on && !g_window_started) {   // arm the window once, on first activation
     g_window_started = true;
     snapshot_tasks();
     g_window0 = std::chrono::steady_clock::now();

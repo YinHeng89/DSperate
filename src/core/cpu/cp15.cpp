@@ -10,14 +10,11 @@
 namespace ds {
 
 // Rebuild the per-4 KB cacheability map from the PU regions and refresh the
-// ARM9 timing table for the pages whose cacheability changed (a full rebuild
-// is 1 M entries; games flip the PU and the caches every few frames). Region
-// 7 has the highest priority.
+// ARM9 timing table for pages that changed. Region 7 has highest priority.
 void cp15_update_pu_map(CpuContext& cpu);
 static void update_pu_map(CpuContext& cpu) { cp15_update_pu_map(cpu); }
 namespace {
-// One PU region as the map sees it: [start, start + size) in 4 KB pages and
-// the cacheability bits it paints, or `on` false.
+// [start, start + size) in 4 KB pages, and the cacheability bits it paints.
 struct PuRegion { bool on; u32 start, size; u8 m; };
 PuRegion decode_region(u32 ctl, u32 dc, u32 cc, u32 rgn, int n) {
   PuRegion r{};
@@ -43,17 +40,14 @@ void cp15_update_pu_map(CpuContext& cpu) {
   bool changed = false;
 
   if ((ctl & 1) && memo.valid && (memo.ctl & 1)) {
-    // PU on before and after: the map only differs inside the regions whose
-    // decode changed -- the old extent (its pages fall back to whatever now
-    // covers them) and the new one. Everything outside is untouched, so
-    // neither the 1 MB rebuild nor the 1 MB compare is needed; a typical
-    // write (one region's cacheability, one 4 MB region) visits ~1 k pages.
+    // PU on before and after: only the old and new extents of changed
+    // regions need rescanning, avoiding a full 1 MB rebuild/compare.
     PuRegion cur[8], prev[8];
     for (int n = 0; n < 8; ++n) {
       cur[n] = decode_region(ctl, cpu.pu_data_cacheable, cpu.pu_code_cacheable, cpu.pu_region[n], n);
       prev[n] = decode_region(memo.ctl, memo.dc, memo.cc, memo.region[n], n);
     }
-    auto value = [&](u32 page) -> u8 {   // highest-numbered enabled region wins, as the full build below
+    auto value = [&](u32 page) -> u8 {   // highest-numbered enabled region wins
       for (int n = 7; n >= 0; --n) if (cur[n].on && page - cur[n].start < cur[n].size) return cur[n].m;
       return 0;
     };
@@ -72,12 +66,11 @@ void cp15_update_pu_map(CpuContext& cpu) {
     };
     for (int n = 0; n < 8; ++n) {
       if (same_region(cur[n], prev[n])) continue;
-      rescan(prev[n]);   // a page visited twice compares equal the second time
+      rescan(prev[n]);
       rescan(cur[n]);
     }
   } else {
-    // PU toggled, or disabled (caches apply everywhere if enabled), or the
-    // memo is stale (reset): build the whole map and diff it in 1 MB chunks.
+    // PU toggled, disabled, or memo stale: build the whole map and diff it.
     static std::unique_ptr<u8[]> fresh(new u8[0x100000]);
     u8* next = fresh.get();
     if (!(ctl & 1)) {
@@ -129,8 +122,7 @@ u32 cp15_read(CpuContext& cpu, u32 opc1, u32 crn, u32 crm, u32 opc2) {
 void cp15_write(CpuContext& cpu, u32 opc1, u32 crn, u32 crm, u32 opc2, u32 value) {
   switch ((crn << 8) | (crm << 4) | opc2) {
   case 0x100: {
-    // Writable bits: M, big-endian(not), D-cache, I-cache, V (vector base),
-    // RR, DTCM enable/load, ITCM enable/load.
+    // Writable: M, big-endian, D/I-cache, V (vector base), RR, DTCM/ITCM enable/load.
     const u32 mask = 0x000FF085;
     const u32 old = cpu.cp15_control;
     cpu.cp15_control = (old & ~mask) | (value & mask) | 0x00000078;   // bits 3-6 read as 1
@@ -147,9 +139,7 @@ void cp15_write(CpuContext& cpu, u32 opc1, u32 crn, u32 crm, u32 opc2, u32 value
   case 0x601: case 0x611: case 0x621: case 0x631: case 0x641: case 0x651: case 0x661: case 0x671:
     if (cpu.pu_region[crm] != value) { cpu.pu_region[crm] = value; update_pu_map(cpu); }
     return;
-  // Games rewrite the TCM registers with their current values (OS entry
-  // code, IRQ handlers); the remap and the timing-table rebuild are only
-  // for real changes.
+  // Games rewrite TCM registers with their current values; remap/rebuild only on real change.
   case 0x910: { const u32 v = value & 0xFFFFF03E; if (cpu.cp15_dtcm != v) { cpu.cp15_dtcm = v; cpu.nds->bus.update_tcm(cpu); } return; }
   case 0x911: { const u32 v = value & 0x0000003E; if (cpu.cp15_itcm != v) { cpu.cp15_itcm = v; cpu.nds->bus.update_tcm(cpu); } return; }
   case 0x704: case 0x782:                   // wait for interrupt

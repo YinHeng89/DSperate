@@ -57,8 +57,8 @@ bool Config::load(const std::string& path) {
   std::ifstream f(path);
   if (!f) return false;
   std::string line, section;
-  std::string cpu_oc;           // emu.cpu_oc, emu.cpu_tuning's old name, as this file gives it
-  bool cpu_tuning = false;      // ... and whether it names the new one
+  std::string cpu_oc;           // emu.cpu_oc value, if present (old name for cpu_tuning)
+  bool cpu_tuning = false;      // whether emu.cpu_tuning is present
   while (std::getline(f, line)) {
     line = trim(line);
     if (line.empty() || line[0] == '#' || line[0] == ';') continue;
@@ -66,16 +66,13 @@ bool Config::load(const std::string& path) {
     const size_t eq = line.find('=');
     if (eq == std::string::npos) continue;
     std::string k = trim(line.substr(0, eq)), v = trim(line.substr(eq + 1));
-    // Trailing comments; a bare `#` inside a value is not expected.
     if (const size_t c = v.find_first_of("#;"); c != std::string::npos) v = trim(v.substr(0, c));
     const std::string key = section.empty() ? k : section + "." + k;
     if (key == "emu.cpu_oc") cpu_oc = v;
     if (key == "emu.cpu_tuning") cpu_tuning = true;
     kv_[key] = v;
   }
-  // emu.cpu_tuning: false | underclock | overclock. A file from before it says
-  // emu.cpu_oc = true/false, which stands in when the file has no cpu_tuning;
-  // "true" (and on/yes/1) is the overclock tier either way.
+  // cpu_oc is the old spelling; "true"/on/yes/1 maps to the overclock tier.
   if (!cpu_tuning && !cpu_oc.empty()) kv_["emu.cpu_tuning"] = cpu_oc;
   if (const auto it = kv_.find("emu.cpu_tuning"); it != kv_.end()) {
     const std::string& t = it->second;
@@ -120,8 +117,6 @@ bool Config::store(const std::string& path, const std::string& key, const std::s
     std::string line;
     while (std::getline(f, line)) lines.push_back(line);
   }
-  // Find the section, then the key within it; insert after the section's
-  // last line if the key is missing; append the section if that is missing.
   size_t sec_start = std::string::npos, sec_end = lines.size();
   for (size_t i = 0; i < lines.size(); ++i) {
     const std::string t = trim(lines[i]);
@@ -144,7 +139,7 @@ bool Config::store(const std::string& path, const std::string& key, const std::s
       if (eq != std::string::npos && trim(t.substr(0, eq)) == name) { lines[i] = entry; done = true; break; }
     }
     if (!done) {
-      size_t at = sec_end;   // before the blank lines that precede the next section
+      size_t at = sec_end;
       while (at > sec_start + 1 && trim(lines[at - 1]).empty()) --at;
       lines.insert(lines.begin() + static_cast<long>(at), entry);
     }

@@ -18,9 +18,8 @@
 
 namespace ds::mem {
 
-// On by default where the JIT reads the views (AArch64 and ARMv7 with the JIT
-// built in); DS_FASTMEM=0 turns it off, DS_FASTMEM=1 turns it on anywhere else
-// (the views are then built and verifiable, and nothing reads them).
+// Default on where the JIT reads views (AArch64/ARMv7 with JIT); DS_FASTMEM
+// overrides.
 bool fastmem_requested() {
 #if (defined(__aarch64__) || defined(__arm__)) && DSPERATE_JIT
   constexpr bool kDefault = true;
@@ -37,8 +36,7 @@ namespace {
 
 constexpr long TMPFS_MAGIC_ = 0x01021994;
 
-// memfd_create by number: glibc before 2.27 has no wrapper, and a kernel
-// before 3.17 has no call (ENOSYS) -- the A30's 3.4 is one.
+// By syscall number: glibc < 2.27 has no wrapper; kernel < 3.17 has no call.
 int try_memfd() {
 #if defined(SYS_memfd_create)
   return static_cast<int>(syscall(SYS_memfd_create, "dsperate-guest", 1u /* MFD_CLOEXEC */));
@@ -47,12 +45,10 @@ int try_memfd() {
 #endif
 }
 
-// An unlinked file on a tmpfs: the same pages as a memfd, just with a name for
-// a moment. A disk-backed directory is refused -- MAP_SHARED on it would write
-// guest RAM to storage -- and so is a tmpfs without room for the whole object:
-// the file is sparse, so a small one (spruce mounts /dev, and with it
-// /dev/shm, at 512 KB) accepts the ftruncate and then raises SIGBUS on the
-// first guest page past its limit.
+// An unlinked file on a tmpfs, as fallback for no memfd. Disk-backed
+// directories are refused (MAP_SHARED would write guest RAM to storage), as
+// is a tmpfs without room for the whole object (else the sparse file
+// SIGBUSes on the first page past its limit).
 int try_tmpfs(size_t bytes, const char** where) {
   static const char* const dirs[] = {"/dev/shm", "/tmp/shm", "/tmp"};
   for (const char* d : dirs) {
@@ -79,7 +75,7 @@ std::unique_ptr<HostArena> HostArena::create(size_t bytes) {
   a->fd_ = try_memfd();
   if (a->fd_ >= 0) a->kind_ = "memfd";
   else if ((a->fd_ = try_tmpfs(size, &where)) >= 0) a->kind_ = where;
-  else return nullptr;
+  else return nullptr;   // no arena, no views: caller falls back
   if (ftruncate(a->fd_, static_cast<off_t>(size)) != 0) return nullptr;
   void* p = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, a->fd_, 0);
   if (p == MAP_FAILED) return nullptr;
@@ -122,11 +118,11 @@ void GuestView::note_all() {
   for (u32 v = 0; v < SPAN / HOST_PAGE; ++v) note(v << 1);
 }
 
-// What view page `v` should be, from the table: both 2 KB halves backed by the
-// arena at consecutive offsets starting on a 4 KB boundary, outside VRAM.
+// What view page `v` should be: both 2 KB halves backed by the arena at
+// consecutive offsets starting on a 4 KB boundary, outside VRAM.
 GuestView::Laid GuestView::desired(u32 v) const {
   const u32 a0 = v * HOST_PAGE;
-  if ((a0 >> 24) == 0x06) return {};   // VRAM: its traps toggle every frame; the table serves it
+  if ((a0 >> 24) == 0x06) return {};   // VRAM: traps toggle every frame
   u32 off[2];
   bool writable = true;
   for (int h = 0; h < 2; ++h) {
@@ -171,8 +167,6 @@ bool GuestView::protect_run(u32 v0, u32 n, bool writable) {
   return true;
 }
 
-// What stays laid of `l` once the table wants `d`: the tighter of the two
-// (the grant side is fault()'s).
 static inline bool same_backing(u32 a_plus1, u32 b_plus1) { return a_plus1 && a_plus1 == b_plus1; }
 
 bool GuestView::flush() {
@@ -181,9 +175,8 @@ bool GuestView::flush() {
   const auto t0 = std::chrono::steady_clock::now();
   std::sort(pending_.begin(), pending_.end());
   bool ok = true;
-  // Two kinds of restriction, each coalesced over consecutive pages: take the
-  // page away (the backing moved or the table stopped serving it), or drop a
-  // read-write page to read-only (same backing: an mprotect).
+  // Coalesces consecutive pages: take away (backing moved / table stopped
+  // serving), or drop rw to ro (same backing: mprotect).
   size_t i = 0;
   while (i < pending_.size()) {
     const u32 v0 = pending_[i];
@@ -223,9 +216,7 @@ bool GuestView::fault(uintptr_t addr) {
   const Laid d0 = desired(v0), l0 = laid_[v0];
   if (!d0.off_plus1 || (same_backing(l0.off_plus1, d0.off_plus1) && l0.writable >= d0.writable)) return false;   // the table refuses too
   if (moved_[v0] >= kVolatile) { ++stats_.volatile_refusals; return false; }
-  // Grant a run: the following pages the table serves the same way at
-  // consecutive offsets that are not yet laid so (one mmap for a buffer's
-  // first touch instead of one fault per page).
+  // Grant a run of consecutive pages too (one mmap, not one fault each).
   constexpr u32 kRun = 256;
   u32 n = 1;
   while (n < kRun && v0 + n < SPAN / HOST_PAGE) {
@@ -250,8 +241,6 @@ bool GuestView::verify(std::string* why) {
       *why = buf;
       return false;
     }
-    // Independent of desired(): each half must be what the table itself
-    // hands the interpreter, and the bytes through the view must be those.
     for (int h = 0; h < 2; ++h) {
       const u32 a = v * HOST_PAGE + static_cast<u32>(h) * PAGE_SIZE;
       const u8* t = table_.read_ptr(a);

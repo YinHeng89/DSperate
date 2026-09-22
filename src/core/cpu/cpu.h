@@ -9,14 +9,10 @@ namespace ds {
 struct NDS;
 
 // Per-CPU state, shared by the interpreter and (on AArch64) the recompiler.
-//
-// Layout is a contract with the JIT, so the struct is `standard-layout`,
-// offsets are static_asserted, and fields the JIT touches are
-// grouped into `JitHot` so they sit within one signed-9-bit / scaled-12-bit
-// immediate range of a single base register.
-//
-// The page table is a *separate* 16 MiB allocation pointed to by `page_table`;
-// the JIT keeps that pointer pinned in a register (jit_internal.h).
+// Layout is a contract with the JIT: standard-layout, offsets static_asserted,
+// JIT-touched fields grouped into `JitHot` to fit one base-register-relative
+// immediate range. `page_table` points to a separate 16 MiB allocation the
+// JIT keeps pinned in a register (jit_internal.h).
 
 enum class Mode : u8 {
   USR = 0x10, FIQ = 0x11, IRQ = 0x12, SVC = 0x13, ABT = 0x17, UND = 0x1B, SYS = 0x1F
@@ -37,8 +33,8 @@ struct JitHot {
 struct CpuContext {
   Cpu  which;
   bool halted;
-  s32  preempt_residual = 0;  // budget handed back when a DMA started by this CPU cuts its slice short (see Scheduler)
-  bool yielded = false;       // Scheduler::yield: the residual is not to be resumed; the other CPU runs first
+  s32  preempt_residual = 0;  // budget handed back when a DMA cuts this CPU's slice short
+  bool yielded = false;       // Scheduler::yield: residual not resumed; other CPU runs first
   bool jumped;       // set by jump(); cleared by the interpreter before each instruction
   u8   _pad0[5];
 
@@ -63,78 +59,57 @@ struct CpuContext {
   u32 dtcm_base, dtcm_mask;// DTCM window: (addr & dtcm_mask) == dtcm_base
 
   // ---- cycle accounting ----
-  // Per-4 KB timing for the ARM9: [0] code cost in ARM9 cycles or 0xFF when
-  // the page is instruction-cacheable; [1] load N16, [2] load N32, [3] load
-  // S32, [5..7] the same for stores (ARM9 cycles; [4] unused). Per-32 KB for
-  // the ARM7: N16, S16, N32, S32.
+  // Per-4 KB timing (ARM9): [0] code cost or 0xFF if instruction-cacheable;
+  // [1] load N16, [2] load N32, [3] load S32, [5..7] same for stores ([4]
+  // unused). Per-32 KB (ARM7): N16, S16, N32, S32.
   const u8 (*timing9)[8];
   const u8 (*timing7)[4];
-  // ARM7 precomputed data cost (mem::Timing::cost7), used by the recompiler's
-  // single-access path; it reaches this from timing7 with one add.
-  const u8* cost7;
+  const u8* cost7;   // ARM7 precomputed data cost (mem::Timing::cost7)
   u32 code_cycles;         // ARM9: cost of the most recent prefetch. ARM7: code-region table index.
   u32 data_cycles;         // accumulated data-access cost of the current instruction
   u32 code_region, data_region;   // high byte of the address (ARM7 main-RAM overlap rules)
   u8  _pad1;
   bool branch_fetch;       // ARM9: the next prefetch is the first after a branch
 
-  // Cycles this CPU owes before it executes anything: melonDS charges its
-  // reset and direct-boot pipeline fills as pending cycles ahead of the first
-  // instruction (136 ARM9 core cycles and 15 ARM7 cycles on a DSi), and a
-  // DSiWare loader measures the ARM7 against the ARM9 at boot. Consumed by
-  // the scheduler out of the first budgets; zero on a DS.
+  // Cycles owed before executing anything: reset/direct-boot pipeline fills,
+  // and a DSiWare loader measuring ARM7 against ARM9 at boot. Zero on a DS.
   s32  boot_stall = 0;
-  // DSi only (melonDS parity): the ARM9's sequential code-fetch cost is
-  // latched at each jump from the page jumped to (melonDS RegionCodeCycles)
-  // and not re-read per instruction, so fetches right after a CP15 write
-  // keep the old price until the next branch. 0 = read the table (DS).
+  // DSi: ARM9 sequential code-fetch cost is latched at each jump, not re-read
+  // per instruction, so it can go stale after a CP15 write. 0 = read the table (DS).
   u8   code_latch = 0;
-  // DSi (melonDS parity): melonDS tests for a pending IRQ after each
-  // instruction, so one raised while a CPU was not running is taken only
-  // after that CPU's next instruction. irq_offline is set by Io::update_irq
-  // when the request lands off-slice; the scheduler turns it into
-  // irq_skip_once at the CPU's next phase start, and check_irq honours it.
+  // DSi: a pending IRQ is only taken after the CPU's next instruction. Set by
+  // Io::update_irq when off-slice; scheduler turns it into irq_skip_once.
   bool irq_offline = false, irq_skip_once = false;
-  // DSi: the cost of an instruction that started an immediate DMA is charged
-  // after the next instruction, not before the DMA (melonDS breaks out of
-  // its loop on the DMA stop before adding the instruction's Cycles, which
-  // stay pending until the CPU resumes). Set by Scheduler::run_cpu, charged
-  // by the interpreter loop.
+  // DSi: cost of an instruction that started an immediate DMA is charged
+  // after the next instruction, not before the DMA.
   s32  defer_cost = 0;
-  // Debug single-stepping: when step_limit != 0 the interpreter stops after
-  // that many instructions regardless of the cycle budget.
+  // Debug single-stepping: interpreter stops after step_limit instructions if nonzero.
   u32 step_limit, steps;
-  // Budget at the moment the CPU halted (the run loops then set the budget
-  // to -1 to end the slice). Lets a harness compare consumed cycles across
-  // engines when a trial ends in a halt.
+  // Budget when the CPU halted, for comparing consumed cycles across engines.
   s32 budget_at_halt;
 
   mem::PageTable page_table;
 
   NDS* nds;
 
-  // Recompiler hooks (null when the CPU runs on the interpreter). The timing
-  // callback fires whenever the per-page cost table or the TCM windows change,
-  // since translated code bakes those costs in.
+  // Recompiler hooks (null on the interpreter). jit_timing_changed fires when
+  // the per-page cost table or TCM windows change.
   void (*jit_timing_changed)(CpuContext&) = nullptr;
   void* jit = nullptr;
 
   void reset(Cpu which, NDS* nds);
-  template <class S> void sync_state(S& s);   // registers and CP15; the page table and timing pointers are rebuilt (Bus::relink)
+  template <class S> void sync_state(S& s);   // page table/timing pointers rebuilt by Bus::relink
 
-  // Mode handling. `switch_mode` banks r8-r14 and SPSR as needed.
-  void switch_mode(u32 new_mode);
+  void switch_mode(u32 new_mode);    // banks r8-r14 and SPSR as needed
   void set_cpsr(u32 value);          // full write incl. mode switch
   void restore_cpsr();               // CPSR <- SPSR (exception return)
 
-  // Exceptions. `return_offset` is added to the current r15 to form LR.
   enum class Exception : u8 { Reset, Undefined, Swi, PrefetchAbort, DataAbort, Irq, Fiq };
   void raise_exception(Exception e);
   void update_tcm_windows();         // recompute itcm_size/dtcm_base/dtcm_mask from CP15
   void check_irq();                  // take a pending IRQ if unmasked
 
-  // Control flow. `addr` bit 0 selects Thumb when `interwork`.
-  void jump(u32 addr, bool interwork);
+  void jump(u32 addr, bool interwork);   // `addr` bit 0 selects Thumb when `interwork`
   bool thumb() const { return hot.cpsr & 0x20; }
   u32  exception_base() const;
 };

@@ -69,11 +69,10 @@ bool Lid::poll(bool& closed) {
     input_event ev;
     bool any = false;
     while (read(fd_, &ev, sizeof ev) == static_cast<ssize_t>(sizeof ev)) any = true;
-    if (any) switch_state(fd_, closed_);       // the absolute state, whatever the burst was
+    if (any) switch_state(fd_, closed_);
   }
 #endif
-  // A suspend the switch did not tell us about (no switch, or the host froze
-  // before we saw the event): the clocks drifted apart by more than a second.
+  // No switch (or host froze before the event): clocks drifted >1s apart.
   const s64 skew = clock_ns(CLOCK_BOOTTIME) - clock_ns(CLOCK_MONOTONIC);
   if (skew - skew_ns_ > 1000000000 && fd_ < 0) { pulse_ = 6; std::fprintf(stderr, "lid: host resumed from suspend; pulsing the lid\n"); }
   skew_ns_ = skew;

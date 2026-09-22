@@ -2,9 +2,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // DSperate - Nintendo DS emulator. Copyright (C) 2026 DSperate contributors.
 //
-// ARM-state executor. Semantics per the ARM Architecture Reference Manual
-// (ARMv5TE); melonDS is the behavioural reference for DS-specific corners,
-// including *where* each instruction charges its cycles (cpu_cycles.h).
+// ARM-state executor (ARMv5TE). melonDS is the behavioural reference for
+// DS-specific corners, including where each instruction charges its cycles.
 #include "core/cpu/interp/interp_internal.h"
 #include "core/cpu/cp15.h"
 
@@ -96,7 +95,7 @@ void ldr_str(CpuContext& cpu, u32 instr, u32 offset) {
   if (l) {
     u32 v = b ? mem_read8(cpu, ea) : rotr32(mem_read32(cpu, ea), (ea & 3) * 8);
     if (wb) R(cpu, rn) = wbv;       // writeback before load-to-PC check; Rd==Rn: loaded value wins
-    charge_CDI(cpu);                // before the jump (melonDS A_LDR)
+    charge_CDI(cpu);                // before the jump
     if (rd == 15) { cpu.jump(v, is_arm9(cpu)); return; }
     R(cpu, rd) = v;
     return;
@@ -181,20 +180,16 @@ void ldm_stm(CpuContext& cpu, u32 instr, bool load) {
     if (pc_loaded) {
       if (s) cpu.restore_cpsr();
       cpu.jump(pc_val, is_arm9(cpu) && !s);
-      charge_CDI_after_jump(cpu);   // after the jump (melonDS A_LDM): new pc, state, code region
+      charge_CDI_after_jump(cpu);   // after the jump: new pc, state, code region
     } else charge_CDI(cpu);
   } else {
     for (u32 i = 0; i < 16; ++i) {
       if (!(list & (1u << i))) continue;
       u32 v = R(cpu, i);
       if (i == 15) v += 4;
-      // STM with Rn in list: first register stores the original base, later ones the written-back value.
+      // STM Rn-in-list: first reg stores original base, later ones the writeback value.
       if (i == rn && !first && w) v = wb;
-      // DS_MELON_STM=1: melonDS's ARM7 stores the slot's own address for a
-      // non-first base register, writeback or not (A_STM, "checkme"). Not
-      // hardware (GBATEK: old base, or the new base with writeback), so only
-      // for trace comparison against melonDS -- a TwlSDK context save
-      // (stmia r1, {r0-r14}) leaves the resumed thread's r1 4 bytes apart.
+      // DS_MELON_STM=1: match melonDS's non-hardware ARM7 STM Rn-in-list quirk.
       static const bool melon_stm = std::getenv("DS_MELON_STM") != nullptr;
       if (melon_stm && i == rn && !first && !is_arm9(cpu)) v = addr;
       mem_write32(cpu, addr, v, !first); addr += 4;
@@ -316,7 +311,7 @@ void exec_arm(CpuContext& cpu, u32 instr) {
     R(cpu, rd) = r;
     if (instr & (1u << 20)) {
       set_nz(cpu, r);
-      if (!is_arm9(cpu)) cpu.hot.cpsr &= ~FLAG_C;   // ARM7: carry destroyed (melonDS)
+      if (!is_arm9(cpu)) cpu.hot.cpsr &= ~FLAG_C;   // ARM7: carry destroyed
     }
     charge_CI(cpu, mul_cycles(cpu, instr & (1u << 20), rs_v, true, op == AOp::Mla ? 1 : 0));
     return;
@@ -404,9 +399,8 @@ void exec_arm(CpuContext& cpu, u32 instr) {
   case AOp::Swp: case AOp::Swpb: {
     const u32 rn = (instr >> 16) & 0xF, rd = (instr >> 12) & 0xF, rm = instr & 0xF;
     const u32 addr = R(cpu, rn);
-    // The swap's store is a second non-sequential access, and both are
-    // charged (melonDS A_SWP: read N + write N); a non-sequential data_cost
-    // restarts the count, so the read's cost is carried over by hand.
+    // Read and store both charge non-sequential; carry the read's cost by
+    // hand since a non-sequential data_cost restarts the count.
     if (op == AOp::Swpb) { u8 old = mem_read8(cpu, addr); const u32 d = cpu.data_cycles; mem_write8(cpu, addr, static_cast<u8>(R(cpu, rm))); cpu.data_cycles += d; R(cpu, rd) = old; }
     else { u32 old = rotr32(mem_read32(cpu, addr), (addr & 3) * 8); const u32 d = cpu.data_cycles; mem_write32(cpu, addr, R(cpu, rm), false); cpu.data_cycles += d; R(cpu, rd) = old; }
     charge_CDI(cpu);
@@ -417,7 +411,7 @@ void exec_arm(CpuContext& cpu, u32 instr) {
   case AOp::Stm: ldm_stm(cpu, instr, false); return;
 
   case AOp::Swi:
-    if ((cpu.nds->dsi_font_hle || cpu.nds->dsi_loader_watch) && cpu.nds->dsi_hle_swi(cpu, (instr >> 16) & 0xFF)) return;   // see NDS::dsi_hle_swi
+    if ((cpu.nds->dsi_font_hle || cpu.nds->dsi_loader_watch) && cpu.nds->dsi_hle_swi(cpu, (instr >> 16) & 0xFF)) return;
     cpu.raise_exception(CpuContext::Exception::Swi); return;
   case AOp::Bkpt: cpu.raise_exception(CpuContext::Exception::PrefetchAbort); return;
 

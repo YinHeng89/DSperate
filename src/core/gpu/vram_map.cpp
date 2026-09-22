@@ -9,9 +9,7 @@ namespace ds::gpu {
 constexpr u32 VramMap::BANK_MASK[9];
 
 void VramMap::add(VramView& v, u32 base, u32 len, int bank) {
-  // `base`/`len` in bytes within the view; a bank smaller than the view
-  // region mirrors within it (F/G at +0x8000 in BG-A etc. are handled by the
-  // caller passing each mirror).
+  // `base`/`len` in bytes within the view; caller passes each mirror separately.
   for (u32 off = 0; off < len; off += VramView::BLOCK) {
     const u32 b = ((base + off) & v.addr_mask()) / VramView::BLOCK;
     v.mask[b] |= static_cast<u16>(1u << bank);
@@ -19,8 +17,7 @@ void VramMap::add(VramView& v, u32 base, u32 len, int bank) {
 }
 
 void VramMap::finish(VramView& v) {
-  // A view smaller than a block (the OBJ extended palettes, 8 KB) is one
-  // partial block: it still gets its direct pointer.
+  // A view smaller than a block still gets its direct pointer.
   const u32 nblocks = v.blocks() ? v.blocks() : 1;
   for (u32 b = 0; b < nblocks; ++b) {
     const u32 m = v.mask[b];
@@ -45,8 +42,7 @@ void VramMap::rebuild(const u8 vramcnt[9], u8* const banks[9]) {
     const u8 cnt = vramcnt[i];
     if (!(cnt & 0x80)) continue;
     const u32 mst = cnt & 7, ofs = (cnt >> 3) & 3;
-    // Which modes have no CPU mapping (see generation()); everything else,
-    // including the invalid modes, counts as writable.
+    // Modes with no CPU mapping (see generation()); everything else counts as writable.
     const bool unmapped = (i <= 3 && (mst & (i <= 1 ? 3u : 7u)) == 3) || (i == 4 && (mst == 3 || mst == 4)) ||
                           ((i == 5 || i == 6) && mst >= 3 && mst <= 5) || (i == 7 && (mst & 3) == 2) || (i == 8 && (mst & 3) == 3);
     if (!unmapped) writable_gen_[i] = gen_;

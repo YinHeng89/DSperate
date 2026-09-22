@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // DSperate - Nintendo DS emulator. Copyright (C) 2026 DSperate contributors.
 //
-// The per-frame host time report both frontends print at the end of a run.
-// It lives here, and not in either main.cpp, so the two cannot drift: the
-// whole point of the numbers is that a headless replay and an SDL replay of the
-// same scene can be put side by side.
-//
-// What goes in the series matters as much as the statistics. It must be
-// emulation work only -- frame pacing (vsync in the present, or the audio
-// queue) must be left out, or the tail stops measuring the emulator and
-// starts measuring the display refresh, and every frame pins to 16.7 ms.
+// Per-frame host time report shared by both frontends so headless and SDL
+// runs stay comparable. The input series must be emulation work only --
+// frame pacing (vsync, audio queue) must be excluded or the tail measures
+// display refresh instead of the emulator.
 #pragma once
 
 #include <algorithm>
@@ -18,20 +13,12 @@
 
 namespace ds {
 
-// A DS frame is 1/59.8261 s. A frame that takes longer than that is one the
-// emulator could not deliver in real time -- which is what a dropped frame
-// and an audio underrun actually are. The mean hides these completely: a
-// change can improve the mean while making the tail worse, and the tail is
-// what is felt. Report both.
+// DS frame period. Frames over budget are dropped/underrun frames; report
+// both mean and tail since the mean can improve while the tail worsens.
 inline constexpr double kFrameBudgetMs = 1000.0 / 59.8261;
 
-// `label` names the series: the default "frame" is the emulation-only slice
-// described above. The SDL frontend also prints a "work" series (emulation +
-// present, pacing still excluded) because a change can move cost between the
-// two slices -- per-scanline scaling deliberately does -- and then neither
-// slice alone can say what happened to the over-budget clusters. The work
-// series is only meaningful with the present unblocked (--no-vsync);
-// with vsync on its tail measures the display refresh, as above.
+// `label` names the series. SDL also prints a "work" series (emulation +
+// present, pacing excluded), meaningful only with --no-vsync.
 inline void frame_report(const std::vector<double>& frame_ms, const char* label = "frame") {
   if (frame_ms.empty()) return;
   std::vector<double> v = frame_ms;
@@ -40,18 +27,14 @@ inline void frame_report(const std::vector<double>& frame_ms, const char* label 
   const size_t n = v.size();
   auto pct = [&](double p) { return v[std::min(n - 1, static_cast<size_t>(p * n))]; };
   size_t over = 0; for (double x : v) if (x > kFrameBudgetMs) ++over;
-  // p95 is the single-number tier the bar is set on (scoping doc SS3.33): a DS
-  // run is part loading screen and cart loads legitimately spend frame time,
-  // so p99 over such a run largely measures the loading. p99 and max stay
-  // here because that is where a driver stall shows, but they do not gate.
+  // p95 is the gating tier; p99/max are reported but not gated on since
+  // loading screens legitimately spend frame time there.
   std::fprintf(stderr, "%s ms: median %.3f mean %.3f p90 %.3f p95 %.3f p99 %.3f max %.3f min %.3f total %.1f\n",
                label, v[n / 2], sum / n, pct(0.90), pct(0.95), pct(0.99), v.back(), v.front(), sum);
   std::fprintf(stderr, "%s budget: %zu of %zu frames over %.3f ms (%.2f%%)\n",
                label, over, n, kFrameBudgetMs, 100.0 * static_cast<double>(over) / static_cast<double>(n));
 
-  // Where the overruns are, not just how many. A count says the run stutters;
-  // this says which frames to re-run with --dump-from/--dump-count and look
-  // at. `frame_ms` is in run order, unlike the sorted copy above.
+  // Locate overruns for --dump-from/--dump-count; frame_ms is in run order.
   if (!over) return;
   size_t worst_i = 0, bursts = 0, longest = 0, longest_at = 0, cur = 0, cur_at = 0;
   for (size_t i = 0; i < frame_ms.size(); ++i) {
@@ -63,8 +46,7 @@ inline void frame_report(const std::vector<double>& frame_ms, const char* label 
   }
   std::fprintf(stderr, "  worst frame #%zu at %.3f ms; %zu bursts, longest %zu frames from #%zu\n",
                worst_i, frame_ms[worst_i], bursts, longest, longest_at);
-  // Ten windows over the run: a flat row is steady load, a spike is a
-  // section that chugs and is worth dumping.
+  // Ten windows over the run; a spike marks a section worth dumping.
   constexpr size_t W = 10;
   const size_t span = (frame_ms.size() + W - 1) / W;
   std::fprintf(stderr, "  over-budget per %zu-frame window:", span);

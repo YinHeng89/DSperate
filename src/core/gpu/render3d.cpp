@@ -34,10 +34,8 @@ namespace ds::gpu {
 std::atomic<unsigned> g_gpu_stalls{0};
 
 
-// DS_EDGE_MOCK=<file>: turns the sub-pixel edge mode on and appends, per rendered
-// frame, the 3D output (u32) and its split map (two u32 slots a pixel) for tools/edge_mock.py.
-// Record i is frame i, so it lines up with --dump-frames; DS_EDGE_MOCK_FROM
-// skips the records before it.
+// DS_EDGE_MOCK=<file>: enables sub-pixel edge mode, appends per-frame 3D
+// output + split map (2 u32/pixel). DS_EDGE_MOCK_FROM skips leading records.
 namespace edge_mock {
 const char* path() { static const char* p = std::getenv("DS_EDGE_MOCK"); return p; }
 bool on() { static const bool v = path() != nullptr; return v; }
@@ -50,11 +48,8 @@ namespace compat = kern::compat;
 
 // ---- interpolation --------------------------------------------------------------
 //
-// Attributes are not divided per pixel. A perspective-correct factor between
-// the two endpoints is computed (9 fractional bits along Y, 8 along X) and the
-// attribute is then interpolated linearly by that factor. When both W values
-// are equal (with low bits clear) the factor is skipped and the interpolation
-// is plainly linear, which is what 2D-style polygons want.
+// Perspective-correct factor (9 fractional bits along Y, 8 along X) between
+// endpoints; skipped for plain linear interpolation when w0 == w1 (low bits clear).
 
 template <int dir>
 void Renderer3D::Interp<dir>::setup(s32 x0_, s32 x1_, s32 w0, s32 w1, bool wbuf) {
@@ -85,9 +80,8 @@ template <int dir>
     if (y0 < y1) return y0 + static_cast<s32>((static_cast<s64>(y1 - y0) * yfactor) >> shift);
     return y1 + static_cast<s32>((static_cast<s64>(y0 - y1) * ((1 << shift) - yfactor)) >> shift);
   }
-  // Linear: d * f / xdiff with d < 2^17 (colours, texture coordinates) and
-  // f <= xdiff < 2^9, so the product fits 32 bits; q = (n * ceil(2^32/xdiff))
-  // >> 32 is the quotient or one too many, and one compare fixes it.
+  // d*f/xdiff via reciprocal (d<2^17, f<=xdiff<2^9 so product fits 32 bits);
+  // q may be one too many, corrected by the compare below.
   const u32 d = static_cast<u32>(y0 < y1 ? y1 - y0 : y0 - y1), f = static_cast<u32>(y0 < y1 ? x : xdiff - x);
   u32 q;
   if (recip) {
@@ -208,11 +202,9 @@ void Renderer3D::Slope<side>::edge_params(bool aa, s32* length, s32* coverage) c
   if (!aa) { *coverage = 0; return; }
   if (increment == 0) { *coverage = swapped ? 0 : 31; return; }
   s32 cov = ((dx >> 9) + (increment >> 10)) >> 4;
-  // The edge's position is taken mid-line. When that is already in the next pixel along its
-  // travel, the hardware calls this pixel fully covered (and never draws that next one); the
-  // split map wants to know where the edge really is, so the coverage it would have had in
-  // that pixel rides along in bits 16-20 with bit 21 set (see extract_splits). The hardware's
-  // own value comes out 31 for an edge travelling outwards and 0 for one travelling inwards.
+  // Saturated (mid-line position spills into the next pixel): hardware treats this
+  // pixel as fully covered; the true coverage rides in bits 16-20 with bit 21 set
+  // for the split map (see extract_splits).
   const bool sat = (cov >> 5) != (dx >> 18);
   s32 raw = cov & 0x1F;
   if (sat) cov = 31;
@@ -226,17 +218,11 @@ void Renderer3D::Slope<side>::edge_params(bool aa, s32* length, s32* coverage) c
 
 // ---- pixel pipeline ---------------------------------------------------------------
 
-// Fixed set of band workers. dispatch() only publishes the job and notifies, so
-// every band runs on a pool thread and the emulation thread renders none of them
-// -- it goes on emulating and pays only what it later blocks for in sync_line.
-// A frame costs one broadcast and one barrier; the threads are created once and
-// parked on a condition variable in between, never per frame.
-//
-// So Pool(n) is n threads *in addition to* the emulation thread, and
-// DS_R3D_THREADS=N asks for N of them. N of 0 is a different shape
-// entirely: band_count returns 0, render() takes the `maxb == 0`
-// path, and the raster runs inline on the emulation thread with no pool.
-// N of 1 is one worker beside the emulation thread.
+// Fixed pool of band workers, parked on a condition variable between frames.
+// dispatch() only publishes the job and notifies; the emulation thread never
+// rasters a band itself, it blocks on sync_line only when it needs one.
+// Pool(n) is n threads in addition to the emulation thread (DS_R3D_THREADS=N).
+// N=0: band_count is 0 and render() rasters inline with no pool.
 struct Renderer3D::Pool {
   explicit Pool(u32 n) : start_(new std::condition_variable[n]) {
     threads_.reserve(n);
@@ -249,24 +235,21 @@ struct Renderer3D::Pool {
   }
   u32 workers() const { return static_cast<u32>(threads_.size()); }
 
-  // Hand the bands to the workers and return. The caller (the emulation
-  // thread) carries on and waits per band, at the line each band's output is
-  // first read -- see Renderer3D::sync_line.
-  // Returns the generation of this dispatch, which is what wait_bits takes.
+  // Hands bands to workers and returns; caller blocks per-band in sync_line
+  // at the line each band's output is first read. Returns this dispatch's
+  // generation (see wait_bits).
   u64 dispatch(const std::function<void(u32)>& fn, u32 jobs, u32 bins) {
     u64 gen;
     {
       std::lock_guard<std::mutex> lk(m_);
-      // Only the first `jobs` workers are woken and counted: the pool is sized
-      // for the most workers a frame can get, and a frame given fewer (one,
-      // on two cores) must not pay a wake-up per idle thread.
+      // Cap to actual workers: a frame given fewer jobs than the pool holds
+      // must not wake idle threads.
       if (jobs > workers()) jobs = workers();
       job_ = &fn; jobs_ = jobs; remaining_.store(jobs, std::memory_order_relaxed);
       done_bits_.store(0, std::memory_order_relaxed);
       nbins_ = bins;
-      // Before the generation bump, not after: a worker that wakes on the new
-      // generation must never see the previous frame's exhausted counter and
-      // conclude there is nothing to do.
+      // next_bin_ reset must precede the generation bump, or a worker waking
+      // on the new generation could see the old exhausted counter.
       next_bin_.store(0, std::memory_order_relaxed);
       gen = generation_.fetch_add(1, std::memory_order_acq_rel) + 1;
     }
@@ -274,10 +257,8 @@ struct Renderer3D::Pool {
     return gen;
   }
 
-  // The next bin no worker has taken, or >= nbins when they are all claimed.
-  // Bins are handed out in ascending Y so the top of the frame is always the
-  // work in flight first -- that is the deadline order, since band b's output
-  // is first read at display line bin_y_[b].
+  // Next unclaimed bin (>= nbins once exhausted). Handed out in ascending Y,
+  // matching the deadline order: band b is first read at display line bin_y_[b].
   u32 claim() { return next_bin_.fetch_add(1, std::memory_order_acq_rel); }
   u32 bins() const { return nbins_; }
 
@@ -286,22 +267,11 @@ struct Renderer3D::Pool {
     done_.notify_all();
   }
 
-  // Returns how long the caller was actually blocked, in nanoseconds.
-  //
-  // Most display lines find their bin already drawn, so the common case takes
-  // no lock at all and costs one atomic load -- which is also what keeps the
-  // clock reads off the fast path. The blocking case is the signal the thread
-  // count is chosen from: it is the emulation thread standing still, waiting
-  // for a strip of the frame it is about to composite.
-  //
-  // `gen` names the dispatch whose bins are meant: a wait for a generation
-  // that has since been superseded returns at once, since a dispatch only
-  // ever follows wait_idle on the one before it -- every bin of the old
-  // generation is done by then. The compositor of frame N asks for frame N's
-  // bands after the emulation thread has dispatched N+1 at line 215, and
-  // without the generation check it would be waiting on N+1's done bits,
-  // for ever if N+1 has fewer bins. Generation is read before the bits so
-  // that a reset between the two is caught by the locked re-check.
+  // Blocks until `mask`'s bins of dispatch `gen` are done; returns ns blocked.
+  // Fast path (bin already drawn) takes no lock. A stale `gen` (superseded by
+  // a later dispatch) returns immediately, since every bin of a generation is
+  // done before the next dispatch -- without this check a wait for frame N
+  // could hang on N+1's bits if N+1 has fewer bins.
   u64 wait_bits(u64 gen, u64 mask) {
     if (!mask) return 0;
     if (generation_.load(std::memory_order_acquire) != gen) return 0;
@@ -316,14 +286,10 @@ struct Renderer3D::Pool {
     return static_cast<u64>((std::chrono::steady_clock::now() - t0).count());
   }
 
-  // Every worker has returned from the job, not merely finished its bins.
-  //
-  // The two are no longer the same. A worker signals a bin from inside the
-  // job (mark_done) so the compositor can read that strip while the rest of
-  // the frame is still being drawn, which means the last bin can be marked
-  // while its worker is still executing -- and the caller of sync_all goes on
-  // to reassign job_fn_, destroying the std::function under it. Bin bits are
-  // what a display line waits for; this is what the frame boundary waits for.
+  // Every worker has returned from the job, not merely finished its bins:
+  // mark_done fires from inside the job, so the last bin can be marked while
+  // its worker still runs, before the caller may reassign job_ (a std::function
+  // reference). Bin bits gate a display line; this gates the frame boundary.
   u64 wait_idle() {
     if (remaining_.load(std::memory_order_acquire) == 0 && thieves_.load(std::memory_order_acquire) == 0) return 0;
     const auto t0 = std::chrono::steady_clock::now();
@@ -433,8 +399,7 @@ u16 Renderer3D::pal16(u32 addr) const {
 
 // ---- pixel pipeline ------------------------------------------------------------
 //
-// Span stage buffers: one entry per pixel of the current span, index 0 at
-// screen x `x0` (the kernels round their counts up to 4: padded).
+// Span stage buffers: one entry per pixel of the span, index 0 at screen x `x0`.
 
 namespace {
 inline u32 c15_to_18(u16 c, u32 shift) { u32 v = (shift == 0 ? (c << 1) : (c >> shift)) & 0x3E; if (v) ++v; return v; }
@@ -462,17 +427,14 @@ void Renderer3D::expand_toon() {
   if (sh.trep) { if (sh.tflip && (t & height)) t = (height - 1) - (t & (height - 1)); else t &= height - 1; }
   else { if (t < 0) t = 0; else if (t >= height) t = height - 1; }
   const u32 texpal = sh.texpal, alpha0 = sh.alpha0;
-  // Cached texels already contain the decoded RGB555 colour and alpha.  Use
-  // them in the scalar sampler too; otherwise non-NEON builds pay the full
-  // dependent VRAM/palette lookup cost despite setup_shade having populated
-  // the same cache for the vector gather path.
+  // Cached texels (from setup_shade) already hold decoded RGB555+alpha; reuse
+  // in the scalar sampler too, or non-NEON builds pay the full lookup anyway.
   if (sh.texels) {
     const u32 packed = sh.texels[static_cast<u32>(t * width + s)];
     *alpha = packed >> 16;
     return packed & 0xFFFF;
   }
   if (sh.tex_ptr) {
-    // Texel and palette reads straight from host memory.
     const u8* tp = sh.tex_ptr; const u16* pp = sh.pal_ptr;
     const u32 off = static_cast<u32>(t * width + s);
     switch (sh.fmt) {
@@ -555,10 +517,8 @@ void Renderer3D::expand_toon() {
 }
 
 
-// Depth test: 'less than' normally (mode 0); 'less or equal' for a
-// front-facing pixel over an opaque back-facing one (mode 1); within a
-// tolerance when the polygon asks for equal-depth testing (mode 2 Z-buffered
-// ±0x200, mode 3 W-buffered ±0xFF).
+// mode 0: less-than. mode 1: less-or-equal for front-facing over opaque
+// back-facing. mode 2/3: equal-depth tolerance, ±0x200 Z-buffered / ±0xFF W-buffered.
 template <int mode>
 [[gnu::always_inline]] inline bool Renderer3D::depth_pass(u32 addr, s32 z, u32 dstattr) const {
   const s32 dstz = static_cast<s32>(depth_[addr]);
@@ -593,7 +553,7 @@ template <bool textured>
   u32 r, g, b, a;
   const u32 blendmode = sh.blendmode;
   if (blendmode == 2) {
-    if (sh.highlight) { vg = vr; vb = vr; }        // highlight: all components from red, toon colour added later
+    if (sh.highlight) { vg = vr; vb = vr; }        // highlight: g/b from red; toon colour added below
     else { u32 tr, tg, tb; rgb15_to_666(sh.toon[vr >> 1], tr, tg, tb); vr = tr; vg = tg; vb = tb; }
   }
   if constexpr (textured) {
@@ -688,17 +648,9 @@ void Renderer3D::setup_right_edge(Edge& e, s32 y) const {
   refresh_edge_state(e);
 }
 
-// Put a polygon's edge cursors back where setup_polygon leaves them: at its
-// own top line, ready to be walked downwards.
-//
-// The chunk loop assumes an entering polygon's cursors still sit at ytop, and
-// with one band per Renderer3D that held -- build_edges put them there and
-// nothing had stepped them yet. With the frame cut into bins claimed by
-// whichever worker is free, one instance renders several bins, and
-// consecutive bins overlap by the line or two that final_pass needs either
-// side of a boundary. A polygon whose ytop falls in that overlap is entered
-// twice on the same instance, and the second entry would otherwise walk from
-// wherever the first entry left the cursors.
+// Reset a polygon's edge cursors to its top line (as setup_polygon leaves
+// them). Needed because a polygon whose ytop falls in the overlap between
+// two bins claimed by the same worker gets entered twice.
 void Renderer3D::rewind_edge(Edge& e) {
   const Polygon& p = *e.poly;
   const u32 n = p.nverts;
@@ -760,46 +712,32 @@ void Renderer3D::setup_polygon(Edge& e, const Polygon& p) {
 
 // ---- scanline rendering ------------------------------------------------------------
 
-// Span stage: the perspective factor, depth and (optionally) the five
-// attributes for screen pixels [xa, xb) of the span [xstart, xend], through
-// the kernels (kern::active). This is Interp<0> (setup, set_x, interpolate,
-// interpolate_z) evaluated for the whole span at once.
-// An upper bound on every factor span_factor(xv, xdiff, wl, wl, wr) yields for
-// 0 <= xv < xdiff, for the attribute kernels' choice of multiply (kernels.h).
-// With xdiff * max(wl, wr) < 2^24 nothing wraps: the numerator 256 * xv * wl
-// and the denominator xv * wl + (xdiff - xv) * wr stay exact and the first is
-// at most 256 times the second, so the quotient is at most 256; the W-constant
-// ramp's step is at most 2^24 / xdiff and xv * step stays below 2^24, so its
-// factors are below 256 too. Otherwise nothing is promised (~0u).
+// Span stage: perspective factor, depth, and (optionally) attributes for
+// [xa, xb) of span [xstart, xend], via kern::active (Interp<0> batched).
+// fac_bound: upper bound on span_factor's output over 0<=xv<xdiff, used by
+// the attribute kernels' multiply (kernels.h). 256 when xdiff*max(wl,wr) <
+// 2^24 (no wraparound in the numerator/denominator); otherwise unbounded (~0u).
 u32 Renderer3D::fac_bound(s32 xdiff, s32 wl, s32 wr) {
 #if defined(__arm__)
   const u64 wmax = std::max(static_cast<u32>(wl), static_cast<u32>(wr));
   return static_cast<u64>(static_cast<u32>(xdiff)) * wmax < (u64{1} << 24) ? 256u : ~0u;
 #else
   (void)xdiff; (void)wl; (void)wr;
-  return ~0u;   // only the ARMv7 kernels use a bound
+  return ~0u;   // only ARMv7 kernels use a bound
 #endif
 }
 
 bool Renderer3D::span_stage(SpanBuf& sb, s32 xstart, s32 xend, s32 xa, s32 xb, s32 wl, s32 wr, s32 zl, s32 zr, bool wbuffer,
                             const s32* al, const s32* ar, bool with_attrs, u32 off) const {
-  // x0 is the screen x that maps to buffer index 0, so a span staged at batch
-  // offset `off` sets it back by that much and every stage indexes correctly.
+  // x0 is the screen x mapping to buffer index 0; offset by `off` for a
+  // span staged at a batch offset.
   sb.x0 = xa - static_cast<s32>(off);
   const u32 n = static_cast<u32>(xb - xa);
   const s32 xdiff = (xend + 1) - xstart;
   const s32 xv0 = xa - xstart;
-  // The factor feeds span_attr_persp (w-buffer depth) and the perspective
-  // attribute kernels. Only the depth needs it across the whole span: the
-  // attributes are staged over the pixels the depth pre-pass leaves alive, so
-  // for a z-buffered span span_attrs computes it there itself, and an occluded
-  // span never computes it at all. On the A30 the factor and the attribute
-  // pass were ~7 % of a heavy frame's raster (2026-09-15). A factor is a
-  // function of its pixel alone, so the values do not depend on the range.
-  // With z constant nothing reads it -- GSDD's title stages 45 k such pixels
-  // a frame (census 2026-08-28).
-  // ARMv7 only: on the A55 it measured flat to slower with the other two
-  // A30 changes, and AArch64 keeps the factor over the whole span.
+  // Factor feeds span_attr_persp (w-buffer depth) and perspective attribute
+  // kernels. ARMv7 only computes it over the whole span when w-buffered and
+  // depths differ; AArch64 always keeps it over the whole span.
 #if defined(__arm__)
   const bool use_factor = xdiff != 0 && wbuffer && zl != zr;
 #else
@@ -807,9 +745,6 @@ bool Renderer3D::span_stage(SpanBuf& sb, s32 xstart, s32 xend, s32 xa, s32 xb, s
   const bool use_factor = xdiff != 0 && (!linear || (wbuffer && zl != zr));
 #endif
   if (use_factor) kern::active::span_factor(xv0, n, xdiff, wl, wl, wr, sb.fac + off);
-  // A constant depth needs no reciprocal or per-pixel interpolation.  Flat
-  // geometry is common in the DS scenes, and keeping this out of the span
-  // kernel also makes the depth pre-pass a straight fill.
   if (xdiff == 0 || zl == zr) kern::active::span_z_const(zl, n, sb.z + off);
   else if (wbuffer) kern::active::span_attr_persp(zl, zr, sb.fac + off, n, sb.z + off, fac_bound(xdiff, wl, wr));
   else kern::active::span_z_linear(zl, zr, xv0, n, xdiff, (1 << 22) / xdiff, sb.z + off);
@@ -817,12 +752,8 @@ bool Renderer3D::span_stage(SpanBuf& sb, s32 xstart, s32 xend, s32 xa, s32 xb, s
   return use_factor;
 }
 
-// Constant-attribute fills for span_attrs. These used to be three libc memset
-// calls plus a scalar loop over sc/tc -- for the 60 % of SM64DS's polygon
-// lines that are eight pixels or shorter, that was ~170 instructions of call
-// overhead and loop to store five constants (qemu hotblocks, 2026-08-27).
-// The buffers carry sixteen entries of slack past any staged span, so whole
-// vectors are stored from `n` rounded up.
+// Constant-attribute fills for span_attrs. Buffers carry 16 entries of slack
+// past any staged span, so `n` is rounded up for whole-vector stores.
 namespace {
 [[gnu::always_inline]] inline void fill_rgb_const(u8* vr, u8* vg, u8* vb, u32 n, const s32* a) {
 #if DSPERATE_NEON
@@ -854,10 +785,6 @@ void Renderer3D::span_attrs(SpanBuf& sb, s32 xstart, s32 xend, s32 ca, s32 cb, s
   const s32 xdiff = (xend + 1) - xstart;
   const s32 xv0 = ca - xstart;
 
-  // Match DraStic's constant-attribute polygon variant: when both ends of the
-  // surviving range agree, no interpolation stage is needed at all.  Keep
-  // the narrowed representations used by the pixel stages, rather than
-  // materialising the old s32 planes just to truncate them again.
   if (attrs_constant || (al[0] == ar[0] && al[1] == ar[1] && al[2] == ar[2] &&
       al[3] == ar[3] && al[4] == ar[4])) {
     fill_rgb_const(sb.vr + off, sb.vg + off, sb.vb + off, n, al);
@@ -871,37 +798,21 @@ void Renderer3D::span_attrs(SpanBuf& sb, s32 xstart, s32 xend, s32 ca, s32 cb, s
 #else
     (void)fac_ready;   // span_stage staged it (ARMv7 alone defers it to here)
 #endif
-    // A span whose colour endpoints agree -- most of them, and every span of
-    // flat-shaded content -- interpolates nothing across r, g and b: fill the
-    // three buffers with the constant and stage only s and t. This is
-    // DraStic's set_buffer8 against interpolate_rgb, which it takes for 83 %
-    // of SM64DS's spans and 100 % of Meteos's.
     if (rgb_constant || (al[0] == ar[0] && al[1] == ar[1] && al[2] == ar[2])) {
       prof::add(prof::C_SPAN_FLAT_RGB, 1);
-      // The kernels write whole vectors past n; match that, the buffers carry
-      // the slack for it.
       fill_rgb_const(sb.vr + off, sb.vg + off, sb.vb + off, n, al);
       kern::active::span_attrs2n(al, ar, sb.fac + off, n, sb.sc + off, sb.tc + off, fac_bound(xdiff, wl, wr));
       return;
     }
     prof::add(prof::C_SPAN_LERP_RGB, 1);
-    // One pass for all five, narrowed as it is stored.
     kern::active::span_attrs5n(al, ar, sb.fac + off, n, sb.vr + off, sb.vg + off, sb.vb + off, sb.sc + off, sb.tc + off, fac_bound(xdiff, wl, wr));
     return;
   }
   if (xdiff == 0) {
-    // Degenerate span: every pixel is the left endpoint.
     fill_rgb_const(sb.vr + off, sb.vg + off, sb.vb + off, n, al);
     fill_st_const(sb.sc + off, sb.tc + off, n, al);
     return;
   }
-  // The linear span gets the same two-way split the perspective one above
-  // does. It used to stage all five attributes as s32 into a 5 KB scratch
-  // buffer and narrow them in a scalar loop, with a 64-bit reciprocal divide
-  // per attribute -- and it never took the constant-colour shortcut at all,
-  // although constant-W content (which is what makes a span linear) is
-  // exactly where flat colour is most common. Meteos takes this branch for
-  // every span it draws.
   if (rgb_constant || (al[0] == ar[0] && al[1] == ar[1] && al[2] == ar[2])) {
     prof::add(prof::C_SPAN_FLAT_RGB, 1);
     fill_rgb_const(sb.vr + off, sb.vg + off, sb.vb + off, n, al);
@@ -935,7 +846,6 @@ void Renderer3D::render_shadow_mask_line(Edge& e, s32 y) {
 
   bool l_fill, r_fill; s32 l_len, r_len, l_cov, r_cov;
   const bool always_fill = (dispcnt_ & ((1 << 4) | (1 << 5))) || (polyalpha < 31 && (dispcnt_ & (1 << 3))) || wireframe || subpix_;
-  // The stencil pass needs the edge lengths only, never the coverage.
   if (xstart > xend) {
     const Vertex &vlnext = gx_->vertex(p.vtx[e.next_vr]), &vrnext = gx_->vertex(p.vtx[e.next_vl]);
     e.right.edge_params<true>(false, &l_len, &l_cov);
@@ -1008,10 +918,8 @@ void Renderer3D::render_shadow_mask_line(Edge& e, s32 y) {
   e.xr = e.right.step();
 }
 
-// Per-pixel resolve of screen pixels [xa, xb) of the current span: stencil,
-// depth test (against the top pixel, then the one underneath), shading,
-// alpha test and the opaque / translucent writes.
-// part: 0 = left edge, 1 = inside, 2 = right edge.
+// Per-pixel resolve of [xa, xb): stencil, depth test (top then under pixel),
+// shading, alpha test, opaque/translucent writes. part: 0=left edge, 1=inside, 2=right edge.
 template <int mode, bool textured, bool aa, bool shadow>
 void Renderer3D::resolve_span(const Shade& sh, const SpanBuf& sb, s32 y, s32 xa, s32 xb, int part, int edge, s32 l_cov, s32 r_cov, s32& xcov) {
   const u32 polyattr = sh.polyattr;
@@ -1020,8 +928,6 @@ void Renderer3D::resolve_span(const Shade& sh, const SpanBuf& sb, s32 y, s32 xa,
   const u8* ra = sb.vr; const u8* ga = sb.vg; const u8* ba = sb.vb;
   const s16* sa = sb.sc; const s16* ta = sb.tc;
   u32 resolved = 0;                // counted once after the loop, not per pixel
-  // Sub-pixel edges: which pixels of an edge part the polygon really draws (the alpha test),
-  // whether or not it wins them -- the batch path's pass plane says as much by itself.
   const bool note = sh.subpix && part != 1 && !shadow;
   u8 drawn[256];
   if (note) std::memset(drawn + xa, 0, static_cast<size_t>(xb - xa));
@@ -1037,8 +943,6 @@ void Renderer3D::resolve_span(const Shade& sh, const SpanBuf& sb, s32 y, s32 xa,
       if (!(st & 2)) dstattr &= ~0xFu;      // no shadow under anti-aliased edges
     }
     const s32 z = sb.z[i];
-    // Failing against the top pixel, try the one underneath -- which only
-    // exists with AA (dispcnt_); without it the pre-pass never named it.
     if (!depth_pass<mode>(addr, z, dstattr)) {
       if (note && (shade_pixel<textured>(sh, ra[i], ga[i], ba[i], sa[i], ta[i]) >> 24) > sh.alpha_ref) drawn[x] = 1;
       if (!aa || !(dstattr & 0xF) || addr >= static_cast<u32>(RSIZE)) continue;
@@ -1085,12 +989,10 @@ void Renderer3D::resolve_span(const Shade& sh, const SpanBuf& sb, s32 y, s32 xa,
   }
 }
 
-// The texture half of a Shade: format, size, VRAM addressing and the direct
-// host pointers. Returns whether the polygon samples through the decoded
-// cache, which is the one thing only the emulation thread may resolve
-// (TextureCache::lookup mutates its map and frame stamps): render() runs this
-// over the list once to record the pointers, and every worker -- job 0
-// included, now that edge setup runs on its pool thread -- reads them back.
+// Texture half of a Shade: format, size, VRAM addressing, direct host
+// pointers. Returns whether the polygon needs the decoded cache, which only
+// the emulation thread may resolve (TextureCache::lookup mutates its map);
+// render() records pointers once and workers just read them back.
 bool Renderer3D::texture_fields(Shade& sh, const Polygon& p) const {
   sh.fmt = (p.texparam >> 26) & 7;
   sh.textured = (dispcnt_ & 1) && sh.fmt != 0;
@@ -1122,25 +1024,19 @@ bool Renderer3D::texture_fields(Shade& sh, const Polygon& p) const {
     const u32 pal_addr = sh.fmt == 2 ? (sh.texpal << 3) : (sh.texpal << 4);
     sh.pal_ptr = reinterpret_cast<const u16*>(direct_range(*palv_, pal_addr, pal_bytes));
   }
-  // The decoded cache wins where sampling from VRAM is a chain of dependent
-  // loads: always for the compressed format, and for any texture the direct
-  // pointers cannot cover. A byte texel plus an L1-resident palette is
-  // cheaper than a word from a four-times-larger decoded array, so the
-  // other formats keep the direct path (measured: Mario & Luigi and Meteos
-  // lost 0.5-1 % with every texture cached).
+  // Decoded cache wins for the compressed format and any texture the direct
+  // pointers can't cover; other formats keep the cheaper direct path.
   return sh.textured && (sh.fmt == 5 || !sh.tex_ptr || !sh.pal_ptr);
 }
 
 void Renderer3D::setup_shade(Shade& sh, const Polygon& p) {
   sh.polyattr = p.attr & 0x3F008000;
   if (!p.facing) sh.polyattr |= (1 << 4);
-  // Edge shaping leaves pixel art alone. A flat, screen-parallel polygon -- every vertex at one w and one depth -- is
-  // a sprite, a logo or a menu plate on a quad; bit 13 (free in the opaque attr) says so to shape_frame. (w alone
-  // would be every polygon of an orthographic scene: NSMB, M&L.)
+  // Edge shaping leaves pixel art alone: bit 13 flags a flat screen-parallel
+  // polygon (sprite/logo/menu plate) or an axis-aligned textured quad whose
+  // texels land one to a pixel (tex is 12.4), for shape_frame.
   if (shape_) {
     bool flat = true; for (u32 i = 1; i < p.nverts; ++i) flat &= p.w[i] == p.w[0] && p.z[i] == p.z[0];
-    // Or pixel art on a quad whatever its depth does (M&L slopes a sprite's z with y to sort it by its feet): an
-    // axis-aligned textured rectangle whose texels land one to a pixel. tex is 12.4.
     bool pix = ((p.texparam >> 26) & 7) != 0 && p.nverts == 4;
     for (u32 i = 0; pix && i < 4; ++i) {
       const Vertex& v0 = gx_->vertex(p.vtx[i]); const Vertex& v1 = gx_->vertex(p.vtx[(i + 1) & 3]);
@@ -1160,9 +1056,7 @@ void Renderer3D::setup_shade(Shade& sh, const Polygon& p) {
   sh.highlight = sh.dispcnt & (1 << 1);
   sh.toon = rs_->toon.data();
   const bool cached = texture_fields(sh, p);
-  // DraStic decides constant attributes at polygon setup.  The endpoint values
-  // are then identical on every scanline, so span_attrs can skip five repeated
-  // comparisons (and take the fill path immediately).
+  // Decided once here so span_attrs can skip the comparison every scanline.
   sh.attrs_constant = true;
   sh.rgb_constant = true;
   const Vertex& v0 = gx_->vertex(p.vtx[0]);
@@ -1174,8 +1068,7 @@ void Renderer3D::setup_shade(Shade& sh, const Polygon& p) {
     if (v.tex[0] != v0.tex[0] || v.tex[1] != v0.tex[1]) sh.attrs_constant = false;
   }
   sh.attrs_constant = sh.rgb_constant && sh.attrs_constant;
-  // The cache was resolved on the emulation thread (render()); every band
-  // worker only reads the pointer that pass recorded.
+  // Cache resolved on the emulation thread (render()); band workers only read the pointer.
   if (cached && texels_in_) sh.texels = setup_poly_ < texels_in_->size() ? (*texels_in_)[setup_poly_] : nullptr;
 #if DSPERATE_NEON
   sh.gather4 = select_gather4(sh);
@@ -1184,12 +1077,10 @@ void Renderer3D::setup_shade(Shade& sh, const Polygon& p) {
   sh.gather4 = nullptr;
   sh.vec = false;
 #endif
-  sh.always_fill = (sh.dispcnt & ((1 << 4) | (1 << 5))) || (sh.polyalpha < 31 && (sh.dispcnt & (1 << 3))) || sh.wireframe || sh.subpix;   // sub-pixel edges: every edge drawn, as AA has it
-  // Provably all-opaque batch: with the polygon's alpha at 31, decal writes
-  // exactly that alpha for every pixel, and every texture format except
-  // A3I5 / A5I3 carries only 0-or-31 texel alpha, which modulate preserves.
-  // The alpha-0 lanes never reach the resolve -- span_shade narrows the pass
-  // plane by the alpha test -- so the opaque resolve needs no alpha logic.
+  sh.always_fill = (sh.dispcnt & ((1 << 4) | (1 << 5))) || (sh.polyalpha < 31 && (sh.dispcnt & (1 << 3))) || sh.wireframe || sh.subpix;
+  // Provably all-opaque: alpha 31 + (decal, or a format whose texel alpha is
+  // only 0-or-31); alpha-0 lanes never reach the resolve (span_shade narrows
+  // the pass plane), so the opaque resolve skips alpha logic entirely.
   sh.opaque = sh.polyalpha == 31 && (!sh.textured || (sh.blendmode & 1) || (sh.fmt != 1 && sh.fmt != 6));
   sh.mode = pick_depth_mode(p);
   sh.resolve = select_resolve(sh);
@@ -1218,16 +1109,13 @@ inline uint32x4_t pack_colour(uint32x4_t r, uint32x4_t g, uint32x4_t b, uint32x4
 }
 
 // Four texels for one (format, S wrap, T wrap) combination, chosen once per
-// polygon (Shade::gather4): the wrap arithmetic and the texel decode are
-// compile-time, the lanes travel through registers (umov out, fmov back)
-// rather than a stack round trip, and there is no switch per block. Direct
-// host pointers only; the compressed format and textures that are not
-// host-contiguous take the per-lane sampler below.
+// polygon (Shade::gather4), wrap/decode resolved at compile time. Direct host
+// pointers only; the compressed format and non-contiguous textures take the
+// per-lane sampler below.
 namespace {
 enum Wrap { CLAMP = 0, REPEAT = 1, FLIP = 2 };
-// The compressed format keeps the colour table of the last 4x4 block it
-// decoded in `scratch` (adjacent lanes nearly always share a block); the
-// other formats ignore it.
+// Compressed format caches the last decoded 4x4 block's colour table in
+// `scratch` (adjacent lanes usually share one); other formats ignore it.
 struct Tex5Block { u32 key; u32 colour[4]; u32 alpha[4]; };
 using Gather4Fn = void (*)(const Renderer3D::Shade&, const s16*, const s16*, uint32x4_t&, uint32x4_t&, Tex5Block*);
 
@@ -1327,8 +1215,6 @@ void gather4_impl(const Renderer3D::Shade& sh, const s16* sa, const s16* ta, uin
   alpha  = vcombine_u32(vcreate_u32(a0 | (static_cast<u64>(a1) << 32)), vcreate_u32(a2 | (static_cast<u64>(a3) << 32)));
 }
 
-// Four texels from the decoded cache: wrap on lanes, one independent load
-// per lane, colour and alpha split from the word.
 template <int swrap, int twrap>
 void gather4_cached(const Renderer3D::Shade& sh, const s16* sa, const s16* ta, uint32x4_t& colour, uint32x4_t& alpha, Tex5Block*) {
   const int32x4_t w = vdupq_n_s32(sh.width), h = vdupq_n_s32(sh.height);
@@ -1342,10 +1228,8 @@ void gather4_cached(const Renderer3D::Shade& sh, const s16* sa, const s16* ta, u
   colour = vandq_u32(v, vdupq_n_u32(0xFFFF));
   alpha = vshrq_n_u32(v, 16);
 }
-// A whole span's texels in one call: the four-lane bodies above in a loop,
-// so the resolve loop neither makes an indirect call nor keeps the texture
-// state live per four pixels. `n` is rounded up to four by the caller (the
-// span buffers carry the slack).
+// Whole span's texels in one call (loop over the four-lane bodies above), so
+// the resolve loop makes no indirect call per four pixels. `n` rounded up to 4 by caller.
 using GatherNFn = void (*)(const Renderer3D::Shade&, const s16*, const s16*, u32, u32*, u32*);
 template <int fmt, int swrap, int twrap>
 void gatherN_impl(const Renderer3D::Shade& sh, const s16* sa, const s16* ta, u32 n, u32* col, u32* alp) {
@@ -1415,23 +1299,17 @@ const void* Renderer3D::select_gather4(const Shade& sh) {
   }
 }
 
-// Four texels through the per-lane sampler: the compressed format, or a
-// texture / palette that is not host-contiguous.
+// Four texels through the per-lane sampler (compressed format, or non-contiguous texture/palette).
 inline void Renderer3D::texture_gather4(const Shade& sh, const s16* sa, const s16* ta, u32* colour, u32* alpha) const {
   for (int k = 0; k < 4; ++k) colour[k] = texture_sample(sh, sa[k], ta[k], &alpha[k]);
 }
 
-// One call per span instead of one per four pixels: the resolve loop then
-// loads texels from the span buffer and keeps no texture state live.
+// One call per span; resolve loop then loads texels from the span buffer.
 void Renderer3D::span_texels(const Shade& sh, SpanBuf& sb, s32 ca, s32 cb) const {
   const u32 off = static_cast<u32>(ca - sb.x0);
-  // Two roundings, deliberately different. The gather is real work -- an
-  // address computation, a wrap and a palette lookup per texel -- and steps
-  // by four, so it runs over the span rounded up to *four*: rounding it to
-  // sixteen fetched up to twelve texels nobody reads, and with a mean span
-  // around ten pixels that was a third of the whole texture stage. The
-  // repack below is byte-lane ALU over a buffer that is already there, so it
-  // keeps its sixteen-wide step and the gap is filled in rather than fetched.
+  // Two roundings, deliberately different: the gather (real per-texel work)
+  // rounds to 4 to avoid fetching unread texels on typically-short spans;
+  // the repack below is cheap ALU so it keeps its 16-wide step.
   const u32 n = static_cast<u32>(cb - ca);
   const u32 n4 = (n + 3) & ~3u;
   const u32 n16 = (n + 15) & ~15u;                         // the buffers carry sixteen entries of slack
@@ -1448,11 +1326,6 @@ void Renderer3D::span_texels(const Shade& sh, SpanBuf& sb, s32 ca, s32 cb) const
   // never looks at, but it has to be a defined value.
   const uint32x4_t zero = vdupq_n_u32(0);
   for (u32 i = n4; i < n16; i += 4) { vst1q_u32(col + i, zero); vst1q_u32(alp + i, zero); }
-  // The RGB555 -> byte-plane repack used to happen here, into four more span
-  // planes. It is now done inside span_shade, a vector at a time, so the
-  // texels go gather -> registers -> shaded record without a round trip
-  // through memory: it was 8 bytes a pixel written and 8 read back, on a
-  // pipeline that measures memory-bound.
 }
 
 // A texel vector unpacked to the four 6-bit byte planes the shader wants:
@@ -1475,26 +1348,12 @@ void Renderer3D::span_texels(const Shade& sh, SpanBuf& sb, s32 ca, s32 cb) const
   out[3] = vcombine_u8(vmovn_u16(a0), vmovn_u16(a1));
 }
 
-// The span's shaded colours. Decal vs modulate is a property of the polygon,
-// so it is decided here once rather than re-tested for every four pixels, and
-// the resolve loop reads finished records.
-//
-// This pass also *narrows the pass plane by the alpha test*. The pre-pass can
-// only mark depth candidates -- a pixel's alpha does not exist until the shade
-// below computes it -- so the resolve used to load and mask every lane of a
-// group before discovering that the alpha test killed all eight. Measured over
-// 900 frames, that was 21 % of every group on etody, 18 % on sm64 and 41 % on
-// meteos: groups where a lane passed depth and nothing drew. The alpha is
-// already in a register here at the moment the record is stored, so folding
-// the test in costs one compare and a read-modify-write of the pass byte per
-// sixteen pixels, and the resolve's existing `pass` pre-test then skips those
-// groups whole.
-//
-// It masks *both* pass bits, which is what the resolve does: alpha gates
-// `m1 | m2`, so it kills the under-layer candidate exactly as it kills the top
-// one. Only the vector path runs this (flush_batch calls it under sh.vec), so
-// the shadow, wireframe and non-NEON resolves keep testing alpha themselves
-// and stay byte-comparable.
+// Span's shaded colours; decal vs modulate decided once here, not per group.
+// Also narrows the pass plane by the alpha test here (alpha isn't known until
+// shading), folding in a compare + RMW of the pass byte per 16 pixels so the
+// resolve's `pass` pre-test skips whole groups the alpha test would kill.
+// Masks both pass bits since resolve gates `m1 | m2` on alpha the same way.
+// Vector path only (flush_batch, under sh.vec); other resolves test alpha themselves.
 template <bool textured>
 void Renderer3D::span_shade(const Shade& sh, SpanBuf& sb, s32 ca, s32 cb) const {
   const u32 off = static_cast<u32>(ca - sb.x0);
@@ -1629,14 +1488,7 @@ template <int mode, bool textured, bool aa, bool opq>
   u8* const cb = reinterpret_cast<u8*>(color_.data());
   u8* const ab = reinterpret_cast<u8*>(attr_.data());
 
-  // plot_translucent on eight lanes, in byte planes: one vld4 each for the
-  // source and destination records and for the destination attributes, the
-  // blend as multiply-long / multiply-accumulate-long in 16-bit lanes with a
-  // narrowing shift, the attribute bytes rebuilt plane by plane, and one
-  // vst4 back for each. DraStic's render_polygon_alpha_blend_c is this
-  // shape; the 32-bit-lane form shifted every channel out of the word and
-  // back for each of the two halves.
-  //
+  // plot_translucent on eight lanes, in byte planes (vld4/vst4 + 16-bit MLA).
   // Attribute of the translucent pixel: byte 0 = polygon bits 4-7 | dest
   // bits 0-3 (edge flags), byte 1 = polygon bits 13-15 (fog only where the
   // destination has it) | dest coverage bits 0-4, byte 2 = polygon id | the
@@ -1680,30 +1532,23 @@ template <int mode, bool textured, bool aa, bool opq>
     }
   };
 
-  // Eight pixels a step, as two four-lane halves: the per-group scalar work
-  // (the pass-byte test, the address arithmetic, the lane-kind reduction and
-  // its branches) is paid once per eight pixels, and the group is the width
-  // the byte-plane stages take (vld4_u8 over eight records). Lane masks are
-  // tested through one 64-bit transfer of the narrowed lanes -- a cross-lane
-  // reduction per test is what the in-order core stalls on.
+  // Eight pixels a step (two four-lane halves), matching the byte-plane
+  // stages' width (vld4_u8). Lane masks tested via one 64-bit transfer of
+  // narrowed lanes to avoid a per-test cross-lane reduction.
   auto lanes8 = [](uint32x4_t a, uint32x4_t b) __attribute__((always_inline)) {
     return static_cast<u64>(vget_lane_u64(vreinterpret_u64_u8(vmovn_u16(vcombine_u16(vmovn_u32(a), vmovn_u32(b)))), 0));
   };
   constexpr u64 HALF[2] = {0x00000000FFFFFFFFull, 0xFFFFFFFF00000000ull};
   const bool untextured_passes = !textured && sh.polyalpha > sh.alpha_ref;
   if (!textured && !untextured_passes) return;   // alpha test fails for every pixel
-  // A range of four pixels or fewer takes a single half: the three-part walk
-  // hands the resolve the edge runs of a span separately, and those are one
-  // to three pixels wide -- an eight-lane group there is twice the lane work
-  // for nothing (etody's tail, device A/B 2026-08-30).
+  // Edge runs (1-3 pixels wide, handed separately by the three-part walk)
+  // take a single half; an eight-lane group there would be wasted work.
   auto step = [&](auto nh_c, s32 x, s32 rem) __attribute__((always_inline)) {
     constexpr u32 NH = decltype(nh_c)::value;
     const u32 i = static_cast<u32>(x - sb.x0);
     u64 p8; std::memcpy(&p8, sb.pass + i, 8);
     if (rem < 8) p8 &= (1ull << (8 * rem)) - 1;    // lanes past the end
     if (!(p8 & 0x0303030303030303ull)) return;
-    // The pass bytes as lane vectors straight from memory: no general-register
-    // to vector transfer, no per-lane shift to spread a word.
     const uint16x8_t p16 = vmovl_u8(vld1_u8(sb.pass + i));
     uint32x4_t pv[2] = {vmovl_u16(vget_low_u16(p16)), compat::movl_high_u16(p16)};
     if (rem < 8) {
@@ -1714,17 +1559,12 @@ template <int mode, bool textured, bool aa, bool opq>
     const u32 addr = row0 + static_cast<u32>(x), under = addr + RSIZE;
     uint32x4_t m1[2] = {v0, v0}; int32x4_t z[2] = {vdupq_n_s32(0), vdupq_n_s32(0)};
     for (u32 k = 0; k < NH; ++k) { m1[k] = vtstq_u32(pv[k], vdupq_n_u32(1)); z[k] = vld1q_s32(sb.z + i + k * 4); }
-    // Pre-pass bit 1: the top pixel fails the depth test but carries edge
-    // flags, so the pixel underneath is a candidate. Its test is done here
-    // (the pre-pass only looks at the top layer), and such lanes then take
-    // the same opaque / translucent writes as the top lanes, at the under
-    // address, without a push and without a second translucent plot -- the
-    // two things the scalar path does differently for addr >= RSIZE.
-    //
-    // Two instantiations, not one body with a zero mask: the in-order core
-    // pays every extra lane operation on the common path (a single body
-    // measured 5 % slower on the span stage for 6 % fewer instructions), so
-    // the no-under group must compile to exactly what it was.
+    // Pre-pass bit 1: top pixel failed depth but carries edge flags, so the
+    // under pixel is a candidate; tested here since the pre-pass only checks
+    // the top layer. Such lanes take the same writes as top lanes, at the
+    // under address, without a push or second translucent plot.
+    // Two instantiations rather than one zero-masked body, to keep the
+    // no-under path free of extra lane operations.
     auto group = [&](auto two_c, const uint32x4_t* m2) __attribute__((always_inline)) {
       constexpr bool two = decltype(two_c)::value;
       uint32x4_t colour[2], mo[2] = {v0, v0}, mo1[2] = {v0, v0}, mt1[2] = {v0, v0}, mo2[2] = {v0, v0}, mt2[2] = {v0, v0}, dstattr[2], mb[2] = {v0, v0}, kv[2] = {v0, v0};
@@ -1733,9 +1573,8 @@ template <int mode, bool textured, bool aa, bool opq>
         colour[k] = vld1q_u32(sb.col + i + k * 4);
         dstattr[k] = vld1q_u32(&attr_[addr + k * 4]);
         if constexpr (opq) {
-          // Every drawing lane is opaque by construction (Shade::opaque), so
-          // the alpha test, the opaque/translucent split, the underneath
-          // probe and the translucent plot below all compile out.
+          // Shade::opaque: alpha test, opaque/translucent split, underneath
+          // probe and translucent plot below all compile out.
           mo1[k] = m1[k]; mo[k] = m1[k];
           kv[k] = vandq_u32(m1[k], vdupq_n_u32(1));
           if constexpr (two) {
@@ -1847,29 +1686,17 @@ template <int mode, bool textured, bool aa, bool opq>
   }
 }
 #endif
-// Derive scanlines [y0, y1) of the polygon on `e` into lines_[].
-//
-// Everything here is a function of the polygon and y alone: the edge walk, the
-// endpoint w/z and attribute interpolations, the swapped-edge handling, the
-// edge lengths and coverages, and the fill rules. None of it reads the
-// framebuffer, which is why it can all leave the per-scanline path.
-//
-// The interpolations are the fourteen Interp::interpolate calls that were
-// ~69 instructions a scanline, and the edge setup another ~48 -- both now paid
-// once per run instead of once per line. The loop also lets the constant
-// polygon and Shade fields (wbuffer, always_fill, ybot, the vertex pointers)
-// stay in registers across the whole run rather than being reloaded per line.
+// Derive scanlines [y0, y1) of the polygon on `e` into lines_[]. Everything
+// here is a function of the polygon and y alone (edge walk, interpolations,
+// fill rules) and reads no framebuffer, so it can leave the per-scanline path.
+// Fourteen Interp::interpolate calls plus edge setup, paid once per run
+// instead of per line; constant fields stay in registers across the run.
 #if DSPERATE_NEON && defined(__arm__)
 // One edge's w and five attributes (r g b s t) at the current scanline, as
-// Interp<1>::interpolate computes each: y0 + ((y1-y0) * f >> 9) rising, else
-// y1 + ((y0-y1) * (512-f) >> 9), y0 when they are equal. Formed in 32-bit
-// lanes, which is exact when every product fits -- f <= 512 and differences
-// below 2^23 -- and that holds for every perspective edge a game draws
-// (colours are 9 bits, texture coordinates s16, W normalised to 16). Returns
-// false, writing nothing, for a linear edge or one the guard rejects; the
-// scalar interpolate then runs as before. On the A30 the ten scalar calls per
-// scanline were ~5 % of a heavy frame's raster (2026-09-15). ARMv7 only: on
-// the A55 the scalar calls are cheap and this measured flat to slower.
+// Interp<1>::interpolate computes each, but batched in 32-bit lanes. Exact
+// when f <= 512 and differences stay below 2^23 (true for every perspective
+// edge a game draws). Returns false (writes nothing) for a linear edge or a
+// rejected guard; caller falls back to scalar interpolate. ARMv7 only.
 [[gnu::always_inline]] inline bool Renderer3D::edge_values_vec(const Interp<1>& in, s32 w0, s32 w1, const Vertex& vc, const Vertex& vn,
                                                                s32* w, s32* a) {
   if (in.xdiff == 0) {
@@ -1957,8 +1784,7 @@ void Renderer3D::precompute_lines(Edge& e, s32 y0, s32 y1) {
     const bool ybot_line = y == ybot1;
     const bool bottom_fill = ybot_line && e.next_sx_differ;
     if (xstart > xend) {
-      // Swapped edges: the hardware walks them backwards, which breaks the
-      // X-major edge lengths (and the AA on them) in a specific way.
+      // Swapped edges: hardware walks them backwards, breaking X-major edge lengths/AA in a specific way.
       astart = 1;
       e.right.edge_params<true>(aa, &l_len, &l_cov);
       e.left.edge_params<true>(aa, &r_len, &r_cov);
@@ -1971,10 +1797,8 @@ void Renderer3D::precompute_lines(Edge& e, s32 y0, s32 y1) {
     } else {
       e.left.edge_params<false>(aa, &l_len, &l_cov);
       e.right.edge_params<false>(aa, &r_len, &r_cov);
-      // Fill rules for opaque edges: left edges fill when their slope is <= 1,
-      // right edges when > 1 or vertical; the bottom pixel of a negative
-      // X-major edge fills next to a flat bottom; fully overlapping identical
-      // edges fill. AA, edge marking, blended translucency or wireframe fill all.
+      // Fill rules: left edge fills when slope<=1, right when >1/vertical; negative
+      // X-major edge's bottom pixel fills next to a flat bottom; overlapping edges fill.
       if (always_fill) { l_fill = r_fill = true; }
       else {
         l_fill = e.nx_l || (bottom_fill && e.lxm) ||
@@ -1995,11 +1819,8 @@ void Renderer3D::precompute_lines(Edge& e, s32 y0, s32 y1) {
     ls.yedge = yedge;
     ls.l_fill = l_fill; ls.r_fill = r_fill;
     ls.wf_skip = wireframe && !yedge;
-    // Attributes at both ends of the span: r g b s t. Computed for every line
-    // of the run, including the ones the depth pre-pass will go on to kill --
-    // the per-scanline path skipped those, but the interpolants are live in
-    // registers here and depth survival is 61-94 % across the five scenes, so
-    // the branch costs more than the arithmetic it saves.
+    // r g b s t at both ends; computed even for lines the depth pre-pass will kill,
+    // since the interpolants are already live in registers here.
     std::memcpy(ls.al, av[astart], sizeof ls.al);
     std::memcpy(ls.ar, av[1 - astart], sizeof ls.ar);
 
@@ -2008,8 +1829,7 @@ void Renderer3D::precompute_lines(Edge& e, s32 y0, s32 y1) {
   }
 }
 #else
-// The AArch64 and portable body, as before the ARMv7 edge path: restructuring it
-// around per-edge arrays measured slower on the A55 (2026-09-15).
+// The AArch64 and portable body.
 void Renderer3D::precompute_lines(Edge& e, s32 y0, s32 y1) {
   const Polygon& p = *e.poly;
   const Shade& sh = e.sh;
@@ -2043,8 +1863,6 @@ void Renderer3D::precompute_lines(Edge& e, s32 y0, s32 y1) {
     const bool ybot_line = y == ybot1;
     const bool bottom_fill = ybot_line && e.next_sx_differ;
     if (xstart > xend) {
-      // Swapped edges: the hardware walks them backwards, which breaks the
-      // X-major edge lengths (and the AA on them) in a specific way.
       vlcur = e.vcr; vlnext = e.vnr;
       vrcur = e.vcl; vrnext = e.vnl;
       istart = &e.right.interp; iend = &e.left.interp;
@@ -2062,10 +1880,6 @@ void Renderer3D::precompute_lines(Edge& e, s32 y0, s32 y1) {
       istart = &e.left.interp; iend = &e.right.interp;
       e.left.edge_params<false>(aa, &l_len, &l_cov);
       e.right.edge_params<false>(aa, &r_len, &r_cov);
-      // Fill rules for opaque edges: left edges fill when their slope is <= 1,
-      // right edges when > 1 or vertical; the bottom pixel of a negative
-      // X-major edge fills next to a flat bottom; fully overlapping identical
-      // edges fill. AA, edge marking, blended translucency or wireframe fill all.
       if (always_fill) { l_fill = r_fill = true; }
       else {
         l_fill = e.nx_l || (bottom_fill && e.lxm) ||
@@ -2086,11 +1900,6 @@ void Renderer3D::precompute_lines(Edge& e, s32 y0, s32 y1) {
     ls.yedge = yedge;
     ls.l_fill = l_fill; ls.r_fill = r_fill;
     ls.wf_skip = wireframe && !yedge;
-    // Attributes at both ends of the span: r g b s t. Computed for every line
-    // of the run, including the ones the depth pre-pass will go on to kill --
-    // the per-scanline path skipped those, but the interpolants are live in
-    // registers here and depth survival is 61-94 % across the five scenes, so
-    // the branch costs more than the arithmetic it saves.
     ls.al[0] = istart->interpolate(vlcur->fcol[0], vlnext->fcol[0]);
     ls.al[1] = istart->interpolate(vlcur->fcol[1], vlnext->fcol[1]);
     ls.al[2] = istart->interpolate(vlcur->fcol[2], vlnext->fcol[2]);
@@ -2108,10 +1917,9 @@ void Renderer3D::precompute_lines(Edge& e, s32 y0, s32 y1) {
 }
 #endif
 
-// Stage one precomputed scanline into the batch. What is left here is exactly
-// the work the framebuffer reaches: the depth pre-pass against live depth_ and
-// attr_, the attribute staging into the span buffer, and the batch job. The
-// pixel stages and the resolve wait for flush_batch.
+// Stage one precomputed scanline into the batch: depth pre-pass against live
+// depth_/attr_, attribute staging into the span buffer, and the batch job.
+// Pixel stages and the resolve wait for flush_batch.
 namespace {
 Renderer3D::CoverageStats g_cov;
 std::mutex g_cov_mu;
@@ -2119,17 +1927,10 @@ std::mutex g_cov_mu;
 const Renderer3D::CoverageStats& Renderer3D::coverage_stats() { return g_cov; }
 
 // Is pixel (x, y) inside the polygon, as a graphics pipeline would decide it?
-//
-// The comparison has to be set up carefully or it measures a half-pixel bias
-// instead of the thing it is for. A GPU generates a fragment when the pixel
-// CENTRE is inside the triangle. If the DS's integer vertex (sx, sy) names a
-// pixel, then drawing it means placing the vertex at that pixel's centre --
-// so the test is centre (x + 0.5, y + 0.5) against vertices (sx + 0.5,
-// sy + 0.5), and the two half-pixels cancel exactly. Hence integer point
-// against integer vertices.
-//
-// A clipped polygon is convex, so "inside" is: the point is on the same side
-// of every directed edge, with a point exactly on an edge accepted either way.
+// GPU rule: fragment generated when pixel CENTRE is inside. Testing integer
+// point against integer vertices is correct because both are offset by the
+// same 0.5 and it cancels. Convex polygon: inside means same side of every
+// directed edge, on-edge accepted either way.
 static bool point_in_poly(const Gpu3D& gx, const Polygon& p, s32 x, s32 y) {
   int sign = 0;
   for (u32 i = 0; i < p.nverts; ++i) {
@@ -2190,7 +1991,8 @@ void Renderer3D::stage_line(Edge& e, s32 y, const LineSpan& ls) {
 
   const s32 xa = ls.xa, xb = ls.xb;
   // One load of the profiling flag for the whole line: the kernels between
-  // the checks are opaque to the compiler, so every test re-read it (~50 insn/line).
+  // the checks are opaque to the compiler, so every test would otherwise
+  // re-read it.
   const bool pe = prof::enabled;
   const int mode = sh.mode;
   if (pe) { prof::add(prof::C_POLY_LINES, 1); prof::add(prof::C_SPAN_PIXELS, xb > xa ? static_cast<u64>(xb - xa) : 0); }
@@ -2301,8 +2103,8 @@ template <typename Range>
   if (j.r_fill) draw_span(j.lim2, 2, j.yedge | 0x2);
 }
 
-// One call per batch instead of 2.4-2.9 per span. The range body inlines into
-// the job loop, so the kernel's 272-byte frame, its twelve register-pair saves
+// One call per batch instead of per span. The range body inlines into the
+// job loop, so the kernel's 272-byte frame, its twelve register-pair saves
 // and every piece of setup that depends only on the Shade are paid once for
 // the whole batch and lifted out of the loop by the compiler.
 template <int mode, bool textured, bool aa, bool shadow>
@@ -2337,31 +2139,20 @@ void Renderer3D::resolve_batch_vec(const Shade& sh, const SpanJob* jobs, u32 n) 
 }
 #endif
 
-// Run the pixel stages once over everything staged, then resolve span by span.
-//
-// This is the point of the batching: span_texels and span_shade are called
-// once for up to BATCH_PX pixels instead of once per span, and our spans
-// average 13-35 pixels (scenes/README.md). Their per-call setup -- the Shade
-// fields, the gather function pointer, the blend-mode decision -- is paid once
-// for the batch, which is what DraStic's flush does (docs/techniques/02 s3).
-//
-// Batching is safe across the spans of one polygon because they lie on
-// distinct scanlines, so no span in the batch reads a pixel another one
-// writes.
+// Runs the pixel stages once over everything staged, then resolves span by
+// span: span_texels/span_shade called once per batch (up to BATCH_PX pixels)
+// instead of per span, amortising their setup. Safe across one polygon's
+// spans since they lie on distinct scanlines.
 void Renderer3D::flush_batch(const Shade& sh) {
   if (!njobs_) { batch_px_ = 0; return; }
   prof::add(prof::C_BATCHES, 1); prof::add(prof::C_BATCH_SPANS, njobs_); prof::add(prof::C_BATCH_PX, batch_px_);
 #if DSPERATE_NEON
   if (sh.vec) {
     SpanBuf& sb = spanbuf_;
-    // One pass over the whole batch. x0 = 0 makes buffer index equal screen x
-    // for the call, so [0, batch_px_) addresses everything staged.
-    sb.x0 = 0;
+    sb.x0 = 0;   // buffer index == screen x for this call; [0, batch_px_) addresses everything staged
     const u32 n16 = (batch_px_ + 15) & ~15u;
-    // Toon: the vertex colour is replaced by toon[vr >> 1] before texturing
-    // (shade_pixel), a 32-entry lookup on the red plane -- one table
-    // instruction per plane. Highlight: all three planes take vr, and the
-    // toon colour is added to the shaded result with a clamp at 63 (below).
+    // Toon: vertex colour replaced by toon[vr>>1] before texturing. Highlight:
+    // all three planes take vr, toon colour added to the result (clamped at 63, below).
     const bool toonmode = sh.blendmode == 2;
     if (toonmode) {
       if (!sh.highlight) {
@@ -2402,40 +2193,24 @@ void Renderer3D::flush_batch(const Shade& sh) {
   njobs_ = 0; batch_px_ = 0;
 }
 
-// Rasterise lines [ya, yb) polygon at a time. The active set is merged once
-// for the whole chunk (polygons entering on any of its lines), then each
-// polygon in list order draws every line it covers inside the chunk.
-//
-// Per pixel this is the same order as line-at-a-time rendering: a pixel
-// belongs to exactly one line, and the polygons still reach it in list order,
-// which is what the translucent blend rules, the polygon-id stencil and the
-// depth interactions depend on. The edge walk is if anything more natural
-// this way -- Slope::step already advances one line at a time and the cursors
-// live in the Edge, so a polygon's lines are still visited in order without
-// gaps.
+// Rasterise lines [ya, yb) polygon at a time: active set merged once for the
+// chunk, then each polygon in list order draws every line it covers inside.
+// Same per-pixel order as line-at-a-time (list order, required by the
+// translucent blend rules, polygon-id stencil, and depth interactions);
+// Slope::step still advances one line at a time via the Edge's own cursors.
 void Renderer3D::render_chunk(s32 ya, s32 yb) {
   for (s32 y = ya; y < yb; ++y) { clear_line(y); line_touched_[y] = false; prev_shadow_mask_[static_cast<u32>((y + 1) & (RING - 1))] = false; }
-  // Merge in everything that starts anywhere in the chunk, keeping list order.
-  //
-  // order_ is sorted by ytop and only then by list index, so the slice for a
-  // whole chunk spans several ytop buckets and is NOT in list order -- merging
-  // it directly puts the active list out of order and changes which polygon
-  // reaches a pixel first. (render_line could merge its slice directly because
-  // a single bucket is one ytop and therefore already in list order.) Sort the
-  // slice by index first; it is at most the polygon count and this runs once
-  // per chunk, not once per line.
+  // order_ is bucketed by ytop then list index, so a whole chunk's slice spans
+  // several buckets and is NOT in list order; sort it by index first (at most
+  // polygon count, once per chunk) before merging into the active list.
   {
     const u32 nin = bucket_[yb] - bucket_[ya];
     if (nin < 32) {
-      // Small bins are cheaper to sort than to touch the complete membership
-      // bitmap. This is the common case for sparse scenes.
       std::copy(&order_[bucket_[ya]], &order_[bucket_[ya]] + nin, enter_.begin());
       std::sort(enter_.begin(), enter_.begin() + nin);
     } else {
-      // order_ is bucketed by ytop, not by submission order. For a busy
-      // tile, mark its local entries and materialise them in edge/list order;
-      // this is linear in the fixed 2048-polygon list and avoids the sort's
-      // log(n) work on the hot bin boundary.
+      // Busy tile: mark local entries and materialise in edge/list order,
+      // linear in the fixed 2048-polygon list, avoiding the sort's log(n).
       for (u32 i = bucket_[ya]; i < bucket_[yb]; ++i) {
         const u32 id = order_[i];
         enter_bits_[id >> 6] |= u64{1} << (id & 63);
@@ -2464,14 +2239,8 @@ void Renderer3D::render_chunk(s32 ya, s32 yb) {
     const Polygon& p = *e.poly;
     const s32 lo = p.ytop > ya ? p.ytop : ya;
     const s32 hi = p.ybot < yb ? p.ybot : yb;
-    // A polygon whose ytop is inside the chunk starts at its own top line;
-    // one that began earlier carries the edge state it already has.
-    //
-    // One batch per polygon, flushed when it fills. Everything staged shares a
-    // Shade, so the pixel stages run once for up to BATCH_PX pixels instead of
-    // once per span. A polygon whose spans are too narrow for that to pay
-    // never enters the batch at all -- stage_line resolves it directly and
-    // jobs_ is not touched.
+    // One batch per polygon, flushed when full; a polygon whose spans are too
+    // narrow to pay for batching skips it (stage_line resolves it directly).
     prof::add(prof::C_CHUNK_ENTRIES, 1);
     // Flat polygons (ybot == ytop) draw their single line at ytop; every other
     // polygon draws [lo, hi). Either way the run is one contiguous stretch of
@@ -2525,36 +2294,22 @@ u32 Renderer3D::fog_density(u32 addr) const {
   return d;
 }
 
-// Sub-pixel edges. An opaque edge pixel is a cell the polygon only partly
-// covers; the scaler can cut its panel cell where the edge really runs instead
-// of showing one colour. Where that is, is gathered as edge parts are plotted
-// (note_edge_part) into side planes over the top layer -- eside_ (SPLIT_*: the
-// side the polygon does NOT cover), epos_ (the edge's position from the pixel's
-// outer boundary, inwards, in 1/32 pixel), eslope_, ez_ -- and turned into the
-// split map a line at a time (extract_splits).
-//
-// Why at plot time and not from the pixel's final owner: a silhouette is often
-// a fan of thin polygons. Line by line a different one owns the outermost
-// pixel, each knowing only its own edge, and one that loses the depth test to
-// its neighbour by a hair takes its knowledge with it -- the cut then hops
-// about by a pixel from line to line. So polygons of one surface (same side,
-// depth within a hair) pool what they know: the outermost edge wins.
-//
-// epos_ runs past the pixel both ways, because the hardware places a Y-major
-// edge by where it is mid-line and calls the pixel covered (31) or not (0)
-// when that is already in the next one (edge_params): -32..0 = the edge is in
-// the pixel beyond, which was never drawn (a spill: that cell's near part is
-// this polygon's); 1..32 = in this pixel; 33..64 = in the next pixel in.
+// Sub-pixel edges: lets the scaler cut a partly-covered cell where the edge
+// really runs. Gathered at plot time into eside_ (SPLIT_* side not covered),
+// epos_ (position from the cell's outer boundary inwards, 1/32 pixel),
+// eslope_, ez_; turned into the split map a line at a time (extract_splits).
+// Gathered at plot time (not from the final owner) so polygons of one surface
+// pool what they know and the outermost edge wins, across a silhouette fan.
+// epos_ runs past the cell both ways: -32..0 = edge in the (undrawn, spilled)
+// pixel beyond; 1..32 = in this pixel; 33..64 = in the next pixel in.
 static inline bool same_surface(s32 za, s32 zb) { const s32 d = za > zb ? za - zb : zb - za; return d <= (std::min(za, zb) >> 6) + 0x200; }
 
 void Renderer3D::note_edge_part(const SpanBuf& sb, s32 y, s32 xa, s32 xb, int part, s32 cov, u32 attr_key, const u8* drawn) {
   note_edge_run(sb, y, xa, xb, part, cov, part == 0 ? sb.e_l0 : sb.e_r0, attr_key, drawn, false);
 }
 
-// A span no wider than its two edge runs together draws the shared pixels as the left run
-// only, and what the right edge knows of them would be lost -- on a sliver at a silhouette
-// that is the very edge that shows (the cut then lands a pixel in, on the next polygon's
-// edge). The batch walk hands the right edge's coverage over for those pixels.
+// A span no wider than its two edge runs draws shared pixels as the left run
+// only, losing what the right edge knows; hand its coverage over for those pixels.
 void Renderer3D::note_edge_overlap(const SpanBuf& sb, s32 y, s32 xa, s32 xb, s32 r_cov, u32 attr_key, const u8* drawn) {
   const s32 lo = std::max(xa, sb.e_r0);
   if (lo < xb) note_edge_run(sb, y, lo, xb, 2, r_cov, sb.e_r0, attr_key, drawn, true);
@@ -2605,26 +2360,15 @@ void Renderer3D::note_edge_run(const SpanBuf& sb, s32 y, s32 xa, s32 xb, int par
   }
 }
 
-// Two record slots (u32) per pixel, its own cut and a neighbour's spill into it (a cell can
-// need both: a thin polygon's outer edge, and the next polygon's edge reaching into it).
-// A record is a cut through that pixel's cell: bits 0-2 the side
-// of the cell that is replaced (SPLIT_*), bits 3-8 how much of the cell that is
-// (0..32, mid-cell), bits 9-15 the cut's signed slope in 1/32 cell per cell
-// across, bits 16-18 where the replacing colour comes from, in pixels along the
-// cut's axis (signed: -2..2), SPLIT_SPILL = the replacing colour is the
-// polygon's own (the cut lies in a neighbour's cell) and SPLIT_WEAK. A strong record
-// is a silhouette by depth: the step to
-// the uncovered side dwarfs the step to the covered side. Everything else is
-// weak -- an interior mesh edge, where cutting only drags texels along the
-// triangulation (GSDD's terrain), but also a crease between two surfaces, a
-// rounded silhouette whose own depth runs away at the rim, and one model in
-// front of another close behind it, all of which should cut. Depth cannot
-// tell those apart; the colours can, so the scaler decides (Gpu::emit_splits).
-//
-// SPLIT_MARKED: the pixel carries the game's edge marking. The outline is a
-// pixel wide and must stay one, so it is not cut but moved: the record holds
-// the edge position whole (bits 19-25, epos_ + 32) and the scaler lays the
-// band from there, the outside before it and the interior after.
+// Two record slots (u32) per pixel: its own cut and a neighbour's spill into it.
+// Record bits: 0-2 replaced side (SPLIT_*), 3-8 how much of the cell (0..32),
+// 9-15 signed slope (1/32 cell per cell), 16-18 replacing-colour source in
+// pixels along the cut's axis (-2..2; SPLIT_SPILL = polygon's own colour),
+// SPLIT_WEAK for anything not a depth silhouette (interior mesh edge, crease,
+// rounded rim, near/far models) -- depth can't tell those apart so the scaler
+// decides (Gpu::emit_splits).
+// SPLIT_MARKED: game's edge marking, a pixel wide, so it's moved not cut --
+// bits 19-25 hold the edge position whole (epos_ + 32).
 void Renderer3D::extract_splits(s32 y) {
   u32* const out = &split_dst_[y * 512];   // two slots a pixel: [2x] its own cut, [2x+1] a neighbour's spill into it
   u8& any = split_any_dst_[y];
@@ -2640,10 +2384,8 @@ void Renderer3D::extract_splits(s32 y) {
   for (s32 x = 0; x < 256; ++x) {
     const u32 a = attr_[base + x];
     if (!(a & 0xF)) continue;                               // not an edge pixel
-    // A translucent polygon over the edge (a cloud, smoke, glass) does not hide it: the pixel
-    // and the neighbour the cut borrows from both show through the same veil, so the cut
-    // stands. It keeps the opaque pixel's edge flags; what it may have replaced is the depth,
-    // and then neither the owner check nor the silhouette test below can be asked.
+    // Translucent overlay doesn't hide an edge (both sides show through the same veil), but
+    // may have replaced the depth, so the owner/silhouette checks below can't be asked then.
     const bool veiled = a & (1u << 22);
     const u32 side = eside_[base + x];
     const bool known = same_surface(ez_[base + x], static_cast<s32>(depth_[base + x]));
@@ -2680,30 +2422,12 @@ void Renderer3D::extract_splits(s32 y) {
 
 // ---- edge shaping ----------------------------------------------------------------
 //
-// The picture is the hardware's, anti-aliasing included. On top of it the stair-stepped boundary
-// between two objects is redrawn as a straight line through the stairs' outer corners:
-//
-//   * the boundary between two neighbouring pixels is TAGGED when one is 3D and the other is not,
-//     their polygon ids differ, or the depth jumps (the step dwarfs both surfaces' own gradients);
-//     the nearer side is the FRONT. Judged on the blended picture: where the hardware has already
-//     mixed an edge the contrast is gone and a flickering depth tag draws no teeth.
-//   * tagged boundaries fall into straight runs. A run is a stair tread when the front reaches
-//     further out at exactly one end (and that riser is no longer than the tread); the front then
-//     GROWS into the back cells by the triangle under the line to that outer corner. Grow-only:
-//     notches and flat ends stay. A tall vertical run (3 and up) only takes a 45-degree chamfer,
-//     so an upright front stays upright over whatever sticks out beneath it.
-//   * pixel art stays pixel art: nothing grows from a screen-parallel polygon (setup_shade's
-//     bit 13), nor from a front one pixel thick.
-//   * painted with the colours from before the blend: the front's cell along a shaped run goes back
-//     to its pure colour (our line defines that edge now), so do its blended neighbours of the same
-//     object, and the triangle takes that colour through the scaler (a SPLIT_GROW record borrows the
-//     composed colour of the front's cell).
-//   * an edge-marked outline belongs to its object: no depth tag between it and the interior, it
-//     keeps the hardware's half-blended colour, and where it grows outwards the interior follows it
-//     in by the same triangle -- the band is moved, not fattened.
-//
-// Runs once per frame on whichever thread first reads the frame (shape_sync); the look was settled
-// on offline mocks, edge-mock/outside-in/boundary_outline_mock.py is the specification.
+// Redraws the stair-stepped boundary between two objects as a straight line
+// through the outer corners, on top of the hardware's blended picture: tagged
+// on a 3D split, id mismatch or depth jump (judged on the blended picture);
+// tagged runs GROW into the back along a stair tread's triangle (grow-only,
+// 45-degree chamfer past 3 rows); screen-parallel/1px-thick fronts never
+// grow; painted from pre-blend colours. Runs once per frame (shape_sync).
 void Renderer3D::save_shape_line(s32 y) {
   const u32 row = row_of(y) + 1, o = static_cast<u32>(y) * 256;
   std::memcpy(shape_dst_.pure + o, &color_[row], 256 * sizeof(u32));
@@ -2806,8 +2530,8 @@ void Renderer3D::shape_frame(u32 idx) {
         // The chamfer is for a lone upright front, not for a shallow edge that is drawn as a regular staircase.
         // Walk the chain of treads both ways from this run, counting the consecutive ones of about its own
         // length; a pair is enough, and because the walk carries on past the first the treads at the ENDS of a
-        // staircase are exempt too. One match on its own would not do: that is the back of Mario's cap, whose
-        // front stands over the rim below it and must keep its chamfer.
+        // staircase are exempt too. One match on its own would not do: a lone rounded rim above an overhang
+        // must keep its chamfer.
         if (span < L) {
           constexpr s32 kStairPair = 2;
           const s32 tol = 1 + L / 3, dl = (s > 0 ? r : -r);
@@ -2962,25 +2686,15 @@ void Renderer3D::final_pass(s32 y) {
     work = (dispcnt & (1 << 7)) && clear_fog;
   }
   if (!work) { if (shape_) save_shape_line(y); std::memcpy(&out_dst_[y * 256], &color_[row_of(y) + 1], 256 * sizeof(u32)); if (subpix_ && split_any_dst_[y]) { std::memset(&split_dst_[y * 512], 0, 512 * sizeof(u32)); split_any_dst_[y] = 0; } return; }
-  // The three passes as 16-pixel byte-plane kernels: a record's four bytes
-  // (r g b a, and edge-flags / coverage+fog / translucent id / opaque id for
-  // an attribute) are deinterleaved by one ld4 into planes, the maths is done
-  // 16 lanes wide in bytes and shorts, and one st4 puts the records back.
-  // This is DraStic's shape for the same passes (video_3d_edge_identify_*,
-  // video_3d_fog_modulate_*, the AA resolve in video_3d_resolve_bin_*):
-  // no per-pixel branch, no lane extraction, and the 32-bit records are
-  // never shifted apart channel by channel. Each pass matches the scalar
-  // loops below it (the non-NEON build) bit for bit.
+  // Three passes as 16-pixel byte-plane kernels (ld4/st4), matching the
+  // scalar loops below bit for bit.
   u8* const cb = reinterpret_cast<u8*>(color_.data());
   u8* const ab = reinterpret_cast<u8*>(attr_.data());
   const u32 base = row_of(y) + 1;
   if (dispcnt & (1 << 5)) {
-    // Edge marking on the topmost pixels, against the four neighbours: a
-    // pixel with edge flags whose polygon id differs from a neighbour's and
-    // lies in front of it takes the edge colour of its id group and a
-    // broken coverage. Only ids (never written here) and depths (never
-    // written) are read from the neighbours, so the 16 lanes are
-    // independent of each other and of the pixels already marked.
+    // Edge marking: a marked pixel whose id differs from and is in front of a
+    // neighbour takes that id group's edge colour. Only reads ids/depths from
+    // neighbours (never written here), so lanes are independent.
     const u32 up = row_of(y - 1) + 1, dn = row_of(y + 1) + 1;
     const uint8x16_t er = vld1q_u8(edge6_[0]), eg = vld1q_u8(edge6_[1]), ebl = vld1q_u8(edge6_[2]);
     for (u32 x = 0; x < 256; x += 16) {
@@ -3260,28 +2974,20 @@ void Renderer3D::render(const Gpu3D& gx) {
     }
   }
   gpu_sync_is_frame_ = false;
-  // Everything from here to the raster seam -- the identical-frame check, the
-  // texture cache validation and the resolve -- is R3D_PREP; the GPU upload
-  // and the band dispatch account for themselves.
+  // From here to the raster seam (identical-frame check, texcache validation,
+  // resolve) is R3D_PREP; GPU upload and band dispatch account separately.
   const auto t_prep0 = prof::enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
   struct PrepEnd { std::chrono::steady_clock::time_point t0; bool* done; ~PrepEnd() { if (prof::enabled && !*done) { prof::add_ns(prof::R3D_PREP, static_cast<u64>((std::chrono::steady_clock::now() - t0).count())); *done = true; } } };
   bool prep_done = false;
   PrepEnd prep_end{t_prep0, &prep_done};
-  // Deferring shows the frame before the last one, so it is only right when
-  // the last two renders both went to the GPU and both actually drew. Every
-  // early return below -- an identical frame kept, ablation -- leaves this
-  // false, which costs one frame of waiting and never shows the wrong thing.
+  // Deferring shows the frame before last, only correct when the last two
+  // renders both went to the GPU and drew; every early return leaves this false.
   gpu_defer_ok_ = false;
   gx_ = &gx;
-  // The slowest band of the frame just synced, kept for two frames (the
-  // band-count choice below). The slots are read again by the profile after
-  // the dispatch, so they are left in place.
-  // The sum over workers, not the slowest: the sum is the serial raster
-  // cost and does not move when the worker count does, so the choice cannot
-  // oscillate with its own effect.
+  // Sum over workers (not the slowest): the serial raster cost, which doesn't
+  // move with worker count, so the band-count choice below can't self-oscillate.
   { u64 sum = 0; for (u32 w = 0; w < last_nb_ && w < 8; ++w) sum += band_ns_[w]; band_sum_ns_[1] = band_sum_ns_[0]; band_sum_ns_[0] = sum; }
-  // DS_ABLATE bit 0: no rasterisation and no texture work at all. See the
-  // comment on ablate() in gpu.cpp -- the picture is stale from here on.
+  // DS_ABLATE bit 0: no rasterisation or texture work at all (see ablate() in gpu.cpp).
   static const bool no_raster = [] { const char* e = std::getenv("DS_ABLATE"); return e && (std::atoi(e) & 1); }();
   if (no_raster) return;
   rs_frame_ = gx.render_state();
@@ -3292,17 +2998,14 @@ void Renderer3D::render(const Gpu3D& gx) {
   vm_ = &nds_.bus.vram_map();
   texv_ = &vm_->texture;
   palv_ = &vm_->texpal;
-  static const bool no_cache = std::getenv("DS_NO_TEXCACHE") != nullptr;   // A/B and debugging
+  static const bool no_cache = std::getenv("DS_NO_TEXCACHE") != nullptr;
   if (no_cache) texcache_.set_enabled(false);
   texcache_.begin_frame(nds_.frame_count);
   const Polygon* const* polys = gx.render_polygons();
   list_polys_ = polys; list_count_ = gx.render_polygon_count();
-  // A frame with no new polygon list and the same render registers draws
-  // the same picture as the last one — unless a texture or palette it reads
-  // changed underneath. Validating every texture it uses through the cache
-  // (a memcmp per texture, once) settles that, and when nothing had to be
-  // re-decoded the previous colour buffer is kept; games that run their 3D
-  // at 30 fps then cost half.
+  // An unchanged polygon list + registers still needs every texture it uses
+  // validated (a memcmp each) in case VRAM changed underneath; the previous
+  // colour buffer is kept only if nothing needed re-decoding.
   if (gx.render_identical() && texcache_.enabled() && rendered_once_ && aa_ == aa_rendered_ && subpix_ == subpix_rendered_ && shape_ == shape_rendered_) {
     for (u32 i = 0; i < gx.render_polygon_count(); ++i) {
       const Polygon& p = *polys[i];
@@ -3315,14 +3018,11 @@ void Renderer3D::render(const Gpu3D& gx) {
   }
   rendered_once_ = true;
   aa_rendered_ = aa_; subpix_rendered_ = subpix_; shape_rendered_ = shape_;
-  // What the emulation thread does itself is only what it must: resolve the
-  // (non-thread-safe) texture cache to plain pointers, in list order, and
-  // count the polygons that draw. Edge setup -- the per-polygon slopes,
-  // interpolants and buckets, ~2048 Edge records at the worst -- moved off
-  // it: job 0 now builds its own edges on its pool thread exactly as workers
-  // 1..n always did, and the bins are cut from the polygon list directly.
+  // Emulation thread only does what it must: resolve the (non-thread-safe)
+  // texture cache to plain pointers and count drawing polygons. Edge setup
+  // moved off it; job 0 builds its own edges on its pool thread like workers 1..n.
   const u32 npoly = gx.render_polygon_count();
-  // Decided before the texture resolve, because the resolve depends on it.
+  // Decided before the texture resolve, which depends on it.
 #if DSPERATE_VULKAN
   gpu_live_ = vk_raster_ != nullptr && vk_raster_->ready();
 #endif
@@ -3334,15 +3034,10 @@ void Renderer3D::render(const Gpu3D& gx) {
     if (p.degenerate) continue;
     ++live;
     Shade sh;
-    // texture_fields answers "does the CPU need the decoded cache for this
-    // one" -- it says no whenever the direct VRAM pointers cover the texture,
-    // because a byte texel plus an L1 palette beats a word from a four-times
-    // larger array. The GPU has no such choice: the shader never learns the
-    // six texel formats, it reads the cache's one word per texel and nothing
-    // else. So with the GPU path live every textured polygon is resolved.
-    // The CPU's own sampling is untouched (setup_shade still takes the
-    // pointer only when texture_fields asked for it), which is what keeps the
-    // A/B comparison honest: the reference is the shipping code path.
+    // texture_fields: does the CPU need the decoded cache here (no when direct
+    // VRAM pointers suffice)? The GPU has no such choice, its shader only
+    // reads the cache's one word per texel, so every textured polygon is
+    // resolved when the GPU path is live; CPU sampling itself is unaffected.
     if (texture_fields(sh, p) || (gpu_live_ && sh.textured)) {
       const TextureCache::Ref r = texcache_.lookup_ref(*vm_, sh.fmt, sh.base, static_cast<u32>(sh.width), static_cast<u32>(sh.height), sh.texpal, sh.alpha0);
       poly_texels_[i] = r.texels;
@@ -3353,17 +3048,10 @@ void Renderer3D::render(const Gpu3D& gx) {
 
   // ---- the GPU raster seam ------------------------------------------------
   if (prof::enabled && !prep_done) { prof::add_ns(prof::R3D_PREP, static_cast<u64>((std::chrono::steady_clock::now() - t_prep0).count())); prep_done = true; }
-  //
-  // Here and not earlier, because everything the GPU needs is now resolved:
-  // the polygon list, the render state, and the decoded textures as plain
-  // pointers. Here and not later, because everything below this point -- the
-  // band count, the pool, the bins, the workers -- IS the CPU raster, and
-  // none of it runs for a frame the GPU takes.
-  //
-  // The fall-through is the whole safety property. A frame the gate refuses,
-  // or one the backend will not dispatch, simply carries on into the band
-  // path below and is drawn exactly as it always was. There is no state to
-  // unwind, because nothing has been written yet.
+  // Here because the polygon list, render state, and decoded textures are now
+  // resolved, and everything below IS the CPU raster (skipped when the GPU
+  // takes the frame). Fall-through is the whole safety property: a refused
+  // frame just continues into the band path below with no state to unwind.
 #if DSPERATE_VULKAN
   if (gpu_live_ || gpu_gate_dryrun_) {
     const u32 reject = gpu_supported(polys, npoly);
@@ -3374,13 +3062,10 @@ void Renderer3D::render(const Gpu3D& gx) {
       ++gpu_stats_.eligible;
     }
     if (reject != GpuOk || !gpu_live_) {
-      // Nothing to do: the dry run only counts, and a refused frame falls
-      // through to the band path below exactly as it did before the seam.
+      // Dry run only counts; a refused frame falls through to the band path.
     } else if (!gpu_ab_ && gpu_thread_.joinable()) {
-      // The GPU job thread takes it from here: conversion, upload, submit,
-      // and the CPU fallback if the upload refuses. Everything it reads --
-      // the polygon list, rs_frame_, the texture refs -- stays put until the
-      // next render(), whose sync_all() joins the job first.
+      // GPU job thread does conversion, upload, submit, and CPU fallback.
+      // Everything it reads stays put until sync_all() joins it next render().
       gpu_job_polys_.assign(polys, polys + npoly);
       gpu_job_n_ = npoly;
       gpu_job_dst_ = out_[display_ ^ 1].data();
@@ -3432,9 +3117,8 @@ void Renderer3D::render(const Gpu3D& gx) {
     }
   }
 #else
-  // Without Vulkan the gate still runs when asked for: --gpu-gate measures
-  // which frames a GPU raster could take, and that question is worth asking
-  // on a build (or a machine) that has no GPU.
+  // No Vulkan: still runs the gate when asked (--gpu-gate), to measure which
+  // frames a GPU raster could take even on a build/machine without one.
   if (gpu_gate_dryrun_) {
     const u32 reject = gpu_supported(polys, npoly);
     if (reject != GpuOk) { ++gpu_stats_.rejected; ++gpu_stats_.reject[reject]; }
@@ -3445,44 +3129,30 @@ void Renderer3D::render(const Gpu3D& gx) {
   gpu_frame_prev_ = false;
 
   u32 maxb = band_count(live);
-  // A hot compositor thread (Gpu lag mode) takes the fourth core of the
-  // handhelds: three band workers beside it measured +9 % on Golden Sun's
-  // title, two measured -3 % in the mean but +18 % at p99 (RG DS,
-  // 2026-09-04) -- the heavy-3D frames of that title need the third worker
-  // (their raster is ~20 ms on two) while the light ones want the core for
-  // the compositor. The recent raster cost decides: its two workloads
-  // alternate frame by frame, so the previous frame of the same phase is
-  // two back -- hence the max over the last two frames. The threshold is
-  // what two workers can finish in the ~240 lines between the dispatch at
-  // line 215 and the last display line. The pin stays at three for frames
-  // whose compositing is batched and brief.
+  // Gpu lag mode: the compositor thread contends for the fourth core, so drop
+  // to 2 workers if the recent raster cost (max of the last two frames, since
+  // its workload alternates by phase) fits within 2 workers' budget.
   if (maxb > 2 && !threads_forced() && nds_.gpu.lag_active()) {
     const u64 recent = band_sum_ns_[0] > band_sum_ns_[1] ? band_sum_ns_[0] : band_sum_ns_[1];
     static const u64 threshold = [] { const char* e = std::getenv("DS_R3D_LAG_NS"); return e ? static_cast<u64>(std::atoll(e)) : kLagBandThresholdNs; }();
     if (recent < threshold) maxb = 2;
   }
-  // The buffer the display is not reading; it becomes the displayed one once
-  // the frame is dispatched (its lines are then waited for per band).
+  // Buffer the display isn't reading; becomes the displayed one after dispatch.
   u32* const dst = out_[display_ ^ 1].data();
   u32* const sdst = split_[display_ ^ 1].data();
   u8* const adst = split_any_[display_ ^ 1].data();
   ShapeDst shd; if (shape_) { const u32 i = display_ ^ 1; shd = {sh_pure_[i].data(), sh_depth_[i].data(), sh_attr_[i].data()}; ++sh_seq_[i]; }
   if (maxb == 0) { pending_bands_ = 0; wait_ns_.store(0, std::memory_order_relaxed); build_edges(); split_dst_ = sdst; split_any_dst_ = adst; shape_dst_ = shd; render_band(0, 192, dst); display_ ^= 1; return; }
 
-  // The pool is always the maximum size and only `nb` of it is given work, so
-  // ramping the thread count costs a dispatch flag rather than creating and
-  // joining threads mid-scene.
+  // Pool is always max size; only `nb` gets work, so ramping the thread count
+  // costs a dispatch flag rather than creating/joining threads mid-scene.
   if (bands_.size() < maxb - 1) {
     while (bands_.size() < maxb - 1) bands_.push_back(std::make_unique<Renderer3D>(nds_));
   }
-  for (auto& b : bands_) { b->aa_ = aa_; b->subpix_ = subpix_; b->shape_ = shape_; b->coverage_probe_ = coverage_probe_; }   // the settings can change between frames
-  // Never replaced once it is big enough: the compositor thread may be
-  // waiting on it for the previous frame's bands (sync_line). So it is made
-  // once, for the most workers any frame gets by default -- three, whatever
-  // the cores now: the online count moves under a running game (see
-  // host_cores) and the lag rule starts some frames at two. Workers a frame
-  // does not use are never woken (Pool::dispatch). Only a forced count past
-  // three can grow it.
+  for (auto& b : bands_) { b->aa_ = aa_; b->subpix_ = subpix_; b->shape_ = shape_; b->coverage_probe_ = coverage_probe_; }
+  // Never replaced once big enough: the compositor may still be waiting on it
+  // for the previous frame's bands (sync_line). Sized for 3 by default (the
+  // usual max); unused workers are never woken (Pool::dispatch).
   if (!pool_ || pool_->workers() < maxb) pool_ = std::make_unique<Pool>(maxb > 3 ? maxb : 3);
 
   u32 nb = (adapt_enabled() && !threads_forced()) ? adaptive_workers(maxb) : maxb;
@@ -3490,17 +3160,13 @@ void Renderer3D::render(const Gpu3D& gx) {
   last_nb_ = nb;
   wait_ns_.store(0, std::memory_order_relaxed);   // consumed by adaptive_workers; start the next frame's tally
 
-  // Bins are cut for the maximum, not for `nb`, so that a ramp changes one
-  // thing at a time: the same strips are drawn either way, by more or fewer
-  // threads. Cutting them for `nb` would re-slice the frame on every ramp.
+  // Bins are cut for the maximum, not `nb`, so a ramp changes only the thread
+  // count -- the same strips are drawn either way, no re-slicing per ramp.
   nbins_ = bin_count(maxb);
   compute_bins(nbins_, maxb);
   const Gpu3D& gxr = gx;
-  // The job outlives this call now, so it is a member, and every worker runs
-  // on a pool thread -- the emulation thread's job is to go on emulating.
-  // Each worker takes bins until they run out, rather than owning one band,
-  // so an uneven split costs the frame nothing: whoever is free next picks up
-  // the next strip of the frame.
+  // job_fn_ is a member since the job outlives this call. Workers claim bins
+  // until exhausted (not one band each), so an uneven split costs nothing.
   job_fn_ = [this, &gxr, dst, sdst, adst, shd](u32 w) {
     const auto t0 = std::chrono::steady_clock::now();
     Renderer3D* r = this;
@@ -3513,17 +3179,14 @@ void Renderer3D::render(const Gpu3D& gx) {
       if (y0 < y1) { r->split_dst_ = sdst; r->split_any_dst_ = adst; r->shape_dst_ = shd; r->render_band(y0, y1, dst); }
       pool_->mark_done(b);
     }
-    // Per worker now, not per bin: what a thread spent on the frame. Each
-    // writes its own slot, so no synchronisation; read at the next frame's
-    // dispatch (after sync_all) for the band-count choice above.
+    // Per worker, own slot, no synchronisation; read next frame after sync_all.
     if (w < 8) band_ns_[w] = static_cast<u64>((std::chrono::steady_clock::now() - t0).count());
   };
   pending_bands_ = nbins_;
   if (pin_threads() && owner_ != std::this_thread::get_id()) pin_current_thread(0);
   owner_ = std::this_thread::get_id();
   {
-    // The next generation's slot: sync_all above guarantees no thief of the
-    // generation two back is still reading it.
+    // Next generation's slot; sync_all above guarantees no thief two back is still reading it.
     DispatchCtx& c = ctx_[(gen_ + 1) & 1];
     c.gx = &gx; c.polys = list_polys_; c.npoly = list_count_; c.texels = poly_texels_; c.rs = rs_frame_;
     c.bin_y = bin_y_; c.nbins = nbins_; c.dst = dst; c.split = sdst; c.split_any = adst; c.shape_dst = shd; c.aa = aa_; c.subpix = subpix_; c.shape = shape_;
@@ -3531,9 +3194,8 @@ void Renderer3D::render(const Gpu3D& gx) {
   gen_ = pool_->dispatch(job_fn_, nb, nbins_);
   display_ ^= 1;
   if (!async_) sync_all();
-  // The emulation thread waits for the slowest band, so that -- not the sum --
-  // is what the 3D raster costs the frame. Both are recorded: the gap between
-  // them is what balancing the bands could recover.
+  // Emulation thread waits for the slowest band (not the sum); both recorded
+  // so the gap shows what balancing the bands could recover.
   if (prof::enabled) {
     u64 mx = 0, sum = 0;
     for (u32 i = 0; i < nb && i < 8; ++i) {
@@ -3547,30 +3209,10 @@ void Renderer3D::render(const Gpu3D& gx) {
 }
 
 // How many bins to cut the frame into for `workers` threads.
-//
-// More bins than workers is what lets a heavy strip be absorbed by threads
-// that finish theirs early, and it does work: at twelve bins the three
-// workers came out even (2400 / 2367 / 2357 ms against 1148 / 1863 / 2972)
-// and the emulation thread's wait fell from 304 ms to 71 ms over 900 frames
-// of sm64.
-//
-// It still loses. Every boundary duplicates two scanlines -- a bin rasterises
-// from y0-1, because final_pass(y0) reads the line above, and through y1,
-// because final_pass(y1-1) reads the line below -- and re-runs seed_active.
-// At twelve bins that is 22 of 192 lines drawn twice, and the total raster
-// work rose 19 % (5983 -> 7124 ms) to save 233 ms of waiting. Device totals
-// over 1800 frames of sm64: 18801 ms at three bins, 18934 at six, 19655 at
-// twelve, 20394 at twenty-four; meteos is flat to slightly worse.
-//
-// The reason the trade is bad here is that the raster is already
-// asynchronous: the emulation thread waits for a band for 2.4 % of the frame,
-// so balancing the workers has almost nothing to win, while the duplicated
-// lines are paid in full and compete with the emulation thread for cores.
-// DraStic bins into twelve fixed 16-line strips (video_3d_bin_polygons_1x,
-// twelve polygon-index lists of stride 0x1004), but its bins are lists of
-// polygons handed to a rasteriser that does not re-walk edges per bin, so it
-// does not pay this. So the default is one bin per worker -- the machinery is
-// here, and DS_R3D_BINS turns it up, if the boundary cost is ever removed.
+// More bins than workers lets a heavy strip be absorbed by threads that
+// finish early, but every boundary duplicates two scanlines (final_pass reads
+// one line above/below) and re-runs seed_active. Default is one bin per
+// worker; DS_R3D_BINS raises it.
 u32 Renderer3D::bin_count(u32 workers) {
   static const int forced = [] {
     const char* e = std::getenv("DS_R3D_BINS");
@@ -3593,40 +3235,18 @@ Renderer3D::Split Renderer3D::split_mode() {
       if (!std::strcmp(e, "taper")) return Split::Taper;
       if (!std::strcmp(e, "stair")) return Split::Ascending;
     }
-    // Taper is the default since the 3-worker pin: head bins keep the
-    // deadline ramp while they can still all start at once, the tail stays
-    // flat so no bin strands a worker. Re-measured 2026-08-31 (6 reps,
-    // paired): GSDD phase 2 −2.6 % mean / −4.3 % p99 against Even, with
-    // etody, sm64 and dbori flat. Descending is better still on etody
-    // (−3 % mean) but costs GSDD +3 % mean / +9 % p99, and Ascending is the
-    // deadline shape, right only while every bin starts at once — measured
-    // at eight bins it cost etody two thirds of its over-budget frames
-    // (188 against 64) and sm64 2 % of its total.
+    // Taper default: head bins keep the deadline ramp while they can still
+    // all start at once, tail stays flat so no bin strands a worker.
     return Split::Taper;
   }();
   return mode;
 }
 
-// Cut points for `nbins` bins.
-//
-// The cost model is the number of polygons covering each line: measured per
-// band on the device, time tracked polygon-lines (1.38M / 1.55M / 2.55M for
-// 5.35 / 8.11 / 6.42 s) and not span pixels, which were nearly equal across
-// the bands. Every line also costs a clear and a final pass whatever covers
-// it, hence the +1: a bin of empty lines is not free.
-//
-// Shares follow the deadlines rather than being equal. The raster is
-// dispatched at line 215 and bin b's output is first read at display line
-// bin_y_[b] of the next frame, so bin b has (263 - 215) + bin_y_[b] lines to
-// finish in -- 48 for the first one. Sized equally, the first bin cannot make
-// that and the emulation thread waits at line 0 having gained nothing: with
-// equal cuts and three bins the workers evened out but the wait *rose*, 304
-// ms to 760. The deadlines depend on the split, so it is solved once from the
-// equal-work split and then refined.
-//
-// The polygons' line ranges are in the list itself (ytop / ybot from the
-// geometry engine), so this is a difference array and a prefix sum over 192
-// entries and needs no edge setup first.
+// Cut points for `nbins` bins. Cost model: polygons per line, +1 for the
+// unavoidable clear/final pass. Shares follow deadlines, not equal work
+// (raster dispatches at line 215, bin b first read at bin_y_[b] next frame),
+// solved once from the equal-work split then refined. Difference array +
+// prefix sum over ytop/ybot; needs no edge setup.
 void Renderer3D::compute_bins(u32 nbins, u32 workers) {
   std::array<s32, 194> delta{};
   const Polygon* const* polys = list_polys_;
@@ -3663,26 +3283,17 @@ void Renderer3D::compute_bins(u32 nbins, u32 workers) {
   split_with(weight, wsum);                       // equal work, to get deadlines
   if (split_mode() == Split::Even) return;
 
-  // The ramp shapes, refined twice because the deadlines depend on the split.
-  //
-  // Ascending is the deadline shape and it is only correct while every bin
-  // *starts* at the same moment, which is true exactly when there is one bin
-  // per worker. Beyond that bins are claimed in sequence, so a late bin does
-  // not begin until a worker frees up and most of its runway is already gone
-  // -- and Ascending hands it the largest share: at eight bins the last is
-  // 4.5x the first (10 12 16 19 24 30 36 45), which is one worker still
-  // grinding while the others have nothing left to claim. Descending is the
-  // opposite bet, sized for when a bin starts rather than when it is due.
+  // Ramp shapes, refined twice since deadlines depend on the split. Ascending
+  // is correct only when every bin starts at once (one bin per worker);
+  // beyond that a late bin's runway is already gone, so Descending sizes for
+  // when a bin starts rather than when it's due.
   for (int pass = 0; pass < 2; ++pass) {
     wsum = 0;
     for (u32 b = 0; b < nbins; ++b) {
       u32 w;
       switch (split_mode()) {
       case Split::Descending: w = 48 + static_cast<u32>(192 - bin_y_[b + 1]); break;
-      // Ramp while the bins can still be started early -- one per worker --
-      // then flat, so the head keeps the deadline taper that gets line 0 out
-      // and the tail has no bin big enough to strand anyone.
-      case Split::Taper: w = 48 + static_cast<u32>(bin_y_[b < workers ? b : workers - 1]); break;
+      case Split::Taper: w = 48 + static_cast<u32>(bin_y_[b < workers ? b : workers - 1]); break;   // ramp then flat
       default: w = 48 + static_cast<u32>(bin_y_[b]); break;
       }
       weight[b] = w; wsum += w;
@@ -3703,24 +3314,16 @@ Renderer3D::FrameRef Renderer3D::frame_ref(bool allow_defer) const {
   if (pending_bands_) f.bin_y = bin_y_;
 #if DSPERATE_VULKAN
   if (gpu_frame_) {
-    // A frame on the job thread: wait until it has decided between the GPU
-    // and the CPU fallback (the conversion, well under a millisecond, and
-    // normally long done by the time the display asks).
+    // Wait for the job thread to decide GPU vs CPU fallback (usually long done by now).
     gpu_job_wait(GpuJobSync::Submitted);
     if (gpu_job_fallback_) {
       f.out = gpu_job_dst_;
       f.job = &gpu_job_;
       return f;
     }
-    // The pointer travels in the ref exactly as out_[display_] does, and for
-    // the same reason: render() of the next frame may already have moved on.
-    // The band cut travels with it too, so a GPU frame describes itself the
-    // way a CPU frame does and sync_line does not care which drew it.
     if (allow_defer && gpu_defer_ok_) {
-      // The frame before the last one. Its fence was waited at the last
-      // render()'s sync_all and its memory invalidated there, so this ref
-      // carries no raster to wait for at all -- f.gpu stays null and
-      // sync_line returns immediately.
+      // Frame before the last: its fence was already waited at the last
+      // render()'s sync_all, so f.gpu stays null and sync_line returns at once.
       ++gpu_stats_.deferred;
       f.out = vk_raster_->output_prev();
       return f;
@@ -3739,8 +3342,8 @@ Renderer3D::FrameRef Renderer3D::frame_ref(bool allow_defer) const {
     return f;
   }
 #endif
-  // The software raster's own frame. The split and shaping planes are its
-  // alone: a GPU frame above leaves them at their defaults (none).
+  // Software raster's own frame; split/shaping planes are its alone (a GPU
+  // frame above leaves them at their defaults).
   f.out = out_[display_].data();
   f.split = (subpix_rendered_ || shape_rendered_) ? split_[display_].data() : nullptr;
   f.shape = shape_rendered_; f.shape_idx = display_; f.shape_seq = sh_seq_[display_];
@@ -3748,20 +3351,14 @@ Renderer3D::FrameRef Renderer3D::frame_ref(bool allow_defer) const {
   return f;
 }
 
-// Wait for the band that owns display line `y` of frame `f`, and no other:
-// the bands are independent and each writes only its own output lines, so
-// the compositor can read the top of the frame while the bottom is still
-// being drawn. Reads nothing of this object that render() changes -- the
-// frame's cut and generation travel in the ref -- so it can run on the
-// compositor thread while the emulation thread dispatches the next frame.
+// Wait only for the band that owns display line `y` of frame `f`: bands are
+// independent, so the compositor can read the top while the bottom still
+// draws. Reads nothing render() changes (the ref carries the cut/generation),
+// so it can run on the compositor thread while emulation dispatches the next frame.
 void Renderer3D::sync_line(const FrameRef& f, s32 y) {
 #if DSPERATE_VULKAN
   if (f.job) { gpu_job_wait(GpuJobSync::FallbackDone); return; }
-  // A GPU frame is banded like a CPU one, so this is the same search: find
-  // the band that owns the line and wait only for that. With one band it
-  // degenerates to waiting for the whole picture, which is what it used to
-  // do unconditionally -- and what made the compositor pay the entire GPU
-  // time on line 0.
+  // GPU frame is banded like a CPU one; one band degenerates to waiting for the whole picture.
   if (f.gpu) {
     u32 b = 0;
     while (b + 1 < f.nbins && y >= f.bin_y[b + 1]) ++b;
@@ -3770,8 +3367,6 @@ void Renderer3D::sync_line(const FrameRef& f, s32 y) {
     const u64 wns = static_cast<u64>((std::chrono::steady_clock::now() - t0).count());
     gpu_stats_.wait_line_ns += wns;
     if (wns > 50'000'000) {
-      // A stall: say whether the job thread was late to run (scheduling) or
-      // the GPU was slow to finish (the device).
       ++gpu_stats_.stalls;
       g_gpu_stalls.fetch_add(1, std::memory_order_relaxed);
       std::fprintf(stderr, "gpu raster: STALL frame %llu line %d -- waited %.1f ms for the GPU frame; job thread woke after %.2f ms, uploaded in %.2f ms\n",
@@ -3783,9 +3378,7 @@ void Renderer3D::sync_line(const FrameRef& f, s32 y) {
   if (!f.nbins || !pool_) return;
   u32 b = 0;
   while (b + 1 < f.nbins && y >= f.bin_y[b + 1]) ++b;
-  // The common line finds its band drawn: one atomic load, no clock, no
-  // thread-id lookup -- the fast path is what it was before stealing.
-  if (pool_->done(f.gen, u64{1} << b)) return;
+  if (pool_->done(f.gen, u64{1} << b)) return;   // fast path: one atomic load
   const auto t0 = std::chrono::steady_clock::now();
   const bool owner = std::this_thread::get_id() == owner_;
   if (!steal_bins(f.gen, b)) {
@@ -3795,16 +3388,13 @@ void Renderer3D::sync_line(const FrameRef& f, s32 y) {
   }
   if (owner) owner_wait_ns_.fetch_add(static_cast<u64>((std::chrono::steady_clock::now() - t0).count()), std::memory_order_relaxed);
 }
-// Wait for all of them: before the next frame's raster, and whenever
-// something is about to change what the workers are reading (Bus::update_vram
-// is the only way texture VRAM or its banking can move -- the texture and
-// texture-palette views are never mapped into either CPU's address space).
+// Waits for all bands: before the next frame's raster, and before anything
+// that changes what workers are reading (Bus::update_vram is the only way
+// texture VRAM/banking can move).
 void Renderer3D::sync_all() {
 #if DSPERATE_VULKAN
-  // Same contract as the bands: after this returns, nothing is reading the
-  // polygon list, the texture cache or the render state. render() calls it
-  // first thing, which is what keeps frame N+1's dispatch behind frame N's
-  // fence without a second flight of buffers.
+  // After this, nothing reads the polygon list, texture cache, or render
+  // state; render() calls it first, keeping frame N+1 behind frame N's fence.
   gpu_job_wait_done();
   if (vk_raster_) {
     const auto t0 = std::chrono::steady_clock::now();
@@ -3818,10 +3408,9 @@ void Renderer3D::sync_all() {
     }
   }
 #endif
-  // Unconditionally, not just while bins are outstanding: sync_line clears
-  // pending_bands_ once it has waited for every bin, and a worker can still
-  // be inside the job at that point -- it marks its last bin done from in
-  // there. Waiting on an idle pool costs one uncontended lock.
+  // Unconditional, not just while bins are outstanding: a worker can still be
+  // inside the job after pending_bands_ clears (marks its last bin from in
+  // there). Waiting on an idle pool costs one uncontended lock.
   u64 ns = 0;
   if (pool_ && (pending_bands_ || !pool_->idle())) {
     const auto t0 = std::chrono::steady_clock::now();
@@ -3844,10 +3433,8 @@ int Renderer3D::steal_mode() {
 // worker still has to reach; whatever is claimed here is on the display's
 // path anyway. Returns true if `upto` is done -- without having waited.
 bool Renderer3D::steal_bins(u64 gen, u32 upto) {
-  // The common line finds its band drawn: one atomic load, no thread-id
-  // lookup -- the fast path is what it was before stealing.
   const u64 mask = u64{1} << upto;
-  if (pool_->done(gen, mask)) return true;
+  if (pool_->done(gen, mask)) return true;   // fast path: one atomic load
   const int mode = steal_mode();
   if (mode == 0 || (mode == 1 && std::this_thread::get_id() != owner_)) return false;
   // A band of this thread's own for the duration; none free means two
@@ -3855,9 +3442,7 @@ bool Renderer3D::steal_bins(u64 gen, u32 upto) {
   StealBand* sb = nullptr;
   for (StealBand& c : steal_) if (!c.busy.exchange(true, std::memory_order_acq_rel)) { sb = &c; break; }
   if (!sb) return false;
-  // Below the three early-outs on purpose: the fast path (band already drawn,
-  // stealing off, no free band) must stay free of a clock, and only this loop
-  // draws anything. "Of which" -- see R3D_STEAL in profile.h.
+  // Below the fast-path early-outs on purpose: only this loop draws anything.
   DS_PROF(R3D_STEAL);
   const DispatchCtx& cx = ctx_[gen & 1];
   bool result = false;
@@ -3881,28 +3466,12 @@ bool Renderer3D::steal_bins(u64 gen, u32 upto) {
 }
 
 // How many workers to run this frame, from how long the emulation thread
-// spent blocked on the raster in the frames before it.
-//
-// A fixed count cannot be right for every scene, because what an extra raster
-// thread is worth is exactly what the compositor is waiting for, and that
-// differs by a factor of six between scenes. Measured over 900 frames with
-// eight even bins: sm64 blocks in sync_line for 2.4 % of the frame, so a
-// third worker buys almost nothing and mostly takes a core off emulation --
-// it measures 19605 ms against 18963 at two. etody blocks for 15.8 %, and the
-// third worker cuts the raster phase from 6156 ms to 4878 and the waiting
-// from 3337 ms to 1286, worth 14100 ms against 14679. Same binary, same
-// bins, opposite answers.
-//
-// Games move between the two regimes within a scene -- etody alternates 3D
-// dungeons with 2D towns -- so this ramps quickly and falls back slowly. Two
-// consecutive busy frames add a worker (a dungeon should not spend a second
-// under-threaded); it takes two seconds of quiet to drop one, so a town does
-// not give the thread back before the next corridor asks for it, and a scene
-// flipping between the two does not thrash the pool.
+// spent blocked on the raster recently. Ramps up fast, falls back slow: a
+// busy scene should not stay under-threaded, but a quiet one shouldn't give
+// a worker back right before the next busy stretch needs it.
 u32 Renderer3D::adaptive_workers(u32 max_workers) {
   constexpr u64 kFrameNs = 16715000;            // one DS frame
   constexpr u32 kDownFrames = 120;              // ~2 s of quiet before giving a worker back
-  // Tunable for the sweep that picked them; see the note below.
   static const int kShift = [] {
     const char* e = std::getenv("DS_R3D_ADAPT_SHIFT");
     return e ? std::atoi(e) : 6;                // averaging window, ~64 frames (~1 s)
@@ -3917,27 +3486,13 @@ u32 Renderer3D::adaptive_workers(u32 max_workers) {
   if (max_workers < 2) return max_workers;
   if (workers_now_ == 0) { workers_now_ = 2; wait_ema_ = 0; }
 
-  // A long average, not a run of frames.
-  //
-  // The first version counted consecutive frames over the threshold, which
-  // measures the wrong thing: what separates the regimes is the *mean* time
-  // blocked, while a burst of heavy frames happens in all of them. sm64's
-  // worst burst is 122 frames, so a short attack trips on it and the slow
-  // decay then latches the count high: measured, that put sm64 at three
-  // workers almost permanently and cost 5 % (19287 ms against 18297 at two).
-  //
-  // The window has to be long for a second reason. Blocked time at two
-  // workers, b=8 even, over 900 frames: etody 15.5 %, mlbis 4.1 %, sm64
-  // 1.1 %, dbori 0.1 %. Only etody wants the extra thread and its 15.5 % is
-  // *sustained*; mlbis's 4.1 % is episodic, and over a short window its
-  // excursions cross any threshold etody needs. Averaging over about a second
-  // separates sustained from episodic, which is the actual distinction.
+  // Long average (~1s), not a run of frames: separates sustained blocking
+  // from a burst that would trip a short window and latch the count high.
   wait_ema_ += (static_cast<s64>(wait_ns_.load(std::memory_order_relaxed)) - wait_ema_) >> kShift;
   const u64 avg = wait_ema_ > 0 ? static_cast<u64>(wait_ema_) : 0;
 
-  // Ramping up needs only the average to cross, so a dungeon is served within
-  // the averaging window; giving a worker back needs the average low *and*
-  // held there, so a town does not hand it over before the next corridor.
+  // Ramp up needs only the average to cross; giving a worker back needs it
+  // low *and* held there.
   if (avg > kBusyNs) {
     quiet_frames_ = 0;
     if (workers_now_ < max_workers) ++workers_now_;
@@ -3951,40 +3506,13 @@ u32 Renderer3D::adaptive_workers(u32 max_workers) {
   return workers_now_;
 }
 
-// DS_R3D_ADAPT=1 turns the controller on; it is off otherwise.
-//
-// SUPERSEDED, and left here only because the reasoning below is still the right
-// reasoning about a 2<->3 ramp. band_count has pinned three workers since
-// 2026-08-29, and the controller ramps between two and three -- so against the
-// current default it can only ever take a worker away. Measured on .20, 1800
-// frames, three interleaved reps against that default: etody mean -0.13 % but
-// p99 +9.33 % and over-budget frames 16 -> 31; sm64 mean +2.57 %, p99 +4.23 %,
-// over-budget 14 -> 24. etody at two workers is where that comes from -- 243
-// over-budget frames against 16, p99 19.5 against 16.4.
-//
-// The measurement in the next paragraph was taken against a TWO-worker baseline
-// and does not describe what enabling this knob does today. Do not re-test the
-// controller without first un-pinning band_count: the two are not independent,
-// and a sweep that varies one while the other is pinned measures the pin.
-//
-// It costs about half a percent of throughput on the scenes that do not need
-// it -- small, but real rather than noise: mlbis, sm64 and dbori are slower
-// in every rep of both machines, from brief ramps that do not pay for
-// themselves. It buys 6 % of etody's total time and 78 % of its over-budget
-// frames (257 -> 57), and the scenes paying the half percent do not pay it in
-// dips: their over-budget counts do not move. Measured three reps on each of
-// two RG DS boards, summed over the five scenes: -0.71 % and -0.72 %.
-//
-// Threshold 18 %, not 12. The means at two workers are etody 15.5 %, mlbis
-// 4.1 %, sm64 1.1 %, dbori 0.1 %. A trigger near etody's own mean is close
-// enough that mlbis's episodic peaks reach it; above it, the controller fires
-// on sustained blocking and little else -- which is the distinction that
-// predicts whether another worker pays, rather than a value threaded between
-// two particular scenes.
+// DS_R3D_ADAPT=1: ramps workers 2<->3 against band_count's default pin of 3,
+// so it can only ever take a worker away. Do not re-test without un-pinning
+// band_count first, since the two are not independent.
 bool Renderer3D::adapt_enabled() {
   static const bool on = [] {
     const char* e = std::getenv("DS_R3D_ADAPT");
-    return e && std::atoi(e) != 0;    // off unless asked: band_count pins three workers
+    return e && std::atoi(e) != 0;
   }();
   return on;
 }
@@ -3997,8 +3525,7 @@ bool Renderer3D::threads_forced() {
 // How many band workers the frame gets; 0 draws it inline on the emulation
 // thread. DS_R3D_THREADS overrides the count. Only near-empty frames stay
 // inline: polygon *count* says nothing about raster cost (a skybox or a
-// full-screen quad is a full frame of spans), and skipping banding below 24
-// polygons cost 12 % of the whole win on SM64DS.
+// full-screen quad is a full frame of spans).
 u32 Renderer3D::band_count(u32 polygons) {
   static const int forced = [] {
     const char* e = std::getenv("DS_R3D_THREADS");
@@ -4006,19 +3533,8 @@ u32 Renderer3D::band_count(u32 polygons) {
   }();
   if (forced >= 0) return static_cast<u32>(forced);
   if (polygons < 2) return 0;
-  // Pinned at three since 2026-08-29 on four cores (RG DS knob sweep against
-  // the CPU cuts of 2026-08-28: mlbis -6.8 %, etody -2.6 %, sm64 -1.4 %,
-  // meteos/dbori flat; GSDD +5.8 %, whose main thread is the critical path).
-  // Before the pin a third worker only paid where the emulation thread was
-  // blocked on the raster (etody +4.3 %; sm64, mlbis, dbori lost 3-9 %),
-  // hence the 2<->3 controller, which stays behind DS_R3D_ADAPT=1.
-  //
-  // Fewer cores: one worker per core. Measured on the A30 with two cores
-  // offline (2x A7, shipped config, SCHED_RR, 2026-09-14), two workers match
-  // three on every scene (etody 26 ms, sm64 11.9, nsmb 31.5) while one worker
-  // is 11 ms worse on etody: the raster there needs both cores, and the
-  // emulation thread's steal does not stand in for a worker (neither did the
-  // compositor stealing, or no lag). A single core draws inline.
+  // Pinned at three on four+ cores (see adapt_enabled for the 2<->3 controller).
+  // Fewer cores: one worker per core; a single core draws inline.
   const u32 cores = host_cores();
   return cores >= 3 ? 3 : cores >= 2 ? 2 : 0;
 }
@@ -4038,9 +3554,8 @@ void Renderer3D::prepare_worker(const Gpu3D& gx, const Polygon* const* polys, u3
   build_edges();
 }
 
-// List the live polygons and bucket them by top line. Every instance repeats
-// this: the edge cursors are walked per line and so cannot be shared. The
-// edges themselves are built on first use (built_edge).
+// Lists the live polygons, bucketed by top line. Every instance repeats this
+// since edge cursors are walked per line; edges are built on first use.
 void Renderer3D::build_edges() {
   const Polygon* const* polys = list_polys_;
   u32 n = 0;
@@ -4122,9 +3637,8 @@ void Renderer3D::render_band(s32 y0, s32 y1, u32* dst) {
     if (rasterised < 192) {
       // Stop at the last line this band can use. final_pass(y1-1) reads y1, so
       // y1 + 1 is the exclusive bound; rounding up to a whole CHUNK instead
-      // rasterises lines that belong to the next band, which draws them again.
-      // That overlap is proportional to CHUNK and was 18.8 % of all polygon
-      // lines at CHUNK 14, 8.2 % at CHUNK 6 (sm64, 3 bands).
+      // rasterises lines that belong to the next band, which draws them
+      // again. That overlap grows with CHUNK.
       const s32 want = y1 + 1 < 192 ? y1 + 1 : 192;
       s32 end = rasterised + CHUNK < 192 ? rasterised + CHUNK : 192;
       if (end > want) end = want;
@@ -4165,17 +3679,11 @@ bool Renderer3D::set_gpu_raster(bool on, std::string* why) {
   if (vk_raster_) vk_raster_->set_smooth(smooth3d_);
   if (!vk_raster_) { if (why) *why = reason; vk_dev_.reset(); return false; }
   if (!vk_raster_->ready()) {
-    // The backend built its buffers but cannot draw yet. Keep it -- it is
-    // still worth reporting what device it opened -- but say so, and leave
-    // render() on the band path, which is what ready() being false means.
+    // Buffers built but not drawable yet; keep it (still worth reporting the
+    // device) but leave render() on the band path.
     if (why) *why = vk_dev_->name() + ": " + reason;
     return false;
   }
-  // Still to come with the upload path: binding the decoded texture cache
-  // for the GPU in place (VK_EXT_external_memory_host) rather than copying
-  // it. That needs the cache's texels in one arena -- today each entry owns
-  // its own vector (texcache.h) -- so it is part of that change, not this
-  // one. Raster::bind_texture_arena is waiting for it.
   if (why) *why = vk_dev_->name();
   static const bool threaded = [] { const char* e = std::getenv("DS_GPU_THREAD"); return !e || std::atoi(e) != 0; }();
   if (threaded && !gpu_thread_.joinable()) {
@@ -4286,17 +3794,10 @@ bool Renderer3D::gpu_raster_active() const {
   return vk_raster_ != nullptr && vk_raster_->ready();
 }
 
-// Which frames the GPU raster may take.
-//
-// The list is what the pixel pipeline does not implement yet, so it shrinks
-// as the shader grows; it is deliberately a whitelist of the simple case
-// rather than a blacklist of known-bad ones, because the failure mode of
-// guessing wrong here is a wrong picture rather than a slow one.
-//
-// Frame granularity is forced, not chosen: the two-deep pixel stack, the
-// edge-marking pass and the translucent polygon ids are all frame-global, so
-// a frame split between the two rasters would be wrong in a way neither of
-// them is alone.
+// Which frames the GPU raster may take: a whitelist of the simple case (not a
+// blacklist), since guessing wrong here means a wrong picture, not a slow one.
+// Frame granularity is forced: the two-deep pixel stack, edge-marking pass,
+// and translucent polygon ids are all frame-global.
 u32 Renderer3D::gpu_supported(const Polygon* const* polys, u32 npoly) const {
   const u32 d = dispcnt_;
 #if DSPERATE_VULKAN
@@ -4305,9 +3806,7 @@ u32 Renderer3D::gpu_supported(const Polygon* const* polys, u32 npoly) const {
   if (d & (1u << 4)) return GpuAA;
 #endif
   if (d & (1u << 14)) return GpuRearBitmap;  // rear plane from a bitmap rather than a clear colour
-  // Edge marking (bit 5) and fog (bit 7) are implemented: the raster writes
-  // its depth and attribute planes and post.comp applies them. They were the
-  // sole thing blocking Golden Sun and Spirit Tracks, on every frame.
+  // Edge marking (bit 5) and fog (bit 7): raster writes depth/attribute planes, post.comp applies them.
   for (u32 i = 0; i < npoly; ++i) {
     const Polygon& p = *polys[i];
     if (p.degenerate) continue;
@@ -4332,28 +3831,12 @@ const char* Renderer3D::gpu_reject_name(u32 r) {
   }
 }
 
-// Compare a GPU frame against the CPU frame drawn from the same list.
-//
-// Counted and summarised rather than printed per pixel: a broken shader
-// differs in tens of thousands of pixels and the interesting number is which
-// frame first went wrong and how badly, not the pixels themselves. The dump
-// that shows WHERE is the frontend's job (--gpu-ab-dump), so that this stays
-// cheap enough to leave running over a whole scene.
-// Convert the frame and submit it.
-//
-// The conversion writes into mapped GPU memory rather than into a staging
-// list that is then copied: this is the only pass over the data, and it lands
-// where the shader reads it. That is what keeps the CPU cost of driving the
-// GPU at the ~0.03 ms the probe measured rather than at the cost of a copy.
-//
-// Three things can make a frame undrawable here, and all three refuse it
-// rather than approximate it: a textured polygon whose texture the cache does
-// not hold (the shader has no other way to sample -- it never learns the six
-// texel formats, it reads the cache's one word per texel), a tile with more
-// polygons than its bin takes, and a list past the fixed buffer sizes. The
-// tile check is done here, on the host, rather than read back from the
-// binning pass: a readback would mean a second submit-and-wait to find out
-// whether the first one was valid.
+// Converts the frame and submits it. Writes straight into mapped GPU memory
+// (no staging copy) since this is the only pass over the data.
+// Refuses (rather than approximates) an undrawable frame: a textured polygon
+// whose texture the cache doesn't hold, a tile with more polygons than its
+// bin takes, or a list past the fixed buffer sizes. Tile check is done here
+// on the host to avoid a second submit-and-wait for a readback.
 bool Renderer3D::gpu_dispatch(const Polygon* const* polys, u32 npoly) {
 #if !DSPERATE_VULKAN
   (void)polys; (void)npoly;
@@ -4369,34 +3852,25 @@ bool Renderer3D::gpu_dispatch(const Polygon* const* polys, u32 npoly) {
   gpu_tile_use_.assign(DS_TILE_COUNT, 0);
   if (gpu_arena_reset_) { gpu_resident_.clear(); gpu_arena_top_ = 0; gpu_arena_reset_ = false; }
 
-  // Shadow stencil clear bits. The hardware clears a whole SCANLINE of the
-  // stencil when a run of mask polygons begins -- when the previous polygon
-  // drawn on that line was not itself a mask. The shader cannot see that: the
-  // polygon that ended the run may cover the line in another tile entirely.
-  // So it is decided here, by the one pass that does see the whole list, in
-  // exactly the order the CPU raster processes it.
-  //
-  // Only for a frame that has masks at all, and the walk is over each
-  // polygon's own scanlines, so it costs about what the raster already pays
-  // per polygon rather than anything quadratic.
+  // Shadow stencil clear bits: hardware clears a whole scanline's stencil
+  // when a mask run begins on it (previous polygon on that line wasn't a
+  // mask). The shader can't see that -- a run-ending polygon may live in
+  // another tile -- so it's decided here, in CPU-raster order, only when the
+  // frame has masks at all.
   bool any_mask = false;
   for (u32 i = 0; i < npoly && !any_mask; ++i) any_mask = polys[i]->shadow_mask && !polys[i]->degenerate;
   u32* const shrun = vk_raster_->shadow_run_buffer();
   u32* const rowpoly = vk_raster_->rowpoly_buffer();
   if (any_mask) { gpu_line_mask_.assign(192, 0); gpu_line_run_.assign(192, 0); }
 
-  // The order-free prefix (vk_layout.h, GpuFrame::first_ordered). The
-  // hardware's own sort puts every opaque polygon before every translucent
-  // one, so the prefix is simply the list up to the first polygon whose
-  // result depends on what is already in the pixel: a translucent one, a
-  // shadow mask (its stencil reads the depth of the moment) or a shadow. An
-  // alpha test nothing passes (alpha_ref 31) empties it, since then an opaque
-  // polygon writes nothing and only the ordered loop knows that.
+  // Order-free prefix (vk_layout.h, GpuFrame::first_ordered): list up to the
+  // first polygon whose result depends on the current pixel content
+  // (translucent, shadow mask, or shadow). Empty when alpha_ref==31, since no
+  // opaque polygon then writes anything.
   u32 first_ordered = ~0u, opaque_rows = 0;
   bool prefix_cut_by_shadow = false;
   const bool alpha_all_fail = rs_->alpha_ref >= 31;
-  // Without the visibility pass the whole list is the ordered tail, and so
-  // the whole list is binned. The census below still counts the prefix.
+  // Without the visibility pass, the whole list is the ordered tail (and thus binned).
   const bool use_vis = vk_raster_->visibility();
 
   u32 np = 0, nv = 0, nt = 0, nrows = 0;
@@ -4488,15 +3962,10 @@ bool Renderer3D::gpu_dispatch(const Polygon* const* polys, u32 npoly) {
     o.xmin = xmin; o.xmax = xmax;
     nv += p.nverts;
 
-    // This polygon's slice of the span table: one row per VISIBLE scanline it
-    // covers. ytop and ybot are not clamped to the screen -- the software
-    // raster clamps them where it loops -- so the rows are allocated for the
-    // clamped range and every consumer agrees to use that same clamp.
-    //
-    // The offsets are a running sum rather than polygon_index * 192, which
-    // would be 23 MB of mostly nothing; the cost of that is that the raster
-    // needs the base and the scanline range to find a row, so the binning
-    // pass carries both (bin.comp).
+    // This polygon's slice of the span table: one row per visible scanline
+    // (ytop/ybot are unclamped, clamped here to match every consumer). Offset
+    // is a running sum, not polygon_index*192 (would be 23MB mostly empty);
+    // the raster needs base + scanline range to find a row, carried by binning.
     const s32 ry0 = p.ytop < 0 ? 0 : p.ytop, ry1 = p.ybot > 191 ? 191 : p.ybot;
     const u32 rows = ry1 >= ry0 ? static_cast<u32>(ry1 - ry0) + 1 : 0;
     if (nrows + rows > DS_MAX_SPAN_ROWS) { gpu_fail_ = "span table full"; return false; }
@@ -4504,10 +3973,8 @@ bool Renderer3D::gpu_dispatch(const Polygon* const* polys, u32 npoly) {
     for (u32 r = 0; r < rows; ++r) rowpoly[nrows + r] = np;   // the span pass is one lane per row: each row names its polygon
     nrows += rows;
 
-    // The texture, as the cache already decoded it: one 32-bit word per texel,
-    // resident in the arena from the first frame that used it until the arena
-    // is next reset. A copy happens only for a texture the arena has never
-    // seen or that the cache re-decoded since (its version moved).
+    // Cache-decoded texture (one word/texel), resident in the arena until
+    // reset; copied only when new to the arena or re-decoded since (version moved).
     const u32 fmt = (p.texparam >> 26) & 7;
     if ((dispcnt_ & 1) && fmt != 0) {
       const TextureCache::Ref& r = poly_texref_[i];
@@ -4535,20 +4002,16 @@ bool Renderer3D::gpu_dispatch(const Polygon* const* polys, u32 npoly) {
       o.tex_w = tw;
       o.tex_h = th;
       o.flags |= DS_PF_TEXTURED;
-      // Whether any texel can carry alpha 0 (see DS_PF_TEX_ALPHA). Formats 1
-      // and 6 carry graded alpha and make the polygon translucent anyway.
-      // The format could carry alpha 0 (bit 29, formats 5 and 7); the cache
-      // knows whether this texture actually does.
+      // Could carry alpha 0 (bit 29, formats 5/7; formats 1/6 have graded
+      // alpha and are translucent regardless); cache knows if it actually does.
       const bool may_alpha = (p.texparam & (1u << 29)) || fmt == 5 || fmt == 7;
       if (may_alpha) ++gpu_stats_.polys_may_alpha;
       if (may_alpha && r.transparent) { o.flags |= DS_PF_TEX_ALPHA; ++gpu_stats_.polys_alpha; }
       ++gpu_stats_.polys_textured;
     }
 
-    // The same bounding box the binning shader will use. Counting it here is
-    // what lets an overflowing frame be refused before anything is submitted.
-    // Only the polygons the binning pass will see: the ordered tail, or the
-    // whole list when the prefix is not going through the visibility pass.
+    // Same bounding box the binning shader uses, so overflow is caught before
+    // submitting; only the polygons binning will actually see.
     if (use_vis && first_ordered == ~0u) { ++np; continue; }
     const s32 tx0 = std::clamp(xmin / DS_TILE_W, 0, DS_TILES_X - 1);
     const s32 tx1 = std::clamp(xmax / DS_TILE_W, 0, DS_TILES_X - 1);
@@ -4602,8 +4065,7 @@ bool Renderer3D::gpu_dispatch(const Polygon* const* polys, u32 npoly) {
   if (dispcnt_ & (1u << 5)) ++gpu_stats_.edge_frames;
   if (dispcnt_ & (1u << 7)) ++gpu_stats_.fog_frames;
   f.alpha_ref = rs_->alpha_ref;
-  // Exactly what clear_line() fills the ring with for a solid clear. The
-  // bitmap rear plane is gated off, so this is the only case that reaches here.
+  // What clear_line() fills the ring with for a solid clear (bitmap rear plane is gated off).
   {
     const u16 c = static_cast<u16>(rs_->clear_attr1);
     auto ch = [](u16 v, u32 shift) { u32 x = (shift == 0 ? (v << 1) : (v >> shift)) & 0x3E; return x ? x + 1 : x; };
@@ -4614,8 +4076,7 @@ bool Renderer3D::gpu_dispatch(const Polygon* const* polys, u32 npoly) {
   gpu_stats_.texel_words += nt;
   gpu_stats_.span_rows += nrows;
   if (nrows > gpu_stats_.span_rows_max) gpu_stats_.span_rows_max = nrows;
-  // The arena's high-water mark, not this frame's copies: the shader reads
-  // whatever any polygon points into.
+  // Arena's high-water mark, not this frame's copies: shader reads whatever any polygon points into.
   const auto t_submit = std::chrono::steady_clock::now();
   const bool ok = vk_raster_->submit(np, nv, gpu_arena_top_, f);
   gpu_stats_.submit_ns += static_cast<u64>((std::chrono::steady_clock::now() - t_submit).count());
@@ -4646,11 +4107,8 @@ void Renderer3D::set_gpu_ab_dump(const char* ref_path, const char* cand_path) {
   ab_cand_ = cand_path ? std::fopen(cand_path, "wb") : nullptr;
 }
 
-// One 3D layer as compare_frames.py wants a frame: the layer in the top
-// screen, a blank bottom screen after it. RGB666 + 5-bit alpha out of the
-// raster, 8 bits a channel in; the 6->8 expansion is (c * 255 + 31) / 63 so
-// that 63 lands on 255 rather than 252 and the images are the colours the
-// display would show.
+// One 3D layer as an A/B dump frame (layer + blank bottom screen). 6->8 bit
+// expansion is (c*255+31)/63 so 63 lands on 255, matching what the display shows.
 void Renderer3D::gpu_ab_write(FILE* f, const u32* layer) {
   if (!f) return;
   static thread_local std::array<u32, 256 * 192> px;
@@ -4680,9 +4138,7 @@ void Renderer3D::gpu_snapshot_output() {
 
 template <class S> void Renderer3D::sync_output(S& s) {
   sync_all();
-  // A GPU-drawn frame is in the raster's buffer, not out_[]. The state saves
-  // the picture the display is reading, so bring it across -- once, on a
-  // save, rather than every frame.
+  // GPU-drawn frame lives in the raster's buffer, not out_[]; bring it across once, on save.
   if constexpr (!S::reading) gpu_snapshot_output();
   if constexpr (S::reading) { reset(); texcache_.clear(); gpu_arena_reset_ = true; }
   s.begin("R3DO");

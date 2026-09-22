@@ -26,15 +26,14 @@ struct Verdict {
   u32  pc = 0;             // key: address of the instruction queried
   bool valid = false;      // an entry lives here
   bool skippable = false;  // ... and it proved a pure loop
-  IdleReject reason = IdleReject::None;   // why not, kept so a cached rejection reports the same reason a fresh one did
+  IdleReject reason = IdleReject::None;   // so a cached rejection reports the same reason
   u32  head = 0, tail = 0;
   u32  checksum = 0;       // body words, re-verified per query (SMC / remap)
   u32  load_count = 0;
   LoadSite loads[MAX_LOADS];
 };
 
-// Direct-mapped structural cache, one per CPU. Keyed by PC; a collision just
-// re-analyses, which is why no eviction policy is needed.
+// Direct-mapped structural cache, one per CPU. A collision just re-analyses.
 constexpr u32 CACHE_BITS = 9;
 constexpr u32 CACHE_SIZE = 1u << CACHE_BITS;
 Verdict g_cache[2][CACHE_SIZE];
@@ -48,13 +47,9 @@ inline bool reject(IdleReject r) {
 
 inline u32 cache_slot(u32 pc) { return (pc >> 2) & (CACHE_SIZE - 1); }
 
-// A poll loop nearly always reads a device register, so refusing all MMIO
-// refuses the whole point. Under the caller's guard -- no DMA, geometry idle,
-// sibling CPU idle, no pending IRQ -- no device can change state before the
-// next scheduled event, and the slice ends there. So the value a register
-// returns is the same on every iteration and reading it is pure, with two
-// exceptions whose reads have side effects and must never be skipped over:
-// the IPC receive FIFO and the gamecard data port, which both pop.
+// Under the caller's guard (no DMA, geometry idle, sibling idle, no pending
+// IRQ) no device changes state before the next scheduled event, so a register
+// read is pure -- except the IPC receive FIFO and gamecard data port, which pop.
 inline bool safe_poll_address(CpuContext& cpu, u32 addr, IdlePorts ports, bool& gxstat) {
   if (cpu.page_table.read_ptr(addr)) return true;          // plain RAM
   if ((addr & 0x0F000000u) != 0x04000000u) return false;   // not I/O at all
@@ -64,17 +59,10 @@ inline bool safe_poll_address(CpuContext& cpu, u32 addr, IdlePorts ports, bool& 
     if (ports == IdlePorts::SpicntOnly && port == 0x040001C0) return true;
     return false;
   }
-  // Only registers that change at a scheduled event, never between two of
-  // them. Anything the scheduler derives from the current time (VCOUNT,
-  // DISPSTAT's blank bits, the timer counters) advances *inside* a slice --
-  // Scheduler::now() interpolates from the running CPU's consumed budget --
-  // so a loop polling those observes values a skip would never produce.
-  // Anything whose read pops a queue is excluded for the obvious reason, and
-  // so are the cartridge/save ports (AUXSPI, ROMCTRL): their busy bits are
-  // driven by transfer timing, and skipping past them changed output in
-  // Bowser's Inside Story and Meteos.
-  // DS_IDLE_PORTS=<hex>,<hex>,... overrides the set, for bisecting which
-  // register a divergence comes from.
+  // Only registers that change at a scheduled event, never inside a slice
+  // (excludes VCOUNT/DISPSTAT/timers, which Scheduler::now() interpolates,
+  // and AUXSPI/ROMCTRL, whose busy bits follow transfer timing).
+  // DS_IDLE_PORTS=<hex>,<hex>,... overrides the set (for bisecting).
   static const char* env = std::getenv("DS_IDLE_PORTS");
   if (env) {
     for (const char* p = env; *p;) {
@@ -99,8 +87,6 @@ inline bool safe_poll_address(CpuContext& cpu, u32 addr, IdlePorts ports, bool& 
   }
 }
 
-// Instruction fetch through the page table: an unmapped or MMIO page is not
-// code we are willing to reason about.
 inline bool fetch(CpuContext& cpu, u32 addr, u32& out) {
   const u8* p = cpu.page_table.read_ptr(addr);
   if (!p) return false;
@@ -108,10 +94,8 @@ inline bool fetch(CpuContext& cpu, u32 addr, u32& out) {
   return true;
 }
 
-// Sum of the body's instruction words. Recomputed on every query so that
-// modified code or a remapped page falls back to a fresh analysis instead of
-// trusting a stale verdict; the body is at most MAX_BODY words, and a query
-// happens once per slice, not once per instruction.
+// Recomputed on every query so SMC or a remapped page falls back to a fresh
+// analysis; at most MAX_BODY words, once per slice.
 u32 body_checksum(CpuContext& cpu, u32 head, u32 tail) {
   u32 sum = 0x9E3779B9u;
   for (u32 at = head; at <= tail; at += 4) {
@@ -135,14 +119,12 @@ inline void do_read(BodyScan& s, u32 r) {
 }
 inline void do_write(BodyScan& s, u32 r) { s.written |= 1u << r; }
 
-// Sign-extend a 24-bit branch offset and resolve it against the ARM pipeline.
 inline u32 branch_target(u32 at, u32 instr) {
   s32 imm = static_cast<s32>(instr << 8) >> 6;   // sign-extend imm24, times 4
   return at + 8 + static_cast<u32>(imm);
 }
 
-// Classify one instruction of the candidate body. Returns false to reject the
-// whole loop. `at` is the instruction's own address.
+// Classify one instruction of the candidate body. Returns false to reject the loop.
 bool scan_instr(BodyScan& s, u32 at, u32 instr, u32 head, u32 tail) {
   using arm::AOp;
   const u32 cond = instr >> 28;
@@ -160,13 +142,13 @@ bool scan_instr(BodyScan& s, u32 at, u32 instr, u32 head, u32 tail) {
     const u32 opcode = (instr >> 21) & 0xF;
     const bool sets_flags = (instr >> 20) & 1;
     const bool compare = opcode >= 0x8 && opcode <= 0xB;      // TST TEQ CMP CMN
-    const bool moves = opcode == 0xD || opcode == 0xF;        // MOV MVN: rn unused
+    const bool moves = opcode == 0xD || opcode == 0xF;        // MOV MVN
     if (!moves) do_read(s, rn);
     if (op != AOp::DpImm) do_read(s, rm);
     if (op == AOp::DpRegShift) do_read(s, rs);
     if (opcode == 0x5 || opcode == 0x6 || opcode == 0x7) do_read(s, FLAGS);  // ADC SBC RSC
     if (compare) { do_write(s, FLAGS); break; }
-    if (rd == 15) return reject(IdleReject::PcWrite);                               // a computed jump is not a poll loop
+    if (rd == 15) return reject(IdleReject::PcWrite);   // a computed jump is not a poll loop
     do_write(s, rd);
     if (sets_flags) do_write(s, FLAGS);
     break;
@@ -212,19 +194,16 @@ bool scan_instr(BodyScan& s, u32 at, u32 instr, u32 head, u32 tail) {
   case AOp::B: {
     const u32 target = branch_target(at, instr);
     const bool inside = target >= head && target <= tail;
-    // An unconditional branch that leaves the range means this is not a loop.
     if (cond == 0xE && !inside && at != tail) return reject(IdleReject::BadInstr);
     break;   // conditional exits are fine: the exit condition cannot change while we skip
   }
   default:
-    // stores, LDM/STM, SWP, SWI, PSR writes, coprocessor, calls, undefined
     return reject((op == AOp::Stm || op == AOp::LdrStrReg || op == AOp::LdrStrHReg)
                     ? IdleReject::Store : IdleReject::BadInstr);
   }
   return true;
 }
 
-// Analyse the loop that contains `pc`, if any, and fill `v`.
 void analyse(CpuContext& cpu, u32 pc, Verdict& v) {
   ++g_stats.analyses;
   v.pc = pc;
@@ -232,8 +211,8 @@ void analyse(CpuContext& cpu, u32 pc, Verdict& v) {
   v.skippable = false;
   v.load_count = 0;
 
-  // Find the back edge: scan forward for a branch that jumps to `pc` or just
-  // above it, i.e. the bottom of a loop that contains `pc`.
+  // Scan forward for a branch that jumps to `pc` or just above it: the
+  // bottom of a loop containing `pc`.
   u32 head = 0, tail = 0;
   bool found = false;
   for (u32 i = 0; i < MAX_SEARCH; ++i) {
@@ -255,11 +234,8 @@ void analyse(CpuContext& cpu, u32 pc, Verdict& v) {
     if (!fetch(cpu, at, instr)) { reject(IdleReject::Fetch); return; }
     if (!scan_instr(s, at, instr, head, tail)) { return; }
   }
-  // A loop that carries a register across the back edge makes progress on its
-  // own -- a delay loop, not a poll loop.
+  // Carrying a register across the back edge is a delay loop, not a poll loop.
   if (s.written & s.read_before_write) { reject(IdleReject::Carried); return; }
-  // A loop with no load can never observe a change, so it either spins forever
-  // or is not what we think it is; either way, leave it alone.
   if (s.load_count == 0) { reject(IdleReject::NoLoad); return; }
 
   v.skippable = true;
@@ -284,8 +260,7 @@ bool in_idle_loop(CpuContext& cpu, IdlePorts ports) {
   if (!v.valid || v.pc != pc || stale) { analyse(cpu, pc, v); v.reason = g_reject; }
   if (!v.skippable) return reject(v.reason);
 
-  // Re-check every load against the live registers: the same code may run with
-  // a base pointer into MMIO, where the read itself can have a side effect.
+  // Re-check every load: the same code may run with a base pointer into MMIO.
   bool gxstat = false;
   for (u32 i = 0; i < v.load_count; ++i) {
     const LoadSite& site = v.loads[i];
@@ -294,8 +269,7 @@ bool in_idle_loop(CpuContext& cpu, IdlePorts ports) {
                        : cpu.hot.regs[site.base] + static_cast<u32>(site.offset);
     if (!safe_poll_address(cpu, addr, ports, gxstat)) return reject(IdleReject::Mmio);
   }
-  // The swap-wait shape is a loop *on GXSTAT*; a RAM-only loop that happens
-  // to run while a swap is pending is not what this mode is for.
+  // A RAM-only loop that happens to run during a pending swap doesn't count.
   if (ports == IdlePorts::GxstatOnly && !gxstat) return reject(IdleReject::Mmio);
   ++g_stats.hits;
   return true;

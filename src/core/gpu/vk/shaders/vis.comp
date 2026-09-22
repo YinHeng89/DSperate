@@ -4,40 +4,25 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 #extension GL_EXT_shader_atomic_int64 : require
 // Visibility pass: the order-free prefix of the list, one invocation per
-// DRAWN pixel of each span, with no per-pixel loop over polygons at all.
+// DRAWN pixel of each span, no per-pixel polygon loop.
 //
-// Why it may ignore draw order. For an opaque-group polygon the pixel's
-// final owner is a MINIMUM under a total order, and a minimum is commutative:
-//   * depth mode 0 is strict less-than, so on a z tie the earlier polygon
-//     keeps the pixel;
-//   * depth mode 1 lets a front-facing polygon pass on a tie only against an
-//     opaque back-facing destination -- so on a tie front beats back in
-//     either order, and front-vs-front or back-vs-back goes to the earlier;
-//   * every alpha such a polygon produces is 0 or 31 (decal: the polygon's 31;
-//     modulate: the texel's, which the cache decodes to 0 or 31 for every
-//     non-graded format), so it either writes the pixel outright or is
-//     alpha-tested away, and never blends with what is there;
-//   * an opaque write replaces colour, depth and the attribute word whole.
-// The key is (z, back-facing, list index), smallest wins, packed into one
-// 64-bit integer and atomicMin'd into the pixel. The clear is the key's
-// initial value in effect: a fragment at or beyond clear_depth simply does
-// not compete, since the clear is never back-facing and never ties its way
-// in. resolve.comp then shades each pixel's winner exactly once.
+// May ignore draw order because for an opaque-group polygon the pixel's
+// final owner is a MINIMUM under a total order (commutative): depth mode 0
+// is strict less-than so ties favour the earlier polygon; mode 1 lets front
+// pass ties only against opaque back-facing, so ties still resolve the same
+// regardless of order; every alpha such a polygon produces is 0 or 31, so it
+// either writes outright or is alpha-tested away, never blends; an opaque
+// write replaces colour/depth/attribute whole. Key is (z, back-facing, list
+// index), smallest wins, atomicMin'd as one 64-bit int; the clear is the
+// key's initial value and never competes.
 //
-// What this is instead of: the raster's loop, which ran every polygon binned
-// to a tile past every pixel of the tile, and shaded a pixel once per
-// polygon that covered it. Here the work is proportional to the pixels the
-// DS actually draws, and the shading is proportional to the screen.
-//
-// The order-DEPENDENT part -- translucency, shadow masks, shadows -- is the
-// tail of the list from first_ordered on; raster.comp still walks that in
-// order, seeded from the resolve pass's output.
+// The order-DEPENDENT tail (translucency, shadow masks/shadows) is walked by
+// raster.comp from first_ordered on, seeded from this pass's output.
 #define DS_GLSL 1
 #include "vk_layout.h"
 
-// DS_VIS_ROWS rows per workgroup, one DS_VIS_LANES-wide subgroup per row, the
-// lanes taking the row's pixels in stride (vk_layout.h). Spans average 13-35
-// pixels, so a lane takes two to five steps.
+// DS_VIS_ROWS rows per workgroup, one DS_VIS_LANES-wide subgroup per row,
+// lanes taking the row's pixels in stride.
 layout(local_size_x = DS_VIS_LANES, local_size_y = DS_VIS_ROWS) in;
 
 layout(std430, binding = 0)  readonly buffer Polys  { GpuPoly polys[]; };
@@ -57,33 +42,25 @@ void main() {
   GpuRow rw = rows[ri];
   if ((rw.fl & 1u) == 0u) return;
   GpuPoly p = polys[rw.poly];
-  // The row's scanline: rows are allocated for the polygon's visible lines
-  // from max(ytop, 0), so the index says which.
-  int py = max(p.ytop, 0) + int(ri - p.row_base);
+  int py = max(p.ytop, 0) + int(ri - p.row_base);   // rows allocated from max(ytop,0)
   int W = 256 * int(pc.f.scale);
 
   bool front = (p.flags & DS_PF_FRONTFACING) != 0u;
   bool wbuf = (rw.fl & 8u) != 0u;
-  // The alpha test can only fail on a texel of alpha 0, and only in the
-  // modulate combine (blend modes 0 and 2), where the texel's alpha is the
-  // pixel's; decal takes the polygon's own alpha, which is 31 here whatever
-  // the texel says. So only a modulated texture that has such texels needs
-  // sampling at all. (The host empties the prefix when alpha_ref is 31, and
-  // wireframe is gated, so 31 always passes.)
+  // Alpha test can only fail under modulate combine (decal always takes the
+  // polygon's own alpha, 31 here), so only a modulated texture needs sampling.
   bool test_tex = (p.flags & (DS_PF_TEXTURED | DS_PF_TEX_ALPHA)) == (DS_PF_TEXTURED | DS_PF_TEX_ALPHA)
                   && ((p.attr >> 4) & 1u) == 0u;
   uint64_t base_key = (front ? 0ul : (1ul << 11)) | uint64_t(rw.poly);
 
   int xa = max(rw.xstart, 0), xb = min(rw.xend, W - 1);
   for (int px = xa + int(gl_LocalInvocationID.x); px <= xb; px += DS_VIS_LANES) {
-    // The fill rules at the two ends, as raster.comp applies them.
     if (px < rw.lim0)       { if ((rw.fl & 2u) == 0u) continue; }
     else if (px >= rw.lim1) { if ((rw.fl & 4u) == 0u) continue; }
 
     Interp ix = row_interp(rw);
-    // The per-pixel division is needed only for a W-buffered depth or for the
-    // texture coordinates of an alpha-tested texel; a Z-buffered depth goes
-    // through the row's reciprocal.
+    // Per-pixel division only for W-buffered depth or texcoords of an
+    // alpha-tested texel; Z-buffered depth uses the row's reciprocal.
     if (wbuf || test_tex) interp_set_x(ix, px);
     else ix.x = px - ix.x0;
 
@@ -96,9 +73,7 @@ void main() {
       if (((sample_tex(p, sc, tc) >> 16) & 0x1Fu) == 0u) continue;
     }
 
-    // The depth test is a SIGNED compare on both rasters (depth_pass casts
-    // the stored depth to s32), so the key orders z as signed: flipping the
-    // sign bit maps signed order onto unsigned.
+    // Depth test is SIGNED on both rasters; flipping the sign bit maps signed order onto the unsigned key.
     atomicMin(keys[uint(py * W + px)], (uint64_t(uint(z) ^ 0x80000000u) << 12) | base_key);
   }
 }

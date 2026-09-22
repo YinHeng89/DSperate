@@ -54,8 +54,7 @@ void NDS::reset() {
   if (cart) cart->reset();
   arm9->reset(Cpu::ARM9, this);
   arm7->reset(Cpu::ARM7, this);
-  // Hardware reset state the BIOS expects: ARM9 vectors high (CP15 V set),
-  // ITCM enabled (32 KB at 0), DTCM off until the BIOS programs it.
+  // ARM9 vectors high (CP15 V set), ITCM enabled (32 KB at 0), DTCM off until the BIOS programs it.
   arm9->cp15_control = 0x00012078 | (1u << 13);
   arm9->cp15_itcm = 0x00000020;
   arm9->hot.regs[15] = arm9->exception_base() + 8;
@@ -75,11 +74,9 @@ void NDS::reset() {
   std::memset(dsi_title_code, 0, sizeof dsi_title_code);
 }
 
-// Normalise the touchscreen calibration in both user-settings blocks so that
-// an ADC reading is exactly the screen pixel << 4, and fix their checksums.
-// The frontend then reports plain pixel coordinates instead of inverting
-// whatever calibration the dumped firmware's owner happened to save; melonDS
-// does the same at reset, which keeps traces against it comparable.
+// Normalises the touchscreen calibration in both user-settings blocks so an
+// ADC reading is exactly the screen pixel << 4, and fixes their checksums,
+// so the frontend can report plain pixel coordinates.
 void NDS::normalise_touch_calibration() {
   if (firmware.size() < 0x20000) return;   // a DS image is 256 KB, the DSi's 128 KB; the pointer at 0x20 places the settings in either
   const u32 base = static_cast<u32>(firmware[0x20] | (firmware[0x21] << 8)) << 3;
@@ -108,7 +105,6 @@ bool NDS::load_bios(const std::string& p9, const std::string& p7, const std::str
   if (have9) { b9 = slurp(p9); if (b9.size() != mem::Bus::BIOS9_SIZE) return fail(p9 + ": not a 4 KB ARM9 BIOS"); }
   if (have7) { b7 = slurp(p7); if (b7.size() != mem::Bus::BIOS7_SIZE) return fail(p7 + ": not a 16 KB ARM7 BIOS"); }
   if (exists(pfw)) { fw = slurp(pfw); if (fw.empty()) return fail(pfw + ": empty firmware"); }
-  // A FreeBIOS image is smaller than its region; the rest stays zero.
   std::memset(bus.bios9.get(), 0, mem::Bus::BIOS9_SIZE);
   std::memset(bus.bios7.get(), 0, mem::Bus::BIOS7_SIZE);
   if (b9.empty()) std::memcpy(bus.bios9.get(), bios::kFreeBios9, bios::kFreeBios9_len);
@@ -116,9 +112,7 @@ bool NDS::load_bios(const std::string& p9, const std::string& p7, const std::str
   if (b7.empty()) std::memcpy(bus.bios7.get(), bios::kFreeBios7, bios::kFreeBios7_len);
   else std::memcpy(bus.bios7.get(), b7.data(), b7.size());
   bios_native = !b9.empty() && !b7.empty();
-  // Over the regions as they will be seen, not the files: that covers the
-  // FreeBIOS substitution and its zero fill in one hash.
-  bios_id = 1469598103934665603ull;
+  bios_id = 1469598103934665603ull;   // hashed over the regions as seen, covering FreeBIOS substitution
   for (u32 i = 0; i < mem::Bus::BIOS9_SIZE; ++i) bios_id = (bios_id ^ bus.bios9.get()[i]) * 1099511628211ull;
   for (u32 i = 0; i < mem::Bus::BIOS7_SIZE; ++i) bios_id = (bios_id ^ bus.bios7.get()[i]) * 1099511628211ull;
   firmware_synthetic = fw.empty();
@@ -132,26 +126,21 @@ bool NDS::load_bios(const std::string& p9, const std::string& p7, const std::str
   return true;
 }
 
-// The two copies of the settings the DS menu writes, found the way
-// normalise_touch_calibration finds them: a pointer to them lives at 0x20 of
-// the header, in 8-byte units. Zero when the image has none.
+// The two copies of the settings the DS menu writes; a pointer to them lives
+// at 0x20 of the header, in 8-byte units. Zero when the image has none.
 namespace {
 constexpr u32 kUserBlockSize = 0x100;
 u16 rd16(const u8* p) { return static_cast<u16>(p[0] | (p[1] << 8)); }
 void wr16(u8* p, u16 v) { p[0] = static_cast<u8>(v); p[1] = static_cast<u8>(v >> 8); }
 
-// Which copy is live: the greater update counter, in the 0..0x7F ring the
-// console counts in, so 0 beats 0x7F rather than losing to it.
+// Which copy is live: the greater update counter, in the console's 0..0x7F ring (0 beats 0x7F).
 int live_user_block(const u8* base) {
   const u16 a = rd16(base + 0x70) & 0x7F, b = rd16(base + kUserBlockSize + 0x70) & 0x7F;
   if (a == b) return 0;
   return ((b - a) & 0x7F) < 0x40 ? 1 : 0;
 }
 
-// A firmware string: UTF-16 with its length in code units. Only the low byte
-// of each unit is kept, and anything not printable ASCII is dropped -- these
-// strings are handed to a menu whose font has no room for the rest, and a
-// character that cannot be shown must not be written back either.
+// UTF-16 firmware string; keeps only the low byte, dropping non-ASCII-printable units.
 std::string read_fw_string(const u8* p, u32 len_units, u32 max_units) {
   std::string out;
   for (u32 i = 0; i < len_units && i < max_units; ++i) {
@@ -186,9 +175,7 @@ bool NDS::write_user_settings(UserField field, const bios::UserSettings& in) {
   const u32 base = user_settings_offset();
   if (!base) return false;
   const u16 counter = static_cast<u16>((rd16(firmware.data() + base + static_cast<u32>(live_user_block(firmware.data() + base)) * kUserBlockSize + 0x70) + 1) & 0x7F);
-  // Both copies are written with the same contents and the same counter, so
-  // whichever the console picks is the one the player asked for. The DS
-  // alternates them instead; it has no reason to, and a tie is ambiguous.
+  // Both copies get the same contents and counter (unlike the DS, which alternates them).
   for (u32 blk = 0; blk < 2; ++blk) {
     u8* u = firmware.data() + base + blk * kUserBlockSize;
     switch (field) {
@@ -206,13 +193,10 @@ bool NDS::write_user_settings(UserField field, const bios::UserSettings& in) {
     case UserField::Colour:        u[0x02] = static_cast<u8>(in.favourite_colour & 15); break;
     case UserField::BirthdayMonth: u[0x03] = (in.birthday_month >= 1 && in.birthday_month <= 12) ? in.birthday_month : 1; break;
     case UserField::BirthdayDay:   u[0x04] = (in.birthday_day >= 1 && in.birthday_day <= 31) ? in.birthday_day : 1; break;
-    // The backlight bits share this halfword and are the console's, not ours.
-    case UserField::Language:      wr16(u + 0x64, static_cast<u16>((rd16(u + 0x64) & ~7) | (in.language & 7))); break;
+    case UserField::Language:      wr16(u + 0x64, static_cast<u16>((rd16(u + 0x64) & ~7) | (in.language & 7))); break;   // backlight bits share this halfword
     }
     wr16(u + 0x70, counter);
     wr16(u + 0x72, bios::crc16(u, 0x70, 0xFFFF));
-    // Mark what changed so the sidecar carries it: a settings block spans one
-    // page at the sizes the DS uses, but page it properly rather than assume.
     for (u32 off = 0; off < kUserBlockSize; off += FW_PAGE)
       firmware_written(base + blk * kUserBlockSize + off);
   }
@@ -227,9 +211,8 @@ void NDS::firmware_written(u32 offset) {
   fw_dirty_pages++;
 }
 
-// Sidecar format: "DSFWOVR1", the size of the firmware it was made from, the
-// identity of that dump, the page size, the page count, then that many
-// (u32 page index, page bytes) records.
+// Sidecar format: "DSFWOVR1", firmware size, dump identity, page size, page
+// count, then that many (u32 page index, page bytes) records.
 namespace {
 constexpr char kFwOvrMagic[8] = {'D', 'S', 'F', 'W', 'O', 'V', 'R', '1'};
 } // namespace
@@ -242,9 +225,7 @@ bool NDS::load_firmware_override(const std::string& path, std::string& err) {
   if (!f.read(magic, 8) || std::memcmp(magic, kFwOvrMagic, 8) != 0) { err = "not a firmware override"; return false; }
   if (!f.read(reinterpret_cast<char*>(head), sizeof head)) { err = "truncated header"; return false; }
   if (head[0] != firmware.size()) { err = "made from a firmware of a different size"; return false; }
-  // A dump mismatch is not fatal: the settings pages are the same shape in
-  // every retail firmware, and refusing to boot because someone re-dumped
-  // their console would be worse than the warning the frontend prints.
+  // Not fatal: settings pages are the same shape in every retail firmware.
   if (head[1] != static_cast<u32>(firmware_id)) err = "made from a different firmware dump";
   if (head[2] != FW_PAGE) { err = "unknown page size"; return false; }
   for (u32 i = 0; i < head[3]; ++i) {
@@ -254,12 +235,7 @@ bool NDS::load_firmware_override(const std::string& path, std::string& err) {
     if (!f.read(reinterpret_cast<char*>(firmware.data() + page * FW_PAGE), FW_PAGE)) { err = "truncated"; return false; }
     firmware_written(page * FW_PAGE);
   }
-  // The user settings pages carry the touchscreen calibration, and the
-  // frontend reports plain pixel coordinates on the strength of that being
-  // normalised. Someone who ran the calibration wizard inside the firmware
-  // has a real calibration in their override, which would put every touch in
-  // the wrong place; normalise again over the top. The console keeps the
-  // calibration screen, it just cannot mis-aim the pen with it.
+  // An override may carry a real calibration from the firmware's wizard; normalise again over it.
   normalise_touch_calibration();
   firmware_ap_slot = bios::stamp_access_point(firmware);   // again, over the override's pages
   return true;
@@ -282,16 +258,13 @@ bool NDS::save_firmware_override(const std::string& path, std::string& err) {
     }
     if (!f) { err = "write failed"; return false; }
   }
-  // Rename over the old one, so an interrupted write cannot leave a truncated
-  // override that would boot the console with half of someone's settings.
+  // Rename over the old one so an interrupted write can't leave a truncated override.
   if (std::rename(tmp.c_str(), path.c_str()) != 0) { err = "cannot replace"; std::remove(tmp.c_str()); return false; }
   return true;
 }
 
 namespace { u64 rom_identity(const cart::RomSource& rom) {
-  // The header plus the size: enough to reject the wrong ROM without
-  // hashing 100 MB on every save. The size is the image's own, not the
-  // card's padded one, so a mapped and an in-memory copy agree.
+  // Header + size: rejects the wrong ROM without hashing the whole image; size is the image's own, not the card's padded one.
   u8 head[0x160];
   rom.read(0, head, sizeof head);
   u64 h = 1469598103934665603ull;
@@ -301,10 +274,8 @@ namespace { u64 rom_identity(const cart::RomSource& rom) {
 } // namespace
 
 bool NDS::load_rom(const std::string& path) {
-  // A zipped ROM comes out the same as a loose one from here on: rom_id is
-  // hashed from the decompressed bytes, so save states, .sav files and scene
-  // hashes are interchangeable between a zipped and a loose copy of the same
-  // game. Sniffed by magic rather than by extension.
+  // A zipped ROM comes out the same as a loose one from here on (rom_id is
+  // hashed from the decompressed bytes). Sniffed by magic, not extension.
   bool zipped = false;
   {
     std::ifstream f(path, std::ios::binary);
@@ -314,11 +285,9 @@ bool NDS::load_rom(const std::string& path) {
   }
   rom_zip_entry.clear();
   rom_cache_path.clear();
-  // DS_CART_MMAP=0 reads everything into memory as before, for A/B and for a
-  // filesystem that cannot map. Otherwise a loose .nds is mapped and a zip
-  // goes through the cache beside it (cart/zip_cache.h): the kernel pages the
-  // image in as the game touches it and gives it back under pressure
-  // (docs/cart-streaming-scoping.md).
+  // DS_CART_MMAP=0 reads everything into memory instead (for a filesystem
+  // that can't map). Otherwise a loose .nds is mapped and a zip goes through
+  // the cache beside it (cart/zip_cache.h).
   static const bool no_map = [] { const char* e = std::getenv("DS_CART_MMAP"); return e && std::atoi(e) == 0; }();
   if (no_map) {
     std::vector<u8> image = slurp(path);
@@ -364,8 +333,8 @@ bool NDS::load_rom_source(std::unique_ptr<cart::RomSource> src) {
   return true;
 }
 
-// Mirrors what the firmware leaves behind when it launches a card (values per
-// GBATEK "DS Firmware Boot" and melonDS's direct-boot setup).
+// Mirrors what the firmware leaves behind when it launches a card (values
+// per GBATEK "DS Firmware Boot").
 void NDS::set_wifi_mac_suffix(u32 suffix) {
   if (firmware.size() < 0x200) return;
   firmware[0x39] = static_cast<u8>(suffix >> 16); firmware[0x3A] = static_cast<u8>(suffix >> 8); firmware[0x3B] = static_cast<u8>(suffix);
@@ -374,9 +343,7 @@ void NDS::set_wifi_mac_suffix(u32 suffix) {
 }
 
 void NDS::setup_direct_boot() {
-  // A NAND boot replaces direct boot outright: boot2 brings up the launcher,
-  // which launches the title itself (see boot_dsi_nand). It needs no cart.
-  if (dsi && dsi_nand_boot && boot_dsi_nand()) return;
+  if (dsi && dsi_nand_boot && boot_dsi_nand()) return;   // NAND boot replaces direct boot outright; needs no cart
   if (!cart) return;
   if (dsi) { setup_direct_boot_dsi(); return; }
   const cart::Header& h = cart->header();
@@ -386,9 +353,7 @@ void NDS::setup_direct_boot() {
   auto rom32 = [&](u32 off) { return cart->rom_read32_at(off); };
 
   io.wramcnt = 3; bus.update_wram();
-  // FreeBIOS leaves the Nintendo logo area (ARM9 BIOS 0x20, 0x9C bytes) blank;
-  // games compare it against the header for DS-GBA comms, so take the
-  // header's copy (as melonDS does).
+  // FreeBIOS leaves the Nintendo logo area blank; games compare it against the header for DS-GBA comms.
   if (!bios_native) for (u32 i = 0; i < 0x9C; ++i) bus.bios9.get()[0x20 + i] = cart->header().nintendo_logo[i];
   for (u32 i = 0; i < 0x170; i += 4) w32(0x027FFE00 + i, rom32(i));
   const u32 id = cart->chip_id();
@@ -431,8 +396,8 @@ void NDS::setup_direct_boot() {
   cp(9, 1, 0, 0x0300000A); cp(9, 1, 1, 0x00000020);
   cp(1, 0, 0, 0x00052078);
 
-  // Register state as melonDS establishes it (the CPUs stay in SVC mode with
-  // IRQ/FIQ masked; the game's own init switches modes and sets IME).
+  // Register state at boot: the CPUs stay in SVC mode with IRQ/FIQ masked;
+  // the game's own init switches modes and sets IME.
   arm9->set_cpsr(0xD3); arm7->set_cpsr(0xD3);
   arm9->hot.regs[12] = h.arm9_entry; arm9->hot.regs[13] = 0x03002F7C; arm9->hot.regs[14] = h.arm9_entry;
   arm9->bank_r13[0] = 0x03003FC0; arm9->bank_r13[2] = 0x03003F80;   // user/sys, IRQ
@@ -443,7 +408,7 @@ void NDS::setup_direct_boot() {
   arm9->hot.cycle_budget = 0; arm7->hot.cycle_budget = 0;
 
   io.exmemcnt = 0xE880; bus.update_gba_slot_timings();
-  io.wifiwaitcnt = 0x0030; bus.update_wifi_timings();   // melonDS NDS::SetupDirectBoot (the Wi-Fi is unpowered until POWCNT2 says otherwise)
+  io.wifiwaitcnt = 0x0030; bus.update_wifi_timings();   // Wi-Fi is unpowered until POWCNT2 says otherwise
   io.cpu_io[0].postflg = 1; io.cpu_io[1].postflg = 1;
   io.powcnt1 = 0x820F; gpu.set_powcnt(0x820F);
   io.powcnt2 = 0x0001; spu.set_powcnt2(0x0001);      // sound on, SOUNDBIAS centred, as the firmware leaves them
@@ -495,7 +460,7 @@ template <class S> void sync_strings(S& s, std::vector<std::string>& v) {
   }
 }
 
-// What the DSi's NAND holds beyond its state base (NandImage::state_delta).
+// NandImage::state_delta: what the DSi's NAND holds beyond its state base.
 template <class S> void sync_nand(S& s, io::NandImage::StateDelta& d) {
   s.begin("NAND");
   s.put(d.identity);
@@ -504,7 +469,7 @@ template <class S> void sync_nand(S& s, io::NandImage::StateDelta& d) {
   s.end();
 }
 
-// The SD card's in-memory part and its host backing (SdCard::state_snapshot).
+// SdCard::state_snapshot: the SD card's in-memory part and its host backing.
 template <class S> void sync_sd(S& s, io::SdCard::StateSnapshot& c) {
   s.begin("SDCD");
   u8 present = c.present;
@@ -594,17 +559,12 @@ bool NDS::load_state(state::Reader& r, std::string& err) {
   u32 state_dsi = 0; r.put(state_dsi);
   r.end();
   if ((state_dsi != 0) != dsi) { err = dsi ? "save state is for a DS, and this is a DSi" : "save state is for a DSi, and this is a DS"; return false; }
-  // A state taken on a firmware boot records a zero game code and identity;
-  // it only loads back into another firmware boot, and vice versa.
+  // A firmware-boot state records a zero game code/identity, and only loads back into another firmware boot.
   const u32 want_code = cart ? cart->header().game_code_u32() : 0u;
   if (code != want_code) { err = cart ? "save state is for another game" : "save state is for a game, not the firmware"; return false; }
   if (ident != rom_id) { err = "save state is for another ROM image"; return false; }
-  // The BIOS is not in the state, but the CPUs' PCs are, and at a frame
-  // boundary the ARM7 is almost always inside a BIOS routine. Resuming that
-  // against a different pair -- swapping a dump for FreeBIOS or back -- puts
-  // it in unrelated code: measured on Mario & Luigi: Bowser's Inside Story,
-  // the ARM7 parks in Undefined mode with IRQs masked and never returns,
-  // which reads to a player as a hang with dead sound and controls.
+  // BIOS isn't in the state, but the CPUs' PCs are, and at a frame boundary
+  // the ARM7 is almost always inside a BIOS routine; a different pair puts it in unrelated code.
   if (bios != bios_id) {
     err = "save state was made with a different BIOS (" +
           std::string(bios_native ? "this run has BIOS dumps, the state was made with others or with FreeBIOS"
@@ -612,14 +572,13 @@ bool NDS::load_state(state::Reader& r, std::string& err) {
           "); it would resume the ARM7 inside the wrong BIOS";
     return false;
   }
-  // A different firmware does not wedge the machine the way a different BIOS
-  // does -- nothing resumes inside it -- so it is reported, not refused.
+  // Unlike a BIOS mismatch, a firmware mismatch doesn't wedge the machine, so it's reported, not refused.
   if (fw != firmware_id)
     std::fprintf(stderr, "state: made with a different firmware; the console identity a game stored in its save may not match\n");
 
-  // The DSi's storage, checked before anything is overwritten. A NAND state
-  // only makes sense on the NAND it was made on; the SD card is taken when
-  // its folder still backs it, and left out (loudly) when not.
+  // DSi storage, checked before anything is overwritten: a NAND state only
+  // makes sense on the NAND it was made on; the SD card is taken when its
+  // folder still backs it, left out (loudly) when not.
   io::NandImage::StateDelta nand;
   io::SdCard::StateSnapshot card;
   bool with_card = false;

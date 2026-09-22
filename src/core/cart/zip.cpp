@@ -18,22 +18,15 @@ constexpr u32 SIG_EOCD    = 0x06054B50;   // "PK\5\6"
 constexpr u16 METHOD_STORE   = 0;
 constexpr u16 METHOD_DEFLATE = 8;
 
-// The largest image we will unpack. A DS card tops out at 512 MB, so this is
-// generous; the point is that the uncompressed size is a number an archive
-// declares about itself, and without a bound a hostile or corrupt one asks us
-// to allocate up to 4 GB before a single byte is decompressed.
+// Largest image unpacked; caps a hostile archive's declared uncompressed size.
 constexpr u64 MAX_ROM = 512ull << 20;
 
-// Every multi-byte field in a zip is little-endian and unaligned. These are
-// the only way this file touches the buffer, and each one is bounds-checked
-// by its caller before it is reached.
+// Zip multi-byte fields are little-endian and unaligned; bounds-checked by the caller.
 u16 rd16(const u8* p) { return static_cast<u16>(p[0] | (p[1] << 8)); }
 u32 rd32(const u8* p) { return static_cast<u32>(p[0]) | (static_cast<u32>(p[1]) << 8) |
                                (static_cast<u32>(p[2]) << 16) | (static_cast<u32>(p[3]) << 24); }
 
-// What an entry's extension says it is. Launchers hand over .ZIP and mixed
-// case inside it too, so the compare is case-insensitive.
-enum class Kind { Other, Rom, Cia };
+enum class Kind { Other, Rom, Cia };   // case-insensitive extension match
 
 Kind entry_kind(const char* name, size_t len) {
   if (len < 4) return Kind::Other;
@@ -41,14 +34,13 @@ Kind entry_kind(const char* name, size_t len) {
   if (e[0] != '.') return Kind::Other;
   auto lower = [](char c) { return c >= 'A' && c <= 'Z' ? static_cast<char>(c + 32) : c; };
   const char a = lower(e[1]), b = lower(e[2]), c = lower(e[3]);
-  if (a == 'n' && b == 'd' && c == 's') return Kind::Rom;   // a DS ROM
-  if (a == 'd' && b == 's' && c == 'i') return Kind::Rom;   // a DSiWare SRL
-  if (a == 's' && b == 'r' && c == 'l') return Kind::Rom;   // the same, as dumpers name it
-  if (a == 'c' && b == 'i' && c == 'a') return Kind::Cia;   // an SRL in a CIA container
+  if (a == 'n' && b == 'd' && c == 's') return Kind::Rom;
+  if (a == 'd' && b == 's' && c == 'i') return Kind::Rom;
+  if (a == 's' && b == 'r' && c == 'l') return Kind::Rom;
+  if (a == 'c' && b == 'i' && c == 'a') return Kind::Cia;   // SRL in a CIA container
   return Kind::Other;
 }
 
-// One entry worth considering.
 struct Entry {
   size_t   name_off = 0, name_len = 0;
   u16      method = 0;
@@ -59,17 +51,10 @@ struct Entry {
   bool     cia = false;
 };
 
-// Inflates raw DEFLATE from `src`, handing the output to `sink` in order,
-// stopping once `want` bytes have been produced. Used twice: with want =
-// 0x160 to peek at a candidate's header without paying for the whole ROM,
-// and with want = the declared uncompressed size to extract the winner.
-// Returns the number of bytes produced, which the caller compares against
-// what it asked for -- a stream that ends early is a corrupt archive, not a
-// short ROM.
-//
-// The dictionary has to be the full 32 KB window whether or not we intend to
-// keep all of it: a back-reference may reach that far, so decoding even the
-// first 0x160 bytes correctly needs the real window.
+// Inflates raw DEFLATE from `src` into `sink`, stopping once `want` bytes are
+// produced. Returns the count produced; a short return means a corrupt
+// stream, not a short ROM. Dictionary must be the full 32 KB window even for
+// a small `want`, since a back-reference may reach that far.
 template <class Sink>
 size_t inflate_raw(const u8* src, size_t csize, size_t want, Sink&& sink) {
   tinfl_decompressor d;
@@ -91,15 +76,12 @@ size_t inflate_raw(const u8* src, size_t csize, size_t want, Sink&& sink) {
     }
     dict_ofs = (dict_ofs + out_bytes) & (TINFL_LZ_DICT_SIZE - 1);
     if (st == TINFL_STATUS_DONE) return out_total;
-    // NEEDS_MORE_INPUT with nothing left is a truncated stream; anything
-    // negative is a malformed one. Both stop here and fail the size check.
+    // NEEDS_MORE_INPUT with nothing left, or any negative status: malformed stream.
     if (st != TINFL_STATUS_HAS_MORE_OUTPUT && st != TINFL_STATUS_NEEDS_MORE_INPUT) return out_total;
     if (st == TINFL_STATUS_NEEDS_MORE_INPUT && in_ofs >= csize) return out_total;
   }
 }
 
-// Copies `want` bytes of an entry's payload into `dst`, whichever way it was
-// stored. False when the stream did not produce them.
 bool read_entry(const u8* zip, const Entry& e, size_t data_off, u8* dst, size_t want) {
   if (want > e.usize) return false;
   if (e.method == METHOD_STORE) {
@@ -112,10 +94,8 @@ bool read_entry(const u8* zip, const Entry& e, size_t data_off, u8* dst, size_t 
                      [&](const u8* p, size_t n) { std::memcpy(dst + got, p, n); got += n; return true; }) == want;
 }
 
-// Where an entry's payload starts. The central directory records the local
-// header's offset, but the name and extra-field lengths there may differ from
-// the local header's own, so the local header has to be read to find the
-// payload. Returns false if it is not there or does not fit.
+// Central directory's name/extra-field lengths may differ from the local
+// header's own, so the local header must be read to find the payload.
 bool data_offset(const u8* zip, size_t size, const Entry& e, size_t& out) {
   if (e.local_off + 30 > size) return false;
   const u8* lh = zip + e.local_off;
@@ -134,8 +114,7 @@ bool is_zip(const u8* data, size_t size) {
 
 bool find_rom(const u8* zip, size_t size, ZipEntry& entry, std::string& err) {
   err.clear();
-  // The end-of-central-directory record is last, but a trailing comment of up
-  // to 64 KB may follow it, so it is found by scanning back over that window.
+  // EOCD is last, but a trailing comment of up to 64 KB may follow it.
   if (size < 22) { err = "not a zip archive (too short)"; return false; }
   size_t eocd = 0;
   bool found = false;
@@ -170,8 +149,7 @@ bool find_rom(const u8* zip, size_t size, ZipEntry& entry, std::string& err) {
     const Kind kind = entry_kind(reinterpret_cast<const char*>(zip + name_off), name_len);
     if (kind == Kind::Other) continue;
     ++rom_seen;
-    // Reasons an entry cannot be used. Counted rather than fatal: a zip may
-    // hold one usable ROM beside something we cannot read.
+    // Counted rather than fatal: a zip may hold one usable ROM beside another we can't read.
     if (flags & 1) { ++skipped_crypt; continue; }
     if (csize == 0xFFFFFFFFu || usize == 0xFFFFFFFFu || local_off == 0xFFFFFFFFu) { ++skipped_zip64; continue; }
     if (method != METHOD_STORE && method != METHOD_DEFLATE) { ++skipped_method; continue; }
@@ -196,12 +174,8 @@ bool find_rom(const u8* zip, size_t size, ZipEntry& entry, std::string& err) {
     return false;
   }
 
-  // Pick. One candidate needs no header peek at all -- the common case, and
-  // the expensive one to get wrong, since peeking inflates from the start of
-  // the stream.
-  // A bare image is always preferred over a CIA, which has to be unwrapped
-  // before anything can even read its header. Only when there is no bare
-  // entry at all does the archive's first CIA win.
+  // A bare image is always preferred over a CIA, which must be unwrapped
+  // before its header is readable. Only with no bare entry does a CIA win.
   std::vector<size_t> bare;
   for (size_t i = 0; i < cands.size(); ++i) if (!cands[i].cia) bare.push_back(i);
 
@@ -217,8 +191,7 @@ bool find_rom(const u8* zip, size_t size, ZipEntry& entry, std::string& err) {
       std::memcpy(&hdr, head, sizeof hdr);
       const int known = known_game_code(hdr.game_code_u32()) ? 1 : 0;
       const int rev = hdr.rom_version;
-      // Database membership first, then the highest revision, then archive
-      // order -- which is why this is a strict > and never replaces on a tie.
+      // Database membership first, then revision, then archive order (strict >, never ties).
       if (known > best_known || (known == best_known && rev > best_rev)) {
         best_known = known; best_rev = rev; best = i;
       }
@@ -268,8 +241,7 @@ bool inflate_entry(const u8* zip, size_t size, const ZipEntry& entry, ZipSink si
     return true;
   };
   if (entry.stored()) {
-    // In 1 MB pieces so a sink writing to disk and the progress callback see
-    // the same rhythm as the deflate path.
+    // 1 MB pieces, matching the deflate path's progress rhythm.
     while (done < total) {
       const size_t n = static_cast<size_t>(total - done < (1u << 20) ? total - done : (1u << 20));
       if (!feed(src + done, n)) break;

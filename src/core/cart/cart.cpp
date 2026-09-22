@@ -2,8 +2,7 @@
 // DSperate - Nintendo DS emulator. Copyright (C) 2026 DSperate contributors.
 //
 // Slot-1 retail cartridge. Protocol per GBATEK ("DS Cartridge Protocol",
-// "DS Cartridge Secure Area", "DS Cartridge Backup"); melonDS (GPLv3) is the
-// behavioural reference.
+// "DS Cartridge Secure Area", "DS Cartridge Backup").
 #include "core/cart/cart.h"
 #include "core/state/state.h"
 #include "core/nds.h"
@@ -19,10 +18,8 @@ inline u32 bswap(u32 v) { return __builtin_bswap32(v); }
 }
 
 namespace {
-// The melonDS ROM list (save_list.inc), sorted by game code. Returns the
-// listed type, or -1 when the code is not in the table at all -- which is the
-// difference between "this game uses a 64 KB EEPROM" and "never heard of it",
-// and both callers below need one of the two answers.
+// save_list.inc, sorted by game code. Returns the listed type, or -1 if the
+// code isn't in the table (distinct from a listed 64 KB EEPROM default).
 int lookup_save_type(u32 code) {
   struct E { u32 code; u32 type; };
   static const E list[] = {
@@ -42,8 +39,8 @@ int lookup_save_type(u32 code) {
 bool known_game_code(u32 code) { return lookup_save_type(code) >= 0; }
 
 SaveType save_type_for(u32 code, u32& size) {
-  // melonDS SaveMemType numbering: 1 = 512 B EEPROM, 2 = 8 KB, 3 = 64 KB,
-  // 4 = 128 KB EEPROM, 5 = 256 KB, 6 = 512 KB, 7 = 1 MB, 8..10 = 8/16/64 MB FLASH.
+  // Numbering: 1 = 512 B EEPROM, 2 = 8 KB, 3 = 64 KB, 4 = 128 KB EEPROM,
+  // 5 = 256 KB, 6 = 512 KB, 7 = 1 MB, 8..10 = 8/16/64 MB FLASH.
   const int found = lookup_save_type(code);
   u32 t = 3;   // unknown title: 64 KB EEPROM, the most common chip
   if (found >= 1 && found <= 10) t = static_cast<u32>(found);
@@ -56,8 +53,6 @@ SaveType save_type_for(u32 code, u32& size) {
 }
 
 SaveType save_type_for_size(u32 bytes) {
-  // The same classes as the list's types: 512 B EEPROM takes a one-byte
-  // address, 8 KB to 128 KB EEPROM two or three, 256 KB and up is FLASH.
   if (bytes == 512) return SaveType::EepromTiny;
   if (bytes == 8192 || bytes == 65536 || bytes == 131072) return SaveType::Eeprom;
   if (bytes >= 262144 && bytes <= 67108864 && (bytes & (bytes - 1)) == 0) return SaveType::Flash;
@@ -65,17 +60,14 @@ SaveType save_type_for_size(u32 bytes) {
 }
 
 Cart::Cart(NDS& nds, std::unique_ptr<RomSource> rom) : nds_(nds), rom_(std::move(rom)) {
-  // The card wraps its address at a power of two and reads 0xFF past the
-  // image; the source pads that way (rom_source.h), so no copy is made here.
   const u32 size = rom_->mask() + 1;
   rom_mask_ = rom_->mask();
   rom_->read(0, reinterpret_cast<u8*>(&header_), sizeof header_);
-  rom_->read(TwlHeader::ROM_OFFSET, reinterpret_cast<u8*>(&twl_), sizeof twl_);   // 0xFF past a small image, like the card
+  rom_->read(TwlHeader::ROM_OFFSET, reinterpret_cast<u8*>(&twl_), sizeof twl_);
   chip_id_ = 0x000000C2;
   if (size >= 1024 * 1024 && size <= 128 * 1024 * 1024) chip_id_ |= ((size >> 20) - 1) << 8;
   else chip_id_ |= (0x100 - (size >> 28)) << 8;
-  // DSi-capable card (unit code bit 1, with a DSi region set -- a zero region
-  // is a bad dump): bit 30, as melonDS reports it on either console.
+  // DSi-capable (unit code bit 1) with a nonzero DSi region: bit 30.
   if ((header_.unit_code & 2) && twl_.region_flags != 0) chip_id_ |= 0x40000000;
   u32 sram_size = 0;
   save_type_ = save_type_for(header_.game_code_u32(), sram_size);
@@ -84,10 +76,8 @@ Cart::Cart(NDS& nds, std::unique_ptr<RomSource> rom) : nds_(nds), rom_(std::move
   if (listed_) sram_.assign(sram_size, 0xFF);
   else save_type_ = SaveType::Detect;   // load_save or the first save access names the chip
 
-  // Dumps often carry a decrypted secure area; the cart must hand out the
-  // encrypted form, so re-encrypt if the "decrypted" marker is present. The
-  // 0x800 bytes sit inside one page (arm9_rom_offset is 0x4000 on a retail
-  // card), rewritten in the source's overlay rather than the file.
+  // Dumps often carry a decrypted secure area; re-encrypt if the "decrypted"
+  // marker is present, rewriting the source's overlay rather than the file.
   const u32 a9 = header_.arm9_rom_offset;
   if (a9 >= 0x4000 && a9 < 0x8000) {
     const u32 w0 = rom_->read32(a9), w4 = rom_->read32(a9 + 0x10);
@@ -155,7 +145,7 @@ void Cart::key1_apply_keycode(u32* keycode, u32 mod) {
   }
 }
 void Cart::key1_init(u32 idcode, u32 level, u32 mod) {
-  // Key table lives in the ARM7 BIOS at 0x30 (0x1048 bytes).
+  // Key table lives at ARM7 BIOS 0x30 (0x1048 bytes).
   std::memcpy(key1_.data(), nds_.bus.bios7.get() + 0x30, key1_.size() * 4);
   u32 keycode[3] = {idcode, idcode >> 1, idcode << 1};
   if (level >= 1) key1_apply_keycode(keycode, mod);
@@ -180,8 +170,7 @@ void Cart::decrypt_secure_area(u8 out[0x800]) {
 }
 
 // ---- ROM commands -----------------------------------------------------------
-u32 Cart::rom_read32() {
-  // Reads wrap within a 4 KB page.
+u32 Cart::rom_read32() {   // reads wrap within a 4 KB page
   const u32 hi = rom_addr_ & rom_mask_ & ~0xFFFu;
   u32 lo = rom_addr_ & 0xFFF;
   if (hi != page_base_) { page_base_ = hi; page_ = rom_->page(hi); }
@@ -209,7 +198,7 @@ void Cart::command_start(const u8 cmd[8]) {
     }
   }
   if (cmd_mode_ == 1) {
-    // KEY1 commands arrive encrypted (the BIOS encrypts them); decrypt to dispatch.
+    // KEY1 commands arrive encrypted; decrypt to dispatch.
     u8 dec[8]; u32 w;
     std::memcpy(&w, &cmd[4], 4); w = bswap(w); std::memcpy(&dec[0], &w, 4);
     std::memcpy(&w, &cmd[0], 4); w = bswap(w); std::memcpy(&dec[4], &w, 4);
@@ -231,11 +220,8 @@ void Cart::command_start(const u8 cmd[8]) {
   std::memcpy(rom_cmd_, cmd, 8);
   if (rom_cmd_[0] == 0xB7) {
     rom_addr_ = ((rom_cmd_[1] << 24) | (rom_cmd_[2] << 16) | (rom_cmd_[3] << 8) | rom_cmd_[4]) & rom_mask_;
-    // The launch signal (see launch_read()), taken from the address the menu
-    // actually asked for. It has to be read before the clamp below, which
-    // folds every sub-0x8000 read onto 0x8000 -- exactly where a loader cart
-    // puts its arm9_rom_offset -- and would otherwise forge the signal out of
-    // an unrelated read of the header area.
+    // Must read before the clamp below folds sub-0x8000 addresses onto 0x8000,
+    // which would otherwise forge the launch signal from an unrelated read.
     if (rom_addr_ == header_.arm9_rom_offset) launch_read_ = true;
     if (rom_addr_ < 0x8000) rom_addr_ = 0x8000 + (rom_addr_ & 0x1FF);   // secure area is not readable here
   }
@@ -268,7 +254,7 @@ void Cart::set_chip(SaveType type, u32 bytes) {
 }
 
 Cart::SaveLoad Cart::load_save(const u8* data, size_t n) {
-  // DeSmuME's .dsv is the raw image with a 122-byte footer ending in this cookie.
+  // .dsv is the raw image with a 122-byte footer ending in this cookie.
   static constexpr char DSV_COOKIE[] = "|-DESMUME SAVE-|";
   if (n >= 122 && std::memcmp(data + n - 16, DSV_COOKIE, 16) == 0) n -= 122;
   if (!listed_) {
@@ -281,13 +267,10 @@ Cart::SaveLoad Cart::load_save(const u8* data, size_t n) {
   return {n == sram_.size(), static_cast<u32>(sram_.size())};
 }
 
-// SaveType::Detect. No save file, so the chip is blank: every read answers
-// 0xFF whatever its address, and only the address width is missing. That
-// comes from DeSmuME's rule -- the SDK's first access to the chip moves a
-// single byte, so the transaction's length is command + address + 1 -- with
-// the commands only one chip class has settling the rest. Nothing is decided
-// until the transaction ends; a write that decides is then replayed into the
-// chip, so nothing the game stored is lost.
+// SaveType::Detect: no save file, chip is blank. The SDK's first access moves
+// a single byte, so transaction length (command + address + 1) plus which
+// commands only one chip class has determines the type. Nothing is decided
+// until the transaction ends; a deciding write is then replayed into the chip.
 u8 Cart::spi_detect(u8 v) {
   if (detect_buf_.size() < 0x1000) detect_buf_.push_back(v);
   return spi_cmd_ == 0x05 ? spi_status_ : 0xFF;
@@ -304,13 +287,10 @@ void Cart::detect_release() {
     if (len == 3) { t = SaveType::EepromTiny; bytes = 512; }
     else if (len == 4) { t = SaveType::Eeprom; bytes = 65536; }
     else if (len == 5) { t = SaveType::Flash; bytes = 524288; }
-    // A longer first write cannot be split into address and data, and cannot
-    // wait either (the game may read it straight back): the commonest chip.
-    else if (cmd == 0x02 && len > 5) { t = SaveType::Eeprom; bytes = 65536; }
+    else if (cmd == 0x02 && len > 5) { t = SaveType::Eeprom; bytes = 65536; }   // commonest chip
     break;
   case 0x0A: case 0x0B:
-    // 512 B EEPROM's upper-half commands, or FLASH page write / fast read
-    // (the latter with a dummy byte after the address).
+    // 512 B EEPROM's upper-half commands, or FLASH page write/fast read.
     if (len == 5 || (cmd == 0x0B && len == 6)) { t = SaveType::Flash; bytes = 524288; }
     else if (len == 3 || cmd == 0x0A) { t = SaveType::EepromTiny; bytes = 512; }
     break;
@@ -397,9 +377,8 @@ u8 Cart::spi_eeprom(u8 v) {
   }
 }
 
-// An unlisted chip's size is a guess (a detected FLASH starts at 512 KB): an
-// address past the end grows it to the next power of two, up to 8 MB, rather
-// than wrapping onto data the game stored at the bottom.
+// Unlisted chip: an address past the end grows it to the next power of two
+// (up to 8 MB) rather than wrapping onto data at the bottom.
 void Cart::fit_flash(u32 addr) {
   if (addr < sram_.size() || addr >= 0x800000) return;
   u32 bytes = static_cast<u32>(sram_.size());
@@ -448,8 +427,6 @@ template <class S> void Cart::sync_state(S& s) {
   s.put(n);
   if constexpr (S::reading) {
     if (n != sram_.size()) {
-      // An unlisted chip's type is a function of its size, so a state names
-      // it: detected (or grown) since, or not yet detected (0 bytes).
       const SaveType t = n ? save_type_for_size(n) : SaveType::Detect;
       if (listed_ || t == SaveType::None) { s.fail("save chip size differs"); return; }
       set_chip(t, n);
@@ -459,8 +436,8 @@ template <class S> void Cart::sync_state(S& s) {
   s.blob(sram_.data(), sram_.size());
   s.end();
   if constexpr (S::reading) {
-    mark_dirty();                                             // the .sav must follow the state
-    if (cmd_mode_ == 1) key1_init(header_.game_code_u32(), 2, 2);   // the only key schedule used in KEY1 mode
+    mark_dirty();
+    if (cmd_mode_ == 1) key1_init(header_.game_code_u32(), 2, 2);
   }
 }
 template void Cart::sync_state<state::Writer>(state::Writer&);

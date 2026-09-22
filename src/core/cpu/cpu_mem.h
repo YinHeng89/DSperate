@@ -13,12 +13,10 @@ namespace ds {
 
 inline u32 rotr32(u32 v, u32 n) { n &= 31; return n ? (v >> n) | (v << (32 - n)) : v; }
 
-// DS_CENSUS=1 (interp.cpp): every executed data access, for sizing the JIT's
-// per-access cost accounting. Null unless the census is on; the interpreter is
-// the only caller of data_cost, so this never reaches a shipped fast path.
+// DS_CENSUS=1: every executed data access, for sizing the JIT's per-access
+// cost accounting. Null unless the census is on.
 extern void (*g_census_access)(bool a9, u32 addr, bool seq);
 
-// ---- cost model -------------------------------------------------------------
 // width: 0 = 8/16-bit, 1 = 32-bit.
 inline void data_cost(CpuContext& cpu, u32 addr, int width, bool seq, bool store) {
   if (g_census_access) g_census_access(cpu.which == Cpu::ARM9, addr, seq);
@@ -78,7 +76,7 @@ inline void mem_write32(CpuContext& cpu, u32 addr, u32 v, bool seq = false) {
   cpu.nds->bus.write32(cpu.which, addr, v);
 }
 
-// Instruction fetch (no cost: the prefetch cost is charged by the run loop).
+// No cost: prefetch cost is charged by the run loop.
 inline u32 fetch32(CpuContext& cpu, u32 addr) {
   if (mem::fmc::on()) mem::fmc::fetch(cpu, addr);
   if (u8* p = cpu.page_table.read_ptr(addr)) { u32 v; std::memcpy(&v, p, 4); return v; }

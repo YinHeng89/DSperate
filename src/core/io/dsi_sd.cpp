@@ -14,12 +14,8 @@
 namespace ds::io {
 
 namespace {
-// melonDS's Transfer_TX / Transfer_RX event function ids, folded into the
-// one event's parameter.
 constexpr u32 TRANSFER_TX = 0, TRANSFER_RX = 1;
-// melonDS schedules the transfer 512 system (ARM7) cycles out; our scheduler
-// counts ARM9 cycles, so the delay doubles (the same conversion the DSi RTC
-// grid event makes).
+// Transfer completes 512 ARM7 cycles out; scheduler counts ARM9 cycles, so double.
 constexpr u64 TRANSFER_DELAY = 512 * 2;
 }  // namespace
 
@@ -45,9 +41,7 @@ void NandImage::create_in_memory(u64 length, const u8 cid[16], u64 console_id) {
   update_state_id();
 }
 
-// FNV-1a over 64-bit words: the console, the size, whether a base was marked,
-// and the base's written sectors in order. A synthesised NAND's base is its
-// title's size; this runs once, when the base is marked.
+// FNV-1a over: console, size, whether a base was marked, and the base's written sectors in order.
 void NandImage::update_state_id() {
   if (!valid()) { state_id_ = 0; return; }
   u64 h = 1469598103934665603ull;
@@ -116,9 +110,8 @@ bool NandImage::open(const std::string& path, bool write_through) {
   const long len = std::ftell(f);
   if (len <= 0x40) { std::fprintf(stderr, "[nand] %s is too small\n", path.c_str()); std::fclose(f); return false; }
 
-  // The nocash footer: normally the last 0x40 bytes, with a second copy at
-  // 0x000FF800 for images cut off by external tools (GBATEK, DSi SD/MMC
-  // images). melonDS NANDImage::NANDImage.
+  // nocash footer: normally the last 0x40 bytes, with a second copy at
+  // 0x000FF800 for images cut off by external tools.
   static const char kRef[16] = {'D','S','i',' ','e','M','M','C',' ','C','I','D','/','C','P','U'};
   char footer[16];
   std::fseek(f, -0x40, SEEK_END);
@@ -167,8 +160,8 @@ void NandImage::peek(u64 addr, u32 len, u8* out) {
   if (!valid()) { std::memset(out, 0, len); return; }
   read_file(addr, len, out);
   if (written_.empty()) return;
-  // Overlay the sectors written this session. Reads are whole blocks from the
-  // SD host and 16-byte pieces from the boot2 loader; both go through here.
+  // Overlay sectors written this session; reads may be whole blocks or
+  // partial (boot2 reads 16 bytes at a time).
   for (u64 s = addr / MMC_BLOCK_SIZE, end = (addr + len + MMC_BLOCK_SIZE - 1) / MMC_BLOCK_SIZE; s < end; ++s) {
     const auto it = written_.find(s);
     if (it == written_.end()) continue;
@@ -202,8 +195,7 @@ void NandImage::poke(u64 addr, u32 len, const u8* in) {
 
 void NandImage::flush() { if (file_) std::fflush(file_); }
 
-// DS_NAND_LOG=<file> writes the block log in trace_melonds's format, so
-// tools/dsi_nand.py map reads ours and the oracle's alike.
+// DS_NAND_LOG=<file>: logs each block read/write as "r|w <addr> <len>".
 void NandImage::log_access(bool write, u64 addr, u32 len) {
   static std::FILE* log = [] {
     const char* path = getenv("DS_NAND_LOG");
@@ -237,7 +229,7 @@ u32 SdHost::irq2_main() const { return num_ ? IRQ2_SDIO : IRQ2_SDMMC; }
 u32 SdHost::irq2_data1() const { return num_ ? IRQ2_SDIO_DATA1 : IRQ2_SD_DATA1; }
 
 void SdHost::reset() {
-  port_select_ = num_ ? 0x0100 : 0x0200;      // melonDS's reset values (CHECKME there too)
+  port_select_ = num_ ? 0x0100 : 0x0200;
   soft_reset_ = 0x0007;
   sd_clock_ = 0;
   sd_option_ = 0;
@@ -271,10 +263,7 @@ void SdHost::reset() {
   if (wifi_) wifi_->reset();
 }
 
-// melonDS's ScheduleEvent drops the request when the event is already live,
-// keeping the first timestamp and function; ours would overwrite it, which
-// silently loses the pending completion (and can swap RX for TX) when two
-// blocks land inside one delay. Match melonDS and refuse.
+// Refuses if the event is already armed: overwriting it could silently lose a pending completion.
 void SdHost::schedule_transfer(u32 which) {
   const EventId ev = num_ ? EventId::Sdio : EventId::SdMmc;
   if (nds_.sched.armed(ev)) return;
@@ -365,9 +354,8 @@ u32 SdHost::data_rx(const u8* data, u32 len) {
     data_fifo_[f].write(v);
   }
 
-  // The delay is load-bearing, not cosmetic: DSi boot2 sends a command and
-  // then polls IRQ0, and an instant IRQ24 would let the handler clear IRQ0
-  // before the send-command routine starts looking (melonDS's note).
+  // Delay is load-bearing: boot2 sends a command then polls IRQ0; an instant
+  // IRQ24 would let the handler clear IRQ0 before send-command starts looking.
   schedule_transfer(TRANSFER_RX);
   return len;
 }
@@ -395,7 +383,6 @@ u32 SdHost::data_tx(u8* data, u32 len) {
       }
       return 0;
     }
-    // Drain FIFO32 into FIFO16.
     for (;;) {
       const u32 cf = cur_fifo_;
       if ((data_fifo_[cf].level << 1) >= block_len16_) break;
@@ -475,9 +462,8 @@ u16 SdHost::read(u32 addr) {
 
   case 0x01C: {
     u16 ret = static_cast<u16>(irq_status_ & (0x031D | (num_ ? 2 : 0)));
-    // Card presence. Host 0: port 0, the SD card slot, whichever port is
-    // selected (melonDS checks Ports[0]); "writable" unless it is read-only.
-    // Host 1: the Wi-Fi module is soldered on -- always inserted.
+    // Card presence: host 0 reflects the SD slot ("writable" unless
+    // read-only); host 1's Wi-Fi module is soldered on, always inserted.
     if (num_) ret |= 0x00A0;
     else if (card_) ret |= card_->read_only ? 0x0020 : 0x00A0;
     return ret;
@@ -541,10 +527,9 @@ void SdHost::write(u32 addr, u16 val) {
     const u8 cmd = command_ & 0x3F;
     SdDevice* dev = device();
     if (!dev) return;
-    // Command type 1 is "ACMD", which on hardware sends an APP_CMD prefix of
-    // its own -- but DSi boot2 sends APP_CMD manually *and* sets the type, so
-    // melonDS treats both types the same and lets the CSR's APP_CMD bit do
-    // the routing.
+    // Command type 1 ("ACMD") normally implies its own APP_CMD prefix, but
+    // boot2 sends APP_CMD manually and sets the type too, so both types are
+    // treated the same and the CSR's APP_CMD bit does the routing.
     const u32 type = (command_ >> 6) & 3;
     if (type <= 1) dev->send_cmd(static_cast<MmcCmd>(cmd), param_);
     return;
@@ -698,10 +683,8 @@ void MmcStorage::send_cmd(MmcCmd cmd, u32 param) {
     return;
 
   case MmcCmd::GetOcr:
-    // CMD1 is MMC-only; an SD card does not answer it (melonDS logs and drops it).
-    if (sd_card_) return;
-    // The eMMC is not high-capacity addressed: bit 30 never sets.
-    param &= ~(1u << 30);
+    if (sd_card_) return;   // CMD1 is MMC-only; SD cards don't answer it
+    param &= ~(1u << 30);   // eMMC is not high-capacity addressed: bit 30 never sets
     ocr_ &= 0xBF000000;
     ocr_ |= param & 0x40FFFFFF;
     host_.send_response(ocr_, true);
@@ -719,8 +702,8 @@ void MmcStorage::send_cmd(MmcCmd cmd, u32 param) {
 
   case MmcCmd::GetRca:
     if (sd_card_) {
-      // An SD card makes up its own address; melonDS answers with the R6 layout
-      // (status bits folded down under an RCA of 1).
+      // An SD card makes up its own address: R6 response layout, status bits
+      // folded down under an RCA of 1.
       host_.send_response((csr_ & 0x1FFF) | ((csr_ >> 6) & 0x2000) | ((csr_ >> 8) & 0xC000) | (1u << 16), true);
       return;
     }
@@ -808,8 +791,8 @@ void MmcStorage::send_acmd(MmcAcmd cmd, u32 param) {
     return;
 
   case MmcAcmd::SetOcr:
-    // boot2 hardcodes 0x40100000 and branches on whether bit 30 took; on the
-    // eMMC it does not. An SD card takes it (and is then block-addressed).
+    // boot2 hardcodes 0x40100000 and branches on whether bit 30 took; it
+    // never does on the eMMC. An SD card takes it (then block-addressed).
     if (!sd_card_) param &= ~(1u << 30);
     ocr_ &= 0xBF000000;
     ocr_ |= param & 0x40FFFFFF;
@@ -860,9 +843,8 @@ void MmcStorage::continue_transfer() {
 u32 MmcStorage::read_block(u64 addr) {
   u32 len = host_.transferrable_len(block_size_);
   u8 data[MMC_BLOCK_SIZE];
-  // melonDS indexes the block buffer by addr&0x1FF; every transfer the DSi
-  // makes is sector-aligned, so this is 0, but clamp rather than smash the
-  // stack if a title ever asks for something else.
+  // Buffer indexed by addr&0x1FF; every DSi transfer is sector-aligned so
+  // this is 0, but clamp rather than overrun the buffer otherwise.
   if ((addr & 0x1FF) + len > MMC_BLOCK_SIZE) len = MMC_BLOCK_SIZE - (addr & 0x1FF);
   storage_.read(addr, len, &data[addr & 0x1FF]);
   return host_.data_rx(&data[addr & 0x1FF], len);
@@ -877,9 +859,8 @@ u32 MmcStorage::write_block(u64 addr) {
   return len;
 }
 
-// ---- save state ---------------------------------------------------------------
-// Registers and FIFOs only. What the NAND and the SD card hold is carried by
-// NDS::save_state (NandImage::state_delta, SdCard::state_snapshot).
+// ---- save state ----
+// Registers and FIFOs only; NAND and SD card contents are carried separately.
 
 template <class S> void MmcStorage::sync_state(S& s) {
   s.fields(cid_, csd_, csr_, ocr_, rca_, scr_, ssr_, block_size_, rw_address_, rw_command_, irq, read_only);
@@ -896,8 +877,7 @@ template <class S> void SdHost::sync_state(S& s) {
            data_fifo_[1].buf, data_fifo_[1].read_pos, data_fifo_[1].write_pos, data_fifo_[1].level,
            data_fifo32_.buf, data_fifo32_.read_pos, data_fifo32_.write_pos, data_fifo32_.level);
   if (storage_) storage_->sync_state(s);
-  // The card's presence is recorded: a state loaded without its card
-  // (NDS::load_state) skips the card's registers.
+  // Card presence recorded: a state loaded without its card skips its registers.
   u8 card = card_ != nullptr;
   s.put(card);
   if (card && !card_) {

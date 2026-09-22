@@ -3,8 +3,7 @@
 //
 // Where a block ends. Shared by every backend on purpose: block boundaries
 // decide where the budget is tested, so two backends that cut blocks
-// identically produce identical slice interleaving -- which makes the AArch64
-// backend's frame hashes an oracle for the A32 one (docs/arm32-jit-scoping.md).
+// identically produce identical slice interleaving.
 #pragma once
 #include "core/cpu/arm_decode.h"
 #include "core/types.h"
@@ -18,12 +17,8 @@ inline bool mcr_is_nop(u32 instr, bool a9) {
   const u32 crn = (instr >> 16) & 0xF, crm = instr & 0xF, opc2 = (instr >> 5) & 7;
   return crn == 7 && !((crm == 0 && opc2 == 4) || (crm == 8 && opc2 == 2));
 }
-// MSR forms translated inline: CPSR writes from a register or immediate. The
-// mode must not change (tested at run time; otherwise the interpreter runs it).
-// SUBS/ADDS/MOVS pc, rn, #imm with S set: the exception return. Inlined --
-// it is one mode switch (restore_cpsr) and an interworking branch, which is
-// 120 k fallbacks a run in Golden Sun's IRQ exit. The register-operand forms
-// and the other opcodes keep the interpreter.
+// SUBS/ADDS/MOVS pc, rn, #imm with S set: exception return, inlined as one
+// restore_cpsr + interworking branch. Register-operand forms stay interpreted.
 inline bool dp_exc_return(u32 instr) {
   if ((instr >> 28) != 0xE) return false;                       // unconditional only
   if (arm::decode_arm(instr) != arm::AOp::DpImm) return false;
@@ -34,26 +29,15 @@ inline bool dp_exc_return(u32 instr) {
 }
 
 inline bool msr_inline(u32 instr) {
-  // SPSR writes inline too: they bank nothing and change no mode -- the
-  // current mode's SPSR is one word -- and user/system mode, which have no
-  // SPSR, is tested at run time. Golden Sun's IRQ handler runs one per
-  // interrupt, 120 k a run through the interpreter before this.
+  // SPSR writes inline too (one word, no bank/mode change); USR/SYS (no SPSR)
+  // checked at run time.
   return !(arm::decode_arm(instr) == arm::AOp::MsrReg && (instr & 0xF) == 15);
 }
 
-// `LDM ^` / `STM ^` (the S bit without r15 in a load list): a user-bank
-// transfer, and 120 k fallbacks a run in Golden Sun's IRQ exit. Inlined for
-// the shapes where the architecture -- not the interpreter -- says the user
-// bank is reachable without a mode switch. `bank_r8_r12` covers USR and FIQ
-// only and `bank_r13`/`bank_r14` are per mode (cpu.h), so in IRQ/SVC/ABT/UND
-// the live r0-r12 ARE the user's and only r13/r14 belong elsewhere. Those two
-// modes-with-banked-r8 (FIQ) and the banks-are-current modes (USR/SYS) are
-// tested at run time and keep the interpreter.
-//
-// Writeback stays on the interpreter: architecturally UNPREDICTABLE with S,
-// and the interpreter writes the base back while still switched to user mode,
-// so a base of r13/r14 would land in a different bank than an inline path
-// would choose. No cost to excluding it -- the shape does not occur.
+// `LDM ^` / `STM ^` (S bit, no r15 in load list): user-bank transfer, inlined
+// where the user bank is reachable without a mode switch (IRQ/SVC/ABT/UND;
+// FIQ and USR/SYS keep the interpreter). Writeback stays interpreted:
+// UNPREDICTABLE with S, and r13/r14 could land in the wrong bank.
 inline bool ldm_user_inline(u32 instr) {
   using arm::AOp;
   const AOp op = arm::decode_arm(instr);
@@ -63,7 +47,7 @@ inline bool ldm_user_inline(u32 instr) {
   const u32 list = instr & 0xFFFF;
   if (list == 0 || ((instr >> 16) & 0xF) == 15) return false;
   const bool load = instr & (1u << 20);
-  return !(load && (list & 0x8000));                            // else: CPSR restore, not a user-bank transfer
+  return !(load && (list & 0x8000));                            // else: CPSR restore
 }
 
 inline bool arm_ends_block(u32 instr, bool a9) {

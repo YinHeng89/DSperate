@@ -108,10 +108,9 @@ bool Ndma::in_mode(Cpu cpu, u32 mode) const {
   return false;
 }
 
-// melonDS DSi_NDMA::Run9/Run7: the unit cost is the two ends' N32 (both in
-// main RAM) or S32 costs, plus one when both ends are in the same region and
-// minus one when only the source is main RAM; ARM9 units are scaled to the
-// core clock.
+// Unit cost is the two ends' N32 (both in main RAM) or S32 costs, plus one
+// when both ends are in the same region and minus one when only the source
+// is main RAM; ARM9 units are scaled to the core clock.
 u32 Ndma::run_channel(Channel& c, u32 budget) {
   const bool a9 = c.cpu == Cpu::ARM9;
   set_running(c, 1);
@@ -131,11 +130,9 @@ u32 Ndma::run_channel(Channel& c, u32 budget) {
   if (a9) unit <<= shift9_;
   const bool fill = ((c.cnt >> 13) & 3) == 3;
   mem::Bus& bus = nds_.bus;
-  // The ARM7's FIFO ends straight to their devices (Io::ndma_read7): the
-  // same calls the bus would make, minus two dispatches a word.
   const bool direct = !a9 && !io::Io::census_on() && !mem::Bus::watch_active();
-  // SCFG_EXT gates the ports (Io::dsi_io_access) and nothing a transfer
-  // does can change it, so the check is made once here, not per word.
+  // SCFG_EXT gates the ports; nothing a transfer does can change it, so
+  // checked once here, not per word.
   const bool src_fifo = direct && !fill && c.src_inc == 0 && (c.cur_src == 0x0400490C || c.cur_src == 0x0400440C) && nds_.io.dsi_io_access(Cpu::ARM7, c.cur_src);
   const bool dst_aes = direct && c.dst_inc == 0 && c.cur_dst == 0x04004408 && nds_.io.dsi_io_access(Cpu::ARM7, c.cur_dst);
   u32 used = 0;
@@ -170,7 +167,7 @@ void Ndma::finished(Channel& c) {
   set_running(c, 0);
   c.in_progress = false;
   nds_.dma.update_armed();
-  if (c.cpu == Cpu::ARM7) { nds_.io.aes.check_input_dma(); nds_.io.aes.check_output_dma(); }   // melonDS: every ARM7 NDMA end re-polls the AES FIFOs
+  if (c.cpu == Cpu::ARM7) { nds_.io.aes.check_input_dma(); nds_.io.aes.check_output_dma(); }   // every ARM7 NDMA end re-polls the AES FIFOs
   if (c.start_mode == 0x04 || c.start_mode == 0x24) { if (nds_.io.cart_drq()) start(c); }
 }
 

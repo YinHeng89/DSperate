@@ -1,10 +1,9 @@
 #version 450
 // After the native-resolution translucent tail: every hi-res pixel whose
 // native parent the tail wrote (the touched plane) takes the parent's
-// colour, attribute and depth records, so the final pass (fog, edge
-// marking) and the display see one picture. The tail's alpha edges land on
-// native pixels over hi-res geometry: the accepted trade for a tail that
-// costs a quarter of the fragments.
+// colour, attribute and depth records, so the final pass and the display
+// see one picture. Trade-off: the tail's alpha edges land on native pixels
+// over hi-res geometry.
 #extension GL_GOOGLE_include_directive : require
 #define DS_GLSL 1
 #include "vk_layout.h"

@@ -23,30 +23,28 @@ const char* const kWhy[WHY_COUNT] = {"I/O or MMIO (no base)", "VRAM region (kept
                                      "store to a read-only / trapped page", "store to data sharing a 4 KB host page with code"};
 
 struct Site {
-  u64 direct = 0;       // accesses the view served
-  u64 walked = 0;       // accesses after the rewrite that the view would have served (lost)
-  u64 slow = 0;         // accesses that would leave the view (before or after the rewrite)
+  u64 direct = 0;        // served by the view
+  u64 walked = 0;        // lost to the view after the rewrite
+  u64 slow = 0;           // would leave the view
   bool rewritten = false;
-  bool mixed = false;   // served directly at least once before its first fault
-  u8 first_why = 0;     // why the first fault left the view, and where it went
+  bool mixed = false;    // served directly before its first fault
+  u8 first_why = 0;
   bool first_store = false;
   u32 first_addr = 0;
-  u64 slow_after = 0;   // faulting accesses after the rewrite (a site that keeps leaving the view)
+  u64 slow_after = 0;    // faults after the rewrite
 };
 
 struct State {
-  bool counting = false;   // the frontend opens the window (a reset maps the whole space: not steady-state churn)
+  bool counting = false;
   std::unordered_map<u64, Site> sites;
-  // The JIT's code tags, approximated for interpreter runs: a host page is
-  // code once an instruction was fetched from it, until a store lands on it
-  // (the JIT invalidates the blocks there and drops the tag). 2 KB guest-page
-  // granularity for the tag, 4 KB for what a host-page protection would cover.
+  // Approximated code tags for interpreter runs: a host page is code once
+  // fetched from, until a store lands on it. 2 KB guest granularity, 4 KB
+  // for host-page protection.
   std::unordered_set<uintptr_t> code2k;
   std::unordered_map<uintptr_t, u32> code4k;   // host 4 KB page -> tagged 2 KB halves in it
   u64 direct[2] = {}, walked[2] = {}, faults_first[2] = {}, slow_why[2][WHY_COUNT] = {};
   u64 rewrites_counted[2] = {}, rewrites_mixed[2] = {};
-  u64 region_direct[2][64] = {};      // by 64 MB region: what the A32 region table must cover
-  // Churn outside the VRAM region.
+  u64 region_direct[2][64] = {};      // direct accesses by 64 MB region
   u64 view_map_changes = 0, view_prot_changes = 0, vram_changes = 0, code_tags_on = 0, code_tags_off = 0;
 };
 State* g_st = nullptr;
@@ -79,9 +77,7 @@ void access(CpuContext& cpu, u32 addr, bool store) {
       why = W_CODE_STORE;
       if (s.code2k.erase(h >> PAGE_SHIFT)) { auto it = s.code4k.find(h >> 12); if (it != s.code4k.end() && --it->second == 0) s.code4k.erase(it); }
     } else if (s.code4k.count(h >> 12)) {
-      // A host page is 4 KB and a guest page 2 KB: the view protects whole
-      // host pages, so data sharing one with code faults too.
-      why = W_BUDDY;
+      why = W_BUDDY;   // shares a 4 KB host page with a 2 KB code guest page
     }
   }
   const u64 key = (static_cast<u64>(c) << 32) | cpu.hot.regs[15];
@@ -116,8 +112,8 @@ void entry_changed(u32 guest_page, uintptr_t old_e, uintptr_t new_e) {
   if (!s.counting || old_e == new_e) return;
   if ((guest_page << PAGE_SHIFT >> 24) == 0x06) { ++s.vram_changes; return; }
   const uintptr_t ob = old_e << 2, nb = new_e << 2;
-  if (ob != nb) ++s.view_map_changes;                                   // the backing moved: an mmap
-  else if ((old_e ^ new_e) & (TAG_CODE | TAG_SPECIAL)) ++s.view_prot_changes;   // same backing, new protection: an mprotect
+  if (ob != nb) ++s.view_map_changes;                                   // backing moved: mmap
+  else if ((old_e ^ new_e) & (TAG_CODE | TAG_SPECIAL)) ++s.view_prot_changes;   // protection: mprotect
 }
 
 void code_tag(bool on) {
@@ -148,7 +144,6 @@ void report(u64 frames) {
     for (auto& [v, r] : reg) std::fprintf(stderr, " %08x %.1f%%", static_cast<u32>(r) << 26, 100.0 * v / s.direct[c]);
     std::fputc('\n', stderr);
   }
-  // The sites that cost the most once rewritten: mixed sites whose lost direct accesses are largest.
   std::vector<std::pair<u64, u64>> lost;
   for (auto& [k, st] : s.sites) if (st.walked) lost.emplace_back(st.walked, k);
   std::sort(lost.rbegin(), lost.rend());

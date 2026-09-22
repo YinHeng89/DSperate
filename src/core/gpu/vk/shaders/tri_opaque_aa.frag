@@ -1,8 +1,8 @@
 #version 450
-// The order-free prefix in the anti-aliasing pass (tri_aa_common.glsl): the
-// pixel's span row gives its coverage, its attributes and its depth; the
-// hardware only decides which pixels to visit (tri.vert grows the polygon by
-// a pixel so every pixel of the DS span is visited, and the rest are cut).
+// The order-free prefix in the AA pass: the pixel's span row gives its
+// coverage, attributes and depth; the hardware only decides which pixels
+// to visit (tri.vert grows the polygon by a pixel so every pixel of the DS
+// span is visited, and the rest are cut).
 #extension GL_GOOGLE_include_directive : require
 #define DS_GLSL 1
 #define DS_AA_PASS 1

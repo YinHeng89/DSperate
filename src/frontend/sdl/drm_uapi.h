@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // DSperate - Nintendo DS emulator. Copyright (C) 2026 DSperate contributors.
 //
-// The handful of DRM UAPI structures and ioctl numbers display_drm.cpp needs,
-// declared here so the build needs neither libdrm nor kernel DRM headers --
-// the handhelds ship libdrm.so but no <drm/drm.h>, and the point of this tier
-// is that it works on a stock device image. These are kernel UAPI: their
-// layout is fixed forever, so copying the dozen fields we use is safe in a
-// way that hand-declaring a library's structs would not be.
-//
-// Taken verbatim (field for field) from linux/include/uapi/drm/drm.h and
-// drm_mode.h. If the names look terse, they are the kernel's.
+// DRM UAPI structs/ioctl numbers needed here, so the build needs neither
+// libdrm nor kernel DRM headers (handhelds ship libdrm.so but no
+// <drm/drm.h>). Kernel UAPI layout is fixed forever, so copying fields is
+// safe. Taken verbatim from linux/include/uapi/drm/drm.h and drm_mode.h.
 #pragma once
 
 #include <cstdint>

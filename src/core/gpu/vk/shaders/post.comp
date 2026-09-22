@@ -3,17 +3,11 @@
 #extension GL_GOOGLE_include_directive : require
 // The final pass: edge marking, then fog.
 //
-// Why it is a pass of its own and not part of the raster: edge marking
-// compares a pixel's polygon id and depth against its four NEIGHBOURS, and in
-// a tiled raster three of those four are in other workgroups. Fog needs no
-// neighbour at all and could have been folded into the raster -- but the
-// hardware applies edge marking first and fog to its result, so they belong
-// together in that order. This is Renderer3D::final_pass_ref transcribed,
-// minus the anti-aliasing arm, which is still host-gated.
+// A pass of its own since edge marking compares a pixel against its four
+// NEIGHBOURS, three of which are in other workgroups in a tiled raster. Fog
+// could fold into the raster but hardware applies it after edge marking.
 //
-// It runs only when DISP3DCNT asks for one of them. The raster writes its
-// depth and attribute planes only in that case too, so a frame with neither
-// pays nothing for this existing.
+// Runs only when DISP3DCNT asks for one; the raster writes depth/attribute planes only then too.
 #define DS_GLSL 1
 #include "vk_layout.h"
 
@@ -23,28 +17,24 @@ layout(std430, binding = 4)          buffer Out   { uint fb[]; };
 layout(std430, binding = 5) readonly buffer Post  { GpuPost ps; };
 layout(std430, binding = 6) readonly buffer Depth { uint zbuf[]; };
 layout(std430, binding = 7)          buffer Attr  { uint abuf[]; };
-layout(std430, binding = 17)          buffer UCol  { uint ucol[]; };    // the pixel underneath (the exact anti-aliasing pass, DS_FF_AA); the scratch plane of the fast one
+layout(std430, binding = 17)          buffer UCol  { uint ucol[]; };    // pixel underneath (exact AA, DS_FF_AA); scratch plane of the fast one
 layout(std430, binding = 18) readonly buffer UAttr { uint uattr[]; };
 layout(std430, binding = 19) readonly buffer UZ    { uint uz[]; };
-// The smooth filter's edge plane (DS_FF2_SMOOTH), for the present stage's
-// composite alone: per edge pixel the UNBLENDED pixel (RGB666 in bits 0-17,
-// alpha in 18-22) and its edge record (coverage 23-27, right run 28, X-major
-// 29, covered half is the top 30), bit 31 set; 0 elsewhere. The layer itself
-// (fb) still gets the anti-aliasing blend: the CPU composite, display
-// capture and save states read it, and a frame the present stage does not
-// composite would otherwise show hard edges.
+// Smooth filter's edge plane (DS_FF2_SMOOTH), present-stage composite only:
+// per edge pixel, UNBLENDED colour (RGB666 bits 0-17, alpha 18-22) + edge
+// record (coverage 23-27, right run 28, X-major 29, covered half top 30),
+// bit 31 set; 0 elsewhere. `fb` still gets the AA blend (capture/save states read it directly).
 layout(std430, binding = 20) writeonly buffer Edge { uint edge[]; };
 layout(push_constant) uniform Push { GpuFrame f; } pc;
 
-// 15-bit colour channel -> 6 bits: bits 1-5 of the field, +1 when non-zero.
+// 15-bit channel -> 6 bits: bits 1-5 of the field, +1 when non-zero.
 uint c15_to_18(uint c, uint shift) {
   uint v = ((shift == 0u ? (c << 1) : (c >> shift)) & 0x3Eu);
   return v != 0u ? v + 1u : v;
 }
 
-// Renderer3D::fog_density. The (z - offset) >> 2 << shift can wrap in 32 bits
-// for large shifts, as it does on hardware, so this is unsigned throughout and
-// deliberately unguarded.
+// (z - offset) >> 2 << shift can wrap in 32 bits for large shifts, as on
+// hardware, so this is unsigned throughout and deliberately unguarded.
 uint fog_density(uint z) {
   uint id, frac;
   if (z < ps.fog_offset) { id = 0u; frac = 0u; }
@@ -80,10 +70,7 @@ void main() {
   uint z     = zbuf[i];
   bool fast = (pc.f.flags & DS_FF_AAFAST) != 0u;
   if (fast && (pc.f.flags & DS_FF_POST2) != 0u) {
-    // Stage 2 of the fast anti-aliasing: stage 1 left every pixel fogged and
-    // edge-marked in the scratch plane; an edge pixel now blends with its
-    // outside neighbour there -- the pixel the DS's under layer holds in
-    // almost every case -- by its coverage.
+    // Stage 2 of fast AA: blend an edge pixel with its outside neighbour by coverage.
     color = ucol[i];
     if ((attr & 0xFu) != 0u) {
       uint cov = (attr >> 8) & 0x1Fu;
@@ -111,10 +98,7 @@ void main() {
   }
 
   if ((pc.f.dispcnt & (1u << 5)) != 0u && (attr & 0xFu) != 0u) {
-    // Edge marking, against the four neighbours. Off the screen the CPU reads
-    // the ring's border rows, which the clear fills with the clear colour's
-    // polygon id and the clear depth -- so that is what a neighbour outside
-    // the frame is here, rather than a special case.
+    // Off-screen neighbour: clear colour's polygon id and clear depth, no special case.
     uint id = attr >> 24;
     bool mark = false;
     for (int k = 0; k < 4; ++k) {
@@ -129,7 +113,7 @@ void main() {
       uint e = ps.edge[id >> 3];
       color = c15_to_18(e, 0u) | (c15_to_18(e, 4u) << 8) | (c15_to_18(e, 9u) << 16) |
               (color & 0xFF000000u);
-      attr = (attr & 0xFFFFE0FFu) | 0x00001000u;   // coverage broken for the anti-aliasing blend (final_pass_ref)
+      attr = (attr & 0xFFFFE0FFu) | 0x00001000u;   // coverage broken for the AA blend
       abuf[i] = attr;
     }
   }
@@ -137,14 +121,13 @@ void main() {
   uint under = aa ? ucol[i] : 0u;
 
   if ((pc.f.dispcnt & (1u << 7)) != 0u) {
-    bool fogcolor = (pc.f.dispcnt & (1u << 6)) == 0u;   // clear: fog the colour too, not the alpha alone
+    bool fogcolor = (pc.f.dispcnt & (1u << 6)) == 0u;   // fog the colour too, not the alpha alone
     uint fc = ps.fog_color;
     uint fa = (fc >> 16) & 0x1Fu;
     if ((attr & (1u << 15)) != 0u) color = fog_apply(color, fog_density(z), fc, fa, fogcolor);
-    if (aa && (uattr[i] & (1u << 15)) != 0u) under = fog_apply(under, fog_density(uz[i]), fc, fa, fogcolor);   // the lower pixel feeds the blend
+    if (aa && (uattr[i] & (1u << 15)) != 0u) under = fog_apply(under, fog_density(uz[i]), fc, fa, fogcolor);
   }
   if (aa) {
-    // Anti-aliasing: the edge pixel blended with the pixel underneath by its coverage.
     uint cov = (attr >> 8) & 0x1Fu;
     if (cov == 0u) color = under;
     else if (cov != 0x1Fu) {
@@ -162,14 +145,13 @@ void main() {
   }
 
   if (fast && (pc.f.flags2 & DS_FF2_SMOOTH) != 0u) {
-    // The smooth filter resolves the edge itself, at panel resolution, from
-    // the unblended pixel and its record; stage 2 still blends the layer.
+    // Smooth filter resolves the edge at panel resolution; stage 2 still blends the layer.
     uint cov = (attr >> 8) & 0x1Fu;
     edge[i] = ((attr & 0xFu) != 0u && cov != 0x1Fu)
       ? ((color & 0x3Fu) | (((color >> 8) & 0x3Fu) << 6) | (((color >> 16) & 0x3Fu) << 12) | (((color >> 24) & 0x1Fu) << 18) |
          (cov << 23) | (((attr & 2u) != 0u) ? 1u << 28 : 0u) | (((attr & 0x2000u) != 0u) ? 1u << 29 : 0u) | (((attr & 0x4000u) != 0u) ? 1u << 30 : 0u) | 0x80000000u)
       : 0u;
   }
-  if (fast) { ucol[i] = color; return; }   // stage 1 of the fast anti-aliasing: stage 2 reads the neighbours from here
+  if (fast) { ucol[i] = color; return; }   // stage 1 of fast AA: stage 2 reads the neighbours from here
   fb[i] = color;
 }

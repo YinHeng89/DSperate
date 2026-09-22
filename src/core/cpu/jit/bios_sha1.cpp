@@ -1,36 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // DSperate - Nintendo DS emulator. Copyright (C) 2026 DSperate contributors.
 //
-// The DSi ARM9 BIOS's SHA-1 block loop, run natively by the recompiler.
-//
-// A title launched from the DSi Menu is hashed while the launch animation
-// plays: the whole .app goes through the BIOS's block function (0xFFFF0A10,
-// r0 = the five state words, r1 = data, r2 = length), about 1300 ARM
-// instructions per 64-byte block. At 16 MB that is several hundred million
-// guest instructions inside a couple of seconds, and on a Cortex-A55 the
-// recompiled loop alone put every frame of Shantae's launch over budget.
-//
-// The loop body (0xFFFF0A18-0xFFFF1E44) has no data-dependent branch, so an
-// iteration's effect is a pure function of its inputs, and so is its cycle
-// cost. Here it is done as plain SHA-1, leaving exactly what the BIOS code
-// leaves -- the new state in memory and in r3/r9-r12 (and r8), the old
-// state words 0-2 and 4 in r4-r6 and lr, the last round constant in r7, the
-// message schedule's last sixteen words W79..W64 in the 64 bytes below sp,
-// r1 += 64, r2 -= 64 with its flags -- and charging the cycles the
-// recompiled instructions charge, from the live timing table (with CPU tuning
-// applied the way the translator prices data accesses under it).
-//
-// What differs from running the instructions: the loop is only left between
-// iterations (at the budget, or with an IRQ pending), not at the recompiler's
-// 64-instruction block edges, so the ARM9 can overshoot a slice by one
-// iteration. The same kind of interleaving difference the block size makes.
-//
-// A zero-cost variant for fast_load was tried: the menu's NAND reads then
-// crowd into fewer, heavier frames (Shantae: ~20 frames at 42 ms instead of
-// ~45 at 21 ms on an RK3568) for a title that starts 4 frames sooner.
-//
-// The routine is recognised by the SHA-1 of its bytes; the cycle pattern is
-// decoded from those bytes when it first arms. Nothing of it is embedded.
+// DSi ARM9 BIOS SHA-1 block loop (0xFFFF0A10, r0 = five state words, r1 =
+// data, r2 = length), run natively by the recompiler. The loop body has no
+// data-dependent branch, so an iteration's effect and cycle cost are a pure
+// function of its inputs; this reproduces exactly the register/memory state
+// the BIOS code leaves, and charges what the recompiled instructions would.
+// Left only between iterations (budget or IRQ pending), so the ARM9 can
+// overshoot a slice by one iteration. Recognised by the SHA-1 of its bytes;
+// the cycle pattern is decoded from those bytes on first arm.
 #include "core/cpu/jit/jit_internal.h"
 #include "core/cpu/cpu_cycles.h"
 #include "core/crypto/sha1.h"
@@ -61,8 +39,7 @@ struct Shape {
 };
 Shape g_shape;
 
-// Decode the loop body's instructions into cost ops. Only the forms the
-// routine uses are accepted; anything else leaves the hook off.
+// Decode the loop body into cost ops; unrecognized forms leave the hook off.
 bool decode_shape(CpuContext& cpu) {
   g_shape.decoded = true;
   mem::Bus& bus = cpu.nds->bus;
@@ -110,11 +87,8 @@ bool decode_shape(CpuContext& cpu) {
 
 inline u32 max3c(s32 a, s32 b, s32 c) { return static_cast<u32>(std::max(a, std::max(b, c))); }
 
-// A word access's data cost as the translator prices it. Untuned: the
-// accessed page's entry at run time. Under CPU tuning (Translator::
-// oc_data_cost) a translate-time constant: main RAM's load entry, or for
-// underclocked stores main RAM's bus cost. A pc-relative literal always
-// keeps its own page's N32 (arm_ldr_str).
+// A word access's data cost as the translator prices it; see
+// Translator::oc_data_cost for the CPU-tuned constant paths.
 s32 data_cost(const CpuContext& cpu, u32 addr, bool seq, bool store, bool literal) {
   const CpuOc oc = rt().cpu_oc;
   if (literal || oc == CpuOc::Off) return cpu.timing9[addr >> 12][(store ? 4 : 0) + (seq ? 3 : 2)];
@@ -186,8 +160,7 @@ bool compute(CpuContext& cpu, Iter& it) {
   const mem::Timing& t = cpu.nds->bus.timing();
   const auto& R = cpu.hot.regs;
   const u32 r0 = R[0], r1 = R[1], sp = R[13];
-  // The bytes the iteration touches: all directly mapped, none of them code,
-  // and not overlapping (the instructions' order would then matter).
+  // The bytes touched must be directly mapped, non-code, and non-overlapping.
   const u32 lo_stack = sp - 64;
   const auto overlap = [](u32 a, u32 an, u32 b, u32 bn) { return a < b + bn && b < a + an; };
   if (lo_stack > sp || overlap(r1, 64, lo_stack, 64) || overlap(r1, 64, r0, 20) || overlap(lo_stack, 64, r0, 20)) return false;
@@ -215,8 +188,7 @@ bool compute(CpuContext& cpu, Iter& it) {
   if (it.again) it.cost += fetch_cost9(cpu, LOOP, true) + fetch_cost9(cpu, LOOP + 4, false);   // the refill
   else { const u32 pc8 = BRANCH + 8; const u8 cc = cpu.timing9[pc8 >> 12][0]; it.cost += cc == 0xFF ? (!(pc8 & 0x1F) ? 3u : 1u) : cc; }
 
-  // SHA-1 over the block from the chaining values in the registers; the
-  // stored state is what is added at the end (the BIOS reloads it).
+  // SHA-1 over the block from the chaining values in the registers.
   u32 W[80];
   for (u32 k = 0; k < 16; ++k) W[k] = bswap(data[k]);
   for (u32 k = 16; k < 80; ++k) W[k] = rol(W[k - 3] ^ W[k - 8] ^ W[k - 14] ^ W[k - 16], 1);

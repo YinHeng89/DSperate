@@ -4,18 +4,8 @@
 // Span pass: the Y stage, once per (polygon, scanline), for the whole frame.
 //
 // ONE LANE PER ROW over the whole frame's span table, not one workgroup per
-// polygon. The first shape was one 64-lane workgroup per polygon, its lanes
-// taking the polygon's scanlines in stride -- and it cost about 4 us per
-// POLYGON whatever the polygon's height (RG DS Plus, DS_VK_TIMING): NSMB's
-// 850 polygons average 2.4 rows, so 61 of 64 lanes idled while the workgroup
-// paid its launch and its divisions, 3.35 ms of a 4.35 ms GPU frame. Here a
-// frame of 2 K rows is 32 workgroups. The host writes each row's polygon
-// index (rowpoly) as it lays the table out, so a lane finds its polygon with
-// one load and its scanline from the polygon's first visible line.
-//
-// The raster used to do this itself, once per tile a polygon touched. Nothing
-// about it depends on x, so those repeats were pure waste -- and they were
-// also the only reason the tile SHAPE mattered.
+// polygon (which would idle most lanes on small polygons and pay per-polygon
+// overhead regardless of height). rowpoly gives a lane its polygon in one load.
 #define DS_GLSL 1
 #include "vk_layout.h"
 
@@ -34,9 +24,7 @@ void main() {
   if (ri >= pc.f.nrows) return;
   uint pi = rowpoly[ri];
   GpuPoly p = polys[pi];
-  // Rows exist only for the visible part of [ytop, ybot], from max(ytop, 0);
-  // every consumer uses the same clamp (render3d.cpp, bin.comp, vis.comp).
-  int y = max(p.ytop, 0) + int(ri - p.row_base);
+  int y = max(p.ytop, 0) + int(ri - p.row_base);   // rows exist from max(ytop,0); every consumer uses this clamp
   GpuRow r = compute_row(p, y);
   r.poly = pi;
   rows[ri] = r;

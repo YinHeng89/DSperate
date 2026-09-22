@@ -1,12 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // DSperate - Nintendo DS emulator. Copyright (C) 2026 DSperate contributors.
 //
-// See lan_mp.h. A port of melonDS's net/LAN.cpp (GPL-3.0-or-later, melonDS
-// team); the wire format is theirs and must stay byte-identical: the
-// discovery beacon, the control commands, the Player array, and the 24-byte
-// MP packet header. Behaviour that is theirs and looks odd (the beacon's
-// Magic field reused as a receive time, the 16 ms freshness window on queued
-// frames, the 32 us reply window) is what a melonDS on the other end expects.
+// Port of melonDS's net/LAN.cpp (GPL-3.0-or-later, melonDS team); wire
+// format must stay byte-identical to interoperate with a real melonDS.
 #include "net/lan_mp.h"
 #include <enet/enet.h>
 #include <arpa/inet.h>
@@ -32,14 +28,14 @@ constexpr u16 kDiscoveryPort = 7063, kLanPort = 7064;
 enum { Chan_Cmd = 0, Chan_MP = 1 };
 enum : u8 { Cmd_ClientInit = 1, Cmd_PlayerInfo, Cmd_PlayerList, Cmd_PlayerConnect, Cmd_PlayerDisconnect };
 
-struct DiscoveryData {          // melonDS's, byte for byte (80 bytes)
+struct DiscoveryData {          // melonDS's, byte for byte
   u32 magic, version, tick;
   char session_name[64];
   u8 num_players, max_players, status;
   u8 pad_;
 };
 static_assert(sizeof(DiscoveryData) == 80, "melonDS wire layout");
-struct MpPacketHeader {         // melonDS's MPPacketHeader (24 bytes)
+struct MpPacketHeader {         // melonDS's MPPacketHeader
   u32 magic, sender_id, type, length;
   u64 timestamp;
 };
@@ -86,7 +82,7 @@ bool LanMp::start_discovery() {
   discovery_fd_ = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
   if (discovery_fd_ < 0) { err_ = "discovery socket"; return false; }
   int one = 1;
-  ::setsockopt(discovery_fd_, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);   // ours: two instances on one box
+  ::setsockopt(discovery_fd_, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
   sockaddr_in sa{}; sa.sin_family = AF_INET; sa.sin_addr.s_addr = htonl(INADDR_ANY); sa.sin_port = htons(kDiscoveryPort);
   if (::bind(discovery_fd_, reinterpret_cast<sockaddr*>(&sa), sizeof sa) < 0 ||
       ::setsockopt(discovery_fd_, SOL_SOCKET, SO_BROADCAST, &one, sizeof one) < 0) {
@@ -317,10 +313,7 @@ void LanMp::process_host_event(ENetEvent& ev) {
       }
       LAN_LOG("client %d is \"%s\"\n", p.id, p.name);
       host_update_player_list();
-      // A peer only learns our radio is on from the connect broadcast sent
-      // when it powered up; a player joining a running session missed it,
-      // and its first CMD frame from us would then read as "host gone".
-      // Tell the newcomer now (melonDS clients accept it at any time).
+      // catch up a late joiner that missed the power-on connect broadcast
       if (connected_mask_ & (1 << me_.id)) { const u8 c = Cmd_PlayerConnect; enet_peer_send(ev.peer, Chan_Cmd, enet_packet_create(&c, 1, ENET_PACKET_FLAG_RELIABLE)); }
       break;
     }
@@ -346,7 +339,7 @@ void LanMp::process_client_event(ENetEvent& ev) {
     if (pid < 0) { enet_peer_disconnect(ev.peer, 0); break; }
     peers_[pid] = ev.peer;
     ev.peer->data = &players_[pid];
-    if (connected_mask_ & (1 << me_.id)) { const u8 c = Cmd_PlayerConnect; enet_peer_send(ev.peer, Chan_Cmd, enet_packet_create(&c, 1, ENET_PACKET_FLAG_RELIABLE)); }   // as above, client to client
+    if (connected_mask_ & (1 << me_.id)) { const u8 c = Cmd_PlayerConnect; enet_peer_send(ev.peer, Chan_Cmd, enet_packet_create(&c, 1, ENET_PACKET_FLAG_RELIABLE)); }
     break;
   }
   case ENET_EVENT_TYPE_DISCONNECT: {
@@ -369,7 +362,7 @@ void LanMp::process_client_event(ENetEvent& ev) {
         std::memcpy(players_.data(), d + 2, sizeof(players_));
         for (Player& p : players_) p.name[31] = '\0';
       }
-      // Clients connect to each other directly; the host only introduces them.
+      // clients connect directly to each other; host only introduces them
       for (int i = 0; i < 16; ++i) {
         if (i == me_.id || players_[i].status != PlayerStatus::Client || peers_[i]) continue;
         ENetAddress pa; pa.host = players_[i].address; pa.port = kLanPort;
@@ -388,8 +381,6 @@ void LanMp::process_client_event(ENetEvent& ev) {
   }
 }
 
-// type: 0 = a plain poll; 1 = drop stale frames, and non-regular ones, from
-// the head of the queue; 2 = wait up to the recv timeout for a frame.
 void LanMp::process_lan(int type) {
   if (!host_) return;
   struct WaitClock {
@@ -401,12 +392,7 @@ void LanMp::process_lan(int type) {
     ENetPacket* pkt = rx_.front();
     auto* h = reinterpret_cast<MpPacketHeader*>(pkt->data);
     const u32 packettime = h->magic;   // overwritten with the receive time on arrival
-    // melonDS drops a queued frame older than 16 ms. That assumes the guest
-    // keeps real time; a guest a frame behind then drops the host's CMDs,
-    // waits 25 ms for the next, falls further behind, and the two time out
-    // on each other until the game gives up (Mario Kart DS Download Play's
-    // game-data stage did exactly that). The emulated timeline orders frames
-    // by their own timestamps anyway, so the window only bounds the backlog.
+    // Bounds the backlog rather than dropping on real-time lag (stale_ms_ widens it).
     if (packettime > time_last || packettime < time_last - stale_ms_) { rx_.pop(); enet_packet_destroy(pkt); continue; }
     if (type == 2) return;
     if (type == 1) {
@@ -462,8 +448,6 @@ bool LanMp::scan_join(const std::string& player_name) {
 }
 
 void LanMp::scan_step() {
-  // process_discovery() rate-limits itself to one poll a second, which is how
-  // often a host beacons, so calling this every frame costs nothing.
   if (!active_) process_discovery();
 }
 
@@ -528,11 +512,7 @@ int LanMp::recv_generic(u8* data, bool block, u64* timestamp) {
 int LanMp::send_packet(const u8* data, int len, u64 timestamp) { return send_generic(0, data, len, timestamp); }
 int LanMp::recv_packet(u8* data, u64* timestamp) { return recv_generic(data, false, timestamp); }
 int LanMp::send_cmd(const u8* data, int len, u64 timestamp) {
-  // melonDS's LocalMP re-bases its reply FIFO on every CMD (LocalMP.cpp,
-  // SendPacketGeneric type 1): a reply that answered an earlier CMD can
-  // never be taken for this one's. Its LAN path has only the wall-clock
-  // stale sweep for that, and with our wider window a backlog of old replies
-  // sat at the head of the queue for the host's reply wait to consume.
+  // drop stale queued replies so they aren't mistaken for an answer to this CMD
   std::queue<ENetPacket*> keep;
   while (!rx_.empty()) {
     ENetPacket* pkt = rx_.front(); rx_.pop();
@@ -547,13 +527,9 @@ int LanMp::send_ack(const u8* data, int len, u64 timestamp) { return send_generi
 int LanMp::peek_host_packet(u8* data, u64* timestamp) {
   if (!host_) return 0;
   if (last_host_id_ != -1 && !(connected_mask_ & (1 << last_host_id_))) return -1;
-  process_lan(0);   // poll ENet and the discovery socket, no wait, keep every type
+  process_lan(0);
   if (rx_.empty()) return 0;
-  // Only the MP protocol's frames (CMD, ack) are worth fetching early; a
-  // regular frame (a beacon) at the head waits for the client's own poll,
-  // as it did before -- the download client reacts to beacons, and feeding
-  // them early changed its behaviour.
-  if (reinterpret_cast<MpPacketHeader*>(rx_.front()->data)->type == 0) return 0;
+  if (reinterpret_cast<MpPacketHeader*>(rx_.front()->data)->type == 0) return 0;   // regular frame: leave for the client's own poll
   ENetPacket* pkt = rx_.front(); rx_.pop();
   auto* h = reinterpret_cast<MpPacketHeader*>(pkt->data);
   u32 len = h->length;
@@ -576,7 +552,7 @@ u16 LanMp::recv_replies(u8* packets, u64 timestamp, u16 aidmask) {
   if (!host_) return 0;
   u16 ret = 0;
   u16 seen = static_cast<u16>(1 << me_.id);
-  if ((seen & connected_mask_) == connected_mask_) return 0;   // nobody else is on
+  if ((seen & connected_mask_) == connected_mask_) return 0;
   for (;;) {
     process_lan(2);
     if (rx_.empty()) return ret;

@@ -1,5 +1,5 @@
-// Game code -> save chip type, sorted by code for binary search.
-// Derived from melonDS src/ROMList.cpp (GPLv3, melonDS team); regenerate rather than hand-edit.
+// Game code -> save chip type, sorted by code for binary search. Regenerate rather than hand-edit.
+// Derived from melonDS src/ROMList.cpp (GPLv3, melonDS team).
 // Types: 0 none, 1 = 512 B EEPROM, 2 = 8 KB, 3 = 64 KB, 4 = 128 KB EEPROM, 5 = 256 KB, 6 = 512 KB, 7 = 1 MB, 8 = 8 MB FLASH.
 {0x41464141,4}, {0x414D4155,8}, {0x43363341,8}, {0x43443241,2},
 {0x43495941,1}, {0x434D5341,2}, {0x434E5341,2}, {0x43575A41,2},

@@ -5,13 +5,11 @@
 
 namespace ds {
 
-// ARM946E-S system control coprocessor. Only the registers the DS BIOS and
-// games touch: ID, control, PU regions (stored, not enforced), cache ops
-// (no-ops), TCM region registers (forwarded to the Bus for remapping).
+// ARM946E-S system control coprocessor: ID, control, PU regions (stored, not
+// enforced), cache ops (no-ops), TCM region registers (forwarded to Bus).
 u32  cp15_read (CpuContext& cpu, u32 opc1, u32 crn, u32 crm, u32 opc2);
 void cp15_write(CpuContext& cpu, u32 opc1, u32 crn, u32 crm, u32 opc2, u32 value);
-// Re-derive the PU/cacheability map (and the ARM9 timing pages it changes)
-// from the stored registers: after a save state restores them.
+// Re-derive the PU/cacheability map after a save state restores registers.
 void cp15_update_pu_map(CpuContext& cpu);
 
 } // namespace ds

@@ -1,13 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // DSperate - Nintendo DS emulator. Copyright (C) 2026 DSperate contributors.
 //
-// The DSi's cameras, after melonDS DSi_Camera: two Aptina sensors on the
-// I2C bus (0x78 outer, 0x7A inner) with their PLL/standby/misc registers and
-// the MCU variable window, and the camera module at 0x04004200 (ARM9) that
-// frames them at ~15 fps: its IRQ event starts a frame, a per-scanline event
-// feeds two 512-word pixel buffers the NDMA (mode 0x0B) drains. No image
-// source is attached, so frames are black -- as in melonDS's trace harness,
-// whose platform camera stub delivers nothing either.
+// DSi's cameras: two Aptina sensors on I2C (0x78 outer, 0x7A inner) plus the camera module at
+// 0x04004200 (ARM9), framing at ~15 fps via an IRQ-started frame and a per-scanline event
+// feeding two 512-word pixel buffers the NDMA (mode 0x0B) drains. No image source; frames black.
 #pragma once
 #include "core/types.h"
 #include <array>
@@ -29,7 +25,7 @@ class DsiCamera {
   bool transfer_done() const { return transfer_y_ >= frame_height_; }
   int  transfer_scanline(u32* buffer, int maxlen, int& nlines);   // lengths in words
 
-  // I2C device (melonDS DSi_I2CDevice).
+  // I2C device.
   void acquire() { data_pos_ = 0; }
   u8   read(bool last);
   void write(u8 val, bool last);
@@ -50,15 +46,15 @@ class DsiCamera {
   std::array<u8, 0x8000> mcu_{};
   u16 frame_width_ = 0, frame_height_ = 0, frame_read_mode_ = 0, frame_format_ = 0;
   int internal_y_ = 0, transfer_y_ = 0;
-  // YUYV, two pixels per word; stays black (no image source). On the heap:
-  // the NDS lives on the stack in the unit tests. Not saved (melonDS neither).
+  // YUYV, two pixels per word; stays black. Heap-allocated (NDS lives on the stack in unit
+  // tests); not saved to state.
   std::vector<u32> frame_;
 };
 
 class DsiCamModule {
  public:
   explicit DsiCamModule(NDS& nds) : nds_(nds), cam_{DsiCamera(0), DsiCamera(1)} {}
-  void reset();                       // schedules the first camera IRQ (melonDS DSi_CamModule::Reset)
+  void reset();                       // schedules the first camera IRQ
   DsiCamera& camera(u32 i) { return cam_[i]; }
 
   static void irq_event(NDS& nds, u32 param);        // EventId::CamIrq
@@ -82,7 +78,7 @@ class DsiCamModule {
   DsiCamera* active_camera();
 
   NDS& nds_;
-  DsiCamera cam_[2];   // 0: 0x78, facing outside; 1: 0x7A, the inner camera
+  DsiCamera cam_[2];   // 0: 0x78 outer, 1: 0x7A inner
   u16 module_cnt_ = 0, cnt_ = 0;
   u32 crop_start_ = 0, crop_end_ = 0;
   bool transferring_ = false;

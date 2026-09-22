@@ -8,33 +8,22 @@
 
 namespace ds::sdl {
 
-// The settings the pause menu offers, as tables rather than code: a row is one
-// entry here, and the menu knows nothing about what any of them mean.
-//
-// These are deliberately a subset of the config file. Everything that is
-// decided once (the tier, the window size, real-time scheduling), everything
-// that only makes sense while debugging (the JIT switch, the CPU interleave)
-// and everything with no visible effect stays ini-only. A menu that lists
-// every key is a menu nobody can find anything in.
+// Pause menu settings, as data tables: the menu knows nothing about what any
+// row means. Deliberately a subset of the config file -- one-time, debug-only,
+// or invisible-effect keys stay ini-only.
 
-// An ini value and what the player reads. The file keeps its own vocabulary;
-// only the menu renames -- "mean" is DEFAULT, "linear" is BILINEAR.
+// An ini value and what the player reads ("mean" -> DEFAULT, "linear" -> BILINEAR).
 struct Choice { const char* value; const char* label; };
 
 enum Flag : u8 {
   FlagLive    = 0,        // takes effect as soon as it is set
-  // Moves the picture about, so it is applied when the menu closes rather
-  // than as it is asked for -- some of these also need the display closed and
-  // opened again, and none of them are worth watching happen a step at a time
-  // while a page is being read.
-  FlagDeferred = 1u << 0,
+  FlagDeferred = 1u << 0, // applied when the menu closes, not per-step (layout changes)
   FlagRestart = 1u << 1,  // only read at startup; the row says so
   FlagInexact = 1u << 2,  // trades accuracy for speed; drawn as a warning
 };
 
-// Why a row might be switched off. Not all of these are "another key has this
-// value" -- some read the live layout, some the display tier -- so the menu
-// asks the host rather than resolving them itself.
+// Why a row might be switched off; the menu asks the host rather than
+// resolving these itself since some depend on live state, not just another key.
 enum class Dep : u8 {
   None,
   FrameskipMode,      // emu.frameskip > 0: adaptive-or-fixed means nothing at 0
@@ -50,14 +39,9 @@ enum class Dep : u8 {
   DominantThreshold,  // Dominant, and dominant_ratio is auto
   Net,                // the build has the Wi-Fi transports (DSPERATE_NET)
   NetInternet,        // net.mode is internet: the DNS choice means nothing otherwise
-  // No network session is up. Frameskip, fast forward and the three inexact
-  // speed knobs all hang off this: each of them either lets the emulator set
-  // its own pace or changes how long its work appears to take, and under a
-  // session the pace is kept outside it -- by a peer that holds every frame to
-  // its timestamp, or by a server with its own timeouts.
-  //
-  // The session, not the request: a --netplay that could not open a socket
-  // leaves an ordinary console, and these rows stay usable.
+  // No network session is up (not just none requested): frameskip, fast
+  // forward and the inexact speed knobs are meaningless once pacing is
+  // controlled by a peer or server instead of the emulator.
   NetSession,
   ShortcutsPath,      // a folder for NAND title shortcuts: paths.dsi_shortcuts, else paths.games
   GpuRaster,          // video.gpu_raster on (the row is restart-only, so the config, not the session)
@@ -67,98 +51,61 @@ enum class Dep : u8 {
 struct Setting {
   const char* key;                 // "video.linear"
   const char* label;               // "BILINEAR"
-  // Text is free-form: `lo` is how many characters the firmware keeps.
-  enum class Type : u8 { Bool, Pick, Int, Percent, Text } type;
+  enum class Type : u8 { Bool, Pick, Int, Percent, Text } type;   // Text: `lo` is max chars kept
   const Choice* choices; u8 nchoices;
-  // Int and Percent. These are the menu's bounds, not the file's: the file
-  // accepts more, and a value already in it outside this range is shown and
-  // left alone until the row is moved.
+  // Int/Percent: menu bounds, not the file's -- a value outside this range is
+  // shown as-is and left alone until the row is moved.
   int lo, hi, step;
-  // A value one step below `lo` that means something other than a number.
-  const char* sentinel_value;      // what goes in the file ("auto", "0")
-  const char* sentinel_label;      // what the player reads ("AUTO", "UNLIMITED")
-  // Appended to a number when it is shown, to say what it counts: a bare "4"
-  // on FAST FORWARD SPEED does not say four of what.
-  const char* suffix;
-  // What the frontend uses when the key is absent. It has to be stated rather
-  // than assumed to be the first choice or the bottom of the range: the menu
-  // would otherwise show a value the emulator is not running with, which is
-  // worse than showing nothing.
-  const char* def;
+  const char* sentinel_value;      // value below `lo` meaning something else, e.g. "auto"/"0"
+  const char* sentinel_label;      // shown for the sentinel, e.g. "AUTO"/"UNLIMITED"
+  const char* suffix;              // appended when shown, e.g. "x" on FAST FORWARD SPEED
+  const char* def;                 // used when the key is absent; must match what the frontend actually runs with
   u8 flags;
   Dep depends;
   const char* note;                // one line, shown under the list
 };
 
-// What the menu needs from the frontend. Implemented in main.cpp, which is the
-// only place that knows about the NDS, the Display and the config file; this
-// keeps menu.cpp free of all three, the way the cheats page is free of the
-// cheat engine.
+// What the menu needs from the frontend. Implemented in main.cpp, keeping
+// menu.cpp free of the NDS/Display/config-file types.
 struct SettingsHost {
   virtual ~SettingsHost() = default;
-  // The value in the config now, or "" if the key is unset (the caller then
-  // falls back to the table's own first choice / lo).
-  virtual std::string get(const char* key) const = 0;
-  // Apply it, then remember it. Where that goes -- the global file or this
-  // game's -- is the host's business; see save_per_game().
+  virtual std::string get(const char* key) const = 0;   // "" if unset; caller falls back to table default
   virtual void set(const char* key, const std::string& value) = 0;
   virtual bool enabled(const Setting& s) const = 0;
-  // Why not, for the row to say. "" when it is enabled.
-  virtual const char* disabled_reason(const Setting& s) const = 0;
-  // Whether a choice is offered at all: the display-engine tier draws chunky
-  // cells in its scaler and can only do their mean, so the rest are not shown
-  // there rather than shown and ignored.
+  virtual const char* disabled_reason(const Setting& s) const = 0;   // "" when enabled
+  // Whether a choice is offered at all, e.g. the display-engine tier can only
+  // do the mean of chunky cells, so the others aren't shown rather than shown and ignored.
   virtual bool value_allowed(const Setting& s, const char* value) const = 0;
-  // Everything deferred, now that the menu is closing. Stepping LCD GRID from
-  // 0 to 50 is five presses, and reopening the display on each of them would
-  // flicker the window five times; laying the screens out again under a page
-  // the player is still reading is worse. The menu calls this once, on its way
-  // out.
+  // Apply everything deferred; called once when the menu closes, not per-step,
+  // to avoid flickering the display on each intermediate value.
   virtual void commit() = 0;
   virtual bool save_per_game() const = 0;
   virtual void set_save_per_game(bool on) = 0;
-  // False when there is no game in the slot, so there is no per-game file to
-  // save to and the toggle is not offered.
-  virtual bool has_game() const = 0;
+  virtual bool has_game() const = 0;   // false: no per-game file to save to
 
-  // The Controls page. Bindings are not Settings: they have no range and no
-  // list of choices, and the value comes from the player pressing the thing
-  // they want rather than from stepping through possibilities.
-  //
-  // A row is a config key ("keys.a", "padhotkeys.pause") and the label the
-  // page shows for it. `pad` picks the column: the page defaults to it when a
-  // controller is plugged in, because on a handheld that is the only input.
+  // The Controls page. Bindings have no range/choices; the value comes from
+  // a key press rather than stepping through possibilities. `pad` picks the
+  // column, defaulting to it when a controller is plugged in.
   struct Binding { std::string key, label, value; };
   virtual int binding_count(bool pad) const = 0;
   virtual Binding binding(bool pad, int i) const = 0;
   virtual bool has_pad() const = 0;
-  // Start listening for the next thing pressed. The frontend swallows it
-  // rather than acting on it -- otherwise rebinding Quit would quit.
-  virtual void begin_capture(bool pad) = 0;
+  virtual void begin_capture(bool pad) = 0;   // frontend swallows the next input rather than acting on it
   virtual void cancel_capture() = 0;
   virtual bool capturing() const = 0;
-  // Non-empty once something was pressed: the caller binds it to `key` and
-  // the capture ends.
-  virtual std::string take_capture() = 0;
+  virtual std::string take_capture() = 0;   // non-empty once something was pressed; ends the capture
   virtual void bind(const std::string& key, const std::string& value) = 0;
-  // Put a whole column back to the built-in layout.
   virtual void reset_bindings(bool pad) = 0;
-  // Bindings that shadow one another, one line each; empty when there are none.
-  virtual std::vector<std::string> collisions() const = 0;
+  virtual std::vector<std::string> collisions() const = 0;   // shadowing bindings, one line each
 
-  // Where the DS Options page's changes end up, for the page to say. With a
-  // generated firmware that is [user] in the config file; with a real dump it
-  // is the dump's own settings pages, edited into the sidecar beside it --
-  // never into the dump, which the player may not be able to regenerate.
-  // Returns null when there is nothing worth saying.
+  // Where DS Options page changes are saved: [user] in the config for
+  // generated firmware, or the dump's sidecar for a real one. Null if nothing to say.
   virtual const char* user_settings_note() const = 0;
 };
 
-// The Layout page's hotkey-cycle rows are one checkbox per Display::Mode,
-// keyed "video.layout_cycle.<mode>". They are the host's view onto the ini's
-// single `video.layout_cycle` list: get() answers whether the mode is in it,
-// set() adds or removes it. The host refuses to remove the last one, so the
-// hotkeys always have somewhere to go.
+// Layout page hotkey-cycle rows are one checkbox per Display::Mode, keyed
+// "video.layout_cycle.<mode>", backed by the ini's single `video.layout_cycle`
+// list. The host refuses to remove the last mode.
 constexpr const char* kLayoutCyclePrefix = "video.layout_cycle.";
 
 // The pages. Each is terminated by a row with a null key.
@@ -168,13 +115,10 @@ extern const Setting kLayoutSettings[];
 extern const Setting kUserSettings[];
 int settings_count(const Setting* table);
 
-// What the row shows on the right: the label for a choice, "50%", "UNLIMITED".
 std::string display_value(const Setting& s, const std::string& value);
-// The value one step in `dir`, clamped at the ends rather than wrapping for
-// numbers, and wrapping for a short list of choices. Skips choices the host
-// does not allow.
+// Value one step in `dir`: clamped at the ends for numbers, wraps for choices.
+// Skips choices the host disallows.
 std::string step_value(const Setting& s, const std::string& value, int dir, const SettingsHost& host);
-// The value a row falls back to when the key is unset.
 std::string default_value(const Setting& s);
 
 } // namespace ds::sdl

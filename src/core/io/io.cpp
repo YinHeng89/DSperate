@@ -42,8 +42,7 @@ void Io::flush_lcd_irq() {
 
 void Io::reset() {
   lcd_irq_pending[0] = lcd_irq_pending[1] = 0;
-  // melonDS (the DSi oracle) raises LCD IRQs at the DISPSTAT event itself;
-  // the DS keeps the measured two-bus-cycle delay (see lcd_irq_delay).
+  // DSi raises LCD IRQs at the DISPSTAT event itself; DS delays two bus cycles.
   lcd_irq_delay = nds_.dsi ? 0 : 4;
   if (const char* e = std::getenv("DS_LCD_IRQ_DELAY")) lcd_irq_delay = static_cast<u32>(std::atoi(e));
   if (const char* e = std::getenv("DS_CART_BULK")) cart_bulk_ = std::atoi(e) != 0;
@@ -52,11 +51,7 @@ void Io::reset() {
   wramcnt = 0; std::memset(vramcnt, 0, sizeof vramcnt);
   powcnt1 = 0; powcnt2 = 0; math = MathUnit{};
   keyinput = 0x03FF; extkeyin = 0x007F; keycnt[0] = keycnt[1] = 0;
-  // melonDS NDS::Reset: both CPUs' EXMEMCNT start at 0x6000, not 0. Direct
-  // boot overwrites this with 0xE880 (which already carries those bits), so
-  // it only shows on a BIOS or NAND boot -- where boot2's ARM7 spins on
-  // exactly these bits before it will go on.
-  exmemcnt = 0x6000; rcnt = 0; wifiwaitcnt = 0;
+  exmemcnt = 0x6000; rcnt = 0; wifiwaitcnt = 0;   // boot2's ARM7 spins on these bits
   spicnt = 0; spidata = 0; spi_ready_at = 0; spi_busy_ = false; spi_flag_mode_ = false;
   spi_fw = SpiFirmware{}; spi_tsc = SpiTouch{}; spi_pm = SpiPower{};
   mic_ = nullptr; mic_count_ = 0; mic_start_ = 0;
@@ -74,16 +69,13 @@ void Io::update_irq(Cpu cpu) {
   CpuIo& c = cpu_io[ci(cpu)];
   CpuContext& ctx = nds_.cpu(cpu);
   bool any = (c.ie & c.if_) != 0;
-  if (cpu == Cpu::ARM7 && nds_.dsi && (dsi.ie2 & dsi.if2)) any = true;   // the DSi's second pair (melonDS NDS::UpdateIRQ)
+  if (cpu == Cpu::ARM7 && nds_.dsi && (dsi.ie2 & dsi.if2)) any = true;   // DSi's second IE/IF pair
   const u32 pending = ((c.ime & 1) && any) ? 1 : 0;
-  // Raised off-slice: taken after the CPU's next instruction (CpuContext::
-  // irq_offline) -- unless the CPU is halted, which melonDS's Execute wakes
-  // and services before any instruction.
-  // A CPU stopped by its own DMA counts as off-slice too (melonDS Halt(2):
-  // the loop resumes with an instruction before its IRQ check).
+  // Raised off-slice: taken after the CPU's next instruction (or before any,
+  // if halted). A CPU stopped by its own DMA counts as off-slice too.
   if (nds_.dsi && pending && !ctx.hot.irq_pending && (nds_.sched.running() != &ctx || nds_.sched.in_dma()) && !ctx.halted) ctx.irq_offline = true;
   ctx.hot.irq_pending = pending;
-  // Halt exits on IE&IF; the ARM9 additionally needs IME (per hardware / melonDS).
+  // Halt exits on IE&IF; the ARM9 additionally needs IME.
   if (any && ctx.halted && (cpu == Cpu::ARM7 || (c.ime & 1))) ctx.halted = false;
 }
 
@@ -92,10 +84,8 @@ void Io::request_irq2(u32 bit) { dsi.if2 |= 1u << bit; update_irq(Cpu::ARM7); }
 
 void Io::request_irq(Cpu cpu, u32 bit) {
   CpuIo& c = cpu_io[ci(cpu)];
-  // A level source re-requests every time it is polled (the GX FIFO IRQ on
-  // every pipe refill, 16 k a frame on Golden Sun). With the bit already set
-  // and the CPU running, update_irq would recompute irq_pending from
-  // unchanged IME/IE/IF -- every write to those recomputes it itself.
+  // A level source (GX FIFO) re-requests every poll; skip the redundant
+  // recompute when the bit's already set and the CPU is running.
   if ((c.if_ & (1u << bit)) && !nds_.cpu(cpu).halted) return;
   c.if_ |= (1u << bit);
   update_irq(cpu);
@@ -134,17 +124,14 @@ void Io::ipc_sync_write(Cpu cpu, u16 value) {
                         (unsigned long long)nds_.sched.now(), (unsigned long long)nds_.frame_count, nds_.gpu.line(), nds_.cpu(cpu).hot.regs[15]);
   CpuIo& me = cpu_io[ci(cpu)];
   CpuIo& them = cpu_io[ci(other(cpu))];
-  // The DSi-loader hack's other half (see the SCFG_EXT write): the ARM7's
-  // IPCSYNC 0 applies a RAM size the ARM9 asked for during the handshake.
+  // DSi-loader handshake: ARM7's IPCSYNC 0 applies the RAM size ARM9
+  // requested via SCFG_EXT; ARM9's IPCSYNC 0 after that starts the title.
   if (nds_.dsi && cpu == Cpu::ARM7 && !(value & 0x0F00) && ((dsi.scfg_ext[0] ^ dsi.scfg_ext[1]) & 0xC000u)) dsi_apply_ram_size();
-  // ...and the ARM9's IPCSYNC 0 after the loader's SCFG_EXT write: the jump to the title follows.
   if (nds_.dsi && cpu == Cpu::ARM9 && !(value & 0x0F00) && nds_.dsi_loader_scfg_seen) { nds_.dsi_loader_scfg_seen = false; nds_.dsi_title_running = true; nds_.dsi_note_title(); }
   me.ipc_sync = (me.ipc_sync & 0x000F) | (value & 0x4F00);
   them.ipc_sync = (them.ipc_sync & 0x4F00) | ((value >> 8) & 0xF);
   if ((value & 0x2000) && (them.ipc_sync & 0x4000)) request_irq(other(cpu), IRQ_IPC_SYNC);
-  // The other CPU may be waiting on this with a tight timeout (the SDK boot
-  // handshake: Pokémon Platinum, Zelda ST, DQIX hung white at quantum >= 2048).
-  nds_.sched.yield(nds_.cpu(cpu));
+  nds_.sched.yield(nds_.cpu(cpu));   // other CPU may be spinning on this (SDK boot handshake)
 }
 
 u16 Io::ipc_fifo_cnt_read(Cpu cpu) {
@@ -170,7 +157,6 @@ void Io::ipc_fifo_cnt_write(Cpu cpu, u16 value) {
   if (!was_send_irq && (value & 0x0004) && me.fifo_out.empty()) request_irq(cpu, IRQ_IPC_SEND_EMPTY);
   if (!was_recv_irq && (value & 0x0400) && !them.fifo_out.empty()) request_irq(cpu, IRQ_IPC_RECV);
   if (value & 0x0008) {
-    // flushing makes the other side's receive FIFO empty; our send FIFO is empty -> send IRQ if enabled
     if (me.ipc_fifo_cnt & 0x0004) request_irq(cpu, IRQ_IPC_SEND_EMPTY);
   }
 }
@@ -203,10 +189,10 @@ static void timer_event(NDS& nds, u32 param) {
 }
 
 u16 Io::timer_value(Cpu cpu, int idx) {
-  nds_.sched.run_soft_timers(cpu);   // melonDS TimerGetCounter: RunTimers first
+  nds_.sched.run_soft_timers(cpu);   // settle count-up chains first
   Timer& t = cpu_io[ci(cpu)].timers[idx];
   if (!t.running() || t.count_up()) return t.counter;
-  u64 elapsed = (nds_.sched.now() - t.start_time) >> 1;   // timers run on the 33 MHz system clock
+  u64 elapsed = (nds_.sched.now() - t.start_time) >> 1;   // 33 MHz system clock
   u64 ticks = elapsed >> t.prescaler_shift();
   u64 v = t.counter + ticks;
   return static_cast<u16>(v);   // overflow handling happens in the event
@@ -241,14 +227,13 @@ void Io::timer_overflow(Cpu cpu, int idx) {
 }
 
 void Io::timer_write_control(Cpu cpu, int idx, u16 value) {
-  nds_.sched.run_soft_timers(cpu);   // melonDS TimerStart: RunTimers first
+  nds_.sched.run_soft_timers(cpu);   // settle count-up chains first
   Timer& t = cpu_io[ci(cpu)].timers[idx];
   const bool was = t.running();
   const u64 now = nds_.sched.now();
-  // A running timer keeps its prescaler phase across a control rewrite
-  // (melonDS keeps the fractional counter bits; the hardware counter is
-  // not restarted unless the start bit goes 0 -> 1). The remainder is
-  // re-expressed in the new prescaler's ticks, as those fraction bits are.
+  // A running timer keeps its prescaler phase across a control rewrite (only
+  // restarts if the start bit goes 0 -> 1); remainder re-expressed in the
+  // new prescaler's ticks.
   u64 rem = 0;                                    // system cycles into the current tick
   const u32 old_shift = t.prescaler_shift();
   if (was && !t.count_up()) {
@@ -290,17 +275,9 @@ u8 Io::spi_transfer(u8 value) {
     if (p.cmd & 0x80) p.data = (reg < 8) ? p.regs[reg] : 0;
     else {
       if (reg < 8) p.regs[reg] = value;
-      // Register 0 bit 6 is the system power line: the ARM7 drops it to shut
-      // the console down. The firmware does this when it leaves its settings
-      // pages, after the flash write that saves them -- so it is also the
-      // moment the settings are complete on disk. Recorded rather than acted
-      // on; the frontend decides what a power-off means (NDS::power_off).
-      if (reg == 0 && (value & 0x40)) nds_.power_off = true;
-      // DSi register 10h bit 0: reset. A DS-mode title cannot reach the I2C
-      // reset (BPTWL 11h: SCFG is locked for it), so this is how one goes back
-      // to the DSi Menu -- Download Play's "Return to DSi Menu?", at least.
-      // The same soft reset as the BPTWL request (see bptwl_write). melonDS
-      // masks the index to 3 bits and never sees it (its TODO: DSi registers).
+      if (reg == 0 && (value & 0x40)) nds_.power_off = true;   // system power line; frontend decides what it means
+      // DSi register 0x10 bit 0: reset. A DS-mode title's only way back to
+      // the DSi Menu (no I2C reset access); same soft reset as bptwl_write.
       if (reg == 0x10 && (value & 0x01) && nds_.dsi) {
         nds_.dsi_soft_reset_pending = true;
         nds_.cpu(Cpu::ARM7).halted = true;
@@ -368,11 +345,10 @@ u8 Io::spi_transfer(u8 value) {
       case 6: sample = mic_sample(); break;   // AUX: the microphone
       default: sample = 0; break;
       }
-      // Bit 3 selects an 8-bit conversion (what the mic sampling loops use:
-      // one byte less per sample). The result stream starts one clock after
-      // the control byte, so the first data byte carries the top bits 7..1
-      // of the conversion in bits 6..0 and the second byte the rest, MSB
-      // first: 12-bit = 11..5 then 4..0 << 3, 8-bit = 7..1 then bit 0 << 7.
+      // Bit 3 selects an 8-bit conversion (one byte less per sample, used by
+      // mic sampling loops). Result stream starts one clock after the
+      // control byte, MSB first: 12-bit = 11..5 then 4..0<<3, 8-bit = 7..1
+      // then bit 0<<7.
       if (value & 0x08) sample = static_cast<u16>((sample >> 4) << 4);
       t.sample = sample;
       t.data = static_cast<u8>(t.sample >> 5);          // first byte: bits 11:5
@@ -388,7 +364,7 @@ u8 Io::spi_transfer(u8 value) {
   }
 }
 
-// ---- frontend input ---------------------------------------------------------
+// ---- input ----
 
 void Io::set_buttons(u32 pressed) {
   keyinput = static_cast<u16>(0x03FF & ~(pressed & 0x03FF));
@@ -401,17 +377,16 @@ void Io::set_touch(int x, int y, bool down) {
   x = x < 0 ? 0 : (x > 255 ? 255 : x);
   y = y < 0 ? 0 : (y > 191 ? 191 : y);
   if (nds_.dsi && spi_tsc.dsi_mode) {
-    // The DSi CODEC (melonDS DSi_TSC::SetTouchCoords): the pen state lives
-    // in bank 3 registers 0x09/0x0E and a "changed" flag on the next sample;
-    // the DS pen-down key bit is not driven in this mode.
+    // DSi CODEC: pen state lives in bank 3 registers 0x09/0x0E plus a
+    // "changed" flag on the next sample.
     SpiTouch& t = spi_tsc;
     const u8 old_up = t.dsi_bank3[0x0E] & 1;
     if (!down) { t.dsi_tx = 0x7000; t.dsi_ty = 0x7000; t.dsi_bank3[0x09] = 0x40; t.dsi_bank3[0x0E] |= 1; }
-    else { t.dsi_tx = static_cast<u16>(x << 4); t.dsi_ty = static_cast<u16>(y << 4); t.dsi_bank3[0x09] = 0x80; t.dsi_bank3[0x0E] &= ~1; }   // 12-bit ADC units: pixel << 4 (melonDS TouchX <<= 4 on the pixel it is given); bit 15 is the pen-changed flag
+    else { t.dsi_tx = static_cast<u16>(x << 4); t.dsi_ty = static_cast<u16>(y << 4); t.dsi_bank3[0x09] = 0x80; t.dsi_bank3[0x0E] &= ~1; }   // 12-bit ADC units: pixel << 4; bit 15 is the pen-changed flag
     if (old_up ^ (t.dsi_bank3[0x0E] & 1)) { t.dsi_tx |= 0x8000; t.dsi_ty |= 0x8000; }
     return;
   }
-  if (!down) {                       // melonDS's release values; games test bit 6
+  if (!down) {                       // release values; games test bit 6
     spi_tsc.x = 0; spi_tsc.y = 0xFFF;
     extkeyin |= 1u << 6;
     return;
@@ -440,7 +415,7 @@ s16 Io::mic_at(u64 t) const {
   return mic_[i];
 }
 
-// ---- DSi microphone (melonDS DSi_I2S) ----
+// ---- DSi microphone ----
 
 u16 Io::dsi_mic_read_cnt() const {
   u16 v = dsi.mic_cnt;
@@ -454,8 +429,7 @@ void Io::dsi_mic_write_cnt(u16 value, u16 mask) {
   nds_.spu.catch_up();
   static const bool log = std::getenv("DS_MIC_LOG") != nullptr;
   if (log) std::fprintf(stderr, "[mic] MIC_CNT %04x -> %04x (mask %04x), FIFO %u, frame %llu\n", dsi.mic_cnt, value, mask, dsi.mic_level, (unsigned long long)nds_.frame_count);
-  // The data format, rate and FIFO clear only take while the mic is stopped.
-  if (dsi.mic_cnt & 0x8000) mask &= ~0x100F;
+  if (dsi.mic_cnt & 0x8000) mask &= ~0x100F;   // format/rate/FIFO clear only take while stopped
   const u16 v = static_cast<u16>((value & mask) | (dsi.mic_cnt & ~mask));
   if (v & (1 << 12)) {
     dsi.mic_cnt &= ~(1 << 11);
@@ -466,7 +440,7 @@ void Io::dsi_mic_write_cnt(u16 value, u16 mask) {
   if ((v ^ dsi.mic_cnt) & 0x8000 && (v & 0x8000)) {
     dsi.mic_divider = 0;
     dsi.mic_temp_count = 0;
-    mic_used_ = true;   // the frontend opens the host capture device now
+    mic_used_ = true;   // triggers the frontend to open the capture device
   }
   dsi.mic_cnt = static_cast<u16>((v & 0xE00F) | (dsi.mic_cnt & (1 << 11)));
 }
@@ -522,14 +496,9 @@ void Io::set_mic(const s16* samples, size_t count) {
   mic_ = samples; mic_count_ = count; mic_start_ = nds_.sched.now();
 }
 
-// The TSC's AUX input sits behind the PMIC's microphone amplifier, whose
-// register 3 bits 0-1 pick the gain (x20/40/80/160). The frontend's samples
-// are taken to be at the x20 level, so the higher gains scale up from there
-// and clip the way the ADC would. Register 2 bit 0 is the amplifier enable;
-// it is not honoured (melonDS does not either): a game that reads AUX with
-// the amplifier off would get noise around the mid value on hardware, and
-// silence there serves nobody. DS_MIC_LOG=1 prints the PMIC writes and a
-// per-second count of AUX reads with their peak.
+// AUX sits behind the PMIC mic amplifier: register 3 bits 0-1 pick the gain
+// (x20/40/80/160); frontend samples assumed at x20, scaled/clipped like the
+// ADC would. Register 2 bit 0 (amplifier enable) not honoured.
 u16 Io::mic_sample() const {
   mic_used_ = true;
   static const bool log = std::getenv("DS_MIC_LOG") != nullptr;
@@ -574,13 +543,9 @@ u16 Io::spicnt_read_arm7() {
   if (++spi_poll_streak_ >= SPI_POLL_STREAK && nds_.sched.idle_skip_enabled()) {
     CpuContext& a7 = nds_.cpu(Cpu::ARM7);
     if (nds_.sched.running() == &a7 && a7.hot.cycle_budget > 0) {
-      // ARM9 cycles left until ready, in ARM7 cycles rounded up, capped at
-      // the slice: past that the loop resumes in the next slice and either
-      // the boundary sleep (Scheduler::arm7_spi_poll) or this catches it.
-      // On the DSi the busy bit is a flag cleared by the SPI event, and the
-      // ARM7 can run past spi_ready_at inside its slice before that event
-      // fires: charging the (underflowed) remainder would hand the ARM7
-      // budget instead of taking it and spin the loop with time frozen.
+      // ARM9 cycles left until ready, converted to ARM7 cycles, capped at the
+      // slice: an underflowed remainder would hand back budget instead of
+      // consuming it, spinning with time frozen.
       const u64 now = nds_.sched.now();
       if (spi_ready_at > now) {
         const u64 rem9 = spi_ready_at - now;
@@ -608,18 +573,16 @@ void Io::spi_write_data(u8 value) {
   else if (spicnt & 0x4000) nds_.sched.schedule(EventId::Spi, spi_ready_at, spi_event, 0);
 }
 
-// ---- RTC (ARM7, bit-banged on 0x04000138) ----------------------------------
-// The clock only free-runs when a frontend asks for it (start_rtc_clock); the
-// harness leaves it at melonDS's frozen 2000-01-01 so runs stay comparable.
+// ---- RTC (ARM7, bit-banged on 0x04000138) ----
+// The clock only free-runs once a frontend calls start_rtc_clock().
 static u8 to_bcd(int v) { return static_cast<u8>(((v / 10) % 10) << 4 | (v % 10)); }
 static int from_bcd(u8 v) { return (v >> 4) * 10 + (v & 0x0F); }
 
 static void rtc_ev(NDS& nds, u32) { nds.io.rtc_event(); }
 
 void Io::rtc_seed() {
-  // DS_RTC_EPOCH pins the seed to a fixed Unix time: the clock still runs (so
-  // the power-lost bit is clear and the firmware skips its setup wizard), but
-  // two runs start from the same date and second and stay comparable.
+  // DS_RTC_EPOCH: pin the seed to a fixed Unix time (clock still runs, so
+  // power-lost stays clear and the firmware skips its setup wizard).
   const char* pinned = std::getenv("DS_RTC_EPOCH");
   const std::time_t t = pinned ? static_cast<std::time_t>(std::strtoll(pinned, nullptr, 0))
                                : std::time(nullptr);
@@ -630,16 +593,14 @@ void Io::rtc_seed() {
   localtime_r(&t, &lt);
 #endif
   Rtc& r = rtc;
-  r.datetime[0] = to_bcd(lt.tm_year % 100);     // the DS keeps two digits; 2000-2099
+  r.datetime[0] = to_bcd(lt.tm_year % 100);     // two digits; 2000-2099
   r.datetime[1] = to_bcd(lt.tm_mon + 1);
   r.datetime[2] = to_bcd(lt.tm_mday);
-  r.datetime[3] = static_cast<u8>(lt.tm_wday);  // 0 = Sunday, as the firmware reads it
-  // Bit 1 of status1 is 24-hour mode; in 12-hour mode bit 6 of the hour byte
-  // is the PM flag. We always run 24-hour, matching the melonDS default.
-  r.datetime[4] = to_bcd(lt.tm_hour);
+  r.datetime[3] = static_cast<u8>(lt.tm_wday);  // 0 = Sunday
+  r.datetime[4] = to_bcd(lt.tm_hour);   // always 24-hour (status1 bit 1)
   r.datetime[5] = to_bcd(lt.tm_min);
   r.datetime[6] = to_bcd(std::min(lt.tm_sec, 59));   // no leap seconds on this chip
-  r.status1 = 0x02;      // 24-hour mode, and *not* power-lost: see Rtc::ticking
+  r.status1 = 0x02;      // 24-hour mode, not power-lost
   r.ticking = true;
   r.next_tick = nds_.sched.now() + ARM9_CLOCK_HZ;
   nds_.sched.schedule(EventId::Rtc, r.next_tick, rtc_ev, 0);
@@ -650,10 +611,8 @@ void Io::start_rtc_clock() {
   rtc_seed();
 }
 
-// One second of carry. Written out rather than converting to a time_t and
-// back because a game may have written its own date into the chip, and
-// whatever it wrote is what has to advance -- including values no calendar
-// would produce.
+// One second of carry, field-by-field rather than via time_t: a game's own
+// (possibly invalid) date must still advance.
 void Io::rtc_tick() {
   Rtc& r = rtc;
   int sec = from_bcd(r.datetime[6]) + 1;
@@ -668,8 +627,7 @@ void Io::rtc_tick() {
   r.datetime[4] = pm;
   r.datetime[3] = static_cast<u8>((r.datetime[3] + 1) % 7);
   const int year = from_bcd(r.datetime[0]), month = from_bcd(r.datetime[1]);
-  // Years are two digits from 2000, so the century rule never bites: every
-  // year divisible by 4 in 2000-2099 is a leap year.
+  // Two-digit years (2000-2099): every year divisible by 4 is a leap year.
   static const int len[13] = {31, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
   const int days = (month == 2 && (year % 4) == 0) ? 29 : len[month >= 1 && month <= 12 ? month : 1];
   int day = from_bcd(r.datetime[2]) + 1;
@@ -683,16 +641,14 @@ void Io::rtc_tick() {
 void Io::rtc_event() {
   Rtc& r = rtc;
   if (!r.ticking) return;
-  // Catch up whole seconds: a slice can overrun the due time, and a save
-  // state reloaded into a fresh run can leave the mark far behind.
-  do {
+  do {   // catch up whole seconds (a slice overrun, or a reloaded state left next_tick behind)
     rtc_tick();
     r.next_tick += ARM9_CLOCK_HZ;
   } while (r.next_tick <= nds_.sched.now());
   nds_.sched.schedule(EventId::Rtc, r.next_tick, rtc_ev, 0);
 }
 
-// Protocol per GBATEK; state and edge sampling mirror melonDS so traces match.
+// Protocol per GBATEK.
 void Io::rtc_cmd_read() {
   Rtc& r = rtc;
   if ((r.cmd & 0x0F) != 0x06) return;
@@ -762,11 +718,11 @@ void Io::rtc_write(u16 value, bool byte) {
   if (value & 0x0010) r.io = value; else r.io = (r.io & 0x0001) | (value & 0xFFFE);
 }
 
-// ---- cart bus (empty slot) ---------------------------------------------------
-// Timing per GBATEK / melonDS: the 8-bit command takes 8 clocks, each data
-// word 4, gap1 before data, gap2 before each 0x200-byte block; clock is
-// 5 or 8 system cycles per transfer clock (ROMCTRL bit 27). System cycles
-// are half ARM9 cycles.
+// ---- cart bus ----
+// Timing per GBATEK: the 8-bit command takes 8 clocks, each data word 4,
+// gap1 before data, gap2 before each 0x200-byte block; clock is 5 or 8
+// system cycles per transfer clock (ROMCTRL bit 27). System cycles are half
+// ARM9 cycles.
 static void cart_ev(NDS& nds, u32 param) { nds.io.cart_event(param); }
 
 void Io::cart_write_romctrl(u32 value) {
@@ -796,29 +752,19 @@ void Io::cart_write_romctrl(u32 value) {
     cart.event_armed = true;
     return;
   }
-  // The first word: an event only if a DMA is waiting for it (see above).
-  cart.next_word_at = nds_.sched.now() + 2 * xfer * (cmddelay + 4);
+  cart.next_word_at = nds_.sched.now() + 2 * xfer * (cmddelay + 4);   // event only if a DMA is waiting for it
   if (cart_dma_armed()) {
     nds_.sched.schedule(EventId::Cart, cart.next_word_at, cart_ev, 1);
     cart.event_armed = true;
   }
 }
 
-// Cart words arrive on a fixed clock, and nothing observes one arriving: the
-// CPU learns of them by reading ROMCTRL's DRQ bit or ROMDATA. So the words are
-// produced at the read (`cart_catch_up`) instead of costing a scheduler event
-// each. On SM64DS the cart was 634-1,033 events a frame -- half of everything
-// we fire -- against DraStic's zero; it reads the card synchronously, and its
-// whole scheduler runs ~1,390 events a frame. melonDS, which this model came
-// from, schedules per word as we did.
-//
-// The exception is a cart-mode DMA channel: it is level-triggered on DRQ and
-// has nothing to poll it, so while one is armed the per-word event stays and
-// the behaviour is exactly what it was.
-// On a DSi the per-word event stays on regardless: melonDS ends an ARM9
-// slice at every word, and the DSiWare loaders' CPU-driven card reads
-// interleave with the ARM7 differently otherwise (the trace harness sees
-// it). The DS keeps the lazy model, which its scene hashes are gated on.
+// Cart words arrive on a fixed clock and nothing observes one arriving: the
+// CPU learns of them by reading ROMCTRL's DRQ bit or ROMDATA, so words are
+// produced lazily at the read (`cart_catch_up`). Exception: a cart-mode DMA
+// channel is level-triggered on DRQ with nothing to poll it, so the
+// per-word event stays while one is armed. Always on for DSi: the ARM9
+// slice must end at every word to interleave correctly with the ARM7.
 bool Io::cart_dma_armed() const { return nds_.dsi || nds_.dma.cart_armed(); }
 
 u32 Io::cart_word_delay() const {
@@ -828,12 +774,9 @@ u32 Io::cart_word_delay() const {
   return 2 * xfer * delay;
 }
 
-// `from` is the base the next word's delay counts from. On the lazy path that
-// is the word's nominal arrival time, so a transfer keeps the card's cadence
-// however late the reader looks. The event path passes now() instead, and must:
-// a nominal deadline there can land in the past, fire again inside the same
-// fire_due pass, and turn a clock-paced transfer into a burst -- measured at
-// 95-104 differing frames against melonDS on SM64DS, against 16 for now().
+// `from` is the base the next word's delay counts from: the word's nominal
+// arrival time on the lazy path, but now() on the event path (a nominal
+// deadline there can land in the past and fire again in the same pass).
 void Io::cart_schedule_receive(u64 from) {
   if (cart.transfer_pos >= cart.transfer_len) return;
   cart.next_word_at = from + cart_word_delay();
@@ -845,15 +788,13 @@ void Io::cart_schedule_receive(u64 from) {
   }
 }
 
-// Materialise every word whose time has passed. The FIFO holds two, and while
-// it is full the transfer stalls (`late`) and resumes from the read that makes
-// room -- as on hardware, and as melonDS's ROMDataLate does.
+// Materialise every word whose time has passed. FIFO holds two; while full,
+// transfer stalls (`late`) and resumes from the read that makes room.
 void Io::cart_catch_up_slow() {
   if (cart.event_armed || cart.late) return;
   while (cart.transfer_pos < cart.transfer_len && cart.fifo_count < 2 && nds_.sched.now() >= cart.next_word_at)
     cart_receive_word(cart.next_word_at);
-  // A DMA armed part-way through a transfer takes the words from here on.
-  if (!cart.event_armed && !cart.late && cart.transfer_pos < cart.transfer_len && cart_dma_armed()) {
+  if (!cart.event_armed && !cart.late && cart.transfer_pos < cart.transfer_len && cart_dma_armed()) {   // a DMA armed mid-transfer takes over
     nds_.sched.schedule(EventId::Cart, cart.next_word_at, cart_ev, 1);
     cart.event_armed = true;
   }
@@ -864,21 +805,13 @@ void Io::cart_receive_word(u64 at) {
   cart.fifo_count++;
   cart.transfer_pos += 4;
   cart.romctrl |= 0x00800000u;                 // DRQ
-  // Only a cart-mode channel can be started by DRQ, and cart_drq() would
-  // re-enter the catch-up; skip the scan when none is armed.
+  // Only a cart-mode channel can be started by DRQ; skip the scan when none is armed.
   if (cart_dma_armed()) {
     nds_.dma.check(Cpu::ARM9, dma::MODE9_CART);
     nds_.dma.check(Cpu::ARM7, dma::MODE7_CART);
-    // DS_CART_BULK: with a DMA taking the words, nothing observes their
-    // cadence -- DRQ is consumed by the channel, ROMCTRL's busy bit holds to
-    // the end either way, and the words the DMA has not yet read are not in
-    // RAM on hardware either. So from here the words are produced as the DMA
-    // reads them (cart_read_data) and the transfer keeps one event, at the
-    // nominal time of the last word, for the done IRQ. What moves is where
-    // the DMA's bus stall lands: all at once instead of a unit per word, so
-    // the CPU interleave (and hashes) shift. Per 512-byte block this is 1
-    // scheduler event and 1 slice instead of 128 of each; a loading screen
-    // streams tens of blocks a frame. Opt-in until swept on the device.
+    // DS_CART_BULK: once a DMA is taking the words, the rest are produced as
+    // it reads them (cart_read_data), one event at the last word's nominal
+    // time for the done IRQ. Opt-in: shifts where the DMA's bus stall lands.
     if (cart_bulk_ && cart.transfer_pos < cart.transfer_len) {
       const u32 xfer = (cart.romctrl & (1u << 27)) ? 8 : 5, gap2 = (cart.romctrl >> 16) & 0x3F;
       const u32 words = (cart.transfer_len - cart.transfer_pos) / 4;
@@ -896,23 +829,19 @@ void Io::cart_end_transfer() {
   cart.bulk = false;
   cart.romctrl &= ~0x80000000u;
   cart.transfer_pos = cart.transfer_len = 0;
-  // The transfer-done IRQ goes to the CPU that owns the slot (EXMEMCNT bit
-  // 11), as on hardware and in melonDS; the other CPU's IF stays clear.
-  if (cart.auxspicnt & 0x4000) request_irq((exmemcnt & 0x0800) ? Cpu::ARM7 : Cpu::ARM9, IRQ_CART_DONE);
+  if (cart.auxspicnt & 0x4000) request_irq((exmemcnt & 0x0800) ? Cpu::ARM7 : Cpu::ARM9, IRQ_CART_DONE);   // to slot owner (EXMEMCNT bit 11)
 }
 
 void Io::cart_event(u32 param) {
   cart.event_armed = false;
   if (param == 0 && cart.bulk) {
-    // The bulk transfer's end. If the DMA stopped taking words (disabled
-    // mid-transfer), fall back to the exact model from the point reached.
+    // Bulk transfer's end; fall back to the exact model if the DMA stopped
+    // taking words mid-transfer.
     cart.bulk = false;
     if (cart.transfer_pos < cart.transfer_len) { if (cart.fifo_count < 2) cart_schedule_receive(nds_.sched.now()); else cart.late = true; return; }
     if (cart.fifo_count) return;   // ends with the read that empties the FIFO
   }
-  // DSi: the next word counts from the ARM7's clock, as melonDS's handler
-  // does (Scheduler::event_base7); the DS keeps the nominal cadence.
-  if (param == 0) cart_end_transfer(); else cart_receive_word(nds_.dsi ? nds_.sched.event_base7() : nds_.sched.now());
+  if (param == 0) cart_end_transfer(); else cart_receive_word(nds_.dsi ? nds_.sched.event_base7() : nds_.sched.now());   // DSi: from ARM7's clock
 }
 
 u32 Io::cart_read_data() {
@@ -934,25 +863,18 @@ u32 Io::cart_read_data() {
   return v;
 }
 
-// ---- divider / square root --------------------------------------------------
+// ---- divider / square root ----
 // Results appear after 18/34 (DIV, 32/64-bit) and 13 (SQRT) system cycles;
-// the busy bit is set meanwhile. Edge cases follow the hardware as documented
-// by GBATEK and melonDS: division by zero yields +/-1 with the numerator as
-// remainder, and the most-negative / -1 overflow wraps.
-//
-// No event: the result is due at a recorded time and computed by the first
-// read after it (see MathUnit). The Div/Sqrt event ids stay bound so a save
-// state written while one was armed still loads; the handlers just settle.
+// busy bit set meanwhile. Division by zero yields +/-1 with the numerator
+// as remainder; most-negative / -1 overflow wraps. No event: due at a
+// recorded time, computed by the first read after it (see MathUnit).
 static void ev_div(NDS& nds, u32)  { nds.io.div_settle(); }
 static void ev_sqrt(NDS& nds, u32) { nds.io.sqrt_settle(); }
 
 void Io::div_start() {
   math.div_pending = true;
   math.div_ready_at = nds_.sched.now() + (((math.divcnt & 3) == 0) ? 18 : 34) * 2;
-  // DSi: melonDS runs the divider as an event, and an event the ARM9
-  // schedules ahead of its slice end cuts the slice there (Scheduler::
-  // schedule); the result itself is still settled lazily.
-  if (nds_.dsi) nds_.sched.schedule(EventId::Div, math.div_ready_at, ev_div, 0);
+  if (nds_.dsi) nds_.sched.schedule(EventId::Div, math.div_ready_at, ev_div, 0);   // cuts the slice there; result still settled lazily
 }
 
 void Io::div_done() {
@@ -1001,8 +923,7 @@ void Io::sqrt_done() {
   MathUnit& m = math;
   m.sqrt_pending = false;
   u64 val = (m.sqrtcnt & 1) ? m.sqrt_val : (m.sqrt_val & 0xFFFFFFFFull);
-  // Digit-by-digit integer square root.
-  u64 res = 0, rem = 0;
+  u64 res = 0, rem = 0;   // digit-by-digit integer square root
   const int nbits = (m.sqrtcnt & 1) ? 32 : 16;
   const int topshift = (m.sqrtcnt & 1) ? 62 : 30;
   for (int i = 0; i < nbits; ++i) {
@@ -1020,18 +941,12 @@ void Io::set_irq_line(Cpu cpu, u32 bit, bool on) {
   else { cpu_io[ci(cpu)].if_ &= ~(1u << bit); update_irq(cpu); }
 }
 
-// ---- register dispatch ----------------------------------------------------
-// Gpu3D owns r in [0x60,0x64), [0x320,0x3C0) and [0x400,0x6A4); Gpu owns
-// r < 0x70 and [0x1000,0x1070); Spu owns [0x400,0x520). So [0x70,0x320) and
-// everything from 0x1070 up belong to no subsystem -- which is where every
-// register the recompiler's slow path actually hits lives (ROMCTRL, DIVCNT,
-// SQRTCNT, IME/IE/IF, IPCSYNC, SPICNT, the timers and DMA, and ROMDATA at
-// 0x04100010). One range test then replaces three probes for all of them.
+// ---- register dispatch ----
+// Gpu3D/Gpu/Spu own r < 0x70, [0x400,0x520) and up; [0x70,0x320) and
+// r >= 0x1070 belong to no subsystem. One range test replaces three probes.
 static inline bool io_unowned(u32 r) { return (r - 0x70 < 0x2B0) || r >= 0x1070; }
 
-// DS_IO_CENSUS=1: histogram of I/O accesses by address and CPU, printed at
-// exit. Finds registers a game polls -- the cost of a poll loop is in the
-// reads, which no write log sees.
+// DS_IO_CENSUS=1: histogram of I/O accesses by address and CPU, printed at exit.
 namespace {
 struct IoCensus {
   bool on = std::getenv("DS_IO_CENSUS") != nullptr;
@@ -1098,7 +1013,7 @@ Io::Special Io::read32_special(Cpu cpu, u32 addr) {
   CpuIo& c = cpu_io[ci(cpu)];
   if (addr == 0x04100000) return {ipc_fifo_recv(cpu), true};   // the two 0x0410xxxx ports, kept out of the dense index below
   if (addr == 0x04100010) return {cart_read_data(), true};
-  switch ((addr - 0x04000000u) >> 2) {   // dense halfword/word index: GCC emits a jump table (a switch on the full address was a compare tree)
+  switch ((addr - 0x04000000u) >> 2) {   // dense index: GCC emits a jump table
   case 0x82: return {c.ime, true};
   case 0x84: return {c.ie, true};
   case 0x85: return {c.if_, true};
@@ -1126,7 +1041,7 @@ Io::Special Io::read32_special(Cpu cpu, u32 addr) {
 
 Io::Special Io::write32_special(Cpu cpu, u32 addr, u32 value) {
   CpuIo& c = cpu_io[ci(cpu)];
-  switch ((addr - 0x04000000u) >> 2) {   // dense halfword/word index: GCC emits a jump table (a switch on the full address was a compare tree)
+  switch ((addr - 0x04000000u) >> 2) {   // dense index: GCC emits a jump table
   case 0x82: c.ime = value & 1; update_irq(cpu); return {0, true};
   case 0x84: c.ie = value; update_irq(cpu); return {0, true};
   case 0x85: c.if_ &= ~value; update_irq(cpu); if (cpu == Cpu::ARM9) nds_.gpu3d.check_fifo_irq_fast(); return {0, true};
@@ -1152,14 +1067,14 @@ u32 Io::read16(Cpu cpu, u32 addr) {
   CpuIo& c = cpu_io[ci(cpu)];
   const bool a9 = cpu == Cpu::ARM9;
   if (!a9 && addr >= 0x04800000 && addr < 0x04810000) return (powcnt2 & 2) ? wifi.read16(addr) : 0;
-  switch ((addr - 0x04000000u) >> 1) {   // dense halfword/word index: GCC emits a jump table (a switch on the full address was a compare tree)
+  switch ((addr - 0x04000000u) >> 1) {   // dense index: GCC emits a jump table
   case 0x2: return dispstat[ci(cpu)];
   case 0x3: return vcount;
   case 0x80: case 0x82: case 0x84: case 0x86: return timer_value(cpu, (addr - 0x04000100) / 4);
   case 0x81: case 0x83: case 0x85: case 0x87: return c.timers[(addr - 0x04000102) / 4].control;
   case 0x98: return keyinput;
   case 0x99: return keycnt[ci(cpu)];
-  case 0x9a: return a9 ? 0 : rcnt;                     // RCNT
+  case 0x9a: return a9 ? 0 : rcnt;
   case 0x9b: return a9 ? 0 : extkeyin;
   case 0x9c: return a9 ? 0 : rtc_read();
   case 0xc0: return c.ipc_sync;
@@ -1172,7 +1087,7 @@ u32 Io::read16(Cpu cpu, u32 addr) {
   case 0xe0: return a9 ? 0 : spicnt_read_arm7();
   case 0xe1: return a9 ? 0 : spidata;
   case 0x102: return exmemcnt;
-  case 0x103: return (!a9 && (powcnt2 & 2)) ? wifiwaitcnt : 0;   // WIFIWAITCNT
+  case 0x103: return (!a9 && (powcnt2 & 2)) ? wifiwaitcnt : 0;
   case 0x5d: case 0x63: case 0x69: case 0x6f: return static_cast<u16>(nds_.dma.read_cnt(cpu, (addr - 0x040000BA) / 12) >> 16);
   case 0x5c: case 0x62: case 0x68: case 0x6e: return static_cast<u16>(nds_.dma.read_cnt(cpu, (addr - 0x040000B8) / 12));
   case 0x104: return static_cast<u16>(c.ime);
@@ -1204,12 +1119,12 @@ void Io::write16(Cpu cpu, u32 addr, u16 value) {
   CpuIo& c = cpu_io[ci(cpu)];
   const bool a9 = cpu == Cpu::ARM9;
   if (!a9 && addr >= 0x04800000 && addr < 0x04810000) { if (powcnt2 & 2) wifi.write16(addr, value); return; }
-  switch ((addr - 0x04000000u) >> 1) {   // dense halfword/word index: GCC emits a jump table (a switch on the full address was a compare tree)
+  switch ((addr - 0x04000000u) >> 1) {   // dense index: GCC emits a jump table
   case 0x2: dispstat[ci(cpu)] = (dispstat[ci(cpu)] & 0x0047) | (value & 0xFFB8); return;   // bit 6 (DSi LCD init flag) is read-only, never set on a DS
   case 0x80: case 0x82: case 0x84: case 0x86: c.timers[(addr - 0x04000100) / 4].reload = value; return;
   case 0x81: case 0x83: case 0x85: case 0x87: timer_write_control(cpu, (addr - 0x04000102) / 4, value); return;
   case 0x99: keycnt[ci(cpu)] = value; update_key_irq(); return;
-  case 0x9a: if (!a9) rcnt = value; return;            // RCNT
+  case 0x9a: if (!a9) rcnt = value; return;
   case 0x9c: if (!a9) rtc_write(value, false); return;
   case 0xc0: ipc_sync_write(cpu, value); return;
   case 0xc2: ipc_fifo_cnt_write(cpu, value); return;
@@ -1236,8 +1151,7 @@ void Io::write16(Cpu cpu, u32 addr, u16 value) {
   case 0xe1: if (!a9) spi_write_data(static_cast<u8>(value)); return;
   case 0x102: {
     const u16 old = exmemcnt;
-    // The DSi has one more ARM9 bit, 10: which CPU the second card slot
-    // answers (melonDS SetExMemCnt). PictoChat sets it and reads it back.
+    // DSi has one more ARM9 bit, 10: which CPU the second card slot answers.
     const u16 rw9 = nds_.dsi ? 0x8CFF : 0x88FF;
     exmemcnt = a9 ? ((exmemcnt & 0x6000) | (value & rw9)) : ((exmemcnt & 0xFF80) | (value & 0x007F));
     if ((old ^ exmemcnt) & 0xFF) nds_.bus.update_gba_slot_timings();
@@ -1246,7 +1160,7 @@ void Io::write16(Cpu cpu, u32 addr, u16 value) {
   case 0xd4: case 0xd5: case 0xd6: case 0xd7: {
     const u32 i = addr - 0x040001A8; cart.cmd[i] = static_cast<u8>(value); cart.cmd[i + 1] = static_cast<u8>(value >> 8); return;
   }
-  case 0x103: if (!a9 && (powcnt2 & 2) && wifiwaitcnt != value) { wifiwaitcnt = value; nds_.bus.update_wifi_timings(); } return;   // WIFIWAITCNT
+  case 0x103: if (!a9 && (powcnt2 & 2) && wifiwaitcnt != value) { wifiwaitcnt = value; nds_.bus.update_wifi_timings(); } return;
   case 0x140: if (a9) { math.divcnt = value & 3; div_start(); } return;
   case 0x158: if (a9) { math.sqrtcnt = value & 1; sqrt_start(); } return;
   case 0x5c: case 0x62: case 0x68: case 0x6e: {
@@ -1303,9 +1217,7 @@ u8 Io::read8(Cpu cpu, u32 addr) {
 }
 
 // VRAMCNT A-I and WRAMCNT, `n` bytes from `addr`. A 32-bit store to 0x240
-// (the usual way banks A-D are programmed) changes up to four banks at once;
-// the remap -- 8 K page-table entries per CPU plus a 2D catch-up and a worker
-// join -- runs once for the store, not once per byte.
+// changes up to four banks at once; the remap runs once for the store.
 void Io::vramcnt_store(u32 addr, u32 value, u32 n) {
   static const bool dbg_vramcnt = std::getenv("DS_DEBUG_VRAMCNT") != nullptr;
   bool vram_changed = false;
@@ -1313,12 +1225,8 @@ void Io::vramcnt_store(u32 addr, u32 value, u32 n) {
     if (addr < 0x04000240 || addr >= 0x0400024A) continue;
     const u32 k = addr - 0x04000240;
     const u8 b = static_cast<u8>(value);
-    // WRAMCNT. On a DSi the NWRAM windows sit *on top* of this region, so the
-    // shared-WRAM re-lay has to be followed by the NWRAM overlay or it wipes
-    // it -- update_nwram does both, in that order. A direct-booted title sets
-    // WRAMCNT before anything maps NWRAM, so only a NAND boot ever saw this:
-    // boot2 runs from NWRAM and its own WRAMCNT write pulled the code out from
-    // under itself, and the ARM7 then fetched zeros mid-routine.
+    // WRAMCNT. On DSi the NWRAM windows sit on top of this region, so
+    // update_nwram must re-lay shared WRAM then the NWRAM overlay, in order.
     if (k == 7) { if (wramcnt != (b & 3)) { wramcnt = b & 3; if (nds_.dsi) nds_.bus.update_nwram(); else nds_.bus.update_wram(); } continue; }
     const u32 bank = k < 7 ? k : k - 1;                 // 0x248/0x249 are banks H/I
     if (dbg_vramcnt) std::fprintf(stderr, "[vramcnt] %c = %02x frame %llu line %u pc %08x\n", 'A' + bank, b, (unsigned long long)nds_.frame_count, nds_.gpu.line(), nds_.cpu(Cpu::ARM9).hot.regs[15]);
@@ -1334,14 +1242,9 @@ void Io::write8(Cpu cpu, u32 addr, u8 value) {
   if (!a9 && addr == 0x04000301) {                       // HALTCNT
     const u8 v = value & 0xC0;
     if (v == 0x80 || v == 0xC0) {
-      // Halting with an interrupt already pending is a no-op. melonDS
-      // re-tests the halt condition before every instruction (NDS::
-      // HaltInterrupted, from ARM::Execute), so a CPU that halts while
-      // IE & IF is nonzero never actually sleeps. We only clear `halted` on
-      // the IRQ *edge* in update_irq, so without this test the ARM7 slept
-      // through an already-pending interrupt until some later, unrelated one
-      // woke it -- measured at up to 1.2 ms, long enough for Download Play's
-      // client to miss its reply slot and be dropped by the host.
+      // Halting with an interrupt already pending is a no-op: `halted` only
+      // clears on the IRQ edge in update_irq, so without this test the ARM7
+      // would sleep through an already-pending interrupt.
       CpuIo& c7 = cpu_io[ci(Cpu::ARM7)];
       bool pending = (c7.ie & c7.if_) != 0;
       if (nds_.dsi && (dsi.ie2 & dsi.if2)) pending = true;
@@ -1361,15 +1264,10 @@ void Io::write8(Cpu cpu, u32 addr, u8 value) {
 }
 
 
-// ---- DSi system registers (0x04004xxx) ---------------------------------------
-// The SCFG/MBK register file and access gating as melonDS models them
-// (DSi.cpp ARM9IORead/Write, ARM7IORead/Write, CheckIO9Access/CheckIO7Access,
-// MapNWRAM_A/B/C, MapNWRAMRange). The pages this phase does not implement
-// (camera 0x4200, DSP 0x4300, mic 0x4600, SD/MMC 0x4800-0x4BFF, console ID
-// 0x4D00) read 0 and drop writes; GPIO 0x4C00 is a plain register file and
-// I2C 0x4500 talks to the BPTWL only.
+// ---- DSi system registers (0x04004xxx) ----
+// GPIO 0x4C00 is a plain register file; I2C 0x4500 talks to the BPTWL only.
 
-// ---- I2C host + BPTWL (melonDS DSi_I2C.cpp) ------------------------------
+// ---- I2C host + BPTWL ----
 void Io::bptwl_reset() {
   dsi.i2c_cnt = dsi.i2c_data = dsi.i2c_device = 0;
   dsi.bptwl_pos = 0xFFFFFFFF;
@@ -1401,10 +1299,8 @@ void Io::bptwl_write(u8 value, bool last) {
   if (dsi.bptwl_pos == 0xFFFFFFFF) { dsi.bptwl_pos = value; return; }
   const u32 p = dsi.bptwl_pos & 0xFF;
   if (p == 0x11 && value == 0x01) {
-    // Soft reset request: melonDS halts the ARM7 (Halt(4)) and resets the
-    // machine when its run returns. Halting ends the slice here the same way;
-    // the scheduler sees the flag and calls NDS::dsi_soft_reset. The register
-    // file is left alone: 0x70 is the warm-boot flag the reset exists to carry.
+    // Soft reset: register file left alone, 0x70 is the warm-boot flag this
+    // reset exists to carry.
     nds_.dsi_soft_reset_pending = true;
     nds_.cpu(Cpu::ARM7).halted = true;
     dsi.bptwl_pos = 0xFFFFFFFF;
@@ -1421,8 +1317,7 @@ void Io::bptwl_write(u8 value, bool last) {
 void Io::i2c_write_cnt(u8 value) {
   if (value & 0x80) {
     const bool last = value & 0x01;
-    // melonDS DSi_I2CHost::GetCurDevice: the BPTWL and the two cameras answer.
-    const u8 dev = dsi.i2c_device;
+    const u8 dev = dsi.i2c_device;   // only BPTWL and the two cameras answer on this bus
     DsiCamera* camdev = dev == 0x78 ? &cam.camera(0) : dev == 0x7A ? &cam.camera(1) : nullptr;
     if (value & 0x20) {                       // read
       value &= 0xF7;
@@ -1456,13 +1351,10 @@ void Io::grid_rtc_event(NDS& nds, u32) {
 }
 
 void Io::dsi_reset() {
-  // melonDS's periodic events, from time 0: the RTC clock's first tick is
-  // one 32768 Hz period out (its error term starts at 0), the camera IRQ
-  // one interval out.
-  rtc.clock_err = 33513982u & 0x7FFF;
+  rtc.clock_err = 33513982u & 0x7FFF;   // RTC's first tick is one 32768 Hz period out
   nds_.sched.schedule(EventId::RtcClock, static_cast<u64>(33513982u >> 15) * 2, grid_rtc_event, 0);
-  // melonDS DSi::Reset with a half BIOS dump (the boot2-from-NAND shape;
-  // direct boot is the only boot here either way).
+  // Half-BIOS-dump (boot2-from-NAND) reset shape; direct boot is the only
+  // boot path here either way.
   dsi.scfg_bios = 0x0101;
   dsi.scfg_clock9 = 0x0187; dsi.scfg_clock7 = 0x0187;
   dsi.scfg_ext[0] = 0x8307F100; dsi.scfg_ext[1] = 0x93FFFB06;
@@ -1474,22 +1366,18 @@ void Io::dsi_reset() {
   dsi.mic_cnt = 0; dsi.mic_rd = dsi.mic_wr = dsi.mic_level = 0; dsi.mic_divider = dsi.mic_temp_count = 0; dsi.mic_temp = 0;
   arm7_bios_prot = 0x20;
   bptwl_reset();
-  cam.camera(0).reset(); cam.camera(1).reset();   // melonDS: the I2C host resets its cameras
-  cam.reset();                                    // then the module (it arms the camera IRQ)
+  cam.camera(0).reset(); cam.camera(1).reset();   // I2C host resets cameras first
+  cam.reset();                                    // then the module (arms the camera IRQ)
   spi_flag_mode_ = true;
-  // The eMMC and the console ID it carries. With no NAND loaded the host has
-  // no device on port 1 (every command is dropped) and the console ID stays
-  // zero, which is what the card-mode gate runs with. This has to precede
-  // aes.reset(): key slots 1 and 3 are seeded from the console ID.
-  dsi.console_id = nds_.dsi_nand.valid() ? nds_.dsi_nand.console_id() : 0;
+  dsi.console_id = nds_.dsi_nand.valid() ? nds_.dsi_nand.console_id() : 0;   // must precede aes.reset(): seeds its key slots
   sd.attach_nand(nds_.dsi_nand.valid() ? &nds_.dsi_nand : nullptr);
   sd.attach_sd(nds_.dsi_sd.valid() ? &nds_.dsi_sd : nullptr);
   sd.reset();
   sdio.reset();
   aes.reset();
-  dsp.set_rst_line(false);   // melonDS DSi::Reset: SetRstLine(false)
+  dsp.set_rst_line(false);
   dispstat[0] |= 0x40; dispstat[1] |= 0x40;   // LCD init flag
-  extkeyin &= ~(1u << 6);                     // melonDS clears the pen-down key bit on a DSi
+  extkeyin &= ~(1u << 6);                     // pen-down key bit unused on a DSi
   dsi_tsc_reset();
 }
 
@@ -1530,10 +1418,8 @@ bool Io::dsi_io_access(Cpu cpu, u32 addr) const {
   }
 }
 
-// NDMA's ARM7 FIFO ends, reached as Io::read / Io::write would reach them
-// through dsi_read / dsi_write, without the dispatch: a NAND title load moves
-// every byte through these a word at a time (SD data FIFO -> AES -> RAM).
-// Callers check census_on(), the bus watch and dsi_io_access first.
+// NDMA's ARM7 FIFO ends, reached without the read/write dispatch: a NAND
+// title load moves every byte through these (SD data FIFO -> AES -> RAM).
 u32 Io::ndma_read7(u32 addr) {
   spi_poll_streak_ = 0;
   return addr == 0x0400490C ? sd.read_fifo32() : aes.read_output_fifo();
@@ -1573,10 +1459,8 @@ u32 Io::dsi_read(Cpu cpu, u32 addr, u32 width) {
     return width == 32 ? dsp.read32(r) : width == 16 ? dsp.read16(r) : dsp.read8(r);
   }
   if (r < 0x040) {
-    // The SCFG block, exactly melonDS's per-width read tables (DSi.cpp
-    // ARM9IORead8/16/32, ARM7IORead8/16/32): what is not listed reads 0 at
-    // that width, and nothing here composes a wider view from narrower ones
-    // (the ARM7's 32-bit SCFG_MC carries no cart-delay half).
+    // SCFG block: what's not listed reads 0 at that width; nothing composes
+    // a wider view from narrower ones.
     const u16 bios = dsi.scfg_bios;
     if (a9) {
       if (width == 8)  return r == 0x000 ? (bios & 0xFF) : r == 0x006 ? (dsi.scfg_rst & 0xFF) : 0;
@@ -1630,11 +1514,11 @@ void Io::dsi_write(Cpu cpu, u32 addr, u32 width, u32 value) {
       h.write(addr + 2, static_cast<u16>(value >> 16));
       return;
     }
-    // melonDS has no 8-bit SD handler; a byte write lands as the 16-bit one.
+    // No 8-bit SD handler; a byte write lands as the 16-bit one.
     h.write(addr & ~1u, static_cast<u16>(value));
     return;
   }
-  if (r >= 0x400 && r < 0x500) {                     // AES: ARM7 only (melonDS DSi::ARM7IOWrite8/16/32)
+  if (r >= 0x400 && r < 0x500) {                     // AES: ARM7 only
     if (a9) return;
     const u32 shift = (r & (width == 8 ? 3 : width == 16 ? 2 : 0)) * 8;
     const u32 mask = (width == 32 ? 0xFFFFFFFFu : width == 16 ? 0xFFFFu : 0xFFu) << shift;
@@ -1660,7 +1544,7 @@ void Io::dsi_write(Cpu cpu, u32 addr, u32 width, u32 value) {
     if (width == 32) cam.write32(addr, value); else if (width == 16) cam.write16(addr, static_cast<u16>(value)); else cam.write8(addr, static_cast<u8>(value));
     return;
   }
-  if (r >= 0x300 && r < 0x400) {                     // DSP host interface: ARM9, plus melonDS's ARM7 32-bit path
+  if (r >= 0x300 && r < 0x400) {                     // DSP host interface: ARM9, plus a 32-bit ARM7 path
     if (width == 32) dsp.write32(r, value);
     else if (a9) { if (width == 16) dsp.write16(r, static_cast<u16>(value)); else dsp.write8(r, static_cast<u8>(value)); }
     return;
@@ -1684,7 +1568,7 @@ void Io::dsi_write(Cpu cpu, u32 addr, u32 width, u32 value) {
     }
     return;
   }
-  if (r >= 0xC00 && r < 0xC06) {                     // GPIO: byte registers, ARM7 only (melonDS: no 32-bit handlers)
+  if (r >= 0xC00 && r < 0xC06) {                     // GPIO: byte registers, ARM7 only
     if (a9 || width == 32) return;
     for (u32 i = 0; i < width / 8; ++i) {
       const u8 b = static_cast<u8>(value >> (i * 8));
@@ -1693,8 +1577,8 @@ void Io::dsi_write(Cpu cpu, u32 addr, u32 width, u32 value) {
       case 0xC01: dsi.gpio_dir = b; break;
       case 0xC02: dsi.gpio_iedgesel = b; break;
       case 0xC03: dsi.gpio_ie = b; break;
-      case 0xC04: dsi.gpio_wifi = b; break;                 // melonDS keeps GPIO_WiFi as a byte: a 16-bit write truncates
-      case 0xC05: break;                                    // melonDS: no byte handler for the high byte
+      case 0xC04: dsi.gpio_wifi = b; break;                 // GPIO_WiFi is byte-wide: a 16-bit write truncates
+      case 0xC05: break;                                    // no byte handler for the high byte
       default: break;
       }
     }
@@ -1745,13 +1629,8 @@ void Io::dsi_write(Cpu cpu, u32 addr, u32 width, u32 value) {
       dsi.scfg_ext[0] = (dsi.scfg_ext[0] & ~0x8007F19Fu) | (value & 0x8007F19Fu);
       dsi.scfg_ext[1] = (dsi.scfg_ext[1] & ~0x00003080u) | (value & 0x00003080u);
       if ((old0 ^ dsi.scfg_ext[0]) & (1u << 13)) nds_.bus.update_vram_timings();
-      // Bits 14-15: main RAM, 4 MB (0-1) or 16 MB (2-3). The DSi loader
-      // limits a DS title (a card, PictoChat, Download Play) to 4 MB, which
-      // the title then sees mirrored. melonDS's DSi-loader hack: the loader
-      // writes this while the ARM7 is still clearing and moving main RAM
-      // (IPCSYNC 5 both ways), which on hardware bus contention lets finish
-      // first; here the size is held until the ARM7 signals it is done
-      // (IPCSYNC 0).
+      // Bits 14-15: main RAM, 4 MB (0-1) or 16 MB (2-3). Held until the ARM7
+      // signals it's done clearing/moving main RAM (IPCSYNC 0, after 5 both ways).
       const bool handshake = (cpu_io[ci(Cpu::ARM9)].ipc_sync & 0x0F0F) == 0x0505;
       if ((old0 ^ dsi.scfg_ext[0]) & 0xC000u) {
         if (!handshake) dsi_apply_ram_size();
@@ -1774,18 +1653,16 @@ void Io::dsi_write(Cpu cpu, u32 addr, u32 width, u32 value) {
   }
 }
 
-// The ARM9 store that wrote SCFG_CLK9 has already priced its data cycles from
-// the old clock's table; melonDS's DataWrite16/32 read DataCycles *after* the
-// bus write, from the table SetScfgClock9 just rebuilt. `idx` is the store
-// table's width index (1 = 16-bit, 2 = 32-bit), as data_cost reads it.
+// The store that wrote SCFG_CLK9 priced its data cycles from the old clock's
+// table; re-read from the table this call just rebuilt. `idx`: 1 = 16-bit,
+// 2 = 32-bit.
 void Io::reprice_clock9_store(u32 idx) {
   CpuContext& a9 = nds_.cpu(Cpu::ARM9);
   if (nds_.sched.running() != &a9) return;
   a9.data_cycles = a9.timing9[0x04004004 >> 12][4 + idx];
 }
 
-// One MBK1-5 byte: slot `slot` of bank A (0), B (1) or C (2). The unsettable
-// bits are dropped, MBK9 write protection honoured, and the map rebuilt.
+// One MBK1-5 byte: slot `slot` of bank A (0), B (1) or C (2).
 void Io::mbk_map_slot(int bank, int slot, u8 value) {
   if (getenv("DS_DEBUG_MBK")) std::fprintf(stderr, "[mbk] slot %c[%d] = %02x  t=%llu\n", "ABC"[bank], slot, value, (unsigned long long)nds_.sched.now());
   value &= bank == 0 ? ~0x72 : ~0x60;
@@ -1799,9 +1676,8 @@ void Io::mbk_map_slot(int bank, int slot, u8 value) {
   nds_.bus.update_nwram(true);
 }
 
-// melonDS DSi::ApplyNewRAMSize: SCFG_EXT9's size becomes the machine's, and
-// the ARM7's SCFG_EXT mirrors it (bits 14-15, read-only there). The mirror is
-// what the bus maps from, so a save state carries the applied size.
+// SCFG_EXT9's size becomes the machine's; SCFG_EXT7 mirrors it (read-only
+// there). The mirror is what the bus maps from, so save state carries it.
 void Io::dsi_apply_ram_size() {
   const u32 size = (dsi.scfg_ext[0] >> 14) & 3;
   const bool was16 = ((dsi.scfg_ext[1] >> 14) & 3) >= 2;
@@ -1818,13 +1694,11 @@ void Io::dsi_write_scfg_mc(u16 value, u16 mask) {
     if (newpower == oldpower) continue;
     const EventId ev = i == 0 ? EventId::CartPower1 : EventId::CartPower2;
     nds_.sched.cancel(ev);
-    const bool inserted = i == 0 && nds_.cart != nullptr;   // the DSi has no second slot to fill
+    const bool inserted = i == 0 && nds_.cart != nullptr;   // no second slot to fill
     if ((newpower == 1 || newpower == 2) && !inserted) { oldpower = newpower; newpower = 3; }
-    // melonDS counts the delay in ARM7 cycles; ours are ARM9's.
-    if (newpower == 3) nds_.sched.schedule(ev, nds_.sched.now() + (static_cast<u64>(dsi.cart_poweroff_delay) << 10), cart_power_event, static_cast<u32>(i));
+    if (newpower == 3) nds_.sched.schedule(ev, nds_.sched.now() + (static_cast<u64>(dsi.cart_poweroff_delay) << 10), cart_power_event, static_cast<u32>(i));   // delay in ARM9 cycles
     if (newpower == 0 && i == 0) cart.romctrl &= ~(1u << 29);   // power state 0 releases the card's reset line
-    // Slot 1 leaving the powered states raises the card IRQ (not slot 2, as on melonDS).
-    if (i == 0 && (oldpower == 1 || oldpower == 2) && (newpower == 3 || newpower == 0)) {
+    if (i == 0 && (oldpower == 1 || oldpower == 2) && (newpower == 3 || newpower == 0)) {   // only slot 1 leaving powered states raises the card IRQ
       request_irq(Cpu::ARM9, IRQ_CART_IREQ);
       request_irq(Cpu::ARM7, IRQ_CART_IREQ);
     }
@@ -1862,15 +1736,13 @@ void Io::mbk_map_range(Cpu cpu, int bank, u32 value) {
   nds_.bus.update_nwram(true);
 }
 
-// The DSi CODEC's SPI protocol (melonDS DSi_TSC::Write): the first byte of a
-// transfer is the index (bit 0 = read), then one register per byte, the
-// index advancing. Register 0 of every bank selects the bank; bank 3 holds
-// the control/status file, bank 0xFC the coordinate FIFO, bank 0xFF the
-// mode register (writing 0 there drops back to DS-compatibility mode).
+// DSi CODEC SPI protocol: first byte of a transfer is the index (bit 0 =
+// read), then one register per byte, the index advancing. Register 0 of
+// every bank selects the bank; bank 3 holds the control/status file, bank
+// 0xFC the coordinate FIFO, bank 0xFF the mode register (0 there drops back
+// to DS-compatibility mode). SPIDATA reads back the output latch, updated
+// only by a read of a modelled register.
 u8 Io::dsi_tsc_transfer(u8 value) {
-  // SPIDATA reads back the CODEC's output latch, which only a read of a
-  // register it models updates: an index byte, a write or a read of an
-  // unmodelled bank leaves the previous byte there (melonDS DSi_TSC::Data).
   SpiTouch& t = spi_tsc;
   if (t.dsi_pos == 0) { t.dsi_index = value; ++t.dsi_pos; return t.dsi_data; }
   const u8 id = t.dsi_index >> 1;
@@ -1901,8 +1773,6 @@ template <class S> void Io::sync_state(S& s) {
   for (CpuIo& c : cpu_io) {
     s.fields(c.ime, c.ie, c.if_, c.ipc_sync, c.ipc_fifo_cnt, c.fifo_out.data, c.fifo_out.head, c.fifo_out.count, c.fifo_out.last, c.postflg, c.dma_fill);
     for (Timer& t : c.timers) s.fields(t.reload, t.control, t.counter, t.start_time);
-    // DS_DEBUG_STATE=1: the timers as loaded, against the scheduler clock --
-    // a timer whose start_time is far from now_ never comes due again.
     if constexpr (S::reading) {
       static const bool dbg = std::getenv("DS_DEBUG_STATE") != nullptr;
       if (dbg) for (int i = 0; i < 4; ++i) { const Timer& t = c.timers[i];
@@ -1961,12 +1831,10 @@ template <class S> void Io::sync_state(S& s) {
     nds_.sched.rebind(EventId::Sqrt, ev_sqrt);
     nds_.sched.rebind(EventId::LcdIrq, ev_lcd_irq);
     nds_.sched.rebind(EventId::Wifi, [](NDS& n, u32) { n.io.wifi.us_timer(); });
-    // The clock is a property of the session, not of the state: a state saved
-    // on a console with a running clock must not stop it on a harness run, or
-    // start one there. Whatever this run was set up with keeps going, rebased
-    // onto the restored timeline.
+    // Clock is a session property, not state: this run's setting keeps
+    // going, rebased onto the restored timeline.
     if (rtc.ticking) { rtc.next_tick = nds_.sched.now() + ARM9_CLOCK_HZ; nds_.sched.schedule(EventId::Rtc, rtc.next_tick, rtc_ev, 0); }
-    else nds_.sched.cancel(EventId::Rtc);   // the saving session's clock event, armed in the state but with no handler here
+    else nds_.sched.cancel(EventId::Rtc);
   }
 }
 template void Io::sync_state<state::Writer>(state::Writer&);

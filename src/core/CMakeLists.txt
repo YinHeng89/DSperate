@@ -95,10 +95,8 @@ if(DSPERATE_NEON)
   target_compile_definitions(dsperate_core PUBLIC DSPERATE_NEON=1)
   # The kernels reach A64-only intrinsics through gpu/neon_compat.h; on an
   # ARMv7 host that header switches to bodies the A32 encoding can express.
-  # DSPERATE_A32_SUBSET forces the same bodies on an AArch64 host.  That is
-  # not a 32-bit build -- the JIT and everything else are held fixed -- but it
-  # is how the subset's exactness is gated (tools/scene_hashes.sh) and how its
-  # instruction mix is measured, neither of which needs an ARMv7 machine.
+  # DSPERATE_A32_SUBSET forces the same bodies on an AArch64 host (kernels only;
+  # not a 32-bit build) to test the subset without an ARMv7 machine.
   if(DSPERATE_HOST_ARM32 OR DSPERATE_A32_SUBSET)
     target_compile_definitions(dsperate_core PUBLIC DS_A32_SUBSET=1)
     message(STATUS "DSperate: NEON kernels restricted to the ARMv7-expressible subset")
@@ -113,11 +111,11 @@ set_property(SOURCE io/dsi_font.cpp APPEND PROPERTY OBJECT_DEPENDS
              "${CMAKE_CURRENT_SOURCE_DIR}/io/dsi_font/TWLFontTable.dat"
              "${CMAKE_CURRENT_SOURCE_DIR}/io/dsi_font/TWLFontTable-cn.dat"
              "${CMAKE_CURRENT_SOURCE_DIR}/io/dsi_font/TWLFontTable-kr.dat")
-# The Vulkan device layer and GPU raster (docs/gpu-path-scoping.md). Opt-in at build time and at
-# run time both: the backend loads libvulkan with dlopen, so a build with this
-# on still starts on a device with no driver -- Device::create returns null and
-# the software raster runs. Only the aarch64 handhelds have a GPU that can host
-# it at all (the A30's Mali-400 has no compute units).
+# The Vulkan device layer and GPU raster. Opt-in at build time and at run
+# time both: the backend loads libvulkan with dlopen, so a build with this on
+# still starts on a device with no driver -- Device::create returns null and
+# the software raster runs. Only the aarch64 handhelds have a GPU that can
+# host it at all (the A30's Mali-400 has no compute units).
 option(DSPERATE_VULKAN "Build the Vulkan compute 3D raster" ON)
 if(DSPERATE_VULKAN)
   # The Vulkan headers are architecture-independent and nothing is linked
@@ -131,9 +129,8 @@ if(DSPERATE_VULKAN)
   endif()
   if(DSPERATE_VULKAN_INCLUDE)
     target_sources(dsperate_core PRIVATE gpu/vk/vk_device.cpp gpu/vk/vk_raster.cpp gpu/vk/vk_shaders.cpp)
-    # The SPIR-V is tracked, not built: tools/gen_shaders.sh regenerates it and
-    # vk_shaders.cpp .incbin's the result, so no shader compiler is needed to
-    # build the emulator. Re-link when a blob changes.
+    # SPIR-V is checked in and .incbin'd by vk_shaders.cpp (no shader compiler
+    # needed at build time); re-link when a blob changes.
     set_property(SOURCE gpu/vk/vk_shaders.cpp APPEND PROPERTY COMPILE_DEFINITIONS
                  DSPERATE_VK_SHADER_DIR="${CMAKE_CURRENT_SOURCE_DIR}/gpu/vk/shaders")
     set_property(SOURCE gpu/vk/vk_shaders.cpp APPEND PROPERTY OBJECT_DEPENDS
