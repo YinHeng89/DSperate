@@ -281,6 +281,14 @@ R"(# DSperate settings. Command-line flags override this file. Two files next
                                 # other Allwinner boards): auto (wherever /dev/disp answers) | true | false
 # fbdev = auto                  # present straight through /dev/fb0 (the H700 handhelds' mali-only SDL2):
                                 # auto (when SDL has no display but fb0 answers) | true | false
+# gpu_present = true            # scale and compose the panel on the GPU (Vulkan, into the scanout
+                                # dma-buf) instead of on the CPU scanline scaler. Default on where the
+                                # device has it; declines cleanly and falls back to the scanline tier
+                                # where it does not (no Vulkan, no DRM or no dma-heap). Measured on the
+                                # RG DS Plus: over-budget frames 72->42 % on Spirit Tracks, 47->28 % on
+                                # Golden Sun, 44->32 % on NSMB, with the longest stutter falling from
+                                # 291 frames to 3-9. Known cost: one 37-80 ms frame per ~1600 on Golden
+                                # Sun, the Mali tiler-heap stall
 # vsync = true
 # fps = false                   # frames-per-second counter in a corner of the primary screen. Counts
                                 # presented frames, so frameskip and fast forward show. The fps hotkey

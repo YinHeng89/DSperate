@@ -1717,10 +1717,26 @@ static int run(int argc, char** argv) {
     chunky = 2;
   }
 
-  // The GPU present stage (gpu_present.h): opt-in while it is measured
-  // (docs/gpu-path-scoping.md P1); Display falls back to the scanline
-  // scaler when the tier has no dma-buf or the driver cannot import one.
-  { const std::string g = cfg.str("video.gpu_present"); vs.gpu_present = g == "true" || g == "on" || g == "1"; }
+  // The GPU present stage (gpu_present.h): ON BY DEFAULT since the device A/B
+  // in the speed-first scoping doc, SS3.33. Measured on three scenes, three
+  // reps, `work ms` with --no-vsync: it nearly halves the over-budget frames
+  // (Spirit Tracks 72 -> 42 %, Golden Sun 47 -> 28 %, NSMB 44 -> 32 %) and
+  // turns sustained chugging into brief blips -- Spirit Tracks' longest burst
+  // goes from 291 frames to 3-9, Golden Sun's from 211 to 15-31. Median, p90
+  // and p95 improve on every scene.
+  //
+  // The one thing it costs: on Golden Sun it provokes the Mali tiler-heap
+  // stall (SS3.37), one 37-80 ms frame per 1600. That is reported and does
+  // not gate -- the bar is over-budget count, then longest burst, then p95,
+  // and it wins all three. Avoiding the GPU-interrupt CPU removes the spike
+  // but costs 7.1 ms of p95 on a four-core device, which is the worse trade.
+  //
+  // Display falls back to the scanline scaler when the tier has no dma-buf or
+  // the driver cannot import one, and GpuPresent::open() declines cleanly
+  // where the Vulkan entry points are missing -- so a device without the
+  // stack (the A30: no Vulkan, no DRM, no dma-heap; SS3.34) simply does not
+  // get it. --no-gpu-present opts out.
+  { const std::string g = cfg.str("video.gpu_present", "true"); vs.gpu_present = g == "true" || g == "on" || g == "1"; }
 
   // The fbdev tier (display_fbdev.h) owns fb0 the same way. auto takes it
   // only where SDL2 was built with the mali video driver -- the BaseOS

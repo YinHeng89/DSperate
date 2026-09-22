@@ -89,10 +89,11 @@ contend for four A55s and the emulation thread waits behind all of them.
 
 ### The route, ordered by evidence per unit of risk
 
-1. **Confirm and default `--gpu-present`.** Merged (`fdd5363`), measured
-   −2.3 ms of median on st-intro (SS3.31), being re-measured on this tree
-   (SS3.33). **Judge it on p90/p99, not the median** — it moves panel-sized
-   writes off both CPU threads, which is a tail lever as much as a median one.
+1. ~~Confirm and default `--gpu-present`.~~ **DONE.** Measured on three
+   scenes (SS3.33) and defaulted on: over-budget frames 72→42 % on st-intro,
+   47→28 % on gsdd, 44→32 % on nsmb, longest burst 291→3-9 frames. Its one
+   cost, a 37-80 ms Mali stall frame per ~1600 on gsdd, is reported and does
+   not gate (SS3.37).
 2. **Attack the 2D hand-off.** It is 4.86 ms of gsdd's median and **17.20 ms
    of its p99**, and it is in **no phase's scope** — Phase 3 does not cover it
    and Phase 5 was dropped on an instrument that could not see it (SS3.18).
