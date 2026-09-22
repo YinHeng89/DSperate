@@ -1,0 +1,27 @@
+#version 450
+// The native-resolution planes from the hi-res ones (P3 at S >= 2): one
+// invocation per native pixel taking the top-left subpixel -- no filter,
+// because this plane goes where the DS's own layer went (the CPU composite
+// on capturing frames, display capture into VRAM, save states), and a
+// filtered colour there would be an invented one. With DS_FF_SHRINK3 the
+// attribute and depth records shrink too: the native-resolution translucent
+// tail draws on all three (vk_raster.cpp, "native tail").
+#extension GL_GOOGLE_include_directive : require
+#define DS_GLSL 1
+#include "vk_layout.h"
+layout(local_size_x = 64) in;
+layout(std430, binding = 4) readonly buffer Out { uint fb[]; };        // the hi-res layer, 256S x 192S
+layout(std430, binding = 6) readonly buffer Depth { uint zbuf[]; };
+layout(std430, binding = 7) readonly buffer Attr { uint abuf[]; };
+layout(std430, binding = 12) writeonly buffer Nat { uint nat[]; };    // 256 x 192
+layout(std430, binding = 14) writeonly buffer NatAttr { uint natattr[]; };
+layout(std430, binding = 15) writeonly buffer NatZ { uint natz[]; };
+layout(push_constant) uniform Push { GpuFrame f; } pc;
+void main() {
+  uint i = gl_GlobalInvocationID.x;
+  if (i >= 256u * 192u) return;
+  uint x = i % 256u, y = i / 256u, S = pc.f.scale;
+  uint j = (y * S) * (256u * S) + x * S;
+  nat[i] = fb[j];
+  if ((pc.f.flags & DS_FF_SHRINK3) != 0u) { natattr[i] = abuf[j]; natz[i] = zbuf[j]; }
+}

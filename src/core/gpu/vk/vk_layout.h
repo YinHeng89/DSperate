@@ -137,8 +137,9 @@ struct GpuRow {
   uint   lrgb, lst, rrgb, rst;
   DS_INT xrz;           // the X stage's (1<<22)/xdiff
   uint   rcp;           // and its reciprocal-of-xdiff
-  uint   fl;            // 1 valid, 2 l_fill, 4 r_fill, 8 w-buffer, 16 linear, 5-8 yedge, 512 mask, 1024 shadow
+  uint   fl;            // 1 valid, 2 l_fill, 4 r_fill, 8 w-buffer, 16 linear, 5-8 yedge, 512 mask, 1024 shadow, 2048/4096 left/right edge runs down-left (smooth filter)
   uint   poly;          // the polygon this row belongs to, so a pass driven by rows can find it
+  uint   lcov, rcov;    // anti-aliasing coverage of the left and right edge runs, as Renderer3D::Slope::edge_params packs it (bit 31: X-major, start << 12 | increment)
 };
 
 // The visibility pass's workgroup: DS_VIS_ROWS span rows per workgroup, a
@@ -181,8 +182,34 @@ struct GpuFrame {
   uint   first_ordered;
   uint   opaque_rows;
   uint   nrows;         // span rows this frame, all polygons: the span pass is one lane per row
-  uint   pad_;
+  uint   flags;         // DS_FF_*
+  uint   flags2;        // DS_FF2_* (flags is full: bits 16-31 are the shadow run)
 };
+
+#define DS_FF_WBUFFER 0x1u   // the frame depth-tests on W (SWAP_BUFFERS bit 1); the triangle path picks its pipelines by it
+#define DS_FF_FACE_BACK  0x4u  // the triangle path's opaque draw, back-facing polygons only (tri.vert collapses the rest)
+#define DS_FF_FACE_FRONT 0x8u  // ... front-facing only: drawn second, LESS_OR_EQUAL, so a front face at the depth of an opaque back-facing pixel wins (Renderer3D::depth_pass mode 1)
+#define DS_FF_RUN_SHIFT 16u  // bits 16-31: the shadow-mask run this draw belongs to (the shadow plane holds run ids; see vk_raster.cpp)
+#define DS_FF_ONLY_PLAIN 0x40u  // the triangle path: draw only polygons WITHOUT DS_PF_TEX_ALPHA (the depth prepass and its EQUAL shaded pass)
+#define DS_FF_ONLY_ALPHA 0x80u  // ... only polygons WITH it (drawn after, with the normal test: they never went through the prepass)
+#define DS_FF_SORTED   0x100u  // the triangle path: this draw's instance i is polygon order[i] (the opaque prefix near to far)
+#define DS_FF_TAIL1X   0x200u  // the translucent tail drawn at native resolution on the shrunk planes (tri.vert divides positions by scale; tri_tail.frag depth-tests in the shader)
+#define DS_FF_SHRINK3  0x400u  // downsample.comp: shrink the attribute and depth records too (before the native tail)
+#define DS_FF_SPANCULL 0x1000u // the AA pass: tri.vert grows every polygon by a pixel and the fragment shader keeps only the pixels of its DS span (tri_aa_common.glsl) -- the DS's coverage, not the hardware's
+#define DS_FF_ROWS     0x2000u // the span table holds this frame's rows: the fragment shaders take edge flags and coverage from it (edge marking, fast AA)
+#define DS_FF_AAFAST   0x4000u // post.comp: the fast anti-aliasing -- edge pixels blended with their outside neighbour, in two stages
+#define DS_FF_POST2    0x8000u // post.comp: stage 2 of the fast anti-aliasing (stage 1 wrote fogged, edge-marked pixels to the scratch plane)
+// The smooth-3D present filter (docs/gpu-path-scoping.md, P4): the fast
+// anti-aliasing's second stage writes each pixel's edge record -- side flags,
+// coverage, X-major, covered half -- to the edge plane instead of blending,
+// and the present stage splits every panel pixel of an edge along the DS's
+// own coverage. The frame is drawn as if DISP3DCNT anti-aliasing were on, so
+// the span table carries coverage whether or not the game asked for it.
+#define DS_FF2_SMOOTH  0x1u
+#define DS_FF_AA       0x800u  // the anti-aliasing pass ran: the final pass blends edge pixels with the layer underneath (post.comp)
+#define DS_FF_TEX0     0x20u  // attribution (DS_VK_TRI_TEX0=1): every texel fetch reads the polygon's first texel (the fetch without its cache misses)
+#define DS_FF_NOTEX    0x10u  // attribution (DS_VK_TRI_NOTEX=1): shade every polygon as untextured
+#define DS_FF_IDCOLOUR 0x2u  // debugging (DS_VK_TRI_IDCOL=1): the opaque draw writes the polygon INDEX as its colour (r = i & 63, g = i >> 6 & 63, b = i >> 12 & 63)
 
 // Render state too large for the push constants: the fog table, the edge
 // colours and the toon table. Uploaded every frame -- it is 320 bytes, which

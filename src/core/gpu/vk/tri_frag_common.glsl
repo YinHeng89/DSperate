@@ -1,0 +1,77 @@
+// Shared by tri_opaque.frag and tri_tail.frag: the per-fragment shading of
+// the triangle path, through ds_shade.glsl's arithmetic.
+layout(std430, binding = 0) readonly buffer Polys  { GpuPoly polys[]; };
+// The texel arena as a uniform texel buffer: on Mali a texelFetch goes
+// through the texture cache where an SSBO load goes through load/store, and
+// the fragment stage was 3.5 ms of a 5.9 ms fence wait at 2x (Golden Sun).
+#define DS_TEXEL_BUFFER 1
+layout(binding = 3) uniform usamplerBuffer texels_tb;
+layout(std430, binding = 5) readonly buffer Post   { GpuPost ps; };
+layout(push_constant) uniform PC { GpuFrame f; } pc;
+layout(location = 0) flat in uint v_poly;
+layout(location = 1) in vec3 v_rgb;
+layout(location = 2) in vec2 v_st;
+layout(location = 3) noperspective in float v_z;
+layout(location = 4) in float v_w;
+layout(location = 5) in float v_zp;
+layout(location = 0) out uint o_col;     // the 3D layer record: RGB666 + alpha5 << 24
+layout(location = 1) out uint o_attr;    // the attribute plane the final pass reads
+layout(location = 2) out uint o_z;       // the depth plane (DS z, or w in W-buffer mode)
+layout(std430, binding = 9) readonly buffer RowsC { GpuRow rows_c[]; };
+// This pixel's edge flags (1 left run, 2 right run, 4 top row, 8 bottom row)
+// and coverage from its polygon's span-table row (Renderer3D::resolve_span's
+// rules); `inside` says whether the DS span reaches the pixel at all. At
+// S >= 2 the caller passes the native pixel (x / S, y / S).
+uint row_edge(GpuPoly p, int x, int y, out uint cov, out bool inside, out GpuRow row) {
+  cov = 31u; inside = false;
+  int y0 = max(p.ytop, 0);
+  int ylast = min(p.ybot, 191);
+  if (y < y0 || y > ylast) return 0u;
+  GpuRow r = rows_c[p.row_base + uint(y - y0)];
+  row = r;
+  if ((r.fl & 1u) == 0u) return 0u;
+  uint yedge = (r.fl >> 5) & 0xFu;
+  int xa = max(r.xstart, 0);
+  if (x < xa || x > r.xend) return 0u;
+  inside = true;
+  if (x < r.lim0) {
+    int c = int(r.lcov);
+    if ((c & int(0x80000000u)) != 0) { int xcov = (c >> 12) & 0x3FF; if (xcov == 0x3FF) xcov = 0; xcov += (x - xa) * (c & 0x3FF); cov = uint(min(xcov >> 5, 31)); }
+    else cov = uint(c & 0x1F);
+    return yedge | 1u;
+  }
+  if (x >= r.lim1) {
+    int c = int(r.rcov);
+    if ((c & int(0x80000000u)) != 0) { int xcov = (c >> 12) & 0x3FF; if (xcov == 0x3FF) xcov = 0; xcov += (x - r.lim1) * (c & 0x3FF); cov = uint(max(31 - (xcov >> 5), 0)); }
+    else cov = uint(c & 0x1F);
+    return yedge | 2u;
+  }
+  return yedge;
+}
+#ifndef DS_AA_PASS
+layout(location = 4) out uint o_touch;   // the native tail pass (DS_FF_TAIL1X): 1 where the tail wrote the pixel, for expand.comp (no such attachment in the hi-res pass: the write is dropped)
+#endif
+#include "ds_shade.glsl"
+struct Frag { uint src; uint alpha; uint polyattr; uint depth; };
+Frag shade_fragment(GpuPoly p) {
+  Frag o;
+  uint blendmode = (p.attr >> 4) & 3u;
+  uint polyalpha = (p.attr >> 16) & 0x1Fu;
+  bool textured = (p.flags & DS_PF_TEXTURED) != 0u && (pc.f.flags & DS_FF_NOTEX) == 0u;   // DS_FF_NOTEX: attribution
+  o.src = shade_pixel(p, blendmode, polyalpha, textured,
+                      int(round(v_rgb.r)), int(round(v_rgb.g)), int(round(v_rgb.b)),
+                      int(floor(v_st.x + 0.01)), int(floor(v_st.y + 0.01)));
+  // Colours round (measured closer to the DS's fixed-point interpolation);
+  // texture coordinates TRUNCATE, as the DS's 12.4 >> 4 does -- a quad that
+  // stretches one texel column across a hundred pixels (Etrian's menu panels,
+  // s 22.0 -> 23.0) otherwise flips to the edge texel columns early. The
+  // 0.01 (a hundredth of a 1/16 texel) absorbs float error at exact texel
+  // boundaries: the same panels step t by exactly 16.0 a row, and 15.9999
+  // floored onto the row above -- the one-row shift in the menu text.
+  o.alpha = o.src >> 24;
+  bool front = (p.flags & DS_PF_FRONTFACING) != 0u;
+  o.polyattr = (p.attr & 0x3F008000u) | (front ? 0u : (1u << 4));
+  bool wbuf = (pc.f.flags & DS_FF_WBUFFER) != 0u;
+  o.depth = uint(clamp(round(wbuf ? v_zp : v_z), 0.0, 16777215.0));   // W-depth is perspective-correct on the DS, z linear
+  return o;
+}

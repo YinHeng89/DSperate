@@ -41,12 +41,33 @@ public:
   // After the tier reopened at a new size: drop and re-import its buffers.
   bool reimport(ScanoutOut& out);
 
-  struct View { int screen; SDL_Rect rect; bool shown; bool blends; };
+  struct View { int screen; SDL_Rect rect; bool shown; bool blends; bool grid = false; };   // grid: the LCD grid applies to this view (Display::grid_on)
   // One frame: take a buffer from the tier, upload fb[0..1], dispatch into
   // that buffer, submit. `lw` x `lh` is the logical (unrotated) frame the
   // rects are laid out in; `rot` maps it onto the presented buffer. False
   // when the tier had no buffer or the submit failed (nothing was shown).
-  bool present(ScanoutOut& out, const u32* const fb[2], const View* views, int nviews, int rot, int lw, int lh, u8 inset_alpha);
+  // `hires`/`hires_bytes`/`scale`: the frame's hi-res 3D layer (an opaque
+  // VkBuffer from the core's raster, Gpu::frame_hires) -- when non-zero and
+  // the planes are registered, screen 0 is composited here at S x from the
+  // exported planes and that layer (shaders/composite.comp) instead of
+  // taken from fb[0].
+  // `drawn`: the rectangle of the overlay the frontend drew this frame (see overlay()).
+  // `edge`: the raster's edge plane of the same frame (Raster::output_edge_handle);
+  // non-zero turns the smooth-3D filter on for that screen (present.comp).
+  // `grid`: the LCD grid's brightness kept on a seam, 0..256 (256 = off), as Gpu::ScaleTarget::grid.
+  bool present(ScanoutOut& out, const u32* const fb[2], const View* views, int nviews, int rot, int lw, int lh, u8 inset_alpha,
+               u64 hires = 0, size_t hires_bytes = 0, u32 scale = 1, int hires_screen = 0, SDL_Rect drawn = SDL_Rect{0, 0, 0, 0}, u64 edge = 0, u32 grid = 256);
+  // The canvas the frontend draws its overlays on (the OSD, the pause menu,
+  // notices) for the coming frame, in the logical frame at `lw` x `lh`
+  // pixels, pitch `lw`, 0xAARRGGBB with the alpha honoured. Host-cached
+  // memory (the drawing reads it back). Cleared where the frame before last
+  // drew, so the caller only paints; present() takes the rectangle drawn.
+  u32* overlay(int lw, int lh);
+  // The planes the core's 2D engine writes for the composite (Gpu::LayerExport
+  // takes exactly these); one set for the process, allocated by the first
+  // stage opened. Null pointers when there is no stage.
+  struct LayerPtrs { u32* top = nullptr; u32* second = nullptr; u32* meta = nullptr; u32* win = nullptr; u32* line = nullptr; u32* mbright = nullptr; };
+  static LayerPtrs layer_ptrs();
   // Wait for the frame in flight and hand its buffer to the tier. Called by
   // present() for the previous frame; call it directly before a pause.
   void flush(ScanoutOut& out);

@@ -533,10 +533,6 @@ void Gpu::update_phase() {
 
 void Gpu::begin_frame() {
   frame_begun_ = true;
-  // The 3D frame this display frame reads, rasterised at line 215 of the
-  // previous one. Latched once, here: the raster moves on to the next frame
-  // at line 215 of this one while the compositor may still be reading it.
-  ref3d_ = nds_.gpu3d.frame_ref();
   if (g_dbg_gpu)
     std::fprintf(stderr, "[gpu] frame %llu powcnt %04x dispcntA %08x dispcntB %08x mb %04x/%04x cap %08x vramcnt %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
                  static_cast<unsigned long long>(nds_.frame_count), nds_.io.powcnt1, engine[0].dispcnt(), engine[1].dispcnt(), master_bright_g_[0], master_bright_g_[1], capcnt_,
@@ -559,6 +555,26 @@ void Gpu::begin_frame() {
   run_fifo_ = uses_fifo() || nds_.dma.in_mode(Cpu::ARM9, dma::MODE9_DISPLAY_FIFO);
   if (capcnt_ & (1u << 31)) capture_on_ = true;
   if (capture_on_) capture_recent_ = CAPTURE_STICKY; else if (capture_recent_) --capture_recent_;
+  // The 3D frame this display frame reads, rasterised at line 215 of the
+  // previous one. Latched once, here: the raster moves on to the next frame
+  // at line 215 of this one while the compositor may still be reading it.
+  //
+  // With the GPU raster and video.gpu_defer, this may instead take the frame
+  // BEFORE that one, which the GPU has certainly finished -- removing the
+  // compositor's fence wait, at a frame of visual latency. Never while
+  // anything captures: capture writes the composited result into VRAM that
+  // the guest reads back, so a stale 3D layer there is wrong emulation
+  // rather than lag. `capture_recent_` is the same conservatism frameskip
+  // uses (skippable()), and for the same reason -- the capture bit clears
+  // itself at line 192, so "off right now" is not "off".
+  //
+  // This is after the capture bits are known, which is why it is here and
+  // not at the top of the function.
+  // The frame whose display lines were just output keeps its layer for the
+  // frontend: run_frame returns from line 0 AFTER this, so ref3d_ already
+  // names the coming frame when the frontend asks (frame_hires).
+  shown_hires_ = ref3d_.hires; shown_hires_bytes_ = ref3d_.hires_bytes; shown_scale_ = ref3d_.scale; shown_edge_ = ref3d_.edge;
+  ref3d_ = nds_.gpu3d.frame_ref(defer_3d_ && !capture_on_ && !capture_recent_ && !run_fifo_);
   update_phase();
   if (prof::enabled) {
     prof::add(prof::C_FRAMES_TOTAL, 1);
@@ -874,6 +890,11 @@ void Gpu::output_engine(int e, u32 line) {
     // brightness, 6->8 bit expansion); the others build the line first.
     if (e == 0) {
       const u32 mode = (en.dispcnt() >> 16) & 3;
+      if (layer_.line) {
+        if (line == 0) layer_screen_ = screen;
+        layer_.line[line] = (en.bldcnt() & 0xFFFFu) | ((en.eva() & 0x1Fu) << 16) | ((en.evb() & 0x1Fu) << 21) | ((en.evy() & 0x1Fu) << 26);
+        layer_.mbright[line] = static_cast<u32>(en.master_bright()) | ((mode == 1 && en.line_exported()) ? (1u << 31) : 0u);
+      }
       if (mode == 1) kern::active::output_line(en.output(), en.master_bright(), dst);
       else if (mode >= 2) output_a(line, dst);      // VRAM / FIFO display: expanded inside
       else { output_a(line, dst); expand_colours(dst); }

@@ -24,6 +24,7 @@
 #endif
 #include "core/profile.h"
 #include "core/frame_report.h"
+#include "core/gpu/vk/vk_layout.h"
 #include "core/cheat/database.h"
 
 #include <cstdio>
@@ -274,6 +275,11 @@ int main(int argc, char** argv) {
   bool rtc_host = false;              // --rtc-host: free-running clock seeded from the wall
   const char* fw_override = nullptr;  // --firmware-override: sidecar of changed firmware pages
   bool no_aa = false;
+  // The GPU 3D raster. --gpu-raster draws with it; --gpu-ab draws every frame
+  // BOTH ways and compares, which is the gate on the shader being right.
+  bool gpu_raster = false, gpu_ab = false;
+  const char* gpu_ab_dump = nullptr;
+  bool gpu_gate = false, gpu_coverage = false, gpu_defer = false;
   int cpu_oc = 0;   // jit::CpuOc: 0 off, 1 overclock, 2 underclock
   bool frames_given = false;
   const char* cheat_db = nullptr;      // a usrcheat.dat to load this ROM's codes from
@@ -362,6 +368,12 @@ int main(int argc, char** argv) {
     else if (flag("--rtc-host")) rtc_host = true;                            // INEXACT by construction: runs stop being reproducible
     else if (arg("--firmware-override")) fw_override = argv[++i];            // load it, and write back what the firmware changed
     else if (flag("--no-aa")) no_aa = true;                                  // 3D anti-aliasing off (Renderer3D::set_aa); inexact, for measurement
+    else if (flag("--gpu-defer")) { gpu_raster = true; gpu_defer = true; }        // show the GPU's 3D frame one display frame later, so the compositor never waits for it (costs a frame of latency; off while anything captures)
+    else if (flag("--gpu-coverage")) gpu_coverage = true;                    // does the DS span ever fall outside the polygon a graphics pipeline would rasterise? (needs no GPU)
+    else if (flag("--gpu-gate")) gpu_gate = true;                            // count what the GPU feature gate WOULD take, drawing nothing differently (needs no GPU)
+    else if (flag("--gpu-raster")) gpu_raster = true;                        // rasterise 3D on the GPU (Vulkan compute) where the frame allows it
+    else if (flag("--gpu-ab")) { gpu_raster = true; gpu_ab = true; }         // draw every frame both ways and report the differences
+    else if (arg("--gpu-ab-dump")) { gpu_ab_dump = argv[++i]; gpu_raster = gpu_ab = true; }  // PREFIX: write the differing frames as PREFIX-cpu.bin / PREFIX-gpu.bin for tools/compare_frames.py
     else if (flag("--cpu-oc")) cpu_oc = 1;                                   // INEXACT: JIT data accesses priced as main RAM at translate time; see jit::set_cpu_oc
     else if (flag("--cpu-uc")) cpu_oc = 2;                                   // INEXACT: --cpu-oc's underclock tier (stores and the ARM7 at main RAM's bus cost)
     // Split A/B knobs: the bundled flag above is three separate changes.
@@ -564,6 +576,28 @@ int main(int argc, char** argv) {
     }
     scaled_out = std::fopen(scaled_path, "wb");
     if (!scaled_out) { std::fprintf(stderr, "could not open %s\n", scaled_path); return 1; }
+  }
+  nds.gpu3d.renderer().set_gpu_gate_dryrun(gpu_gate);
+  nds.gpu3d.renderer().set_coverage_probe(gpu_coverage);
+  if (gpu_raster) {
+    // Report either way and carry on. A device without Vulkan running this
+    // harness should still run the scene -- on the CPU, saying so -- rather
+    // than fail, because the same command line is used on all four devices.
+    std::string why;
+    const bool on = nds.gpu3d.renderer().set_gpu_raster(true, &why);
+    if (on) std::fprintf(stderr, "gpu raster: %u completion bands (DS_VK_BANDS)\n",
+                         nds.gpu3d.renderer().gpu_bands());
+    std::fprintf(stderr, "gpu raster: %s%s%s\n", on ? "on" : "OFF -- software raster",
+                 why.empty() ? "" : " -- ", why.c_str());
+    nds.gpu3d.renderer().set_gpu_ab(gpu_ab);
+    nds.gpu.set_defer_3d(gpu_defer && on);
+    if (gpu_defer && on) std::fprintf(stderr, "gpu raster: deferred composite -- the 3D layer is shown one frame late\n");
+    if (gpu_ab && on) std::fprintf(stderr, "gpu raster: A/B mode, every frame drawn both ways\n");
+    if (gpu_ab_dump && on) {
+      const std::string a = std::string(gpu_ab_dump) + "-cpu.bin", b = std::string(gpu_ab_dump) + "-gpu.bin";
+      nds.gpu3d.renderer().set_gpu_ab_dump(a.c_str(), b.c_str());
+      std::fprintf(stderr, "gpu A/B: differing frames to %s and %s\n", a.c_str(), b.c_str());
+    }
   }
 
   if (rom && cheat_db) {
@@ -1000,6 +1034,82 @@ int main(int argc, char** argv) {
                                                             {d, nds.dsi_nand_synthetic ? std::string() : d + "/nand.ovr", d + "/photos"});
     std::fprintf(stderr, "dsi persist: out %d saves, %d system files, %d photos\n", r.saves, r.system_files, r.photos);
     for (const std::string& n : r.notes) std::fprintf(stderr, "dsi persist: %s\n", n.c_str());
+  }
+  if (gpu_raster || gpu_gate) {
+    using R3D = ds::gpu::Renderer3D;
+    const R3D::GpuStats& g = nds.gpu3d.renderer().gpu_stats();
+    const ds::u64 seen = g.eligible + g.rejected;
+    std::fprintf(stderr, "gpu gate: %llu of %llu frames eligible (%.1f%%)%s\n",
+                 (unsigned long long)g.eligible, (unsigned long long)seen,
+                 seen ? 100.0 * double(g.eligible) / double(seen) : 0.0,
+                 gpu_raster ? "" : " -- dry run, nothing drawn differently");
+    for (ds::u32 r = 1; r < R3D::GpuRejectCount; ++r)
+      if (g.reject[r]) std::fprintf(stderr, "gpu gate:   %-24s %llu frames\n", R3D::gpu_reject_name(r), (unsigned long long)g.reject[r]);
+    if (gpu_raster)
+    if (g.frames) {
+      const double n = static_cast<double>(g.frames);
+      std::fprintf(stderr, "gpu raster: per frame -- upload %.3f ms (CPU, of which submit %.3f), %.0f K texels copied, %.0f K span rows (peak %u of %d)\n",
+                   double(g.upload_ns) / n / 1e6, double(g.submit_ns) / n / 1e6, double(g.texel_words) / n / 1024.0,
+                   double(g.span_rows) / n / 1024.0, g.span_rows_max, DS_MAX_SPAN_ROWS);
+      std::fprintf(stderr, "gpu raster: per frame -- order-free prefix %.0f polygons (%.0f K span rows), ordered tail %.0f covering %.0f K px of bounding box; prefix cut short by a shadow polygon on %llu frames\n",
+                   double(g.opaque_polys) / n, double(g.opaque_rows) / n / 1024.0, double(g.tail_polys) / n,
+                   double(g.tail_area) / n / 1024.0, (unsigned long long)g.prefix_cut_by_shadow);
+      if (g.deferred || g.undeferred)
+        std::fprintf(stderr, "gpu raster: %llu display frames deferred, %llu not (%.1f %%) -- refused %llu by the caller (capture), %llu for no GPU frame before\n",
+                     (unsigned long long)g.deferred, (unsigned long long)g.undeferred,
+                     100.0 * double(g.deferred) / double(g.deferred + g.undeferred),
+                     (unsigned long long)g.defer_no_caller, (unsigned long long)g.defer_no_prev);
+      std::fprintf(stderr, "gpu raster: fence wait %.3f ms -- composite %.3f, next dispatch %.3f, forced %.3f (%.2f per frame)\n",
+                   double(g.wait_line_ns + g.wait_frame_ns + g.wait_forced_ns) / n / 1e6,
+                   double(g.wait_line_ns) / n / 1e6, double(g.wait_frame_ns) / n / 1e6,
+                   double(g.wait_forced_ns) / n / 1e6, double(g.wait_forced_n) / n);
+
+      // Why frames did not go to the GPU: the gate (per reason, above), the
+      // identical-frame path (nothing drawn at all), and the upload's own
+      // refusals, per reason.
+      std::fprintf(stderr, "gpu raster: %llu frames kept by the identical-frame path; %llu refused at upload%s\n",
+                   (unsigned long long)g.kept, (unsigned long long)g.failed, g.failed ? ":" : "");
+      for (const auto& f : g.fails) if (f.why) std::fprintf(stderr, "gpu raster:   %-40s %llu frames\n", f.why, (unsigned long long)f.n);
+      // GPU time per pass (DS_VK_TIMING=1), per frame.
+      { ds::u64 pns[5], pf = 0;
+        if (nds.gpu3d.renderer().gpu_pass_times(pns, &pf) && pf) {
+          const double k = 1.0 / (double(pf) * 1e6);
+          std::fprintf(stderr, "gpu raster: GPU time per frame -- span %.3f ms, bin %.3f, visibility %.3f, raster %.3f, final pass %.3f (total %.3f, %llu frames stamped)\n",
+                       double(pns[0]) * k, double(pns[1]) * k, double(pns[2]) * k, double(pns[3]) * k, double(pns[4]) * k,
+                       double(pns[0] + pns[1] + pns[2] + pns[3] + pns[4]) * k, (unsigned long long)pf);
+        } }
+    }
+      std::fprintf(stderr, "gpu raster: %llu frames drawn, %llu not dispatched%s%s; %llu with edge marking, %llu with fog\n",
+                   (unsigned long long)g.frames, (unsigned long long)g.failed,
+                   g.last_fail ? " -- last: " : "", g.last_fail ? g.last_fail : "", (unsigned long long)g.edge_frames, (unsigned long long)g.fog_frames);
+      std::fprintf(stderr, "gpu raster: textured polygons %llu, of which %llu could carry alpha 0 by format and %llu actually do\n",
+                   (unsigned long long)g.polys_textured, (unsigned long long)g.polys_may_alpha, (unsigned long long)g.polys_alpha);
+    if (gpu_ab) {
+      if (!g.ab_checked)
+        std::fprintf(stderr, "gpu A/B: nothing compared -- no frame reached the GPU raster\n");
+      else if (!g.ab_bad)
+        std::fprintf(stderr, "gpu A/B: %llu frames, all identical to the software raster\n",
+                     (unsigned long long)g.ab_checked);
+      else
+        std::fprintf(stderr, "gpu A/B: %llu of %llu frames DIFFER -- %llu pixels total, worst frame %u of 49152, first at frame %d\n",
+                     (unsigned long long)g.ab_bad, (unsigned long long)g.ab_checked,
+                     (unsigned long long)g.ab_pixels, g.ab_worst, g.ab_first_frame);
+    }
+  }
+  if (gpu_coverage) {
+    const ds::gpu::Renderer3D::CoverageStats& c = ds::gpu::Renderer3D::coverage_stats();
+    std::fprintf(stderr, "gpu coverage: %llu pixels drawn, %llu outside the polygon (%.4f %%)\n",
+                 (unsigned long long)c.drawn, (unsigned long long)c.outside,
+                 c.drawn ? 100.0 * double(c.outside) / double(c.drawn) : 0.0);
+    std::fprintf(stderr, "gpu coverage: %llu of %llu spans affected (%.2f %%), worst run %u pixels\n",
+                 (unsigned long long)c.spans_bad, (unsigned long long)c.spans,
+                 c.spans ? 100.0 * double(c.spans_bad) / double(c.spans) : 0.0, c.worst_run);
+    static const char* kB[6] = {"1", "2", "3-4", "5-8", "9-16", ">16"};
+    std::fprintf(stderr, "gpu coverage: affected spans by outside pixels --");
+    for (int b = 0; b < 6; ++b)
+      std::fprintf(stderr, " %s:%.1f%%", kB[b], c.spans_bad ? 100.0 * double(c.bucket[b]) / double(c.spans_bad) : 0.0);
+    std::fprintf(stderr, "; wholly outside %.2f %% of affected\n",
+                 c.spans_bad ? 100.0 * double(c.spans_all_out) / double(c.spans_bad) : 0.0);
   }
   std::fprintf(stderr, "ran %llu frames, %llu cycles\n",
               static_cast<unsigned long long>(nds.frame_count),

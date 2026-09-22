@@ -219,6 +219,19 @@ public:
     // Columns are cropped in xrun (runs outside the buffer are empty).
     u32 y_lo = 0, y_hi = 0;
   };
+  // The GPU composite's per-line input beside Engine2D's planes: `line[y]` =
+  // bldcnt | eva << 16 | evb << 21 | evy << 26; `mbright[y]` = MASTER_BRIGHT
+  // | 1 << 31 when the line's planes were exported (a 3D line in display mode
+  // 1) -- otherwise the composite takes the finished pixels. Engine A only.
+  struct LayerExport { u32* top = nullptr; u32* second = nullptr; u32* meta = nullptr; u32* win = nullptr; u32* line = nullptr; u32* mbright = nullptr; };
+  void set_layer_export(const LayerExport& e) { layer_ = e; engine[0].set_layer_export(e.top, e.second, e.meta, e.win); }
+  // The hi-res 3D layer the display lines of the frame just finished read (0
+  // when the CPU raster drew it): for the present stage's composite. Latched
+  // at begin_frame, which runs at line 0 before run_frame returns.
+  // `screen`: the screen engine A (the one with the 3D layer) displayed on
+  // this frame -- POWCNT1 bit 15, which Spirit Tracks flips every frame.
+  // `edge`: the smooth filter's edge plane of the same frame (0 when none).
+  u64 frame_hires(size_t* bytes, u32* scale, int* screen = nullptr, u64* edge = nullptr) const { if (bytes) *bytes = shown_hires_bytes_; if (scale) *scale = shown_scale_; if (screen) *screen = layer_screen_; if (edge) *edge = shown_edge_; return shown_hires_; }
   // Both screens or neither: pass a null `px` to go back to fb_.
   void set_scale_target(int screen, const ScaleTarget& t) { scale_[screen] = t; if (scale_[screen].y_hi == 0) scale_[screen].y_hi = t.h; update_shape(); }
   // Edge shaping only shows through the scanline scaler's runs: it repaints the 3D frame with the colours from
@@ -295,6 +308,13 @@ private:
   u16 master_bright_g_[2] = {0, 0};   // guest-visible; the engines hold the render-side value
   u32 capcnt_ = 0;
   bool capture_on_ = false;
+public:
+  // video.gpu_defer: show the GPU's frame one later than it is drawn, so the
+  // compositor never waits for it. See the note in begin_frame.
+  void set_defer_3d(bool on) { defer_3d_ = on; }
+  bool defer_3d() const { return defer_3d_; }
+private:
+  bool defer_3d_ = false;
   std::array<u16, 16> fifo_{};
   u8 fifo_rd_ = 0, fifo_wr_ = 0;
   alignas(16) std::array<u16, 256> fifo_line_{};
@@ -489,6 +509,9 @@ private:
   // worker scales the stash after engine A's lines. On Golden Sun's title
   // that is ~1.1 ms a frame off the emulation thread with two panels.
   struct StashedLine { u32 line; int screen; u64 key; alignas(16) u32 px[SCREEN_W]; };   // key: see emit_splits
+  LayerExport layer_;
+  int layer_screen_ = 0;   // engine A's screen on the frame's first line (frame_hires)
+  u64 shown_hires_ = 0; size_t shown_hires_bytes_ = 0; u32 shown_scale_ = 1; u64 shown_edge_ = 0;   // the layer of the frame whose lines were just output (begin_frame latches it)
   StashedLine bscale_[SCREEN_H];
   u32  bscale_n_ = 0;                   // lines stashed for the job being built / in flight
   bool bscale_defer_ = false;           // output_engine stashes engine B's line instead of scaling it

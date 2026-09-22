@@ -142,7 +142,17 @@ if(DSPERATE_VULKAN)
                  "${CMAKE_CURRENT_SOURCE_DIR}/gpu/vk/shaders/post.spv"
                  "${CMAKE_CURRENT_SOURCE_DIR}/gpu/vk/shaders/span.spv"
                  "${CMAKE_CURRENT_SOURCE_DIR}/gpu/vk/shaders/vis.spv"
-                 "${CMAKE_CURRENT_SOURCE_DIR}/gpu/vk/shaders/raster_vis.spv")
+                 "${CMAKE_CURRENT_SOURCE_DIR}/gpu/vk/shaders/raster_vis.spv"
+                 "${CMAKE_CURRENT_SOURCE_DIR}/gpu/vk/shaders/tri_vert.spv"
+                 "${CMAKE_CURRENT_SOURCE_DIR}/gpu/vk/shaders/tri_opaque_frag.spv"
+                 "${CMAKE_CURRENT_SOURCE_DIR}/gpu/vk/shaders/tri_tail_frag.spv"
+                 "${CMAKE_CURRENT_SOURCE_DIR}/gpu/vk/shaders/downsample.spv"
+                 "${CMAKE_CURRENT_SOURCE_DIR}/gpu/vk/shaders/tri_flat_frag.spv"
+                 "${CMAKE_CURRENT_SOURCE_DIR}/gpu/vk/shaders/tri_mask_frag.spv"
+                 "${CMAKE_CURRENT_SOURCE_DIR}/gpu/vk/shaders/tri_pre_frag.spv"
+                 "${CMAKE_CURRENT_SOURCE_DIR}/gpu/vk/shaders/expand.spv"
+                 "${CMAKE_CURRENT_SOURCE_DIR}/gpu/vk/shaders/tri_opaque_aa_frag.spv"
+                 "${CMAKE_CURRENT_SOURCE_DIR}/gpu/vk/shaders/tri_tail_aa_frag.spv")
     target_include_directories(dsperate_core PRIVATE ${DSPERATE_VULKAN_INCLUDE})
     target_compile_definitions(dsperate_core PUBLIC DSPERATE_VULKAN=1)
     # No link against libvulkan on purpose: vk_device.cpp dlopens it.

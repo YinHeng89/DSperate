@@ -71,10 +71,21 @@ void TextureCache::clear() { entries_.clear(); bytes_ = 0; }
 
 const u32* TextureCache::lookup(const VramMap& vm, u32 fmt, u32 base, u32 width, u32 height, u32 texpal, u32 alpha0) {
   if (!enabled_ || fmt == 0) return nullptr;
+  return find_or_decode(vm, fmt, base, width, height, texpal, alpha0).texels.data();
+}
+
+TextureCache::Ref TextureCache::lookup_ref(const VramMap& vm, u32 fmt, u32 base, u32 width, u32 height, u32 texpal, u32 alpha0) {
+  if (!enabled_ || fmt == 0) return {};
+  const Entry& e = find_or_decode(vm, fmt, base, width, height, texpal, alpha0);
+  return { e.texels.data(), static_cast<u32>(e.texels.size()), e.id, e.version, e.transparent };
+}
+
+TextureCache::Entry& TextureCache::find_or_decode(const VramMap& vm, u32 fmt, u32 base, u32 width, u32 height, u32 texpal, u32 alpha0) {
   const u64 k = key(fmt, base, width, height, texpal, alpha0);
   auto it = entries_.find(k);
   if (it == entries_.end()) {
     Entry e; e.fmt = fmt; e.base = base; e.width = width; e.height = height; e.texpal = texpal; e.alpha0 = alpha0;
+    e.id = next_id_++;
     it = entries_.emplace(k, std::move(e)).first;
     decode(vm, it->second);
     snapshot(vm, it->second);
@@ -93,7 +104,7 @@ const u32* TextureCache::lookup(const VramMap& vm, u32 fmt, u32 base, u32 width,
     it->second.validated = frame_;
   }
   it->second.used = frame_;
-  return it->second.texels.data();
+  return it->second;
 }
 
 void TextureCache::snapshot(const VramMap& vm, Entry& e) {
@@ -139,6 +150,7 @@ bool TextureCache::unchanged(const VramMap& vm, Entry& e) {
 // NEON build, which samples the cache, and the reference build, which calls
 // the sampler, is what checks them against each other).
 void TextureCache::decode(const VramMap& vm, Entry& e) {
+  ++e.version;
   const VramView& tv = vm.texture; const VramView& pv = vm.texpal;
   const u32 w = e.width, h = e.height, n = w * h;
   e.texels.resize(n);
@@ -223,6 +235,13 @@ void TextureCache::decode(const VramMap& vm, Entry& e) {
     src(base, n * 2, false);
     break;
   }
+  // Whether any texel is fully transparent -- once per decode, so the GPU
+  // raster can treat a texture that MAY carry alpha 0 (its format allows it)
+  // but does not as the opaque texture it is: the depth prepass shades only
+  // the polygons this is true for.
+  bool transparent = false;
+  for (u32 i = 0; i < n && !transparent; ++i) transparent = ((out[i] >> 16) & 0x1Fu) == 0u;
+  e.transparent = transparent;
 }
 
 } // namespace ds::gpu

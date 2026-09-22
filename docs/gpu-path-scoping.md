@@ -166,9 +166,10 @@ flag, B = fog flag) plus depth.
 
 What it does that Mali punishes, and the Vulkan shape that avoids it:
 - `gl_FragDepth` for W-buffered polygons kills early-Z. Compute the DS depth
-  in the VERTEX shader for both modes (W-buffer depth is linear in 1/w, so
-  a perspective-correct interpolation of w through `gl_Position.w` gives it)
-  and keep fixed-function depth.
+  in the VERTEX shader for both modes and keep fixed-function depth. The
+  W-buffer value is NOT 1 / vt.w: the DS compares w normalised per polygon
+  to its own 16-bit range (`gpu3d.cpp` wshifted, carried in vt.z), so it is
+  `1 / vt.z` with a GREATER test -- see "W-buffer depth" below.
 - One draw call per translucent polygon with stencil state churn. Keep
   the id rule in the stencil but bake it into the pipeline state and draw
   runs of same-state polygons; `VK_EXT_rasterization_order_attachment_access`
@@ -219,7 +220,7 @@ write-combine + flush) 0.2, record + submit 0.13-0.17. GPU time per panel
 frame is the emulation thread with the scaler already off it.
 
 Checked by eye on the device (grim): dual window, single window, rotation
-90 on both panels, the PiP inset with `--pip-alpha 128` (translucent), the
+90 on both panels, the PiP inset (its alpha blend still to be checked with `--pip-alpha 0.5`; 128 clamps to opaque), the
 FPS overlay. Left for later: the pause menu and notices take the DS-space
 path on this tier (`canvas_capable()` is false, as on the SDL_Renderer
 tier), so they come out at DS resolution -- a panel-resolution overlay
@@ -269,3 +270,813 @@ on `speed-first` contradicted it: with present on and the raster off, two runs
 of the same binary on Golden Sun read p99 19.04 / max 25.3 and p99 41.58 /
 max 74.1, the same bimodality, while the present-off arm was metronomic
 (max 26.8 and 27.1). See the speed-first scoping doc, SS3.33.
+
+## P2a — the compute raster transplanted onto main: LANDED (`--gpu-raster`, opt-in)
+
+The gpu-raster branch's hooks (`gpu_supported`, `gpu_dispatch`, the seam
+after the texcache resolve, `FrameRef::gpu`, the A/B harness `--gpu-ab`,
+the `video.gpu_raster` knob which still implies `emu.timing_oc`) applied
+onto main by three-way merge; three conflicts in `Renderer3D::render`, all
+the branch's supersets of main's profiling lines. Gates: scene hashes of
+etody and mlbis (300 frames) identical to main with the knobs off; host
+A/B identical; device A/B Golden Sun 340/340 identical, Etrian Odyssey 14
+of 388 frames differ by 26 pixels (the branch's known seam residual).
+GPU times on the device in A/B mode (CPU drawing beside it): etody 4.4 ms,
+gsdd 10.5. Not yet changed: the upload still runs on the emulation thread
+(P2b moves it), and the branch's deferred-composite knob came along
+(`video.gpu_defer`, measured worthless there; left off).
+
+## P2b — the GPU job thread: LANDED, and the compute raster's verdict at 1x
+
+`Renderer3D` now hands a GPU frame to its own thread (`gpu_thread_main`):
+the polygon conversion, the upload and the submit run there, and a frame
+the upload refuses is drawn by the CPU raster on that thread into `out_[]`
+(`FrameRef::job`; `frame_ref()` waits for the decision, `sync_all()` joins
+the job). `DS_GPU_THREAD=0` keeps the old inline path. Frame hashes of the
+threaded and inline paths are identical (etody, mlbis, 600 frames, host).
+The core and the frontend now share one Vulkan context
+(`vk::Device::shared`), which P2c/P3 need to bind the raster's layer from
+the present stage.
+
+**The gate the plan set for P2 -- "emulation median not worse than software
++ untimed geometry" -- FAILS, and not because of the upload.** Device, SDL
+dual window, GPU present on in every arm, work median (emulation + present):
+
+| scene | software + timing_oc | compute raster, job thread | inline | compositor's fence wait |
+| --- | --- | --- | --- | --- |
+| NSMB | 11.0 | 11.1-11.2 | 11.6 | 0.11 ms |
+| Spirit Tracks | 15.8-16.0 | 16.6-17.2 | 17.1 | 1.2-2.3 ms |
+| Golden Sun | 16.8 | 22.7-23.4 | 23.0-23.7 | 6.5-8.0 ms |
+| Etrian Odyssey | 6.8-6.9 | 14.7-14.9 | 14.7-14.8 | 5.3-6.0 ms |
+
+The thread saves its 0.5 ms on NSMB and nothing elsewhere: the term is the
+compositor waiting for the GPU at line 0. The raster dispatches at line 215
+and the display asks for line 0 about 3 ms later; a compute frame of 3-7 ms
+cannot be there, and on Golden Sun (engine A per line, capture every frame)
+the wait lands squarely on the emulation thread. The deferred composite
+would hide it but is refused exactly where it is needed (capture). So on
+this device the compute raster is not a frame-time path at 1x either; it
+stays as the **exact GPU reference, opt-in** (`--gpu-raster`), and the
+freed cores do not pay for its latency.
+
+**Consequence for the plan.** The graphics-pipeline renderer of P0.3 draws
+these scenes in 0.5-2 ms at 1x (fans + texel), which fits the window with
+room for its real shading. It therefore becomes the GPU 3D path at 1x as
+well as at hi-res (inexact coverage, allowed by the user's decision), fed
+through the same seam and `FrameRef` the compute raster uses, so P3 lands
+first at S=1 against the same A/B and frame-time gates, and the composite
+work (P2c) follows for S>=2.
+
+## P3 at 1x — the triangle path: LANDED (default GPU raster; `DS_VK_MODE=compute` for the old one)
+
+`vk_raster.cpp` grew a second mode: polygons drawn as fans through the
+hardware rasteriser (`shaders/tri.vert`, `tri_opaque.frag`, `tri_tail.frag`,
+`tri_frag_common.glsl` over `ds_shade.glsl`), one render pass with three
+R32_UINT colour attachments (the layer record, the attribute plane, the DS
+depth plane) and a D32 depth buffer, then copies into the compute path's
+`out[]`/`depth`/`attr` buffers -- so the final pass (fog, edge marking), the
+output contract, `FrameRef`, the A/B harness and the host see exactly what
+the compute passes gave them. The opaque prefix is one draw with the
+hardware depth test in submission order (LESS on z, or GREATER on 1 / the
+normalised w for W-buffer frames, chosen by `GpuFrame::flags`); the translucent tail is drawn
+in runs by depth-write bit with the DS blend and the equal-id rule in the
+fragment stage, reading the attachments it writes -- ordered per pixel by
+`VK_EXT_rasterization_order_attachment_access` on libmali, or behind a
+per-polygon barrier on drivers without it (RADV). Not yet: shadow masks and
+shadow polygons (skipped), edge flags (edge marking marks nothing), the
+mode-1 back-facing depth rule, anti-aliasing (gated as before).
+
+Fill and sampling rules that had to be learnt from the picture (user's eye on
+the Etrian menu, `tools/compare_frames.py` and a thresholded red overlay of
+the differing pixels), with the count of pixels differing from the software
+raster over Etrian's replay (700 frames, 488 rasterised):
+- vertices at the pixel centre, (sx + 0.5, sy + 0.5): that is where the DS
+  evaluates a pixel's attributes (its integer position), so texture rows and
+  columns land where the CPU puts them; the right-side vertices a hair
+  (0.001 px) further so the inclusive last column of the span is covered
+  (a whole-pixel push covers it too but stretches the attributes: shifted
+  glyphs, wrong corners);
+- texture coordinates TRUNCATE (12.4 >> 4, as the DS) with a 0.01-unit bias
+  before the floor; colours ROUND. The menu panels stretch ONE texel column
+  across 102 pixels (s 22.0 -> 23.0) and step t by exactly 16.0 a row, so
+  rounding flipped columns onto the edge texel early (the "vertical cut")
+  and float error floored 15.9999 onto the row above (the one-row shift in
+  the text);
+- zero-width / zero-height polygons get a pixel of extent (a line to the DS).
+Measured along the way: round everything 5.0 M pixels but the cut; floor
+everything 7.0 M; whole-pixel push 6.1 M; final 5.0 M with 249 of 488
+frames differing and the menu clean. `DS_GPU_DUMP_AT=x,y` prints the
+polygons over a pixel, which is how the stretched quad was found.
+
+Device (SDL, dual window, GPU present on, work median, both orders):
+
+| scene | software + timing_oc | triangle path | over budget |
+| --- | --- | --- | --- |
+| Golden Sun | 16.8 | **15.5-15.6** | 52 % -> 28 % |
+| Spirit Tracks | 15.9 | **15.7** | 17-23 % -> 10-12 % |
+| NSMB | 10.9-11.0 | 11.0-11.2 | 0.2 % -> 0.1 % |
+| Etrian Odyssey | 6.7 | 6.6-6.7 | 2.3 % -> 2.1 % |
+
+GPU time per frame (device, A/B mode): Golden Sun 9.7 ms raster + 0.9 final
+pass -- higher than the P0.3 probe's 2 ms because this is the full shading
+with the real tail, the three attachments and the copies, and the A/B run
+draws on the CPU beside it; the compositor's fence wait is 0.1-0.6 ms
+against the compute raster's 6.5-8. The first GPU 3D path that is never
+slower than the software one here, and it idles the three band workers.
+
+## P2c + P3 hi-res — the GPU composite and `--internal-res N`: LANDED (opt-in)
+
+- Core: `Engine2D::set_layer_export` / `export_planes` -- a 3D line takes the
+  full select and copies `resolve16_full`'s top, second, ids, kind, alpha
+  and window into 256x192 planes the frontend owns; `Gpu::LayerExport` adds
+  the per-line BLDCNT word and MASTER_BRIGHT with bit 31 = exported. The
+  CPU composite still runs, so `fb_`, capture and states are untouched.
+- Raster: `DS_VK_SCALE` / `video.internal_res` scales the triangle path's
+  coordinates on upload; `out[]` is the hi-res layer and `downsample.comp`
+  makes the native plane the CPU reads (top-left subpixel; at S=2 the A/B
+  against the software raster matches S=1 to within a few pixels).
+  `FrameRef` carries the frame's hi-res buffer; `Gpu::frame_hires` hands it
+  to the frontend, which is what keeps the composite on the frame the
+  display lines used rather than the one the raster submitted at line 215.
+- Frontend: `shaders/composite.comp` (kern::composite_line with the hi-res
+  3D pixel substituted, then master brightness and the 6->8 expansion) runs
+  in the present stage's command buffer before `present.comp`, which samples
+  screen 0 from the composited buffer at S x. Verified by reading the tier's
+  own panel buffer back at frame 400 (`DS_GPU_COMP_DUMP`): the Etrian logo at
+  1024x768 composited at 2x. (Screenshots timed with `grim` caught the
+  intro's fades and showed black; the readback is the tool.)
+
+Known limits: an OSD label or the save flash drawn into screen 0's copy does
+not show on 3D lines (the composite takes the planes) until the overlays get
+their own plane; the composite at S>1 chooses the layer beneath by the
+native pixel's kind, so a hi-res 3D silhouette over 2D is native-res-exact
+only at the pixel level.
+
+Cost, the thing to fix next (device, headless, `DS_VK_TIMING=1`, GPU ms):
+
+| gsdd | full | flat fragment | nothing drawn | nothing drawn, no copies |
+| --- | --- | --- | --- | --- |
+| 1x | 6.6 | 4.3 | 2.9 | **0.9** |
+| 2x | 8.8 | 5.7 | | |
+
+| etody 1x | full 2.2 | flat 2.2 | nothing drawn 2.0 |
+
+The three image-to-buffer copies of the attachments cost ~1.9 ms a frame at
+1x (a tiled-to-linear conversion the driver does slowly), which is most of
+Etrian's whole pass and a third of Golden Sun's; the real fragment stage is
+2.2 ms on Golden Sun over the flat one, and the tail is free. Next: render
+into LINEAR images aliased on the buffers' memory (no copies), then the
+fragment stage. Timestamps inside the render pass read zero on this tiler,
+so attribution is by leaving parts out (`DS_VK_TRI_NOTAIL`, `_NOOPAQUE`,
+`_NOCOPY`, `DS_VK_TRI_FLAT`).
+
+## Aliased attachments, the overlay plane, and the 2x gate (2026-09-18)
+
+**No more copies.** The triangle path's colour, attribute and depth-plane
+attachments are LINEAR images bound to the memory of `out[i]`, `attr` and
+`depth` (`alias_image` in `tri_setup`; libmali renders R32_UINT linear, and
+asks 198208 bytes for a 196608-byte plane, so the buffers carry 16 KB of
+slack). Where the driver refuses, the copies remain (`DS_VK_TRI_COPY=1`
+forces them). Headless GPU ms per frame: Etrian 2.2 -> 1.9 at 1x, 4.2 at 2x;
+Golden Sun 6.6 -> 7.7 (noise across runs; its pass is fragment work). Same
+A/B residuals to the pixel.
+
+**The overlay plane.** `GpuPresent::overlay()` is the GPU tier's canvas
+(`Display::canvas`/`canvas_capable`): a host-cached plane per slot in the
+logical frame, cleared where the frame before last drew, blended last by
+`present.comp`. The OSD, toasts, the pause menu and the loader notice come
+out at panel resolution again on this tier, over the composited 3D screen.
+Two traps that cost a session: the overlays were sized at open, when the
+window is still 512x384, and `reimport()` after the fullscreen resize kept
+them -- a GPU read fault (dmesg `JOB_READ_FAULT`, `vkWaitForFences`
+returning DEVICE_LOST after 25 frames) that showed as a black picture with
+a flickering label; and `note_canvas_draw_all()` measured the canvas by the
+scanline path's frame size, zero here, so nothing was blended at all. The
+unscaled canvas path now notes only the label rectangles.
+
+**The gate at 1x and 2x** (device, dual window, GPU present, work median,
+both orders; `sw-oc` = software raster + untimed geometry):
+
+| scene | sw-oc | triangle 1x | triangle 2x |
+| --- | --- | --- | --- |
+| Golden Sun | 16.9 | **15.1-15.6** | 20.8 |
+| Spirit Tracks | 16.3-16.5 | 16.5-16.7 | 16.8 |
+| NSMB | 11.3-11.4 | 11.2-11.7 | 11.5 |
+| Etrian Odyssey | 7.6-7.7 | 7.6 | 14.1 |
+
+At 1x: never worse, Golden Sun 1.5 ms better, the three band-worker cores
+idle. At 2x NSMB is free and Etrian and Golden Sun pay 4-6.5 ms, all of it
+the compositor's fence wait at line 0: a 2x pass of 4-10 ms plus the 2x
+composite and present on the shared GPU cannot land in the ~3 ms between the
+dispatch at line 215 and the first display line. So `video.internal_res`
+stays a per-game choice for now; the plan's auto cap (drop to 1x after N
+over-budget fence waits) is the follow-up, and the fragment stage is the
+remaining GPU lever (flat shading measured 2.2 ms cheaper on Golden Sun).
+
+## Shadow volumes on the triangle path (2026-09-18)
+
+The depth attachment is D24_UNORM_S8 (or D32_S8) where the driver has it;
+a run of mask polygons clears the stencil and draws with no colour and no
+depth write, setting the stencil where its depth test FAILS (the volume's
+interior); a run of shadow polygons draws with the stencil test EQUAL and
+the shadow's own id rule in `tri_tail.frag` (against the destination's
+translucent id when it has one, else its opaque id). The DS clears its
+stencil per scanline when a run begins; whole-frame is the approximation.
+Host A/B, stencil off -> on: Spirit Tracks 4.78 M -> 4.54 M differing
+pixels over 300 frames, Dragon Ball 12006 -> 11905 (the rest is the usual
+rounding residual). `DS_VK_TRI_NOSTENCIL=1` measures without.
+
+## W-buffer depth and the swapped screen (2026-09-18)
+
+Spirit Tracks on the panel showed the hills in front of the train and the
+shadows as spikes. Two bugs, both found with `--gpu-ab-dump` on the host
+(`tools/compare_frames.py --png`) and `DS_GPU_DUMP_AT=x,y`:
+
+1. **The W-buffer depth was 1 / vt.w.** vt.w is the interpolation w; the DS
+   compares `wshifted` (gpu3d.cpp:1292), w normalised per polygon to its own
+   16-bit range, which travels in vt.z. Polygons of a different w size do
+   not share a scale, so 1 / vt.w ranked the hills (w ~5500, z = 16 w) in
+   front of the train (w ~37000, z = w). Now `gl_Position.z = w / vt.z`
+   (perspective-correct, exactly the DS's hyperbolic interpolation of W),
+   GREATER, cleared to 1 / clear_depth, and the depth format prefers
+   D32_SFLOAT_S8 (24 fixed bits of 1 / 40000 resolve ~100 DS units; the
+   shadow volumes sit within a few hundred of the ground). Frame 399 of
+   st-intro: 32851 -> 12559 differing pixels, the rest texel rounding.
+2. **The GPU composite was one frame ahead and always on screen 0.**
+   `Gpu::begin_frame` runs at line 0 BEFORE run_frame returns, so the
+   frontend read the coming frame's 3D layer against the finished frame's
+   planes; and Spirit Tracks flips POWCNT1 bit 15 every frame (30 Hz
+   alternation through display capture), so engine A's layer belongs to a
+   different screen each frame. Both panels showed the same scene,
+   alternating. `frame_hires` now returns the layer latched at begin_frame
+   plus engine A's screen; `GpuPresent::present` composites that screen
+   (`view.w` in present.comp names it, composite.comp reads that screen's
+   fb). Verified by `DS_GPU_COMP_DUMP` (now per display and presented
+   frame, 400-403): four consecutive frames, both panels steady.
+
+## Edge marking and the facing rule on the triangle path (2026-09-18)
+
+- **Edge marking** ran (the final pass is shared with the compute path) but
+  never marked: it tests bits 0-3 of the attribute record, the span
+  raster's edge flags, and the triangle shaders wrote none. Every opaque
+  pixel now carries 0xF and the neighbour id + depth test alone decides,
+  as melonDS's GL renderer does. Spirit Tracks' character outlines appear
+  (frame 400 of st-intro, before/after crops in the session record).
+  Scenes that use it: st (every frame, with fog); gsdd has fog only;
+  etody/mlbis/sm64/meteos neither (new "with edge marking / with fog"
+  counters in the headless stats).
+- **Depth mode 1** (`Renderer3D::depth_pass`): a front-facing polygon takes
+  an opaque back-facing pixel at EQUAL depth. Without it the pixel column
+  where a side face and a front face share a vertical edge went to
+  whichever was drawn first (a dark 1 px line right of the train's wheel,
+  x=206 rows 45-76 of frame 399). The opaque prefix is now two instanced
+  draws over the same range: back faces with LESS, then front faces with
+  LESS_OR_EQUAL (GREATER / GREATER_OR_EQUAL in W-buffer mode); tri.vert
+  collapses the polygons of the other facing from `GpuFrame::flags`
+  (DS_FF_FACE_BACK/FRONT pushed between the draws). Front-over-front at
+  equal depth now goes to the later polygon where the DS keeps the earlier
+  (same surface in practice). Device cost: none measurable (st 1x 15.1 ms,
+  gsdd 15.3). Equal-depth mode (attr bit 14, +-0x200 tolerance) is still
+  LESS.
+- `DS_VK_TRI_IDCOL=1` colours every opaque pixel by polygon index (r = i &
+  63, g = i >> 6, b = i >> 12) so an A/B dump names the owner of a pixel;
+  with `DS_GPU_DUMP_AT=x,y` that is the whole diagnosis loop.
+
+## GPU-side stalls (2026-09-18, OPEN)
+
+Single frames of 270-976 ms at random points (about one per 25 s at 1x,
+three per 25 s at 2x on st). The new stall report (line waits over 50 ms)
+shows the job thread woke within 0.1 ms and uploaded in 1-2 ms every
+time: the fence itself took the whole stall, i.e. the GPU frame completed
+late. No kernel messages, no page-reclaim counters moving, compute mode
+not yet caught in the act. Suspects: kbase's completion workqueue starved
+by the process's SCHED_RR threads until RT throttling (950 ms / 1 s -- the
+magnitude fits), tiler-heap regrowth through GPU page faults (fits "more
+at 2x").
+
+Later the same day: with the GPU devfreq governor set to `performance`
+(800 MHz) the stall came on EVERY run at the SAME frame (st 2x: nds frame
+986, three runs; gsdd 1x: frame 271) -- and frame 986 holds FIVE polygons
+(the sky screen), so the GPU was not slow on our work, its completion was
+held. Then, with a rebuilt binary carrying the stall-triggered panel dump,
+the same command did not stall in two 1500-frame runs; nor did four
+ondemand runs, nor two with emu.realtime=off. Panels around frame 986
+(both displays, ten frames) are consistent: no edge-marking or composite
+transition. Tools left in place: `DS_GPU_COMP_DUMP=<f>
+DS_GPU_COMP_DUMP_ON_STALL=1 [DS_GPU_COMP_DUMP_COUNT=n]` dumps both panels
+for the frames presented after each stall report; `DS_GPU_DUMP_FRAME=N`
+prints every polygon of NDS frame N; `DS_GPU_COMP_DUMP_FROM/COUNT` set a
+fixed window. Verdict so far: a driver-side hold of GPU job completion,
+timing-dependent, not content-dependent and not the frame limiter (the
+wait is inside the raster's fence at line 0).
+
+### Stall bisect from power-on (2026-09-18, later)
+
+The intro from power-on (`--dual-window --gpu-present --gpu-raster
+--internal-res 2 --frames 1800`, no load-state) reproduces the stall in
+most runs, 1-4 per run, at 1x as well as 2x. Bisect by environment switch,
+one or two 1800-frame runs each (a probabilistic stall, so single clean
+runs prove little):
+
+| configuration | runs | stalls |
+| --- | --- | --- |
+| baseline (stencil shadows) | 6 | 1, 4, 0, 2, 1, 1 |
+| DS_VK_TRI_NOTAIL (no translucent tail) | 1 | 0 |
+| DS_VK_TRI_NOSTENCIL / NOSHADOWDRAW (no masks, no shadows) | 3 | 0 |
+| DS_VK_MODE=compute | 1 | 0 |
+| D24_S8 instead of D32_S8 | 4 | 0, 1, 0, 0 |
+| DS_VK_TRI_NOROAA (per-polygon barriers) | 1 | 3 |
+| shadow PLANE instead of stencil (below) | 4 | 3, 1, 0, 0 |
+| masks only / shadows only / masks through the tail pipeline | 2 each | 0+0 / 2+1 / 0+3 |
+
+The stencil was rebuilt as a colour plane of run ids (tri_mask.frag writes
+the run id where the DS depth test fails, reading the depth and attribute
+records as input attachments; tri_tail.frag discards a shadow fragment
+whose plane id differs; no stencil attachment, no in-pass clears; host A/B
+identical to the stencil version). The stall survived it. And a per-frame
+census of shadow-mode polygons (`DS_GPU_DUMP_SHADOWS=1`) shows the first
+shadow polygon of the intro at frame 339, while stalls were reported at
+frames 240 and 246 -- so the shadows are not the trigger either; the clean
+runs above were luck or a time-varying condition. What is established: the
+job thread submits within 1 ms, the fence completes 0.2-0.95 s late, no
+kernel message, no memory-reclaim activity, both governors, any depth
+format, with and without ordered attachment access. Single window (no
+`--dual-window`) at 2x: 4 runs, stalls 0, 0, 2, 2 -- and the two stalling
+runs stalled at the SAME frames (308, then ~1120): a run is either in a
+stalling state from the start or it is not, and in that state the stalls
+land on the same frames. Not the dual-window sync. Next step is a Mali
+kernel trace (kbase ftrace events / debugfs instrumentation) around a
+stall to see whether the job is queued, soft-stopped or replayed, and a
+look at what differs per process start (GPU context, memory placement).
+
+### RESOLVED: the stall is the Mali fault worker starved on CPU0 (2026-09-18)
+
+The stall probe (`DS_GPU_STALL_PROBE=1`: a fence not signalled in 100 ms
+dumps this process's kbase context from debugfs, then keeps waiting) caught
+three stalls in one run. Mid-stall: a tiler/compute atom (core req 0x4e)
+running for hundreds of milliseconds, the frame's fragment atom queued
+behind it with no start time, a JIT_FREE soft job queued, JIT memory in use
+(the tiler heap, ~112 KB, `mem_jit_used`). The Mali JM driver grows the
+tiler heap on demand through GPU page faults; the MMU interrupt (irq 82,
+`/proc/interrupts`) and the two other GPU interrupts are serviced on CPU0
+only, and the fault is completed by a kernel worker on that CPU. Our
+SCHED_RR threads (the whole process is RR 5) saturate whichever core they
+land on; when that is CPU0 the worker runs only when the RT bandwidth cap
+opens (950 ms of every second to RT) -- the 0.2-0.95 s hold, the per-run
+bimodality (where the RT threads landed at start), and the same frames
+within a stalling run (where the heap grows). Content only sets the fault
+points; the sky frame stalled because its heap was regrown after a trim.
+
+| configuration | runs | stalls |
+| --- | --- | --- |
+| baseline, RR 5, all CPUs | ~20 | ~12 runs, 0.2-0.95 s |
+| serialize_jobs=full (kbase) | 4 | 2 runs |
+| emu.realtime=off | 6 | 0 (max frame 51 ms; costs 1.5-2 ms median) |
+| RR 5, `taskset -c 1-3` | 4 | 0 (max 56 ms; median unchanged, 15.1 vs 15.2) |
+| RR 5, automatic avoidance (below), dual window | 4 | 0, 0, 0, one 85 ms |
+
+Landed: `ds::gpu_irq_cpus()` reads the CPUs that service any gpu/mali
+interrupt from /proc/interrupts (effective affinity), `ds::avoid_cpus()`
+drops them from the process affinity when at least two CPUs remain and
+every dropped CPU has an equal-or-greater `cpu_capacity` (else max
+frequency) among the rest -- a big.LITTLE device keeps its big cores.
+`emu.gpu_irq_avoid` (default on) applies it at start-up when real-time
+scheduling took and `video.gpu_raster` is on; the present stage alone is a
+compute dispatch with no tiler, and its software raster wants every core.
+`fully_backed_gpf_memory` (the kbase module parameter that would remove the
+faults) is read-only on ROCKNIX. The stencil-vs-shadow-plane bisect above
+was chasing noise; the shadow plane stays because it is simpler.
+
+### Real-time on/off and the CPU governor on the GPU path (2026-09-18)
+
+Device, dual window, 1x triangle path, quantum 0, work ms; two passes each
+(second pass = clean: the first real-time-off pass of gsdd and st ran
+without the default config's cpu_tuning = overclock, vsync and limiter).
+"RT" = SCHED_RR 5 with emu.gpu_irq_avoid; "off" = emu.realtime = off, where
+the pacer's ondemand handling (busy wait under a polling governor) is the
+only thing keeping the clock up.
+
+| governor | scene | RT median / p90 / p99 | off median / p90 / p99 |
+| --- | --- | --- | --- |
+| performance | gsdd | 15.3 / 16.8 / 21.2 | 16.8 / 19.7 / 23.8 |
+| performance | st | 15.7 / 18.7 / 21.1 | 16.3 / 18.1 / 21.0 |
+| performance | nsmb | 14.0 / 16.4 / 19.0 | 14.3 / 16.9 / 20.1 |
+| performance | etody | 5.2 / 8.3 / 18.6 | 6.0 / 8.4 / 18.7 |
+| ondemand | gsdd | 15.6 / 17.9 / 22.0 | 16.8 / 19.4 / 24.3 |
+| ondemand | st | 16.0 / 18.9 / 21.5 | 16.9 / 19.8 / 23.9 |
+| ondemand | nsmb | 14.2 / 16.6 / 19.4 | 14.4 / 17.1 / 20.8 |
+| ondemand | etody | 5.4 / 9.0 / 18.7 | 5.4 / 8.8 / 19.2 |
+
+No GPU stall in 32 runs (one 1-frame report in the first RT gsdd... st run,
+under 100 ms). Two answers: (1) ondemand with the pacer's busy wait is
+within 0.2-0.4 ms of performance on every scene under RT -- the lessened
+CPU load of the GPU path does not let the governor clock down on us; (2)
+real-time still buys 0.6-1.5 ms of median and 2-3 ms of p90 on the two
+heavy scenes (gsdd, st) under either governor, and nothing on nsmb/etody.
+So the default stays RR 5 + irq avoid; turning real-time off is a valid
+"no root" fallback that costs about a millisecond and a half where it
+matters.
+
+### Native plane on the CPU at S >= 2: measured, a loss (2026-09-18)
+
+The idea: capture-heavy scenes are the ones with the emulation thread at its
+limit, so take the downsample dispatch (hi-res layer -> native plane for the
+CPU composite and display capture) off the GPU frame they wait for at line
+0 and gather the top-left subpixels on the CPU a line at a time as the
+composite reads them (`Raster::reduce_line`, byte-identical to
+downsample.comp over 402 frames). Device, 2x, dual window, two passes:
+
+| scene | GPU downsample median / p90 / fence | CPU reduce median / p90 / fence |
+| --- | --- | --- |
+| gsdd | 19.7-19.9 / 22.7-23.6 / 5.95 ms | 19.8-20.1 / 22.7-22.9 / 5.81 ms |
+| etody | 5.4-5.5 / 19.3 / 1.96 | 5.6 / 19.1 / 1.94 |
+| st | 17.2-17.4 / 18.9-19.0 / 0.42-0.52 | 17.8-18.0 / 19.7-20.1 / 0.57-0.58 |
+
+The dispatch was worth ~0.15 ms of GPU time; the gather (256 strided loads
+of host-cached hi-res memory per line) lands on the thread reading the
+line, which on a capturing frame is the emulation thread, and Spirit
+Tracks pays 0.5 ms of median for it. Kept as an opt-in
+(`DS_VK_CPU_DOWNSAMPLE=1`) for a host with CPU to spare; the GPU dispatch
+stays the default. The Golden Sun 2x fence wait of 5.9 ms is the real
+problem and it is raster time, not the passes around it.
+
+## The fragment stage at 2x (2026-09-18): attribution, prepass, sort, and a fog bug
+
+Device, dual window, 2x triangle path, work ms median and the raster's
+fence wait at line 0 (the GPU time the emulation thread waits for):
+
+| variant | gsdd | etody (p90) | st |
+| --- | --- | --- | --- |
+| baseline | 20.0 / 5.9 | 5.4 (19.3) / 2.0 | 17.3 / 0.5 |
+| flat shading (no texel, constant colour) | 16.4 / 1.6 | 5.5 (8.5) / 0.1 | 15.4 / 0.1 |
+| no translucent tail | 16.8 / 3.0 | 5.5 (18.2) / 1.5 | 17.1 / 0.3 |
+| no texel fetch, arithmetic kept | 16.5 / 2.6 | 5.4 (8.9) / 0.1 | 16.0 / 0.1 |
+| texel fetch via uniform texel buffer | 20.1 / 6.2 | 5.4 (19.5) / 2.0 | 17.3 / 0.6 |
+| texel fetch from one address | 19.4 / 5.5 | 5.4 (18.9) / 1.9 | 17.2 / 0.4 |
+| depth prepass, alpha-blind (wrong holes) | 16.3 / 2.6 | 5.4 (8.5) / 0.1 | 16.0 / 0.2 |
+| depth prepass, alpha-tested by format | 22.1 / 7.4 | 5.5 (20.5) / 2.2 | 18.5 / 1.5 |
+| exact transparent flag + hybrid prepass | 20.8 / 5.9 | 5.4 (19.0) / 1.8 | 16.6 / 0.15 |
+| opaque prefix sorted near to far | 21.6 / 6.3 | 5.5 (19.1) / 2.0 | 17.4 / 0.6 |
+
+Readings:
+- The texel FETCH is ~3.6 of Golden Sun's 5.9 ms and the arithmetic ~1 ms;
+  the fetch mechanism (SSBO load, texel buffer, one address) barely matters,
+  so it is the NUMBER of fetches: overdraw times fragments.
+- Half of it is the translucent tail (3.0 of 5.9 with the tail off), which
+  is order-dependent: no prepass, no sort, no early-Z can touch it.
+- A depth prepass only pays for polygons whose texture has no transparent
+  texel; an alpha-tested polygon has to fetch in the prepass too, so it
+  costs baseline + 1. The texture cache now scans each decoded texture once
+  (`Ref::transparent`) and the raster flags only those: st had 99 % of its
+  polygons flagged by format and 7 % actually transparent; gsdd 7 % / 7 %;
+  etody 47 % / 47 %. The hybrid prepass (plain polygons prepassed and shaded
+  at EQUAL, alpha-tested ones drawn after with the normal test) is a win
+  on st only; `DS_VK_TRI_PREPASS=1` keeps it opt-in (its inexactness: the
+  equal-depth tie goes to the later polygon).
+- Sorting the prefix near to far did nothing on any scene: Mali does not
+  early-reject behind a shader that discards, and the vertex read-back from
+  write-combined memory cost the job thread ~1 ms. Opt-in `DS_VK_TRI_SORT`.
+- Found on the way, from the user's report of Golden Sun's mist showing
+  hard, dark borders: the tail wrote the DS depth RECORD for every
+  fragment, depth write bit or not, so the final pass fogged a translucent
+  pixel at its own near depth instead of the fogged terrain's behind it.
+  Fixed (tri_tail.frag keeps the record when bit 11 is clear): gsdd A/B
+  7.63 M -> 7.04 M differing pixels over 440 frames, the mist matches.
+
+Where that leaves 2x on the RG DS Plus: gsdd needs ~4 ms it does not have,
+all of it fragments (tail 3, prefix shading 2.3 minus what a prepass wins,
+0.7 fixed). Levers left: a leaner fragment shader (per-polygon constants
+as flat varyings instead of the polys[] load per fragment, fewer input
+attachment reads, variants per blend mode), the translucent tail at a
+lower resolution (inexact, allowed), or the auto cap.
+
+### The translucent tail at native resolution (2026-09-18): built, opt-in
+
+At S >= 2 the frame can run as: pass A (hi-res, the opaque prefix), a
+shrink dispatch (colour, attribute and depth records to 1x planes, top-left
+subpixel; downsample.comp with DS_FF_SHRINK3), pass B (1x, on images
+aliased on those planes: the tail, masks and shadows with tri.vert dividing
+positions by S and tri_tail.frag depth-testing in the shader against the
+depth record, with the mode-1 rule and the equal-depth tolerance; a
+"touched" plane marks what it wrote), an expand dispatch (touched parents
+back into the hi-res planes), then the final pass and the native
+downsample as before. Host A/B of the native plane: unchanged (st 5.409 M
+vs 5.408 M, gsdd 7.038 M vs 7.039 M). Device, 2x, dual window, two passes:
+
+| scene | full-resolution tail median / fence | native tail median / fence |
+| --- | --- | --- |
+| gsdd | 20.8-21.4 / 6.6 | 20.4-20.9 / 5.7 |
+| etody | 5.5 / 2.1 | 5.7 / 3.1 |
+| st | 17.4 / 0.6 | 17.7 / 0.5 |
+| nsmb | 14.6 / 0.16 | 14.3 / 0.11 |
+
+The tail's fragments were a quarter as many, but the shrink and expand
+passes (one read of three hi-res planes, one conditional write of three)
+cost about a millisecond, which is the whole gain on Golden Sun and a loss
+on Etrian, whose tail was cheap. Opt-in (`DS_VK_TRI_NATIVE_TAIL=1`) until
+the passes are cheaper: expand only inside the tail's bounding rows, or
+fold the shrink into pass A's store. The user's next step is a like-for-
+like DraStic comparison (its --benchmark from matching save states) before
+deciding how much further 2x is worth pushing.
+
+## DraStic hi-res 3D beside ours (2026-09-18)
+
+DraStic on the same RG DS Plus, `--benchmark 600` from the user's slot-0
+save states (it loads slot 0 by itself; unthrottled, no screen path, so
+its "Full run time" is CPU per frame with its threaded 3D raster
+overlapping the main thread where it can):
+
+| scene | DraStic hires_3d=1 | DraStic hires_3d=0 | ours 2x (paced work median) | ours 1x |
+| --- | --- | --- | --- | --- |
+| Spirit Tracks intro | 15.4 ms (3D 6.7, 2D 8.8) | 7.1 ms (3D 0.2, 2D 1.3) | 17.3 | 15.0 |
+| Etrian | 13.7 (3D 8.7, 2D 11.0) | 5.6 (3D 2.2, 2D 2.9) | 5.4 | 5.2 |
+| NSMB | ~9.5 (phase 5) | ~7.6 | 14.2 | 13.9 |
+| Golden Sun | 15.3 (3D 2.6, 2D 6.4, geometry 2.4; 22.0 with threaded_3d off, 3D 9.5) | 10.8 (3D 0.1, 2D 2.0) | 20.4 | 15.3 |
+
+Not the same metric (theirs unthrottled CPU, ours a paced wall frame with
+the GPU overlapped), but the shape is clear: DraStic's hi-res mode DOUBLES
+its frame (its "2D" then composites at hi-res too, 1.3 -> 8.8 ms on st),
+while ours costs +2.3 ms on st and nothing on Etrian, where DraStic hi-res
+is 2.5x slower than we are. The cases where DraStic's hi-res still holds
+60 are the ones where it had 8 ms of headroom to spend.
+
+Our own unthrottled headless numbers on the device are NOT comparable and
+are worse than the software raster (st 20.8 vs 16.0, gsdd 26.2 vs 16.4):
+without pacing the emulation thread runs straight into the GPU frame in
+flight (gsdd fence wait 8.1 ms at 1x), where the paced frame hides it. Two
+consequences worth remembering: fast-forward with the GPU raster on is
+slower than the software raster, and the DraStic-style benchmark cannot
+rank the two paths.
+
+### DraStic's threading versus ours (2026-09-18)
+
+TheGammaSqueeze's GammaOS runner (GammaOSDrasticRunner.cpp, read in full)
+patches DraStic in memory: its threaded 3D is a band pipeline -- the frame
+is kicked at scanline 214 of the previous frame, rasteriser threads draw
+interleaved 32-hi-res-line bands and set a bit per band, and the engine-A
+compose waits per band on that mask (sched_yield spin), with the line
+fetch patched to read the in-flight buffer so the original one-frame lag
+goes away; engine B composes on a 2D worker; edge marking is off by
+default; a non-temporal-store cave for the hi-res 2D compose is off by
+default; no affinity or RT policy beyond SCHED_RR 5 inherited by the
+workers. That is our software raster's shape already (band workers kicked
+at line 215, per-line band waits, engine B on the line worker), so there is
+nothing in the threading to adopt.
+
+What differs is the cost per pixel. DS_PROFILE on the device, 1x, our
+software raster: Golden Sun 19 ms of band-worker CPU per frame (bands 0
+and 1 at 9.5 ms each, band 2 idle: the scene fills the top two thirds),
+Spirit Tracks 17 ms. DraStic's whole hi-res (2x) raster is 9.5 ms of CPU
+per frame on Golden Sun (its unthreaded figure), so per pixel it is about
+eight times cheaper than ours -- the price of the exact span rules and the
+per-pixel resolve. A software 2x for us would be ~75 ms of worker time a
+frame. The GPU path is the only 2x route, and on Golden Sun it now sits at
+20.4 ms paced against DraStic's 15.3 unthrottled CPU; DraStic's CPU
+emulation alone is 8.3 ms there against our ~13.
+
+### DraStic live, not benchmarked (2026-09-18, user-verified)
+
+DraStic's on-screen overlay's first number is emulation SPEED (the user
+confirmed audio skips whenever it is under 100 %): on the Golden Sun title
+scene with hires_3d + threaded_3d on ROCKNIX it reads 64.8 % (grim
+screenshot), on the light 2D title card 99.7 %, with the process at ~210 %
+CPU across its threads under the ondemand governor. So live, presenting
+two 1024x768 panels through its SDL NEON scaler and playing audio, DraStic
+hi-res runs the hardest scene at two thirds speed: ~25.7 ms a frame, not
+the 15.3 ms its --benchmark reports (the benchmark skips the screen path).
+Ours on the same scene: 20.4 ms paced at 2x (about 82 % speed), 15.3 at 1x
+(full speed). The earlier reading of the benchmark table as "DraStic 4.5 ms
+ahead at every resolution" was wrong for live play: the CPU-emulation gap
+is real (8.3 vs ~13 ms), but DraStic spends it and more again on its CPU
+present path, and on the heaviest scene our GPU path at 2x is ahead of
+DraStic's hi-res, at 1x comfortably so. On the scenes people cite (NSMB,
+Etrian, Spirit Tracks) both hold 60 at 2x.
+
+## P4: the smooth-3D present filter (2026-09-18)
+
+The user's observation: most of the remaining jaggedness at 4x panel scale
+is the nearest upscale of a 1x frame, and the DS's own anti-aliasing only
+tints the edge pixel. The question was whether a cheap edge pass over the
+polygon bounds with a filter could help without rendering higher. The
+answer is better than a filter, because the detection already exists: the
+triangle path's attribute plane carries, per native pixel and from the DS
+span table, which run of its polygon the pixel is on and the DS's 5-bit
+coverage -- the fraction of the pixel the polygon covers. That places the
+true edge inside the pixel to 1/32, so the present shader can split the
+4x4 panel block of an edge pixel along it: the panel pixels on the
+polygon's side keep its colour, the rest take the outside neighbour's (the
+pixel the fast AA blended with), and the crossing is interpolated towards
+the adjacent pixel of the same edge so a diagonal is a line, not steps.
+
+What it changes and what it does not: polygon silhouettes and the
+boundaries between polygons. Textures, interiors, text drawn as polygons
+and everything the 2D engines draw stay pixel-exact -- which is what the
+user wants (2D and text blocky, 3D edges clean), and what post-process AA
+cannot promise.
+
+Plumbing (`video.smooth3d`, `--smooth-3d`, needs `gpu_raster` + `gpu_present`,
+1x only):
+* span.comp records each run's slope direction in the row flags (bits
+  11/12: the edge runs down-left); tri_opaque.frag adds to the attribute
+  bits 13 (X-major run) and 14 (the covered half is the top: a left run's
+  edge running down-right leaves the polygon above it, a right run's below).
+* The raster draws every frame as an anti-aliased one (the coverage has to
+  exist whether or not the game enabled DISP3DCNT AA). The fast AA's final
+  pass, under DS_FF2_SMOOTH (`GpuFrame::flags2`; `flags` was full), writes
+  the unblended pixel and the edge record to a per-slot edge plane in ONE
+  stage -- no scratch plane, no stage 2 -- and `Raster::output_edge_handle`
+  names it beside the hi-res layer (FrameRef::edge -> Gpu::frame_hires ->
+  Display -> GpuPresent::present).
+* composite.comp packs the record into the composited pixel's alpha byte
+  (unused before): right-run, X-major, top, coverage; 0xFF = no edge (a
+  record never has coverage 31). So present.comp reads nothing it did not
+  read already; the float work and the neighbour reads run on edge pixels
+  only (~1 % of the panel).
+
+Measured on the RG DS Plus, Spirit Tracks intro, dual window, 1x, work ms
+median over 1500 frames: no AA 16.2, fast AA 16.7, smooth 16.5-16.6. The
+first cut cost 17.1 (a separate edge plane read per panel pixel, the
+per-pixel float set-up, and the AA stage 2): packing the record into the
+alpha byte, doing the set-up only on edge pixels and folding the final pass
+into one stage took it under the fast AA it replaces. The present's
+previous-frame fence wait on the second panel: 0.47 ms no AA, 0.64-0.75
+fast AA, 0.71-0.77 smooth.
+
+Verified with DS_GPU_COMP_DUMP panel dumps at frame 400: the difference
+mask against the nearest present is the polygon outlines and nothing else;
+the light square's diagonal and the tender's bar are straight lines where
+nearest has four-pixel steps; Golden Sun's title scene (fog, translucent
+mist) shows no artefacts.
+
+Not done: S >= 2. There the hardware's own edge at S x and the native
+record's reconstruction disagree inside an edge pixel (a 2-pixel
+sawtooth); culling every polygon to its DS span (DS_FF_SPANCULL) would
+make the sub-pixels agree, but tri.vert's grow is 1x code and at 2x it
+scattered the geometry (giant black polygons), so the filter is gated to
+1x in the raster and the present, and the hi-res path keeps its hardware
+edges. Also open: the mask shader's span-cull branch now divides by S
+(it read hi-res coordinates as native rows).
+
+### P4: the LCD grid on the GPU present (2026-09-18)
+
+`video.lcd_grid` now applies on the GPU present tier, as kern::scale_row_grid
+draws it on the scanline tiers: the first panel pixel of a source pixel's
+run and the first panel row of a source line dimmed to f/256 (opaque black
+at full strength), only for runs at least ceil(scale) wide, on every other
+DS pixel at exactly 2x, per axis, with Display::grid_on's per-view rule
+(full strength needs 2x, a dimmed grid applies from 1x). Verified against
+the CPU rule pixel for pixel on the RG DS Plus panel dumps at full and half
+strength (0 mismatches over a 1/35 sample of the panel).
+
+Three shapes were measured, Spirit Tracks 1x dual window, work ms median:
+* arithmetic per pixel (eight integer divides): +6 ms -- Mali emulates
+  integer division; the float form was still +2.5 ms;
+* per-view seam bitmasks built on the CPU each frame (two bit tests a
+  pixel) with integer dimming: +0.9 ms at full strength, +1.6 at half;
+* the same with the dimming as a float multiply after the colour
+  conversion: +0.5 ms at either strength (16.9-17.1 -> 17.4-17.5).
+Attribution probes (view flag off / seams black / no table read) put the
+cost in the shader itself, not the CPU tables: at 1.5 M panel pixels a
+frame every instruction in present.comp is ~40 us on this GPU, which is
+also the reason the smooth filter and any future filter must stay off the
+common per-pixel path. Replacing the base nearest map's integer divides
+with (exact) float division measured a loss (retire 0.77 -> 1.13 ms) and
+was reverted.
+
+P4 status: LCD grid and the smooth-3D edge filter done; bilinear, the box
+filter and chunky remain (chunky cells are still CPU-only).
+
+### Smooth 3D: the layer keeps its AA blend (2026-09-19)
+
+The user saw the picture looking "non-composited" with the filter on. The
+raster's final pass had been skipping the anti-aliasing blend whenever the
+filter was on, so the layer the CPU consumes -- the CPU composite of any
+frame the present stage does not composite, display capture, save states --
+carried hard, unblended edges. Now the edge plane holds the UNBLENDED pixel
+(RGB666 + alpha, 23 bits) beside its record, the final pass blends the layer
+as it always did (stage 2 runs again), and composite.comp substitutes the
+plane's pixel for the layer's at edge pixels. Verified on the device under
+the user's own config with --dual-window: frames the display does not
+composite are now identical with the filter on and off; composited frames
+differ by the outlines only; no measurable cost change.
+
+### Smooth 3D: the edge as a curve (2026-09-19) -- and the shader that never built
+
+The user asked for the reconstruction to use the panel's pixels rather
+than sticking to one straight segment per DS pixel. present.comp fits a
+parabola through the crossings of the previous, current and next row (or
+column, for X-major runs) of the same edge; three collinear crossings give
+the straight edge back exactly, and at a vertex of the silhouette the
+curve bends through the corner across the two neighbouring DS pixels
+instead of stepping. One neighbour missing falls back to the linear
+interpolation towards the other.
+
+TRAP, and the record of 168ec78 is wrong because of it: the edit that
+added the curve cut grid_seam out of the file, glslang rejected the
+shader, and tools/gen_shaders.sh sent the compiler's output (which goes to
+stdout) to /dev/null and did not stop the pipeline, so the device kept
+running the previous SPIR-V. The "curve" crops and the cost figure in that
+commit are the old shader. The script now prints the compiler's log and
+exits non-zero on the first failure. Rebuilt and measured properly, the
+curve differs from the linear form by 91 panel pixels on the Spirit Tracks
+frame -- modest, as the eye said. The kinks that remain are where an edge
+changes from Y-major to X-major around a corner, which the record's kind
+test stops the curve from crossing.
+
+### The capture pass-through (2026-09-19)
+
+Why the user saw the staircase live where the dumps showed the slant:
+Spirit Tracks renders the 3D on one screen and shows the previous frame's
+DISPLAY CAPTURE of it on the other, swapping every frame, so each panel
+alternates between the composited frame (smooth) and the game's own
+DS-resolution bitmap copy of it (stepped), at 30 Hz. The copy carries no
+edge information; no filter can recover it. But the present stage still
+holds the previous frame's composite at panel resolution, and the copy IS
+that picture. So present() keeps a cached copy of each frame's two DS
+screens and, for a screen it is not compositing this frame, compares the
+new DS frame against the screen the previous slot composited (every other
+row, every third pixel, 12/255 a channel: the capture keeps 5 bits of the
+composite's 6); a match shows the previous composite again (binding 5,
+view bit 2), with its smooth records (bit 3). Gated on the filter or S > 1
+(at 1x without the filter the copy is the same picture). Verified: on the
+3D panel, presented frames 400 and 401 are now pixel-identical (before,
+401 was the stepped copy); no change to composited frames; the grid still
+right. Cost: smooth + pass-through 17.75 ms against 16.9 without the
+filter (the copy and the compare are ~0.5 ms of that; a cheaper compare is
+possible). At S >= 2 the same mechanism gives the captured screen the
+hi-res picture. TRAP found on the way: the push constant's scale was only
+sent with a composited frame, so a pass-through frame divided by zero in
+the shader and read off the end of the buffer (JOB_READ_FAULT, device
+lost); the scale now goes with every frame.
+
+### Smooth 3D: coverage at panel resolution (2026-09-19)
+
+With the edge in the right place the user still saw it "basically the
+same": each panel pixel was decided all-or-nothing against the crossing,
+which leaves a one-panel-pixel staircase along the slant. Now each panel
+pixel takes its coverage of the polygon -- its centre's distance past the
+reconstructed crossing in panel pixels, clamped to [0, 1] -- and blends
+the polygon's colour with the outside neighbour's by it: screen-space
+anti-aliasing of the reconstructed edge at the panel's resolution. The DS
+coverage still places the edge; the panel's own pixels shade it. Interiors,
+textures and 2D untouched as before. Spirit Tracks 17.88 ms against 17.75.
+
+## P4 probe: post-process AA at panel resolution, GPU versus NEON (2026-09-19)
+
+The user's next ask was a real screen-space anti-aliasing pass over the
+nearest-scaled 3D layer (FXAA/SMAA family), so that texels and interior
+polygon boundaries stop reading as 4x4 cells, and asked for a probe of the
+GPU against a NEON kernel before building it. tools/aa_probe.c: one FXAA
+3.11-quality kernel (luma edge detect, direction, 12-step end search each
+way, sub-pixel blend) as a compute shader (tools/aa_probe_fxaa.comp; the
+two-pass form with a luma plane, aa_probe_luma.comp + aa_probe_fxaa2.comp)
+and as C built -O3 for the A55, over a synthetic 1024x768 frame with a
+game's edge statistics (60 flat/textured triangles at 1x, nearest 4x;
+5.2 % of pixels touched). RG DS Plus:
+
+  one A55 core, scalar -O3   luma plane 2.8 ms + FXAA 46.7 ms = 49.5 ms per panel
+  (memcpy of one panel 1.1 ms: the floor for any CPU pass)
+  Mali-G52, one pass         10.6 ms per panel (ondemand = performance)
+  Mali-G52, luma plane       2.1 ms per panel  (one read, one write a pixel)
+  Mali-G52, FXAA from plane  8.2 ms per panel  (10.3 for both passes)
+
+Conclusion: a full-panel post-process pass is not affordable on this
+device on either processor. The GPU's floor for ANY pass over a panel is
+~2 ms (3 MB in, 3 MB out), and the 9-tap detect that every pixel pays puts
+FXAA at 8-10 ms a panel, 16-20 ms for the two; a hand-NEON version of the
+walk would gain 2-3x on 47 ms and still be far outside the budget, on
+cores the emulator is already using. What is affordable is work that
+scales with DS pixels, not panel pixels: the current edge filter (edge
+pixels only, ~1 % of the panel), or a per-pixel interior blend done inside
+the present pass that is already reading every panel pixel (bilinear
+between the polygon's own texels, stopped at the edge records) -- a blur
+family, not an AA, but it removes the cells at ~4 taps a 3D pixel.
+
+## The 1x verdict: software raster + GPU present (2026-09-19)
+
+The user asked for GPU raster + GPU present + AA against software raster +
+GPU present + AA at 1x, Spirit Tracks intro, dual window, the device's
+config:
+
+  gpu raster, fast AA      work 15.9 ms median
+  software raster, DS AA   work 15.6 ms median
+
+Equal cost -- and the pictures are not equal. The software raster's DS
+anti-aliasing gives the soft silhouettes the user has been asking for all
+along; the triangle path's fast AA barely changes the edges. The reason:
+the soft part of the DS's AA is the partially covered edge pixels, whose
+centres lie OUTSIDE the triangle, and the hardware rasteriser never
+produces them; the fast path blends only the pixels it did draw. The exact
+AA pass gets them by growing each polygon a pixel and culling to the DS
+span (DS_FF_SPANCULL), at 12.8 ms on Golden Sun.
+
+Tried and reverted: DS_FF_SPANCULL on the fast path (opaque and tail
+shaders culling to the span, tail opaque pixels given edge records).
+Extrapolated hardware depth on the grown pixels undercut coplanar decals
+(the light polygon on the ground: speckles, a chewed corner); taking every
+pixel's depth from the span row through gl_FragDepth did not cure it and
+cost early-Z (raster fence 0.08 -> 1.39 ms, work 17.2). Left as a known
+gap: the triangle path has no cheap DS-exact AA. (DECISION, user: at 1x the
+target is the SOFTWARE raster through the GPU present stage -- exact DS AA,
+the GPU scaler, the grid, the pass-through and the pause-menu fix all
+apply; the GPU raster stays the opt-in route to 2x and the smooth filter.)

@@ -277,6 +277,13 @@ R"(# DSperate settings. Command-line flags override this file. Two files next
                                 # pixel-exact. true / false still read as accurate / off, and the older
                                 # smooth (a polygon's edge drawn where it really falls inside a DS pixel,
                                 # unblended) is still read from a file though the menu no longer offers it
+# gpu_raster = false            # draw 3D on the GPU (Vulkan) where the frame allows it; the software
+                                # raster stays the exact reference and takes the frames the GPU declines
+# internal_res = 1              # with gpu_raster: 3D drawn at 1..4 times the DS's resolution (read at start)
+# smooth3d = false              # with gpu_raster and gpu_present: polygon edges rebuilt at the panel's
+                                # resolution from the DS's own edge coverage, so a 4x upscale shows a
+                                # slanted edge instead of a four-pixel staircase. Textures, interiors
+                                # and everything the 2D engines draw stay pixel-exact
 # disp = auto                   # present through the display engine's hardware scaler (Miyoo A30 and
                                 # other Allwinner boards): auto (wherever /dev/disp answers) | true | false
 # fbdev = auto                  # present straight through /dev/fb0 (the H700 handhelds' mali-only SDL2):

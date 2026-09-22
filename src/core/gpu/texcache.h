@@ -43,6 +43,12 @@ public:
   // Decoded texels (width*height words) for a polygon's texture, decoding or
   // revalidating as needed; nullptr when the cache is disabled.
   const u32* lookup(const VramMap& vm, u32 fmt, u32 base, u32 width, u32 height, u32 texpal, u32 alpha0);
+  // The same, with the entry's identity: `id` names the entry for as long as
+  // it lives and `version` counts its decodes, so a consumer keeping its own
+  // copy (the GPU raster's texel arena) can tell whether the copy it holds is
+  // still this texture. texels is null when the cache is disabled.
+  struct Ref { const u32* texels = nullptr; u32 words = 0; u32 id = 0; u32 version = 0; bool transparent = false; };   // transparent: some texel has alpha 0 (scanned once per decode)
+  Ref lookup_ref(const VramMap& vm, u32 fmt, u32 base, u32 width, u32 height, u32 texpal, u32 alpha0);
   void clear();
   bool enabled() const { return enabled_; }
   u32  decodes_this_frame() const { return decodes_; }
@@ -56,6 +62,8 @@ private:
     std::vector<u8> copy;        // the source ranges, concatenated
     std::vector<u32> texels;
     u64 validated = 0, used = 0; // frames
+    u32 id = 0, version = 0;     // identity and decode count, for Ref
+    bool transparent = false;    // any texel with alpha 0: the exact alpha-test gate (the GPU raster's DS_PF_TEX_ALPHA)
     u32 gen = 0, banks = 0;      // VramMap generation the copy was last known current at, and the banks behind the ranges then
     u64 sig = 0;                 // VramMap::block_signature of the ranges then
   };
@@ -66,7 +74,9 @@ private:
   void stamp(const VramMap& vm, Entry& e) const;   // record the generation, banks and signature of the ranges now
   bool verify_ = false;   // DS_TEXCACHE_VERIFY
 
+  Entry& find_or_decode(const VramMap& vm, u32 fmt, u32 base, u32 width, u32 height, u32 texpal, u32 alpha0);
   std::unordered_map<u64, Entry> entries_;
+  u32 next_id_ = 1;
   size_t bytes_ = 0;
   u64 frame_ = 0;
   u32 gate_hits_ = 0;   // validations settled by the generation gate alone (DS_TEXCACHE_VERIFY report)

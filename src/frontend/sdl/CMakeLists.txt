@@ -44,5 +44,6 @@ if(DSPERATE_VULKAN AND DSPERATE_VULKAN_INCLUDE)
   set_property(SOURCE gpu_present.cpp APPEND PROPERTY COMPILE_DEFINITIONS
                DSPERATE_PRESENT_SHADER_DIR="${CMAKE_CURRENT_SOURCE_DIR}/shaders")
   set_property(SOURCE gpu_present.cpp APPEND PROPERTY OBJECT_DEPENDS
-               "${CMAKE_CURRENT_SOURCE_DIR}/shaders/present.spv")
+               "${CMAKE_CURRENT_SOURCE_DIR}/shaders/present.spv"
+               "${CMAKE_CURRENT_SOURCE_DIR}/shaders/composite.spv")
 endif()

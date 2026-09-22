@@ -203,6 +203,33 @@ int edge_len(Slope s, int side, bool swapped) {
   return ((s.dx + s.increment) >> 18) - (s.dx >> 18);
 }
 
+// Renderer3D::Slope::edge_params, the anti-aliasing half: the coverage of the
+// edge's run on this scanline. X-major edges pack the first pixel's coverage
+// and a per-pixel increment behind bit 31; Y-major edges a single 5-bit
+// coverage. `len` is the raw run length the CPU computed in the same call
+// (before its swapped override to 1); it only matters for the right side.
+int edge_rawlen(Slope s, int side) {
+  if ((side ^ int(s.negative)) != 0) return (s.dx >> 18) - ((s.dx - s.increment) >> 18);
+  return ((s.dx + s.increment) >> 18) - (s.dx >> 18);
+}
+int edge_cov(Slope s, int side, bool swapped, int len) {
+  if (s.xmajor) {
+    int startx = s.dx >> 18;
+    if (s.negative) startx = s.xlen - startx;
+    if (side != 0) startx = startx - len + 1;
+    int startcov = (((startx << 10) + 0x1FF) * s.ylen) / s.xlen;
+    int xcov_incr = (s.ylen << 10) / s.xlen;
+    return int(0x80000000u) | ((startcov & 0x3FF) << 12) | (xcov_incr & 0x3FF);
+  }
+  if (s.increment == 0) return swapped ? 0 : 31;
+  int cov = ((s.dx >> 9) + (s.increment >> 10)) >> 4;
+  if ((cov >> 5) != (s.dx >> 18)) cov = 31;
+  cov &= 0x1F;
+  if (swapped) { if ((side ^ int(s.negative)) != 0) cov = 0x1F - cov; }
+  else         { if ((side ^ int(s.negative)) == 0) cov = 0x1F - cov; }
+  return cov;
+}
+
 // ---- edge chains -----------------------------------------------------------
 
 uint chain_step(uint cur, int dir, uint n) {
@@ -256,6 +283,7 @@ GpuRow compute_row(GpuPoly p, int y) {
   GpuRow o;
   o.poly = 0u;
   o.fl = 0u;
+  o.lcov = 0u; o.rcov = 0u;
   bool isflat = p.ytop == p.ybot;
   // ybot is EXCLUSIVE: a polygon draws [ytop, ybot), and a flat one draws its
   // single line at ytop (render_chunk, seed_active). A row at y == ybot used
@@ -320,9 +348,14 @@ GpuRow compute_row(GpuPoly p, int y) {
   bool l_fill, r_fill;
   Interp istart, iend;
   GpuVert alv, alw, arv, arw;
+  bool aa = (pc.f.dispcnt & 16u) != 0u;
+  int l_cov = 0, r_cov = 0;
+  bool l_neg, r_neg;   // the run's edge runs down-left (x falls as y grows): the smooth filter's covered half
   if (xstart > xend) {
+    l_neg = sr.negative; r_neg = sl.negative;
     alv = vcr; alw = vnr; arv = vcl; arw = vnl;
     istart = sr.ip; iend = sl.ip;
+    if (aa) { l_cov = edge_cov(sr, 1, true, edge_rawlen(sr, 1)); r_cov = edge_cov(sl, 0, true, 0); }
     l_len = edge_len(sr, 1, true);
     r_len = edge_len(sl, 0, true);
     int tmp = xstart; xstart = xend; xend = tmp;
@@ -334,8 +367,10 @@ GpuRow compute_row(GpuPoly p, int y) {
       r_fill = (!sl.negative && sl.xmajor) || (!(sl.negative && sl.xmajor) && r_incr0) || (bottom_fill && sl.xmajor);
     }
   } else {
+    l_neg = sl.negative; r_neg = sr.negative;
     alv = vcl; alw = vnl; arv = vcr; arw = vnr;
     istart = sl.ip; iend = sr.ip;
+    if (aa) { l_cov = edge_cov(sl, 0, false, edge_rawlen(sl, 0)); r_cov = edge_cov(sr, 1, false, edge_rawlen(sr, 1)); }
     l_len = edge_len(sl, 0, false);
     r_len = edge_len(sr, 1, false);
     if (always_fill) { l_fill = true; r_fill = true; }
@@ -354,6 +389,7 @@ GpuRow compute_row(GpuPoly p, int y) {
   int W = 256 * int(pc.f.scale);
   o.xrz = ix.xrecip_z;
   o.rcp = ix.recip;
+  o.lcov = uint(l_cov); o.rcov = uint(r_cov);
   o.xstart = xstart;
   o.xend   = xend;
   o.lim0   = min(min(xstart + l_len, xend + 1), W);
@@ -375,6 +411,7 @@ GpuRow compute_row(GpuPoly p, int y) {
   uint yedge = (y == p.ytop) ? 4u : ((y == p.ybot - 1) ? 8u : 0u);
   o.fl = 1u | (l_fill ? 2u : 0u) | (r_fill ? 4u : 0u) | (wbuf ? 8u : 0u) |
          (ix.linear ? 16u : 0u) | (yedge << 5) |
+         (l_neg ? 2048u : 0u) | (r_neg ? 4096u : 0u) |
          ((p.flags & DS_PF_SHADOW_MASK) != 0u ? 512u : 0u) |
          ((p.flags & DS_PF_SHADOW) != 0u ? 1024u : 0u);
   return o;

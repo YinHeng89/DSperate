@@ -21,6 +21,16 @@ Spirv shader_raster();   // raster pass: one workgroup per tile
 Spirv shader_post();     // final pass: edge marking then fog
 Spirv shader_vis();      // visibility pass: the order-free prefix, one fragment at a time
 Spirv shader_raster_vis();   // raster pass seeded from the visibility pass (needs shaderInt64)
+Spirv shader_tri_vert();     // the triangle path: polygons as fans through the hardware rasteriser
+Spirv shader_tri_opaque();   // ... its opaque-prefix fragment stage
+Spirv shader_tri_tail();     // ... and the ordered translucent tail
+Spirv shader_downsample();
+Spirv shader_expand();
+Spirv shader_tri_opaque_aa(); // the anti-aliasing pass: the prefix on the two-deep pixel stack
+Spirv shader_tri_tail_aa();   // ... and the tail       // the native tail back into the hi-res planes
+Spirv shader_tri_pre();      // the depth prepass: alpha test only (DS_VK_TRI_PREPASS)
+Spirv shader_tri_mask();     // the shadow-mask draw: the run id into the shadow plane where the depth test fails
+Spirv shader_tri_flat();     // attribution: the opaque draw with a constant colour   // the native plane from the hi-res layer (S >= 2)
 
 } // namespace ds::gpu::vk
 

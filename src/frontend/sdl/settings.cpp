@@ -27,6 +27,7 @@ const Choice kIntScale[] = {{"off", "OFF"}, {"under", "UNDER"}, {"over", "OVER"}
 // 3D edges. "true"/"false" are the old boolean and read as accurate/off, and "smooth" is the older sub-pixel
 // mode, still read from a file but no longer offered here -- enhanced supersedes it (aa_mode in main.cpp).
 const Choice kAa[]       = {{"off", "OFF"}, {"accurate", "ACCURATE"}, {"enhanced", "ENHANCED"}};
+const Choice kIntRes[]   = {{"1", "1X"}, {"2", "2X"}, {"3", "3X"}, {"4", "4X"}};
 const Choice kSeam[]     = {{"dark", "DARK"}, {"blend", "BLEND"}, {"blend_linear", "BLEND LINEAR"}};
 // The file's own words on the left. "mean" is the ordinary cell and reads as
 // DEFAULT; the rest are named for what they do rather than how they do it.
@@ -170,6 +171,20 @@ const Setting kVideoSettings[] = {
          "PANEL PIXELS BETWEEN THE TWO SCREENS WHEN THEY ARE STACKED OR SIDE BY SIDE"),
   pick("video.aa", "ANTI-ALIASING", kAa, 3, "off", FlagLive, Dep::None,
        "ACCURATE BLENDS 3D EDGES AS THE HARDWARE DID. ENHANCED REDRAWS THE STEPPED EDGE BETWEEN OBJECTS AS STRAIGHT LINES ON TOP OF THAT"),
+  boolean("video.gpu_raster", "GPU 3D RASTER", "false", FlagDeferred, Dep::None,
+          "RASTERISE 3D ON THE GPU WHERE THE FRAME ALLOWS IT. NEEDS VULKAN"),
+  boolean("video.gpu_defer", "GPU 3D DEFER", "false", FlagDeferred, Dep::None,
+          "SHOW THE GPU 3D LAYER A FRAME LATE SO NOTHING WAITS FOR IT. ADDS A FRAME OF LAG"),
+  pick("video.internal_res", "GPU 3D RESOLUTION", kIntRes, 4, "1", FlagRestart, Dep::GpuRaster,
+       "DRAW 3D AT A MULTIPLE OF THE DS'S RESOLUTION. 2X COSTS MOST OF A FRAME ON HEAVY SCENES"),
+  // The present stage reopens with the display (Host::reopen), like the
+  // scaler effects above it. On by default (ca91e83), as the config says.
+  boolean("video.gpu_present", "GPU PRESENT", "true", FlagDeferred, Dep::None,
+          "SCALE AND LAY OUT THE SCREENS ON THE GPU. NEEDS VULKAN AND A DIRECT-TO-PANEL DISPLAY"),
+  // Live: the raster flips a flag and the present stage reads the edge plane
+  // when it is handed one.
+  boolean("video.smooth3d", "SMOOTH 3D EDGES", "false", FlagLive, Dep::GpuPath,
+          "REBUILD POLYGON EDGES AT PANEL RESOLUTION FROM THE DS'S OWN COVERAGE. 2D STAYS SHARP"),
   boolean("video.fps", "FPS COUNTER", "false", FlagLive, Dep::None,
           "FRAMES PER SECOND IN THE CORNER OF THE SCREEN"),
   boolean("video.fullscreen", "FULLSCREEN", "false", FlagDeferred, Dep::Windowed, nullptr),

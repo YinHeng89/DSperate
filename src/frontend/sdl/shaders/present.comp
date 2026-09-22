@@ -8,12 +8,144 @@
 layout(local_size_x = 16, local_size_y = 8) in;
 layout(binding = 0, rgba8) uniform writeonly image2D dst;
 layout(std430, binding = 1) readonly buffer Src { uint src[]; };   // slot base + screen * 49152 + y * 256 + x, 0xAARRGGBB
+layout(std430, binding = 2) readonly buffer Comp { uint comp[]; };  // this frame's composited screen at S x (view bit 0); b.w bits 24-30 carry S every frame
+layout(std430, binding = 5) readonly buffer PComp { uint pcomp[]; };   // the PREVIOUS frame's (view bit 2): a screen showing the game's own capture of what that composite drew takes it again, at panel resolution
+bool g_prev = false;
+layout(std430, binding = 3) readonly buffer Over { uint over[]; };  // the frontend's overlay (OSD, menu) in the logical frame, 0xAARRGGBB; b.z bit 8 says it has content
+layout(std430, binding = 4) readonly buffer Tab  { uint tab[]; };   // the LCD grid's seam bitmasks: per view, 32 words of columns then 32 of rows
 layout(push_constant) uniform P {
   uvec4 a;        // presented w, h; logical w, h
-  uvec4 b;        // rotation (0/90/180/270), nviews, inset alpha 0..255, source base (words)
+  uvec4 b;        // rotation (0/90/180/270), nviews, inset alpha 0..255 | 1 << 8 (overlay drawn) | grid brightness 0..256 << 16 (256 = off), source base (words) | S << 24 | 1 << 31 when screen 0 is the composited buffer
   ivec4 rect[2];  // x, y, w, h in the logical frame, draw order
-  ivec4 view[2];  // screen, shown, blends (inset), unused
+  ivec4 view[2];  // screen, shown, blends (inset), bit 0 this frame's composited screen | bit 1 the LCD grid applies | bit 2 the previous frame's composite shown again | bit 3 the smooth filter's records are in that composite
 } pc;
+uint rd(uint i) { return g_prev ? pcomp[i] : comp[i]; }
+// The smooth-3D filter (b.z bit 9). A polygon's edge pixel carries, in the
+// composited pixel's alpha byte (composite.comp's edge_byte, from the
+// raster's span table), which side of the polygon it is on (bit 0: a right
+// run, else a left one), whether the edge is X-major (bit 1: the coverage
+// is then a vertical fraction), for those whether the covered part is the
+// top of the pixel (bit 2), and the DS's 5-bit coverage (bits 3-7: how much
+// of the pixel the polygon covers); 0xFF is no edge. That is enough to place the true edge inside
+// the native pixel to 1/32: the panel pixels of the native pixel on the
+// polygon's side keep its colour, the rest take the outside neighbour's --
+// the same neighbour the fast anti-aliasing would have blended with. The
+// crossing is interpolated towards the adjacent pixel of the same edge so a
+// diagonal comes out as a line, not as steps. Interiors, textures and the
+// 2D engines are untouched: only silhouettes and polygon boundaries change.
+//
+// `sx, sy`: the source pixel (at S x); `nx, ny` its native pixel; `fx, fy`
+// this panel pixel's centre inside the native pixel, in [0, 1).
+float edge_q(uint e) { return float(((e >> 3) & 31u) + 1u) / 32.0; }   // the covered fraction
+// The crossing of the same edge in the adjacent row (Y-major) or column
+// (X-major), `step` away: within one pixel along the other axis, since a
+// major-axis slope moves less than a pixel a step. `found` false if the
+// edge ends there (a vertex, or another polygon).
+float edge_cross(uint kind, bool left, bool top, bool xmajor, int S, int W, int H, int sx, int sy, int step, out bool found) {
+  found = false;
+  if (!xmajor) {
+    int qy = sy + step * S;
+    if (qy < 0 || qy >= H) return 0.0;
+    for (int k = -1; k <= 1; ++k) {
+      int qx = sx + k * S;
+      if (qx < 0 || qx >= W) continue;
+      uint n = rd(uint(qy) * uint(W) + uint(qx)) >> 24;
+      if (n == 0xFFu || (n & 7u) != kind) continue;
+      found = true;
+      return float(sx / S + k) + (left ? 1.0 - edge_q(n) : edge_q(n));
+    }
+  } else {
+    int qx = sx + step * S;
+    if (qx < 0 || qx >= W) return 0.0;
+    for (int k = -1; k <= 1; ++k) {
+      int qy = sy + k * S;
+      if (qy < 0 || qy >= H) continue;
+      uint n = rd(uint(qy) * uint(W) + uint(qx)) >> 24;
+      if (n == 0xFFu || (n & 7u) != kind) continue;
+      found = true;
+      return float(sy / S + k) + (top ? edge_q(n) : 1.0 - edge_q(n));
+    }
+  }
+  return 0.0;
+}
+// The edge through this pixel as a curve in the panel's resolution rather
+// than a straight segment per DS pixel: a parabola through the crossings of
+// the previous, this and the next row (or column). Three collinear
+// crossings give the straight edge back exactly; at a vertex of the
+// silhouette, where the slope changes, the curve bends through the corner
+// across the two neighbouring DS pixels instead of taking it as a step --
+// which is what makes a wheel of twelve edges read as round. With one
+// neighbour missing (the edge ends) it is the linear interpolation towards
+// the other; with both missing, a constant.
+float edge_curve(float c0, bool fp, float cp, bool fn, float cn, float t) {   // t in [-0.5, 0.5): the position inside the pixel relative to its centre
+  if (fp && fn) return c0 + t * 0.5 * (cn - cp) + t * t * 0.5 * (cn - 2.0 * c0 + cp);
+  if (fn) return mix(c0, cn, max(t, 0.0));
+  if (fp) return mix(c0, cp, max(-t, 0.0));
+  return c0;
+}
+// `pwx, pwy`: a panel pixel's size in DS pixels along each axis. Instead of
+// deciding each panel pixel all-or-nothing against the crossing (which
+// leaves a one-panel-pixel staircase along the slant), the pixel takes its
+// coverage of the polygon -- how far its centre sits inside the edge, in
+// panel pixels, clamped to [0, 1] -- and blends the polygon's colour with
+// the outside neighbour's by it: screen-space anti-aliasing of the
+// reconstructed edge, at the panel's resolution.
+uint blend8(uint a, uint b, float w) {   // a over b by w
+  vec3 ca = vec3(float((a >> 16) & 255u), float((a >> 8) & 255u), float(a & 255u));
+  vec3 cb = vec3(float((b >> 16) & 255u), float((b >> 8) & 255u), float(b & 255u));
+  vec3 c = round(mix(cb, ca, w));
+  return (a & 0xFF000000u) | (uint(c.r) << 16) | (uint(c.g) << 8) | uint(c.b);
+}
+uint smooth_pick(uint s, int S, int W, int H, int sx, int sy, float fx, float fy, float pwx, float pwy) {
+  uint e = s >> 24;
+  if (e == 0xFFu) return s;
+  int nx = sx / S, ny = sy / S;
+  bool left = (e & 1u) == 0u, xmajor = (e & 2u) != 0u, top = (e & 4u) != 0u;
+  uint kind = e & 7u;
+  float q = edge_q(e);
+  float w; int ox = 0, oy = 0;
+  bool fp, fn;
+  if (!xmajor) {
+    // A near-vertical edge: the polygon is to the right of a left run's
+    // crossing, to the left of a right run's.
+    float c0 = float(nx) + (left ? 1.0 - q : q);
+    float cp = edge_cross(kind, left, top, xmajor, S, W, H, sx, sy, -1, fp);
+    float cn = edge_cross(kind, left, top, xmajor, S, W, H, sx, sy, 1, fn);
+    float c = edge_curve(c0, fp, cp, fn, cn, fy - 0.5);
+    float d = (float(nx) + fx - c) / pwx;   // the centre's distance past the crossing, in panel pixels
+    w = clamp(0.5 + (left ? d : -d), 0.0, 1.0);
+    ox = left ? -1 : 1;
+  } else {
+    // A near-horizontal edge: the polygon is below the crossing when the
+    // covered part is the bottom, above it otherwise.
+    float c0 = float(ny) + (top ? q : 1.0 - q);
+    float cp = edge_cross(kind, left, top, xmajor, S, W, H, sx, sy, -1, fp);
+    float cn = edge_cross(kind, left, top, xmajor, S, W, H, sx, sy, 1, fn);
+    float c = edge_curve(c0, fp, cp, fn, cn, fx - 0.5);
+    float d = (float(ny) + fy - c) / pwy;
+    w = clamp(0.5 + (top ? -d : d), 0.0, 1.0);
+    oy = top ? 1 : -1;
+  }
+  if (w >= 1.0) return s;
+  int px = clamp(sx + ox * S, 0, W - 1), py = clamp(sy + oy * S, 0, H - 1);
+  uint o = rd(uint(py) * uint(W) + uint(px));
+  if (w <= 0.0) return o;
+  return blend8(s, o, w);
+}
+
+// The LCD grid, as kern::scale_row_grid draws it on the scanline tiers: the
+// FIRST panel pixel of a source pixel's run, and the first panel row of a
+// source line, dimmed to f/256 (opaque black at f = 0). Which columns and
+// rows those are is a property of the view's size alone, so the CPU
+// computes them once a frame as bitmasks (GpuPresent::present; the run
+// rules are there) and this tests two bits a pixel -- Mali has no integer
+// divide, and the arithmetic form cost 3 ms a panel. Even so the grid is
+// about 1 ms of GPU a frame on the RG DS Plus: at 1.5 M panel pixels a
+// frame every instruction here is ~40 us.
+bool grid_seam(int v, int d, int axis) {
+  return ((tab[v * 64 + axis * 32 + (d >> 5)] >> uint(d & 31)) & 1u) != 0u;
+}
+
 void main() {
   uvec2 p = gl_GlobalInvocationID.xy;
   if (p.x >= pc.a.x || p.y >= pc.a.y) return;
@@ -27,10 +159,33 @@ void main() {
   for (int v = 0; v < int(pc.b.y); ++v) {
     ivec4 r = pc.rect[v]; ivec4 vi = pc.view[v];
     if (vi.y == 0 || lx < r.x || ly < r.y || lx >= r.x + r.z || ly >= r.y + r.w) continue;
-    int sx = (lx - r.x) * 256 / r.z, sy = (ly - r.y) * 192 / r.w;
-    uint s = src[pc.b.w + uint(vi.x) * 49152u + uint(sy) * 256u + uint(sx)];
-    vec3 col = vec3(float((s >> 16) & 255u), float((s >> 8) & 255u), float(s & 255u)) / 255.0;
-    c = (vi.z != 0 && pc.b.z < 255u) ? mix(c, col, float(pc.b.z) / 255.0) : col;
+    uint s;
+    if ((vi.w & 5) != 0) {   // a composited screen: this frame's (bit 0) or the previous frame's shown again (bit 2)
+      g_prev = (vi.w & 4) != 0;
+      int S = int((pc.b.w >> 24) & 0x7Fu);
+      int sx = (lx - r.x) * 256 * S / r.z, sy = (ly - r.y) * 192 * S / r.w;
+      s = rd(uint(sy) * uint(256 * S) + uint(sx));
+      if ((vi.w & 8) != 0 && (s >> 24) != 0xFFu) {   // an edge pixel of the smooth filter (bit 3: that composite carries the records)
+        float fx = (float(lx - r.x) + 0.5) * 256.0 / float(r.z) - float(sx / S);
+        float fy = (float(ly - r.y) + 0.5) * 192.0 / float(r.w) - float(sy / S);
+        s = smooth_pick(s, S, 256 * S, 192 * S, sx, sy, fx, fy, 256.0 / float(r.z), 192.0 / float(r.w));
+      }
+    } else {
+      int sx = (lx - r.x) * 256 / r.z, sy = (ly - r.y) * 192 / r.w;
+      s = src[(pc.b.w & 0xFFFFFFu) + uint(vi.x) * 49152u + uint(sy) * 256u + uint(sx)];
+    }
+    vec3 col = vec3(float((s >> 16) & 255u), float((s >> 8) & 255u), float(s & 255u));
+    uint gf = (pc.b.z >> 16) & 0x1FFu;
+    // A seam: each channel (c * f) >> 8 as kern::dim_px has it, in floats (exact: c * f < 2^16), 0 at full strength.
+    if (gf < 256u && (vi.w & 2) != 0 && (grid_seam(v, lx - r.x, 0) || grid_seam(v, ly - r.y, 1))) col = floor(col * (float(gf) / 256.0));
+    col /= 255.0;
+    c = (vi.z != 0 && (pc.b.z & 0xFFu) < 255u) ? mix(c, col, float(pc.b.z & 0xFFu) / 255.0) : col;
+  }
+  if ((pc.b.z & 0x100u) != 0u) {
+    // Whatever the frontend drew on its canvas, over the picture: Display::blend_row's rule.
+    uint ov = over[min(uint(ly) * uint(lw) + uint(lx), uint(lw * lh) - 1u)];
+    uint oa = ov >> 24;
+    if (oa != 0u) c = mix(c, vec3(float((ov >> 16) & 255u), float((ov >> 8) & 255u), float(ov & 255u)) / 255.0, float(oa) / 255.0);
   }
   imageStore(dst, ivec2(p), vec4(c, 1.0));
 }

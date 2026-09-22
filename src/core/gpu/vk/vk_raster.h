@@ -46,6 +46,16 @@ public:
   // Internal resolution. 1 for P1; P2 raises it, and everything downstream
   // (the composite) has to agree, which is why it is not a free knob.
   u32 scale() const { return scale_; }
+  // The hi-res layer (256S x 192S records) of the frame output() belongs to,
+  // as an opaque VkBuffer handle for the present stage's composite. At S = 1
+  // it is the same buffer output() maps.
+  u64 output_hires_handle() const;
+  size_t output_hires_bytes() const;
+  // The smooth filter's edge plane of that same frame (0 when the frame did
+  // not write one), and whether the filter is on (DS_VK_SMOOTH3D at creation).
+  u64 output_edge_handle() const;
+  bool smooth() const;
+  void set_smooth(bool on);   // live (the menu); 1x only -- at S >= 2 it stays off
 
   // Whether the order-free prefix goes through the visibility pass
   // (vis.comp / resolve.comp) rather than the ordered loop. Needs 64-bit
@@ -113,6 +123,11 @@ public:
   // one: edge marking reads across band boundaries, so no part of the picture
   // is final until the whole of it is.
   u32 frame_bands() const;
+  // The triangle path is drawing (DS_VK_MODE=tri, or the default where the
+  // device can): polygons through the hardware rasteriser rather than the
+  // compute passes. Same output contract, one band.
+  bool tri() const;
+  bool tri_ordered() const;   // ... with ordered attachment access (one draw per tail run)
   s32 band_line(u32 b) const;
 
   // Wait for bands 0..b and make their output readable by the CPU. Idempotent
@@ -132,6 +147,22 @@ public:
   // N-1 is still in flight and N has yet to be submitted.
   const u32* output() const;
   const u32* output_prev() const;
+  // At S >= 2 the native plane output() names is built on the CPU, a line at
+  // a time as the composite asks for it: the top-left subpixel of each SxS
+  // block of the hi-res layer (what downsample.comp did on the GPU). The
+  // capture-heavy scenes are the ones with the emulation thread at its
+  // limit, and this takes a dispatch and a barrier off the GPU frame they
+  // wait for at line 0; the copy itself is 256 strided loads a line. Call
+  // after sync_line (the hi-res rows must be finished and invalidated);
+  // idempotent, any thread. reduce_all for the whole plane (save states,
+  // the A/B). Opt-in (DS_VK_CPU_DOWNSAMPLE=1): on the RG DS Plus it measured
+  // a loss -- the gather lands on the reading thread and the dispatch it
+  // saves is ~0.15 ms of a 6 ms fence wait (docs/gpu-path-scoping.md).
+  void reduce_line(const u32* nat, u32 y);
+  // Whether frames with DISP3DCNT anti-aliasing can be drawn here (the
+  // triangle path's AA pass, 1x only); else the gate keeps them on the CPU.
+  bool aa_supported() const;
+  void reduce_all(const u32* nat);
 
   // GPU time per pass, summed over the frames read back so far, when
   // DS_VK_TIMING=1 and the queue has timestamps. Read after wait(): a
@@ -149,6 +180,7 @@ public:
 private:
   Raster() = default;
   struct Impl;
+  bool tri_setup(Impl& d, Device& dev, std::string* why);   // the triangle path's resources (vk_raster.cpp)
   std::unique_ptr<Impl> d_;
   bool ready_ = false;
   bool vis_ = false;

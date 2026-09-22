@@ -146,7 +146,7 @@ public:
   // The frame the display reads now (see Renderer3D::FrameRef): taken on the
   // emulation thread at the start of a display frame, used by whichever
   // thread composites its lines.
-  Renderer3D::FrameRef frame_ref() const { return renderer_.frame_ref(); }
+  Renderer3D::FrameRef frame_ref(bool allow_defer = false) const { return renderer_.frame_ref(allow_defer); }
   u64 last_raster_ns() const { return renderer_.last_band_sum_ns(); }
   const u32* line(const Renderer3D::FrameRef& f, u32 y);
   const u32* split_line(const Renderer3D::FrameRef& f, u32 y);   // the line's split map, scrolled the same way (after line(); null = none)   // 3D output for display line y, X-scrolled (RGB666 + 5-bit alpha at 24-28)
