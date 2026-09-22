@@ -4641,6 +4641,25 @@ sdl_ready:
       // headless frontend writes it -- for the shape of a tail, not its size.
       static FILE* series = [] { const char* p = std::getenv("DS_FRAME_SERIES"); return p ? std::fopen(p, "w") : nullptr; }();
       if (series) std::fprintf(series, "%.3f %.3f\n", frame_ms.back(), work_ms.back());
+      // DS_HITCH_PNG=<ms>: write what is ON SCREEN for any frame whose work
+      // time exceeds that, named <index>-<ms>. A tail statistic says a run
+      // stutters and a window histogram says roughly where; neither says
+      // whether the player was looking at a loading screen -- where a spike
+      // is expected and tolerable -- or at the game. This answers that, and
+      // it is the check that decides whether a hitch needs mitigating.
+      // Capped at DS_HITCH_MAX (default 12) so a bad run cannot fill a disk.
+      static const double hitch_ms = [] { const char* p = std::getenv("DS_HITCH_PNG"); return p ? std::atof(p) : 0.0; }();
+      static const long hitch_max = [] { const char* p = std::getenv("DS_HITCH_MAX"); return p ? std::atol(p) : 12; }();
+      static long hitch_n = 0;
+      if (hitch_ms > 0.0 && work_ms.back() > hitch_ms && hitch_n < hitch_max) {
+        ++hitch_n;
+        char nm[64];
+        std::snprintf(nm, sizeof nm, "/hitch-%05zu-%.1fms.png", work_ms.size() - 1, work_ms.back());
+        ::mkdir(session.shots_dir.c_str(), 0755);
+        const std::string path = session.shots_dir + nm;
+        if (write_png(nds, path, display.current_layout()))
+          std::fprintf(stderr, "hitch: frame %zu at %.1f ms -> %s\n", work_ms.size() - 1, work_ms.back(), path.c_str());
+      }
     }
     if (fs_adaptive && fs_limit > 0) {
       // Only real-time play has a budget to fall behind: unthrottled fast

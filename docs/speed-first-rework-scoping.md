@@ -653,7 +653,8 @@ frame count and longest burst**, which `frame_report` already prints, and read
 p95 rather than p99 when a single number is wanted. p99 and max stay reported
 — they are how the Mali stall would show — but they are not the bar.
 
-**The p99 regression is the Mali stall, not the present stage.** Re-run with
+**The p99 regression is not the present stage** — and, contrary to what this
+section first recorded, **not the Mali stall either; see SS3.38.** Re-run with
 the p95 tier added, same binary, same arm, same scene:
 
 | gsdd | median | p90 | **p95** | p99 | max | over-budget | longest burst |
@@ -664,8 +665,9 @@ the p95 tier added, same binary, same arm, same scene:
 | off rep 2 | 16.76 | 18.59 | 18.97 | 20.29 | 26.8 | 51 % | 91 |
 
 The two on-reps differ by **22 ms at p99 and 49 ms at max** with nothing else
-changed — the per-run bimodality `gpu-path` recorded for the stall ("where the
-RT threads landed at start"). On the clean rep, present is better than either
+changed. This was read as the per-run bimodality `gpu-path` recorded for the
+Mali stall; **SS3.38 shows it is a periodic emulation-thread catch-up on the
+title screen instead.** On the clean rep, present is better than either
 off-rep at *every* percentile including p99. **So present wins at p95 in every
 run, and at p99 whenever the stall does not fire.**
 
@@ -712,6 +714,57 @@ the tiler that actually faults, so it is a different trade.
 without a core: `emu.realtime=off` (gpu-path measured 0 stalls, costs
 1.5–2 ms of median everywhere), and lowering RT bandwidth so the kbase fault
 worker on CPU 0 gets a slot without the process leaving the core.
+
+**SS3.38 — The gsdd tail is a periodic catch-up on the TITLE SCREEN, and it is
+not the Mali stall.** SS3.33 and SS3.37 both attributed gsdd's 37-80 ms
+outliers to the GPU. **That attribution is wrong**, and it was reached by
+matching a bimodality pattern from `gpu-path` without checking which slice the
+time was in.
+
+*What the frames actually show* (`DS_HITCH_PNG=<ms>`, added for this: it writes
+the screen for any frame over the threshold, because a percentile says a run
+stutters and a window histogram says roughly where, but neither says what the
+player was looking at). **Every captured hitch is the animated title screen** —
+the Golden Sun logo over the live sunrise with the pulsing "Tap the Touch
+Screen" prompt. Not a loading screen. So the "it sits in the loading windows
+where a spike is tolerable" reasoning in SS3.33 does not hold for this scene.
+
+*Where the time is.* `frame_ms` (emulation) and `work_ms` (emulation + present)
+name the same frame with almost the same value on every spike — 52.17/53.80,
+59.29/61.08, 68.79/69.95. **~97 % of the spike is inside emulation**, so it is
+not a fence wait.
+
+*What it is not.* The `aw88166` amplifier driver fills the kernel log with PLL
+lock failures in ~27 ms retry loops, which looks like a perfect culprit and is
+not one: across three runs the one with **zero** such messages had the **worst**
+spike (max 76.7 ms) and the one with 23 had the mildest (56.2). Nor is it the
+limiter (the period survives auto / 60 / off), the internal audio buffer
+(50 ms and 100 ms show no trend), or the device period.
+
+*What it is.* A **periodic, deadline-driven catch-up in the emulation thread**:
+
+* periodic at **~53-54 frames**, autocorrelation 0.575 at lag 54 with a
+  secondary at 101;
+* **gone entirely at `--speed 50`** (max 25.6 ms, zero frames over 28) — fixed
+  emulated work would still cost its 40 ms with twice the wall-clock slack, so
+  this is something forced only when the frame is near its deadline;
+* suppressed by `--quantum 128` (peak `cpu arm9` 39.9 → 13.3, at the cost of a
+  25.8 ms median);
+* **halved by `--no-audio`** (max 57.8 → 30.0, p99 24.5 → 19.2) with the median
+  and p95 unchanged, so the audio pump amplifies it but is not all of it —
+  audio-off still shows `spu 17.2`, `cpu arm9 28.3`, `dma 17.8` spikes;
+* and **the stage that carries it varies** (`cpu arm9` 39.9, `spu` 31.6, `dma`
+  32.3), which is a backlog being worked off wherever the scope happens to be
+  open, not genuine load in one row.
+
+**So it belongs with Phase 3e (scheduler granularity) and 3f (SPU), not the
+render path.** `Audio::pump` drains the SPU inline on the emulation thread
+(`while ((n = nds.spu.take(buf, 2048)) != 0)`) with a drop path when the queue
+is over target, which is the shape of the amplification.
+
+*One cheap win found on the way:* **`--limiter 60` beats the default `auto`** —
+24.2 % of frames over budget against 31.3 %, p95 17.81 against 19.31 — and
+`--limiter off` is much worse (p99 64). Worth taking on its own.
 
 **SS3.34 — What the target devices actually expose.** Probed over ssh. The
 present stage requests **Vulkan 1.1** (`vk_device.cpp` `apiVersion`, shaders
