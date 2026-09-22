@@ -10,7 +10,6 @@ void main() {
   Frag f = shade_fragment(p);
   if (f.alpha <= pc.f.alpha_ref) discard;
   o_col = f.src;
-  if ((pc.f.flags & DS_FF_IDCOLOUR) != 0u) o_col = 0x1F000000u | (v_poly & 63u) | (((v_poly >> 6) & 63u) << 8) | (((v_poly >> 12) & 63u) << 16);
   // Bits 0-3: DS edge flags (left/right/top/bottom pixel of a span). Every
   // opaque pixel is a candidate; the final pass's neighbour test decides, so
   // in practice only the outline marks. (AA reads these bits as coverage; the AA gate keeps such frames off this path.)

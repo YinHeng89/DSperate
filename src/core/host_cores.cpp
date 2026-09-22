@@ -27,6 +27,7 @@ int forced_cores() {
   static const int n = [] { const char* e = std::getenv("DS_HOST_CORES"); return e ? std::atoi(e) : 0; }();
   return n;
 }
+std::atomic<u32> g_configured_cores{0};
 
 #if defined(__linux__)
 // "0,3" or "0-3,6" -> mask. 0 when unreadable.
@@ -51,7 +52,7 @@ u64 read_online_mask() {
   return mask;
 }
 
-// Process affinity as first read, before any pin narrows it.
+// Process affinity as first read.
 u64 read_affinity() {
   cpu_set_t set;
   CPU_ZERO(&set);
@@ -178,35 +179,17 @@ bool avoid_cpus(u64 cpus, std::string* note) {
 #endif
 }
 
+void set_host_cores(u32 n) { g_configured_cores.store(n, std::memory_order_relaxed); }
+
 u32 host_cores() {
   if (forced_cores() > 0) return static_cast<u32>(forced_cores());
+  if (const u32 n = g_configured_cores.load(std::memory_order_relaxed)) return n;
 #if defined(__linux__)
   const u64 m = usable_mask();
   if (m != ~u64{0}) return static_cast<u32>(__builtin_popcountll(m));
 #endif
   const u32 hc = std::thread::hardware_concurrency();
   return hc ? hc : 4u;
-}
-
-bool pin_threads() {
-  static const bool on = [] { const char* e = std::getenv("DS_PIN_THREADS"); return e && std::atoi(e) != 0; }();
-  return on;
-}
-
-void pin_current_thread(u32 k) {
-#if defined(__linux__)
-  const u64 m = usable_mask();   // k-th usable CPU, wrapping
-  const u32 count = m == ~u64{0} ? 0 : static_cast<u32>(__builtin_popcountll(m));
-  if (!count) return;
-  u32 want = k % count, cpu = 0;
-  for (; cpu < MAX_CPUS; ++cpu) if ((m >> cpu) & 1) { if (want == 0) break; --want; }
-  cpu_set_t set;
-  CPU_ZERO(&set);
-  CPU_SET(static_cast<int>(cpu), &set);
-  sched_setaffinity(0, sizeof set, &set);   // a hint: failure leaves the thread where it was
-#else
-  (void)k;
-#endif
 }
 
 void name_current_thread(const char* name) {

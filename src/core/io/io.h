@@ -2,6 +2,7 @@
 // DSperate - Nintendo DS emulator. Copyright (C) 2026 DSperate contributors.
 #pragma once
 #include "core/types.h"
+#include "core/profile.h"
 #include "core/io/dsi_aes.h"
 #include "core/io/dsi_dsp.h"
 #include "core/io/dsi_camera.h"
@@ -95,8 +96,7 @@ struct Cart {
   u32 fifo[2] = {0, 0}; u32 fifo_head = 0;
   bool late = false;                        // FIFO was full; receive paused
   u64 next_word_at = 0;                     // nominal, not a slice end
-  bool event_armed = false;                 // per-word event (DMA only); in bulk mode, the end event
-  bool bulk = false;                        // DS_CART_BULK: DMA reads at full speed, one end event
+  bool event_armed = false;                 // per-word event (DMA only)
 };
 
 // 0x04000280-0x040002BF.
@@ -153,14 +153,14 @@ public:
 
   u32  read (Cpu cpu, u32 addr, u32 width);
   void write(Cpu cpu, u32 addr, u32 width, u32 value);
-  static bool census_on();   // DS_IO_CENSUS: paths bypassing write() must count too
+  // DS_IO_CENSUS (census builds): paths bypassing write() must count too.
+  static bool census_on() { return prof::census && census_env_on(); }
   u32  ndma_read7(u32 addr);         // 0x0400490C (SD FIFO) or 0x0400440C (AES out FIFO)
   void ndma_write7_aes(u32 value);  // 0x04004408
-  void set_cart_bulk(bool on);   // DS_CART_BULK overrides
 
   void request_irq(Cpu cpu, u32 bit);
-  // LCD IRQs lag their DISPSTAT flag by lcd_irq_delay ARM9 cycles
-  // (DS_LCD_IRQ_DELAY) so a VCOUNT poll can see the match before the IRQ.
+  // LCD IRQs lag their DISPSTAT flag by lcd_irq_delay ARM9 cycles so a
+  // VCOUNT poll can see the match before the IRQ.
   void lcd_irq(Cpu cpu, u32 bit);
   void flush_lcd_irq();
   u32  lcd_irq_delay = 4;
@@ -273,6 +273,7 @@ public:
   void mbk_map_range(Cpu cpu, int bank, u32 value);     // MBK6-8
   bool dsi_io_access(Cpu cpu, u32 addr) const;   // SCFG_EXT gate: disabled pages read 0, drop writes
 private:
+  static bool census_env_on();
   u8   dsi_tsc_transfer(u8 value);
   NDS& nds_;
   u32  read16(Cpu cpu, u32 addr);
@@ -317,7 +318,6 @@ public:
 private:
 
   void cart_write_romctrl(u32 value);
-  bool cart_bulk_ = false;
   u32  cart_read_data();
   void cart_end_transfer();
   void cart_receive_word(u64 at);

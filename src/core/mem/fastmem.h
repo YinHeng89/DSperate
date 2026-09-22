@@ -86,7 +86,6 @@ public:
     dirty_[v] = 1;
     pending_.push_back(v);
   }
-  void note_all();
   bool pending() const { return !pending_.empty(); }
   bool flush();
   // Refused access at host `addr`, from the fault handler (async-signal-safe:

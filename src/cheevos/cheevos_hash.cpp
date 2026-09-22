@@ -2,6 +2,7 @@
 // DSperate - Nintendo DS emulator. Copyright (C) 2026 DSperate contributors.
 #include "cheevos/cheevos_hash.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 
@@ -44,7 +45,7 @@ size_t rs_read(void* h, void* buffer, size_t requested) {
   Cursor* c = static_cast<Cursor*>(h);
   if (!t_src || requested == 0) return 0;
   if (c->pos > 0xFFFFFFFFull) return 0;
-  u32 n = requested > 0xFFFFFFFFull ? 0xFFFFFFFFu : static_cast<u32>(requested);
+  const u32 n = static_cast<u32>(std::min<u64>(requested, 0xFFFFFFFFu));
   // Return the short count, not `n`: lets rcheevos 0-pad a truncated read itself.
   const u32 have = t_src->read_unpatched(static_cast<u32>(c->pos), static_cast<u8*>(buffer), n);
   c->pos += have;

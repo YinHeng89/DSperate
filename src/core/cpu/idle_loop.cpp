@@ -4,7 +4,6 @@
 #include "core/cpu/arm_decode.h"
 #include "core/cpu/cpu.h"
 
-#include <cstdlib>
 #include <cstring>
 
 namespace ds::cpu {
@@ -62,17 +61,6 @@ inline bool safe_poll_address(CpuContext& cpu, u32 addr, IdlePorts ports, bool& 
   // Only registers that change at a scheduled event, never inside a slice
   // (excludes VCOUNT/DISPSTAT/timers, which Scheduler::now() interpolates,
   // and AUXSPI/ROMCTRL, whose busy bits follow transfer timing).
-  // DS_IDLE_PORTS=<hex>,<hex>,... overrides the set (for bisecting).
-  static const char* env = std::getenv("DS_IDLE_PORTS");
-  if (env) {
-    for (const char* p = env; *p;) {
-      const u32 v = static_cast<u32>(std::strtoul(p, const_cast<char**>(&p), 16));
-      if (v == port) return true;
-      while (*p == ',' || *p == ' ') ++p;
-      if (!*p) break;
-    }
-    return false;
-  }
   switch (port) {
   case 0x04000180:   // IPCSYNC
   case 0x04000184:   // IPCFIFOCNT

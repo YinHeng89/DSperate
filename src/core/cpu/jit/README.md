@@ -14,11 +14,11 @@ nothing has been.
 The runtime is host-agnostic; each backend directory provides the encoder,
 the stubs and the translator behind the `backend` interface in
 `jit_internal.h` (`emit_stubs`, `translate_block`, `write_entry_redirect`,
-`patch_link`, `relative_branch_class`). CMake picks the directory by host.
+`patch_link`). CMake picks the directory by host.
 
 | file | role |
 |---|---|
-| `runtime.cpp` | code arena, block cache, LUT, block linking, park-and-revive, SMC tracking by host page, the pre-translation worker, the helpers translated code calls |
+| `runtime.cpp` | code arena, block cache, LUT, block linking, park-and-revive, SMC tracking by host page, the helpers translated code calls |
 | `jit.h` | public API: `attach`, `run` (a `RunFn`), `flush`, `set_trace`, `stats` |
 | `jit_internal.h` | context offsets, block/runtime structures, the backend interface |
 | `block_shape.h` | where a block ends -- shared so every backend cuts blocks identically and their frame hashes are comparable |
@@ -196,9 +196,8 @@ ends the slice, exactly as the interpreter's loop does.
 - `DS_JIT_STRICT=1`: per-instruction budget checks (lockstep with the interpreter).
 - `DS_JIT_DEBUG=1`: log every fallback with pc, instruction and resulting state; dump every translated block as hex words.
 - `DS_JIT_HIST=1` (with `DS_PROFILE=1`): fallback counters and the hottest fallback sites at exit.
-- `DS_JIT_FASTCOST=1`, `DS_QUANTUM=<cycles>`: measurement knobs, inexact (`DS_JIT_FASTCOST=1` is also the mutation check for the fuzzer: `test_jit` must fail with it).
 - `DS_DEBUG_TIMING=1`: log every ARM9 timing-table rebuild (each one drops every translated block).
-- `--interp`, `--jit9`, `--jit7`: choose the engine per CPU.
+- `--interp`: run both CPUs on the interpreter.
 
 ## Measured on the RK3566 (Cortex-A55 @ 1.99 GHz)
 

@@ -69,9 +69,6 @@ void NDS::reset() {
   exit_requested = false;
   dsi_dsp_started = false;
   dsi_loader_launched = false;
-  dsi_loader_scfg_seen = false;
-  dsi_title_running = false;
-  std::memset(dsi_title_code, 0, sizeof dsi_title_code);
 }
 
 // Normalises the touchscreen calibration in both user-settings blocks so an
@@ -285,24 +282,8 @@ bool NDS::load_rom(const std::string& path) {
   }
   rom_zip_entry.clear();
   rom_cache_path.clear();
-  // DS_CART_MMAP=0 reads everything into memory instead (for a filesystem
-  // that can't map). Otherwise a loose .nds is mapped and a zip goes through
-  // the cache beside it (cart/zip_cache.h).
-  static const bool no_map = [] { const char* e = std::getenv("DS_CART_MMAP"); return e && std::atoi(e) == 0; }();
-  if (no_map) {
-    std::vector<u8> image = slurp(path);
-    if (zipped) {
-      std::vector<u8> rom;
-      std::string err, chosen;
-      if (!cart::extract_rom(image.data(), image.size(), rom, err, &chosen)) {
-        std::fprintf(stderr, "rom: %s: %s\n", path.c_str(), err.c_str());
-        return false;
-      }
-      rom_zip_entry = std::move(chosen);
-      image = std::move(rom);
-    }
-    return load_rom_image(std::move(image));
-  }
+  // A loose .nds is mapped and a zip goes through the cache beside it
+  // (cart/zip_cache.h).
   std::string err;
   std::unique_ptr<cart::RomSource> src;
   if (zipped) {
@@ -317,9 +298,24 @@ bool NDS::load_rom(const std::string& path) {
   } else {
     src = cart::RomSource::map_file(path, err);
   }
-  if (!src) { std::fprintf(stderr, "rom: %s: %s\n", path.c_str(), err.c_str()); return false; }
-  src->prefetch();   // no-op unless DS_CART_PREFETCH=1, see rom_source.h
-  return load_rom_source(std::move(src));
+  if (src) return load_rom_source(std::move(src));
+  std::fprintf(stderr, "rom: %s: %s\n", path.c_str(), err.c_str());
+  if (err.compare(0, 6, "mmap: ") != 0) return false;
+  // A filesystem that can't map: read (and unzip) the whole ROM into memory.
+  std::fprintf(stderr, "rom: loading into memory instead\n");
+  std::vector<u8> image = slurp(path);
+  if (zipped) {
+    std::vector<u8> rom;
+    std::string chosen;
+    if (!cart::extract_rom(image.data(), image.size(), rom, err, &chosen)) {
+      std::fprintf(stderr, "rom: %s: %s\n", path.c_str(), err.c_str());
+      return false;
+    }
+    rom_zip_entry = std::move(chosen);
+    rom_cache_path.clear();
+    image = std::move(rom);
+  }
+  return load_rom_image(std::move(image));
 }
 
 bool NDS::load_rom_image(std::vector<u8> image) {
@@ -627,9 +623,6 @@ bool NDS::load_state(state::Reader& r, std::string& err) {
     r.begin("DSIH");
     r.fields(dsi_loader_launched, exit_requested, dsi_soft_reset_pending, dsi_dsp_started);
     r.end();
-    dsi_loader_scfg_seen = false;
-    dsi_title_running = true;   // not in the state: one is made in a title, not mid-hand-off
-    dsi_note_title();
   }
   if (!r.ok()) { err = r.error(); return false; }
   if (dsi) {

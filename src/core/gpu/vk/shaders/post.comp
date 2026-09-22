@@ -17,14 +17,12 @@ layout(std430, binding = 4)          buffer Out   { uint fb[]; };
 layout(std430, binding = 5) readonly buffer Post  { GpuPost ps; };
 layout(std430, binding = 6) readonly buffer Depth { uint zbuf[]; };
 layout(std430, binding = 7)          buffer Attr  { uint abuf[]; };
-layout(std430, binding = 17)          buffer UCol  { uint ucol[]; };    // pixel underneath (exact AA, DS_FF_AA); scratch plane of the fast one
-layout(std430, binding = 18) readonly buffer UAttr { uint uattr[]; };
-layout(std430, binding = 19) readonly buffer UZ    { uint uz[]; };
+layout(std430, binding = 13)          buffer UCol  { uint ucol[]; };    // fast AA's scratch plane
 // Smooth filter's edge plane (DS_FF2_SMOOTH), present-stage composite only:
 // per edge pixel, UNBLENDED colour (RGB666 bits 0-17, alpha 18-22) + edge
 // record (coverage 23-27, right run 28, X-major 29, covered half top 30),
 // bit 31 set; 0 elsewhere. `fb` still gets the AA blend (capture/save states read it directly).
-layout(std430, binding = 20) writeonly buffer Edge { uint edge[]; };
+layout(std430, binding = 14) writeonly buffer Edge { uint edge[]; };
 layout(push_constant) uniform Push { GpuFrame f; } pc;
 
 // 15-bit channel -> 6 bits: bits 1-5 of the field, +1 when non-zero.
@@ -117,31 +115,11 @@ void main() {
       abuf[i] = attr;
     }
   }
-  bool aa = (pc.f.flags & DS_FF_AA) != 0u && (attr & 0xFu) != 0u;
-  uint under = aa ? ucol[i] : 0u;
-
   if ((pc.f.dispcnt & (1u << 7)) != 0u) {
     bool fogcolor = (pc.f.dispcnt & (1u << 6)) == 0u;   // fog the colour too, not the alpha alone
     uint fc = ps.fog_color;
     uint fa = (fc >> 16) & 0x1Fu;
     if ((attr & (1u << 15)) != 0u) color = fog_apply(color, fog_density(z), fc, fa, fogcolor);
-    if (aa && (uattr[i] & (1u << 15)) != 0u) under = fog_apply(under, fog_density(uz[i]), fc, fa, fogcolor);
-  }
-  if (aa) {
-    uint cov = (attr >> 8) & 0x1Fu;
-    if (cov == 0u) color = under;
-    else if (cov != 0x1Fu) {
-      uint tr = color & 0x3Fu, tg = (color >> 8) & 0x3Fu, tb = (color >> 16) & 0x3Fu, ta = (color >> 24) & 0x1Fu;
-      uint br = under & 0x3Fu, bg = (under >> 8) & 0x3Fu, bb = (under >> 16) & 0x3Fu, ba = (under >> 24) & 0x1Fu;
-      ++cov;
-      if (ba > 0u) {
-        tr = ((tr * cov) + (br * (32u - cov))) >> 5;
-        tg = ((tg * cov) + (bg * (32u - cov))) >> 5;
-        tb = ((tb * cov) + (bb * (32u - cov))) >> 5;
-      }
-      ta = ((ta * cov) + (ba * (32u - cov))) >> 5;
-      color = tr | (tg << 8) | (tb << 16) | (ta << 24);
-    }
   }
 
   if (fast && (pc.f.flags2 & DS_FF2_SMOOTH) != 0u) {

@@ -43,9 +43,6 @@ void   Device::invalidate(const Buffer&, size_t, size_t) {}
 Buffer Device::import_host(void*, size_t) { return {}; }
 void   Device::flush(const Buffer&, size_t, size_t) {}
 const  DeviceInternal* Device::internal() const { return nullptr; }
-u64    Device::raw_device() const { return 0; }
-u64    Device::raw_queue() const { return 0; }
-u32    Device::queue_family() const { return 0; }
 
 #else
 
@@ -74,7 +71,7 @@ struct Device::Impl {
                             : VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     for (int pass = 0; pass < 2; ++pass) {
       const VkMemoryPropertyFlags want =
-        need | (pass == 0 ? VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT : 0u);
+        need | (pass == 0 ? VkMemoryPropertyFlags{VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT} : 0u);
       for (u32 i = 0; i < memprops.memoryTypeCount; ++i)
         if ((bits & (1u << i)) && (memprops.memoryTypes[i].propertyFlags & want) == want) {
           *out = i;
@@ -405,10 +402,6 @@ void Device::flush(const Buffer& b, size_t offset, size_t size) {
 }
 
 const DeviceInternal* Device::internal() const { return &d_->internal; }
-
-u64 Device::raw_device() const { return reinterpret_cast<u64>(d_->dev); }
-u64 Device::raw_queue() const  { return reinterpret_cast<u64>(d_->queue); }
-u32 Device::queue_family() const { return d_->qfam; }
 
 #endif // DS_VK_AVAILABLE
 

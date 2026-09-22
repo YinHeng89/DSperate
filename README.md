@@ -32,9 +32,8 @@ hardware. No DraStic code is in this tree. See [docs/techniques](docs/techniques
 - **melonDS-grade cycle timing** with per-page cost tables and TCM windows,
   plus an idle-loop detector that proves a poll loop side-effect-free and skips
   to the next event.
-- **Two interleave modes.** 128-cycle lockstep with melonDS (the default for
-  measurement) or event-bound as DraStic does it (the default for play, a few
-  percent faster).
+- **Event-bound CPU interleave** as DraStic does it: each CPU runs to the
+  next scheduled event.
 - **Full system.** DMA with burst timing, timers, IPC, SPI (touchscreen,
   firmware flash, power management, microphone), RTC, divider/sqrt, and Wi-Fi
   with real frames (see *Local wireless and internet* below).
@@ -195,15 +194,11 @@ firmware or a ROM with `--direct`, and offers instruction traces, frame and
 audio dumps, save-state checkpoints and cheats from the command line. It never
 writes a battery save back.
 
-Performance knobs that trade accuracy for speed, off by default: `--cpu-oc`
-(or its underclock tier, `--cpu-uc`, for the harder to run games and/or the lowest end devices),
-`--timing-oc`, `--fast-load`. Turn them off first if a game misbehaves.
-
 ## Diagnostics, tests and tools
 
 Environment variables (`DS_VERBOSE`, `DS_FRAME_STATS`, `DS_FPS`, `DS_PROFILE`,
-`DS_FRAME_HASH`, `DS_IO_CENSUS`, `DS_JIT_*`, `DS_R3D_THREADS` and others) are
-documented where they are read. `ctest` runs the unit tests in
+`DS_FRAME_HASH`, `DS_IO_CENSUS`, `DS_JIT_*` and others) are documented where
+they are read. `ctest` runs the unit tests in
 [tests/](tests/): interpreter, recompiler against interpreter, NEON kernels
 against portable references, page table, scheduler, I/O, SPU, 2D/3D pipelines
 and the texture cache. [tools/](tools/) holds the frame/trace/audio comparison

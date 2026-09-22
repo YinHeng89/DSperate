@@ -140,18 +140,6 @@ struct NDS {
   void dsi_autoload(u32 title_lo, u32 title_hi = 0x00030004);
   bool dsi_soft_reset_pending = false;   // BPTWL soft reset (reg 0x11 <- 1); scheduler calls dsi_soft_reset() as the ARM7's run returns
   void dsi_soft_reset();
-  // The DSi Menu has handed off and jumped to a title. Set when the loader
-  // stub's IPCSYNC 5/5 handshake writes SCFG_EXT (dsi_loader_scfg_seen) and
-  // completes with IPCSYNC 0. Cleared by reset()/soft reset, set on state
-  // load. The frontend defers cpu_oc's underclock tier to it, since the
-  // handshake is timing-sensitive.
-  bool dsi_loader_scfg_seen = false;
-  bool dsi_title_running = false;
-  // Game code of the title dsi_title_running marks (header @ 02FFFE0C),
-  // zero before. Used by the frontend to keep CPU tuning away from
-  // PictoChat/Download Play.
-  char dsi_title_code[4] = {};
-  void dsi_note_title();
   // Guest started a DSP program (unemulated): it will hang waiting for
   // replies. Sticky until reset()/soft reset; frontends warn once per start.
   bool dsi_dsp_started = false;

@@ -64,7 +64,7 @@ public:
   // so the gap isn't repaid as a burst.
   void reset() { next_ = SDL_GetPerformanceCounter(); }
 
-  // This frame's deadline, in SDL performance-counter ticks (used by DS_WIFI_SLICE).
+  // This frame's deadline, in SDL performance-counter ticks (used by LAN slicing).
   Uint64 next() const { return next_; }
 
   // Advance to the next deadline and sleep until it. `scale`: 2.0 = double speed, 0.5 = half.

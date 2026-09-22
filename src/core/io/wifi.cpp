@@ -88,7 +88,6 @@ void Wifi::reset() {
   timer_err_ = 0; us_timestamp_ = us_counter_ = us_compare_ = 0;
   block_beacon_irq14_ = false;
   us_until_power_on_ = 0; cmd_counter_ = rx_counter_ = 0;
-  no_peek_ = std::getenv("DS_WIFI_NO_PEEK") != nullptr;
 
   tx_slots_.fill(TxSlot{}); tx_buffer_.fill(0);
   com_status_ = 0; tx_cur_slot_ = -1;
@@ -216,7 +215,7 @@ void Wifi::us_timer() {
     // Peek every 64 us, but never while our reply is out or right after
     // start_rx() (hence com_status_ re-checked): the fetch would overwrite the
     // ack being received with the next CMD, breaking Download Play.
-    else if (!no_peek_ && !com_status_ && !rx_timestamp_ && !(reg(W_TXBusy) & 0x0080) && !(us_timestamp_ & 0x38)) check_rx(3);
+    else if (!com_status_ && !rx_timestamp_ && !(reg(W_TXBusy) & 0x0080) && !(us_timestamp_ & 0x38)) check_rx(3);
   }
 
   if (!(us_timestamp_ & 0x3FF & kTimeCheckMask)) ap_ms_timer();

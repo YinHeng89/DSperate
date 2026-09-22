@@ -114,10 +114,6 @@ GuestView::~GuestView() {
   if (base_) munmap(base_, static_cast<size_t>(RESERVE));
 }
 
-void GuestView::note_all() {
-  for (u32 v = 0; v < SPAN / HOST_PAGE; ++v) note(v << 1);
-}
-
 // What view page `v` should be: both 2 KB halves backed by the arena at
 // consecutive offsets starting on a 4 KB boundary, outside VRAM.
 GuestView::Laid GuestView::desired(u32 v) const {
@@ -270,7 +266,6 @@ HostArena::~HostArena() = default;
 u8* HostArena::take(size_t) { return nullptr; }
 std::unique_ptr<GuestView> GuestView::create(const HostArena&, const PageTable&) { return nullptr; }
 GuestView::~GuestView() = default;
-void GuestView::note_all() {}
 GuestView::Laid GuestView::desired(u32) const { return {}; }
 bool GuestView::lay_run(u32, u32, const Laid&) { return false; }
 bool GuestView::flush() { return true; }

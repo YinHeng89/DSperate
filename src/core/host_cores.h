@@ -8,14 +8,11 @@
 
 namespace ds {
 
-// DS_HOST_CORES=N overrides. Else the CPUs online now, re-read at most once a second (the
-// online set can move under a running game).
+// DS_HOST_CORES=N overrides, then set_host_cores(). Else the CPUs online now, re-read at
+// most once a second (the online set can move under a running game).
 u32 host_cores();
-
-// DS_PIN_THREADS=1: pin the emulation thread to the first usable core, band worker i to the
-// (1+i)-th, wrapping. Off by default.
-bool pin_threads();
-void pin_current_thread(u32 k);
+// Frontend setting (emu.host_cores); 0 = detect.
+void set_host_cores(u32 n);
 
 // CPUs servicing the GPU's interrupts, as a bit mask; 0 if unknown. A tiler page fault is
 // serviced on the interrupting CPU, which a SCHED_RR emulator thread there can starve.

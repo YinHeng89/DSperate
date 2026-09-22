@@ -246,9 +246,6 @@ void NDS::dsi_soft_reset() {
   dsi_soft_reset_pending = false;
   dsi_loader_launched = false;
   dsi_dsp_started = false;
-  dsi_loader_scfg_seen = false;
-  dsi_title_running = false;
-  std::memset(dsi_title_code, 0, sizeof dsi_title_code);
   if (dsi_nand_synthetic) {
     // Nothing to reset into; ARM7 stays halted by the exit request.
     std::fprintf(stderr, "dsi: soft reset on a synthesised NAND: the title is leaving\n");
@@ -286,12 +283,6 @@ void NDS::dsi_soft_reset() {
 #if DSPERATE_JIT
   if (jit::has_runtime()) jit::flush_all();   // boot2 went over NWRAM and ITCM
 #endif
-}
-
-void NDS::dsi_note_title() {
-  for (u32 i = 0; i < 4; ++i) dsi_title_code[i] = static_cast<char>(bus.dma_read8(Cpu::ARM9, 0x02FFFE0C + i));
-  if (std::getenv("DS_DEBUG_DSI_TITLE"))
-    std::fprintf(stderr, "dsi: title %.4s running (frame %llu)\n", dsi_title_code, static_cast<unsigned long long>(frame_count));
 }
 
 bool NDS::load_dsi_nand_title(u32 title_lo, std::string* err) {

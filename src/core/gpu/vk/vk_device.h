@@ -71,11 +71,6 @@ public:
   // The dispatch table and handles, for vk_raster.cpp only.
   const DeviceInternal* internal() const;
 
-  // Opaque handles for the backend (vk_raster.cpp); zero when unavailable.
-  u64 raw_device() const;
-  u64 raw_queue() const;
-  u32 queue_family() const;
-
   struct Limits {
     u32 max_workgroup_invocations = 0;
     u32 max_shared_memory = 0;

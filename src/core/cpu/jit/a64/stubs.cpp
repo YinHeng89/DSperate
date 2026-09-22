@@ -470,12 +470,5 @@ void patch_link(u8* site, const u8* target) {
   Emitter::patch(site, w);
 }
 
-// 0 = not a pc-relative branch; else an id equal across encodings of the same kind.
-u32 relative_branch_class(u32 w) {
-  if ((w & 0x7C000000u) == 0x14000000u) return 1 + ((w >> 31) & 1);
-  if ((w & 0xFF000010u) == 0x54000000u) return 3;
-  return 0;
-}
-
 } // namespace backend
 } // namespace ds::jit

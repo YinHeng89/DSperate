@@ -259,7 +259,6 @@ private:
   // The table a settings page shows, and where its row state lives.
   const Setting* table() const;
   int  table_slot() const;
-  int  settings_rows() const;
   // Skips rows the host switched off. False when nothing selectable in that
   // direction, leaving the selection where it was.
   bool move_setting_row(int delta);

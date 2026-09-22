@@ -19,7 +19,8 @@ namespace ds::gpu::vk {
 class Raster {
 public:
   // Null when the device cannot run it; the caller keeps the software path.
-  static std::unique_ptr<Raster> create(Device& dev, std::string* why = nullptr);
+  // scale: internal resolution 1..4 (triangle path only; otherwise 1).
+  static std::unique_ptr<Raster> create(Device& dev, u32 scale = 1, std::string* why = nullptr);
   ~Raster();
 
   Raster(const Raster&) = delete;
@@ -41,7 +42,7 @@ public:
 
   // Whether the order-free prefix uses the visibility pass (vis.comp /
   // resolve.comp) instead of the ordered loop. Needs 64-bit buffer atomics;
-  // DS_VK_VIS=0 disables. Either path draws the same picture.
+  // DS_VK_VIS=0 disables (compute mode). Either path draws the same picture.
   bool visibility() const { return vis_; }
 
   // Caller writes the frame directly into mapped GPU memory (no CPU-side
@@ -56,7 +57,7 @@ public:
   // Submit the frame: clear bin counts, bin, then rasterise in BANDS of
   // scanlines, each with its own completion, so sync_line only waits on the
   // band owning the line it reads (matches the software raster's shape).
-  // DS_VK_BANDS controls the count. A display-capture frame (DISPCAPCNT bit
+  // One band per tile row (one in all on the triangle path). A display-capture frame (DISPCAPCNT bit
   // 24) cannot be composited a frame behind, gated on Gpu::capture_render_.
   bool submit(u32 npoly, u32 nvert, u32 ntexels, const GpuFrame& f);
 
@@ -83,14 +84,8 @@ public:
   // reads frame N-2 while N-1 is still in flight and N is not yet submitted.
   const u32* output() const;
   const u32* output_prev() const;
-  // At S >= 2, builds the native (1x) plane on the CPU line by line as the
-  // composite asks: top-left subpixel of each SxS block. Call after
-  // sync_line. reduce_all does the whole plane (save states). Opt-in via
-  // DS_VK_CPU_DOWNSAMPLE=1.
-  void reduce_line(const u32* nat, u32 y);
-  // Whether DISP3DCNT anti-aliasing can run here (triangle path, 1x only).
+  // Whether DISP3DCNT anti-aliasing can run here (triangle path).
   bool aa_supported() const;
-  void reduce_all(const u32* nat);
 
   // GPU time per pass, summed since the last read, when DS_VK_TIMING=1 and
   // the queue has timestamps. Read after wait().

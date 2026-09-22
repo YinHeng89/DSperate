@@ -41,11 +41,9 @@ Scheduler::~Scheduler() {
 }
 
 Scheduler::Scheduler(NDS& nds) : nds_(nds), now_(0) {
-  if (const char* q = std::getenv("DS_QUANTUM")) { set_quantum(std::atoll(q)); quantum_forced_ = true; }
   debug_slices_ = std::getenv("DS_DEBUG_SLICES") != nullptr;
   idle_survey_ = std::getenv("DS_IDLE_SURVEY") != nullptr;
-  if (const char* e = std::getenv("DS_IDLE_SKIP"))
-    idle_skip_ = (e[0] == '0') ? 0 : (std::strcmp(e, "all") == 0 || e[0] == '2') ? 2 : 1;
+  if (const char* e = std::getenv("DS_IDLE_SKIP")) set_idle_skip(e);
   reset();
 }
 
@@ -68,10 +66,8 @@ void Scheduler::set_clock9_shift(u32 timing_shift) {
   arm9_carry_ = 0;
 }
 
-void Scheduler::set_quantum(s64 q) {
-  if (quantum_forced_) return;
-  quantum_ = q <= 0 ? EVENT_BOUND_QUANTUM : q;
-  update_soft_mask();
+void Scheduler::set_idle_skip(const char* mode) {
+  idle_skip_ = (mode[0] == '0') ? 0 : (std::strcmp(mode, "all") == 0 || mode[0] == '2') ? 2 : 1;
 }
 
 void Scheduler::reset() {
@@ -90,7 +86,6 @@ void Scheduler::schedule(EventId id, u64 at, EventFn fn, u32 param) {
   const bool was_next = (armed_ & (1u << i)) && next_id_ == i;   // only a live next event can be pushed later and leave next_ stale
   at_[i] = at; fn_[i] = fn; param_[i] = param;
   armed_ |= 1u << i;
-  if (soft_mask_ & (1u << i)) { if (at < next_soft(i)) next_soft(i) = at; return; }   // soft: fired when due, never a deadline (see soft_mask_)
   if (at < next_) { next_ = at; next_id_ = i; }
   else if (was_next && at > next_) rescan();
   if (cut_on_schedule_) cut_arm9_at(at);
@@ -106,22 +101,6 @@ void Scheduler::cut_arm9_at(u64 at) {
   a9.hot.cycle_budget = nb - consumed;   // <= 0: the ARM9 stops after this instruction, as melonDS's loop does
 }
 
-void Scheduler::run_soft_timers(Cpu cpu) {
-  const u32 first = static_cast<u32>(cpu == Cpu::ARM9 ? EventId::Timer0 : EventId::Timer7_0);
-  if (!(soft_mask_ & (0xFu << first))) return;
-  const u64 t = now();
-  bool fired = false;
-  for (u32 i = first; i < first + 4; ++i) {
-    while ((armed_ & (1u << i)) && at_[i] <= t) {
-      armed_ &= ~(1u << i);
-      firing_at_ = at_[i];
-      fired = true;
-      fn_[i](nds_, param_[i]);
-    }
-  }
-  if (fired) rescan();
-}
-
 void Scheduler::cancel(EventId id) {
   const u32 i = static_cast<u32>(id);
   if (!(armed_ & (1u << i))) return;
@@ -133,12 +112,10 @@ void Scheduler::cancel(EventId id) {
 void Scheduler::rescan() {
   u64 best = std::numeric_limits<u64>::max();
   u32 best_id = EVENT_COUNT;
-  for (u32 m = armed_ & ~soft_mask_; m; m &= m - 1) {
+  for (u32 m = armed_; m; m &= m - 1) {
     const u32 i = static_cast<u32>(__builtin_ctz(m));
     if (at_[i] < best) { best = at_[i]; best_id = i; }
   }
-  next_soft9_ = next_soft7_ = ~u64{0};
-  for (u32 m = armed_ & soft_mask_; m; m &= m - 1) { const u32 i = static_cast<u32>(__builtin_ctz(m)); if (at_[i] < next_soft(i)) next_soft(i) = at_[i]; }
   next_ = best;
   next_id_ = best_id;
 }
@@ -152,8 +129,6 @@ bool Scheduler::machine_idle(bool& skip9, bool& skip7) const {
   // Swap-wait mode: skip the PC ring/body walk/DMA probes unless a swap is pending.
   const bool gx_only = idle_skip_ == 1;
   if (gx_only && !nds_.gpu3d.swap_pending()) return both_idle();
-  CpuContext& a9 = const_cast<CpuContext&>(nds_.cpu(Cpu::ARM9));
-  CpuContext& a7 = const_cast<CpuContext&>(nds_.cpu(Cpu::ARM7));
   // A pending GX command doesn't veto: logged commands cost no time. DMA vetoes
   // on DSi only (a9_dma_iter_ needs a CPU to have run); elsewhere advance_dma_only
   // keeps a skipped channel moving.
@@ -246,7 +221,7 @@ void Scheduler::count_slice(bool skipped, s64 slice) const {
   if (skipped) prof::add(prof::C_SLICES_SKIPPED, 1);
 
   // Cycle-weighted halt state: plain slice counts hide it since awake-CPU
-  // slices are the ones the quantum keeps short.
+  // slices are the ones SLICE_QUANTUM keeps short.
   const u64 cyc = static_cast<u64>(slice);
   prof::add(prof::C_CYC_TOTAL, cyc);
   if (a9.halted && a7.halted) prof::add(prof::C_CYC_BOTH_HALTED, cyc);
@@ -338,20 +313,15 @@ void Scheduler::count_slice(bool skipped, s64 slice) const {
 // handler may reschedule an event already overshot (timer period shorter
 // than a slice), which one pass would leave armed in the past.
 void Scheduler::fire_due() {
-  // Soft (timer) events step from the CPU's own position, overshoot
-  // included. ARM7 timers are ids 6..9.
-  const u64 lim7 = arm7_debt_ < 0 ? now_ + static_cast<u64>(-arm7_debt_) : now_;
-  while (now_ >= next_ || now_ >= next_soft9_ || lim7 >= next_soft7_) {
+  while (now_ >= next_) {
     next_ = std::numeric_limits<u64>::max();
-    next_soft9_ = next_soft7_ = std::numeric_limits<u64>::max();
     next_id_ = EVENT_COUNT;
     // Ascending id order; `armed_` re-read after every handler so an event
     // armed at a higher id fires this pass, a lower one waits for the next.
     for (u32 m = armed_; m; ) {
       const u32 i = static_cast<u32>(__builtin_ctz(m));
       const u32 bit = 1u << i;
-      const u64 lim = ((soft_mask_ & bit) && soft7(i)) ? lim7 : now_;
-      if (at_[i] <= lim) {
+      if (at_[i] <= now_) {
         armed_ &= ~bit;
         firing_at_ = at_[i];
         if (debug_slices_) std::fprintf(stderr, "[fire] t %llu event %u at %llu\n", (unsigned long long)now_, i, (unsigned long long)at_[i]);
@@ -368,8 +338,7 @@ void Scheduler::fire_due() {
         }
         m = armed_ & ~((bit << 1) - 1);
       } else {
-        if (soft_mask_ & bit) { if (at_[i] < next_soft(i)) next_soft(i) = at_[i]; }     // soft events never bound a slice
-        else if (at_[i] < next_) { next_ = at_[i]; next_id_ = i; }
+        if (at_[i] < next_) { next_ = at_[i]; next_id_ = i; }
         m &= ~bit;
       }
     }
@@ -461,10 +430,10 @@ begin:
     if (deadline > sl_.until) deadline = sl_.until;
     s64 slice = static_cast<s64>(deadline - now_);
     if (slice <= 0) slice = 1;
-    // With both CPUs asleep the quantum only paces the clock: run to the deadline.
+    // With both CPUs asleep SLICE_QUANTUM only paces the clock: run to the deadline.
     const bool all_idle = machine_idle(sl_.skip9, sl_.skip7);
-    const bool idle = slice > quantum_ && all_idle && !dsi_;   // DSi: melonDS steps 64 cycles even with both CPUs asleep (its timers are checked per step)
-    if (slice >= quantum_ + slice_margin_ && !idle) slice = quantum_;   // melonDS: minEvent < max + margin extends, equal does not
+    const bool idle = slice > SLICE_QUANTUM && all_idle && !dsi_;   // DSi: melonDS steps 64 cycles even with both CPUs asleep (its timers are checked per step)
+    if (slice >= SLICE_QUANTUM + slice_margin_ && !idle) slice = SLICE_QUANTUM;   // melonDS: minEvent < max + margin extends, equal does not
     u64 wake = 0;
     if (!all_idle && !sl_.skip7 && arm7_spi_poll(wake)) {
       sl_.skip7 = true;
@@ -605,8 +574,8 @@ u64 Scheduler::run_until_impl(u64 until, bool until_frame) {
     if (slice <= 0) slice = 1;
     bool skip9 = false, skip7 = false;
     const bool all_idle = machine_idle(skip9, skip7);
-    const bool idle = slice > quantum_ && all_idle && !dsi_;   // DSi: melonDS steps 64 cycles even with both CPUs asleep (its timers are checked per step)
-    if (slice >= quantum_ + slice_margin_ && !idle) slice = quantum_;   // melonDS: minEvent < max + margin extends, equal does not
+    const bool idle = slice > SLICE_QUANTUM && all_idle && !dsi_;   // DSi: melonDS steps 64 cycles even with both CPUs asleep (its timers are checked per step)
+    if (slice >= SLICE_QUANTUM + slice_margin_ && !idle) slice = SLICE_QUANTUM;   // melonDS: minEvent < max + margin extends, equal does not
     u64 wake = 0;
     if (!all_idle && !skip7 && arm7_spi_poll(wake)) {
       skip7 = true;
@@ -654,7 +623,7 @@ u64 Scheduler::run_until_impl(u64 until, bool until_frame) {
     running_ = nullptr;
 
     now_ += static_cast<u64>(ran9);
-    // DS_DEBUG_SLICES=1: one line per slice (engine lockstep debugging).
+    // DS_DEBUG_SLICES=1: one line per slice.
     if (debug_slices_) std::fprintf(stderr, "[slice] now %llu ran9 %lld a9pc %08x b7 %d a7left %d a7pc %08x\n", (unsigned long long)now_, (long long)ran9, a9.hot.regs[15], budget7, a7.hot.cycle_budget, a7.hot.regs[15]);
     fire_due();
   }

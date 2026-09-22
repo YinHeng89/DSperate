@@ -18,24 +18,14 @@ extern "C" double ds_pow_compat(double x, double y);
 
 namespace ds::gpu {
 
-// DS_ABLATE bit mask: removes rendering work but leaves timing untouched, so
-// frames are garbage while set (measurement only, not for output).
-//   1  3D rasterisation (and its texture cache)
-//   2  2D line drawing/output/sprites (journal replay and window latches still run)
-//   4  display capture
-//   8  engine A's 2D drawing only
-//  16  engine A's scanline scaler only (emit_scaled)
-//  32  engine B's scanline scaler only
-// Knobs read once in the constructor: ablate() runs several times per line per engine.
+// Knobs read once in the constructor.
 namespace {
-unsigned g_ablate = 0;
 bool g_dbg_join = false, g_dbg_gpu = false, g_dbg_vramnz = false, g_dbg_skip = false;
 const char* g_dump_frame = nullptr;
 void read_knobs() {
   static bool done = false;
   if (done) return;
   done = true;
-  if (const char* e = std::getenv("DS_ABLATE")) g_ablate = static_cast<unsigned>(std::atoi(e));
   g_dbg_join = std::getenv("DS_DEBUG_JOIN") != nullptr;
   g_dbg_gpu = std::getenv("DS_DEBUG_GPU") != nullptr;
   g_dbg_vramnz = std::getenv("DS_DEBUG_VRAMNZ") != nullptr;
@@ -43,7 +33,6 @@ void read_knobs() {
   g_dump_frame = std::getenv("DS_DEBUG_DUMP_FRAME");
 }
 }  // namespace
-unsigned ablate() { return g_ablate; }
 
 static void ev_scanline(NDS& nds, u32) { nds.gpu.on_scanline_start(); }
 static void ev_hblank(NDS& nds, u32)   { nds.gpu.on_hblank(); }
@@ -51,16 +40,7 @@ static void ev_fifo(NDS& nds, u32 x)   { nds.gpu.on_display_fifo(x); }
 
 Gpu::Gpu(NDS& nds) : engine{Engine2D(nds, 0), Engine2D(nds, 1)}, nds_(nds) {
   read_knobs();
-  // DS_2D_THREAD=0 keeps engine B on the emulation thread (must produce identical frames).
-  if (const char* l = std::getenv("DS_2D_LAZY")) lazy_enabled_ = std::atoi(l) != 0;
-  if (const char* l = std::getenv("DS_2D_LAZY_CAPTURE")) lazy_capture_ = std::atoi(l) != 0;
-  const char* e = std::getenv("DS_2D_THREAD");
-  if (!e || std::atoi(e) != 0) {
-    worker_.start(&Gpu::worker_job, this);
-    par_2d_ = worker_.running();
-  }
-  if (const char* l = std::getenv("DS_2D_LAG")) lag_enabled_ = std::atoi(l) != 0;
-  if (const char* l = std::getenv("DS_2D_DEFER")) defer_join_ = std::atoi(l) != 0;
+  worker_.start(&Gpu::worker_job, this);
 }
 
 void Gpu::reset() {
@@ -283,7 +263,7 @@ void Gpu::fall_back_per_line(u32 mask) {
   catch_up(mask);
   for (int e = 0; e < 2; ++e) if (mask & (1u << e)) { per_line_[e] = true; burst_[e] = false; }
   // Trap now guards the in-flight line, not the batch.
-  if (!(lag_frame_ && par_2d_) && per_line_[0] && per_line_[1]) disarm_trap();
+  if (!lag_frame_ && per_line_[0] && per_line_[1]) disarm_trap();
 }
 
 // ---- timing -----------------------------------------------------------------
@@ -494,11 +474,11 @@ void Gpu::begin_frame() {
   if (skipping && --lazy_probe_in_ == 0) { lazy_probe_ = true; lazy_probe_in_ = lazy_probe_period_; if (g_dbg_skip) std::fprintf(stderr, "[lazy] probe at frame %llu period %u futile %u\n", (unsigned long long)nds_.frame_count, lazy_probe_period_, lazy_futile_); }
   else if (!skipping) lazy_probe_in_ = lazy_probe_period_;
   const bool futile = skipping && !lazy_probe_;
-  lazy_frame_ = lazy_enabled_ && !run_fifo_ && (!capture_on_ || lazy_capture_) && !futile;
+  lazy_frame_ = lazy_enabled_ && !run_fifo_ && !futile;
   lazy_tried_ = lazy_frame_;
   if (futile) prof::add(prof::C_2D_LAZY_SKIPPED, 1);
   lazy_bursts_[0] = lazy_bursts_[1] = 0; burst_[0] = burst_[1] = false; burst_left_[0] = burst_left_[1] = 0;
-  lag_frame_ = lag_enabled_ && par_2d_ && !run_fifo_;
+  lag_frame_ = !run_fifo_;
   lag_trap_hits_ = 0;
   if (lazy_frame_ || lag_frame_) arm_trap();
   if (lazy_frame_) prof::add(prof::C_2D_LAZY_FRAMES, 1);
@@ -570,8 +550,8 @@ void Gpu::finish_a() {
 }
 
 void Gpu::debug_dump(FILE* f) {
-  std::fprintf(f, "  gpu: line %u hblank_done %d render_next %u/%u lazy %d per_line %d/%d trap %d job a %u..%u b %u..%u inflight %d/%d deferred %d read_trap %d lag %d par_2d %d frame_ready %d\n", line_, hblank_done_ ? 1 : 0, render_next_[0], render_next_[1],
-               lazy_frame_ ? 1 : 0, per_line_[0] ? 1 : 0, per_line_[1] ? 1 : 0, trap_armed_ ? 1 : 0, job_first_[0], job_last_[0], job_first_[1], job_last_[1], inflight_[0] ? 1 : 0, inflight_[1] ? 1 : 0, a_deferred_ ? 1 : 0, read_trap_bank_, lag_frame_ ? 1 : 0, par_2d_ ? 1 : 0, nds_.frame_ready ? 1 : 0);
+  std::fprintf(f, "  gpu: line %u hblank_done %d render_next %u/%u lazy %d per_line %d/%d trap %d job a %u..%u b %u..%u inflight %d/%d deferred %d read_trap %d lag %d frame_ready %d\n", line_, hblank_done_ ? 1 : 0, render_next_[0], render_next_[1],
+               lazy_frame_ ? 1 : 0, per_line_[0] ? 1 : 0, per_line_[1] ? 1 : 0, trap_armed_ ? 1 : 0, job_first_[0], job_last_[0], job_first_[1], job_last_[1], inflight_[0] ? 1 : 0, inflight_[1] ? 1 : 0, a_deferred_ ? 1 : 0, read_trap_bank_, lag_frame_ ? 1 : 0, nds_.frame_ready ? 1 : 0);
   worker_.debug_dump(f);
   nds_.gpu3d.debug_dump(f);
 }
@@ -593,7 +573,7 @@ void Gpu::render_ranges(u32 af, u32 al, u32 bf, u32 bl) {
     worker_.dispatch();
     inflight_[0] = a; inflight_[1] = b;
     // A capture in flight writes an LCDC bank the guest may read before the join: trap it.
-    if (a && capture_render_ && read_trap_bank_ < 0 && !(ablate() & 4)) {
+    if (a && capture_render_ && read_trap_bank_ < 0) {
       const int bank = static_cast<int>((capcnt_render_ >> 16) & 3);
       nds_.bus.set_lcdc_read_trap(bank, true);
       read_trap_bank_ = bank;
@@ -607,15 +587,15 @@ void Gpu::render_ranges(u32 af, u32 al, u32 bf, u32 bl) {
   if (prof::enabled) {
     prof::add(prof::C_RR_CALLS, 1);
     prof::add(parked_at_decision ? prof::C_RR_PARKED : prof::C_RR_AWAKE, 1);
-    if (b_has && par_2d_ && b_len < 24 && !parked_at_decision) prof::add(prof::C_RR_SHORT_HANDED_AWAKE, 1);
-    if (b_has && par_2d_ && b_len < 24 && parked_at_decision) prof::add(prof::C_RR_SHORT_INLINE_PARKED, 1);
+    if (b_has && b_len < 24 && !parked_at_decision) prof::add(prof::C_RR_SHORT_HANDED_AWAKE, 1);
+    if (b_has && b_len < 24 && parked_at_decision) prof::add(prof::C_RR_SHORT_INLINE_PARKED, 1);
   }
-  if (a_has && par_2d_ && al == SCREEN_H - 1 && (a_len >= 24 || (!worker_.parked() && a_len >= b_len))) {
+  if (a_has && al == SCREEN_H - 1 && (a_len >= 24 || (!worker_.parked() && a_len >= b_len))) {
     // Run to the last display line: deferred join, engine B drawn here meanwhile.
     prof::add(prof::C_RR_DEFER_A, 1);
     hand(true, false);
     a_handed = true; a_deferred_ = true;
-  } else if (par_2d_ && lag_frame_ && (a_has || (b_has && scaling()))) {
+  } else if (lag_frame_ && (a_has || (b_has && scaling()))) {
     // Lag: A's lines stay in flight until next HBlank unless this is the
     // last one. B is drawn here (its window streams per-line, joining lag on
     // every store), but its scaling is stashed with the job (bscale_).
@@ -628,7 +608,7 @@ void Gpu::render_ranges(u32 af, u32 al, u32 bf, u32 bl) {
     prof::add(prof::C_RR_LAG, 1);
     hand(a_has, false);
     a_handed = a_has;
-  } else if (b_has && par_2d_ && (b_len >= 24 || !worker_.parked())) {
+  } else if (b_has && (b_len >= 24 || !worker_.parked())) {
     // Short run against a parked worker drawn here: wake-up costs more than the lines do.
     prof::add(prof::C_RR_HAND_B, 1);
     hand(false, true);
@@ -646,9 +626,10 @@ void Gpu::render_ranges(u32 af, u32 al, u32 bf, u32 bl) {
   if (b_has && !b_handed) for (u32 x = bf; x <= bl; ++x) step_engine(1, x);
   // A's deferred batch stays in flight until line 0; a lagged run until the
   // next line. The last display line always joins.
-  if (a_deferred_) { if (!defer_join_) join_worker(JoinSite::RangesPost); }
-  else if ((a_handed || b_handed || scale_inflight_) && lag_frame_ && last < SCREEN_H - 1) prof::add(prof::C_2D_LAG_LINES, 1);
-  else join_worker(JoinSite::RangesPost);
+  if (!a_deferred_) {
+    if ((a_handed || b_handed || scale_inflight_) && lag_frame_ && last < SCREEN_H - 1) prof::add(prof::C_2D_LAG_LINES, 1);
+    else join_worker(JoinSite::RangesPost);
+  }
   if (a_has) render_next_[0] = al + 1;
   if (b_has) render_next_[1] = bl + 1;
   if (!frame_finished_ && render_next_[0] >= SCREEN_H && render_next_[1] >= SCREEN_H) {
@@ -673,14 +654,13 @@ void Gpu::step_engine(int e, u32 line) {
     en.replay_to(line * 2 + 1);
     en.pre_draw(line, false);
   }
-  const unsigned abl = ablate();
   // Engine B on a hidden screen draws nothing; the line it comes back on re-renders its sprites.
-  const bool draw = !(abl & 2) && !(e == 0 && (abl & 8)) && !skip_frame_ && !(e == 1 && !screen_visible_[en.screen()]);
+  const bool draw = !skip_frame_ && !(e == 1 && !screen_visible_[en.screen()]);
   if (!draw) skipped_[e] = true; else if (skipped_[e]) { skipped_[e] = false; en.render_sprites(line); }
   // Reading the 3D line joins the raster bands: skip it when the raster never ran.
   if (e == 0 && (draw || capture_render_)) { prof::Scope l3(prof::R3D_LINE); line3d_ = nds_.gpu3d.line(ref3d_, line); en.set_3d_line(line3d_); split3d_ = splits_on() ? nds_.gpu3d.split_line(ref3d_, line) : nullptr; }
   if (draw) { en.render_line(line); output_engine(e, line); }
-  if (e == 0 && capture_render_ && !skip_frame_ && !(abl & 4)) { DS_PROF(CAPTURE); capture(line); }
+  if (e == 0 && capture_render_ && !skip_frame_) { DS_PROF(CAPTURE); capture(line); }
   // Sprites are rendered one line ahead of the backgrounds.
   if (draw && line < SCREEN_H - 1) {
     prof::Scope sc(prof::OBJ_DRAW, e == 0);
@@ -735,7 +715,7 @@ void Gpu::output_engine(int e, u32 line) {
       else { output_b(dst); expand_colours(dst); }
     }
   } else { for (u32 i = 0; i < 256; ++i) dst[i] = 0xFF000000; }
-  if (scaled && !(ablate() & (e == 0 ? 16u : 32u))) {
+  if (scaled) {
     if (e == 1 && bscale_defer_ && bscale_n_ < SCREEN_H) {
       StashedLine& st = bscale_[bscale_n_++];
       st.line = line; st.screen = screen;
@@ -1366,10 +1346,6 @@ void Gpu::emit_scaled(int screen, u32 line, const u32* src) {
   for (u32 y = stage ? yfirst : yfirst + 1; y < y1; ++y)
     if (row_kept(t, y)) std::memcpy(row_at(t, y), row, bytes);
   if (seam && row_kept(t, y0)) kern::active::scale_row_grid(src, t.xrun, t.grid, min_run, pitch_x, true, row_at(t, y0));
-}
-
-static inline u32 rgb15_to_18_plain(u16 c) {
-  return ((c & 0x001F) << 1) | (((c & 0x03E0) >> 4) << 8) | (((c & 0x7C00) >> 9) << 16);
 }
 
 void Gpu::output_a(u32 line, u32* dst) {

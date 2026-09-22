@@ -67,12 +67,12 @@ void TextureCache::begin_frame(u64 frame) {
 void TextureCache::clear() { entries_.clear(); bytes_ = 0; }
 
 const u32* TextureCache::lookup(const VramMap& vm, u32 fmt, u32 base, u32 width, u32 height, u32 texpal, u32 alpha0) {
-  if (!enabled_ || fmt == 0) return nullptr;
+  if (fmt == 0) return nullptr;
   return find_or_decode(vm, fmt, base, width, height, texpal, alpha0).texels.data();
 }
 
 TextureCache::Ref TextureCache::lookup_ref(const VramMap& vm, u32 fmt, u32 base, u32 width, u32 height, u32 texpal, u32 alpha0) {
-  if (!enabled_ || fmt == 0) return {};
+  if (fmt == 0) return {};
   const Entry& e = find_or_decode(vm, fmt, base, width, height, texpal, alpha0);
   return { e.texels.data(), static_cast<u32>(e.texels.size()), e.id, e.version, e.transparent };
 }

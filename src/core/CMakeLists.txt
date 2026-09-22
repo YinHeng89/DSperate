@@ -95,9 +95,7 @@ if(DSPERATE_NEON)
   target_compile_definitions(dsperate_core PUBLIC DSPERATE_NEON=1)
   # The kernels reach A64-only intrinsics through gpu/neon_compat.h; on an
   # ARMv7 host that header switches to bodies the A32 encoding can express.
-  # DSPERATE_A32_SUBSET forces the same bodies on an AArch64 host (kernels only;
-  # not a 32-bit build) to test the subset without an ARMv7 machine.
-  if(DSPERATE_HOST_ARM32 OR DSPERATE_A32_SUBSET)
+  if(DSPERATE_HOST_ARM32)
     target_compile_definitions(dsperate_core PUBLIC DS_A32_SUBSET=1)
     message(STATUS "DSperate: NEON kernels restricted to the ARMv7-expressible subset")
   endif()
@@ -144,12 +142,7 @@ if(DSPERATE_VULKAN)
                  "${CMAKE_CURRENT_SOURCE_DIR}/gpu/vk/shaders/tri_opaque_frag.spv"
                  "${CMAKE_CURRENT_SOURCE_DIR}/gpu/vk/shaders/tri_tail_frag.spv"
                  "${CMAKE_CURRENT_SOURCE_DIR}/gpu/vk/shaders/downsample.spv"
-                 "${CMAKE_CURRENT_SOURCE_DIR}/gpu/vk/shaders/tri_flat_frag.spv"
-                 "${CMAKE_CURRENT_SOURCE_DIR}/gpu/vk/shaders/tri_mask_frag.spv"
-                 "${CMAKE_CURRENT_SOURCE_DIR}/gpu/vk/shaders/tri_pre_frag.spv"
-                 "${CMAKE_CURRENT_SOURCE_DIR}/gpu/vk/shaders/expand.spv"
-                 "${CMAKE_CURRENT_SOURCE_DIR}/gpu/vk/shaders/tri_opaque_aa_frag.spv"
-                 "${CMAKE_CURRENT_SOURCE_DIR}/gpu/vk/shaders/tri_tail_aa_frag.spv")
+                 "${CMAKE_CURRENT_SOURCE_DIR}/gpu/vk/shaders/tri_mask_frag.spv")
     target_include_directories(dsperate_core PRIVATE ${DSPERATE_VULKAN_INCLUDE})
     target_compile_definitions(dsperate_core PUBLIC DSPERATE_VULKAN=1)
     # No link against libvulkan on purpose: vk_device.cpp dlopens it.

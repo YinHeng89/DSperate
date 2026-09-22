@@ -45,7 +45,6 @@ inline constexpr u32 make_key(u32 pc, bool thumb) { return thumb ? (pc & ~1u) | 
 inline constexpr u32 key_pc(u32 key) { return key & ~1u; }
 inline constexpr bool key_thumb(u32 key) { return key & 1; }
 inline constexpr u32 key_r15(u32 key) { return key_pc(key) + (key_thumb(key) ? 4 : 8); }
-inline constexpr u32 key_next(u32 key) { return key + (key_thumb(key) ? 2 : 4); }
 
 // DS_JIT_DENSITY: one slot per translation (not per key).
 struct DensitySlot {
@@ -81,8 +80,6 @@ struct Block {
   u8   owner;        // index into Runtime::cpus
   bool dead;
   bool pooled;       // in Runtime::block_pool (freed by arena reset), not heap
-  u32  succ[4];      // static targets for the pre-translation worker (best-effort)
-  u8   nsucc;
   // Park-and-revive: a killed block keeps code, guest bytes, overwritten entry
   // bytes and timing stamp; matching guest bytes later revive it.
   u32  entry_words[3];
@@ -180,7 +177,7 @@ struct Runtime {
   u32 fm_ring_n = 0;
   u64 fm_faults = 0;
   std::vector<FmRel> fm_new;    // moved to fm_rels on block install
-  std::deque<Block> block_pool;   // emulation-thread blocks; deque: stable addresses
+  std::deque<Block> block_pool;   // deque: stable addresses
   size_t blocks_live = 0;         // since last reset; translate() resets at MAX_BLOCKS
   // host page -> blocks; span = lo | hi << 16 (page offsets) for store range tests.
   struct PageBlocks {
@@ -201,15 +198,6 @@ struct Runtime {
   // Entry code embeds &slot.execs: slots must never move. Emulation thread only.
   std::deque<DensitySlot> density_slots;
   bool hist = false;      // DS_JIT_HIST: histogram of fallback executions by pc
-  bool fastcost = false;  // DS_JIT_FASTCOST: inexact data-cost arithmetic
-  CpuOc cpu_oc = CpuOc::Off;   // --cpu-oc: inexact, no per-access timing lookup
-  bool retime_all = false;   // DS_JIT_RETIME_ALL: timing rebuild kills all ARM9 blocks
-  // DS_JIT_COSTPROBE_PART: 1 = timing-table lookup, 2 = combine arithmetic, 3 (default) = both.
-  int  costprobe_part = 3;
-  bool nocsel = false;    // DS_JIT_NOCSEL: branch instead of csel for conditional ALU ops
-  bool nocost7 = false;   // DS_JIT_NOCOST7: inline ARM7 cost model instead of the table
-  int  costprobe = 0;     // DS_JIT_COSTPROBE: 1 = both CPUs, 9 or 7 = that CPU
-  int  memprobe = 0;      // DS_JIT_MEMPROBE: extra page-table walk (always hits); 1/9/7 as above
   std::unordered_map<u64, u64> fallback_hist;
   Stats stats;
 };
@@ -218,7 +206,6 @@ Runtime& rt();
 inline u64 fm_key(bool arm9, u32 pc, bool thumb) { return (u64{arm9 ? 0u : 1u} << 33) | (u64{thumb} << 32) | pc; }
 
 // Runtime services used by the translator.
-void   invalidate_host_page(const u8* host_page);
 void   invalidate_host_range(const u8* host_page, const u8* lo, const u8* hi);
 void   invalidate_cpu(JitCpu& jc);
 void   lut_insert(JitCpu& jc, Block* b);
@@ -235,8 +222,6 @@ bool translate_block(JitCpu& jc, u32 key, u8* buf, size_t cap, Block& b, u32& si
 void write_entry_redirect(u8* entry, u32 key, const u8* dispatch);
 bool fastmem_capable();
 void patch_link(u8* site, const u8* target);
-// 0 if not a pc-relative branch, else an id equal across encodings of the same kind.
-u32  relative_branch_class(u32 word);
 }
 
 // Helpers called from translated code (through the stubs).

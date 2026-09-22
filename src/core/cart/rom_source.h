@@ -14,9 +14,7 @@
 //     overlay that `page()` serves first.
 #pragma once
 
-#include <atomic>
 #include <memory>
-#include <thread>
 #include <string>
 #include <vector>
 
@@ -44,12 +42,6 @@ public:
   u32 size() const { return size_; }          // bytes in the image
   u32 mask() const { return mask_; }          // padded power-of-two size minus one
   bool mapped() const { return map_ != nullptr; }
-
-  // Pulls the whole mapping into the page cache on a worker thread. Opt-in
-  // (DS_CART_PREFETCH=1). Refuses when MemAvailable is below size + `margin`.
-  // Returns whether it started.
-  bool prefetch(u64 margin = 128ull << 20);
-  bool prefetching() const { return worker_.joinable(); }
 
   // The 4 KB page holding `addr` (masked). Never null: past the image it is
   // the 0xFF page. Pointer is valid for the life of the source.
@@ -93,8 +85,6 @@ private:
   std::vector<u8> tail_;
   std::vector<Patch> overlay_;
   void* map_ = nullptr; size_t map_len_ = 0;
-  std::thread worker_;
-  std::atomic<bool> stop_{false};
 };
 
 } // namespace ds::cart

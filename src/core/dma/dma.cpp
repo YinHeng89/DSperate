@@ -470,7 +470,7 @@ u32 Dma::run(Cpu cpu, u32 budget) {
       if (c.running) { run_base_ = used; used += run_channel(c, budget - used); }
     }
     if (nds_.dsi && used < budget && (running_mask_[cpu == Cpu::ARM9 ? 0 : 1] & 0x10)) { nds_.ndma.run_base_ = used; used += nds_.ndma.run(cpu, budget - used); }
-    // A bulk cart transfer re-triggers its channel from inside run_channel;
+    // A cart channel can re-trigger from inside run_channel (DRQ already up);
     // keep going in this share instead of ending the slice per word.
   } while (used < budget && cart_running(cpu));
   return used;

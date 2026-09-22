@@ -40,9 +40,6 @@ public:
   // only; not in save state.
   u32 tx_frames() const { return tx_frames_; }
   MpTransport* transport() const { return mp_; }
-  // SSID the emulated AP beacons under; probes naming another SSID are
-  // answered with that name so any-open-network firmware still associates.
-  void set_ap_name(const std::string& name) { ap_.name = name; }
 
   u32 host_syncs() const { return host_syncs_; }   // times this console, as MP host, synced a client
   // In a local-wireless exchange now, as host (armed beacon slot) or client
@@ -135,7 +132,6 @@ private:
   bool is_mp_ = false, is_mp_client_ = false;
   u32  host_syncs_ = 0;
   int  last_rx_type_ = 0;            // trace only: which check_rx delivered the frame
-  bool no_peek_ = false;            // DS_WIFI_NO_PEEK: never fetch host frames early
   u64 next_sync_ = 0, rx_timestamp_ = 0;
 
   // ---- the emulated access point (melonDS WifiAP) ----

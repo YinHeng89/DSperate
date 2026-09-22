@@ -13,7 +13,6 @@ endif()
 
 option(DSPERATE_JIT      "Build the recompiler (AArch64 and ARMv7 hosts)"          ON)
 option(DSPERATE_NEON     "Build NEON renderer kernels (AArch64 or ARMv7+NEON)"    ON)
-option(DSPERATE_A32_SUBSET "Force the ARMv7 NEON subset on an AArch64 host" OFF)
 option(DSPERATE_TESTS    "Build unit tests"                                       ON)
 option(DSPERATE_HEADLESS "Build the headless frontend"                            ON)
 option(DSPERATE_SDL      "Build the SDL2 frontend (off when SDL2 is not found)"   ON)
@@ -97,7 +96,7 @@ option(DSPERATE_PGO_STRICT "PGO use: warn about every function without a matchin
 # Flags every object sees; a flag added per target must be added here too.
 string(TOUPPER "${CMAKE_BUILD_TYPE}" _ds_build_type_uc)
 string(SHA1 _ds_pgo_fingerprint
-  "${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION} ${CMAKE_SYSTEM_PROCESSOR} ${CMAKE_BUILD_TYPE} ${CMAKE_CXX_FLAGS} ${CMAKE_CXX_FLAGS_${_ds_build_type_uc}} harden=${DSPERATE_HARDEN} tune=${DSPERATE_TUNE} jit=${DSPERATE_JIT} neon=${DSPERATE_NEON} a32sub=${DSPERATE_A32_SUBSET}")
+  "${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION} ${CMAKE_SYSTEM_PROCESSOR} ${CMAKE_BUILD_TYPE} ${CMAKE_CXX_FLAGS} ${CMAKE_CXX_FLAGS_${_ds_build_type_uc}} harden=${DSPERATE_HARDEN} tune=${DSPERATE_TUNE} jit=${DSPERATE_JIT} neon=${DSPERATE_NEON}")
 set(DSPERATE_PGO_FINGERPRINT "${_ds_pgo_fingerprint}" CACHE INTERNAL "")
 file(WRITE "${CMAKE_BINARY_DIR}/pgo-fingerprint" "${_ds_pgo_fingerprint}\n")
 # A different checkout path only trips GCC's location checksum (a warning);

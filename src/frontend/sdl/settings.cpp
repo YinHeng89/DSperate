@@ -15,7 +15,6 @@ using T = Setting::Type;
 
 const Choice kOnOff[]   = {{"false", "OFF"}, {"true", "ON"}};
 const Choice kSkipMode[] = {{"adaptive", "ADAPTIVE"}, {"fixed", "FIXED"}};
-const Choice kCpuOc[] = {{"false", "OFF"}, {"underclock", "UNDERCLOCK"}, {"overclock", "OVERCLOCK"}};
 // Panel-typical rates, plus the console's own (auto, the default) and no limit.
 const Choice kLimiter[] = {{"auto", "CONSOLE (59.8)"}, {"30", "30"}, {"60", "60"}, {"120", "120"},
                            {"144", "144"}, {"240", "240"}, {"off", "UNLIMITED"}};
@@ -78,12 +77,6 @@ const Setting kEmuSettings[] = {
          "DRAW FEWER FRAMES. THE GAME STILL RUNS IN FULL"),
   pick("emu.frameskip_mode", "FRAMESKIP MODE", kSkipMode, 2, "adaptive", FlagLive, Dep::FrameskipMode,
        "ADAPTIVE SKIPS ONLY WHILE BEHIND REAL TIME"),
-  pick("emu.cpu_tuning", "CPU TUNING", kCpuOc, 3, "false", FlagLive | FlagInexact, Dep::NetSession,
-       "UNDERCLOCK: FOR THE HARDER TO RUN GAMES AND/OR THE LOWEST END DEVICES. OFF IF A GAME MISBEHAVES"),
-  boolean("emu.timing_oc", "TIMING OC", "false", FlagLive | FlagInexact, Dep::NetSession,
-          "FASTEST AND LEAST SAFE. GAMES THAT PACE ON THE 3D FIFO WILL BREAK"),
-  boolean("emu.fast_load", "FAST LOAD", "false", FlagLive | FlagInexact, Dep::NetSession,
-          "SHORTER LOADING SCREENS. GAMES THAT RACE THE CARD CAN MISBEHAVE"),
   pick("emu.limiter", "FRAME LIMITER", kLimiter, 7, "auto", FlagLive, Dep::NetSession,
        "THE RATE THE GAME IS HELD TO. CONSOLE IS THE ONE THE GAME WAS WRITTEN FOR"),
   // Whole percent in the file ("100"), so not a Percent row (0..1 fraction).

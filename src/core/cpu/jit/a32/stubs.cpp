@@ -455,11 +455,5 @@ void patch_link(u8* site, const u8* target) {
   Emitter::patch(site, 0xEA000000u | Emitter::rel24_from(site, target));
 }
 
-// b / bl of any condition: class by L bit and condition.
-u32 relative_branch_class(u32 w) {
-  if ((w & 0x0E000000u) == 0x0A000000u) return 1 + ((w >> 24) & 1) + ((w >> 28) << 1);
-  return 0;
-}
-
 } // namespace backend
 } // namespace ds::jit

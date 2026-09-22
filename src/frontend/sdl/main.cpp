@@ -171,16 +171,11 @@ const char* kUsage =
     "  --no-mic        do not open the microphone (M still fakes one)\n"
     "  --no-vsync      present without waiting for the display refresh\n"
     "  --interp        interpreter instead of the recompiler\n"
-    "                  emu.timing_oc in the config\n"
-    "  --cpu-oc        CPU tuning, overclock: recompiled data accesses priced as main RAM, geometry on its\n                  own thread with every polygon priced as drawn (less accurate); emu.cpu_tuning = overclock\n"
-    "  --cpu-uc        CPU tuning, underclock: for the harder to run games and/or the lowest end devices.\n                  The game's CPUs run slower than a console's, so there is less to emulate a frame\n                  (less accurate; a game can miss VBlanks); emu.cpu_tuning = underclock\n"
-    "  --fast-load     cart DMA reads the card without its clock (may affect accuracy); emu.fast_load\n"
     "  --aa [off|accurate|enhanced] / --no-aa  3D edges; video.aa, off by default. accurate: the hardware's blend.\n"
     "                  resolution (scanline tiers, nearest/grid/seam; 2D untouched). accurate (bare --aa): the hardware's blend\n"
     "  --gpu-raster    rasterise 3D on the GPU (Vulkan compute) where the frame allows it; video.gpu_raster, off by default\n"
     "  --smooth-3d     with the GPU raster and present: rebuild polygon edges at panel resolution from the\n"
     "                  DS's own edge coverage (2D stays pixel-exact); video.smooth3d, off by default\n"
-    "  --lockstep      128-cycle CPU interleave (melonDS lockstep) instead of event-bound; --quantum N for any value\n"
     "  --frameskip N   skip drawing up to N frames in N+1 (0 = off); emu.frameskip. Skipping runs\n"
     "                  in whole display periods, so on a game that drives its screens on\n"
     "                  alternate frames the limit counts pairs (DS_DEBUG_SKIP=1 shows the period)\n"
@@ -212,8 +207,6 @@ const char* kUsage =
     "  --netplay       local wireless with whoever is on the LAN: join a session heard within\n"
     "                  2.5 s, else host one (melonDS's LAN protocol; a melonDS can be the other end).\n"
     "                  The menu's NETWORK FEATURES row and net.mode do the same without a flag.\n"
-    "                  Any local wireless forces --cpu-oc and --fast-load off: the\n"
-    "                  two consoles in a session have to keep the same time as each other\n"
     "  --lan-host NAME host a local-wireless session as NAME; --lan-join ADDR joins the one at ADDR;\n"
     "                  --lan-name NAME is our player name (default: the console's nickname)\n"
     "  --internet      the game reaches the real network through the emulated access point, over a\n"
@@ -412,24 +405,6 @@ std::string state_path(NDS& nds, const std::string& dir, int slot) {
 std::string auto_state_path(NDS& nds, const std::string& dir) {
   const std::string code(nds.cart ? nds.cart->header().game_code : "NONE", 4);
   return dir + "/" + code + ".auto.dss";
-}
-
-// emu.cpu_tuning: false | underclock | overclock ("true" = overclock).
-// Returns 0/1/2, the order of jit::CpuOc; unreadable = off.
-int cpu_oc_mode(const std::string& v) {
-  if (v == "underclock") return 2;
-  return (v == "overclock" || v == "1" || v == "true" || v == "yes" || v == "on") ? 1 : 0;
-}
-
-// CPU tuning tier, given cpu_oc_mode's 0/1/2. On a DSi NAND boot, underclock
-// waits for dsi_title_running (else the ARM9 loses the DSi Menu hand-off IPC
-// race); PictoChat (HNE?) and Download Play (HND?) always run untuned.
-int cpu_tuning_for(const NDS& nds, int mode) {
-  if (mode == 0 || !nds.dsi || !nds.dsi_nand_boot) return mode;
-  if (!nds.dsi_title_running) return mode == 2 ? 0 : mode;
-  const char* c = nds.dsi_title_code;
-  if (c[0] == 'H' && c[1] == 'N' && (c[2] == 'E' || c[2] == 'D')) return 0;
-  return mode;
 }
 
 // Auto slot as the starting point when emu.autoload is set and it exists.
@@ -1106,11 +1081,6 @@ static int run(int argc, char** argv) {
     else if (flag("--no-mic")) cli.set("audio.mic", "false");
     else if (flag("--no-vsync")) cli.set("video.vsync", "false");
     else if (flag("--interp")) cli.set("emu.jit", "false");
-    else if (flag("--lockstep")) cli.set("emu.quantum", std::to_string(ds::LOCKSTEP_QUANTUM));
-    else if (arg("--quantum")) cli.set("emu.quantum", argv[++i]);
-    else if (flag("--cpu-oc")) cli.set("emu.cpu_tuning", "overclock");
-    else if (flag("--cpu-uc")) cli.set("emu.cpu_tuning", "underclock");
-    else if (flag("--fast-load")) cli.set("emu.fast_load", "true");
     else if (arg("--frameskip")) cli.set("emu.frameskip", argv[++i]);
     else if (arg("--frameskip-mode")) cli.set("emu.frameskip_mode", argv[++i]);
     else if (flag("--frameskip-capture")) cli.set("emu.frameskip_capture", "true");
@@ -1164,7 +1134,7 @@ static int run(int argc, char** argv) {
   }
   auto apply_cli = [&] { for (const char* k : {"paths.bios9", "paths.bios7", "paths.firmware", "video.scale", "video.dual_window", "video.layout", "video.screen", "video.pip_alpha", "video.screen_gap", "video.dominant_ratio", "video.dominant_threshold", "video.integer_scale",
                                               "video.fullscreen", "video.linear", "video.lcd_grid", "video.chunky", "video.chunky_threshold", "video.chunky_cell", "video.seam", "video.disp", "video.fbdev", "video.gpu_present", "video.vsync", "audio.enabled", "audio.volume",
-                                              "audio.mic", "emu.jit", "emu.quantum", "emu.speed", "emu.limiter", "emu.pacing", "audio.buffer_size", "audio.latency_frames", "emu.timing_oc", "emu.gx_worker", "emu.cpu_tuning", "emu.fast_load", "emu.frameskip", "emu.frameskip_mode", "emu.frameskip_capture", "video.aa", "video.gpu_raster", "video.gpu_defer", "video.internal_res", "video.smooth3d", "emu.autosave_png", "emu.autoload", "cheevos.enabled", "cheevos.token_file", "cheevos.username"}) if (cli.has(k)) cfg.set(k, cli.str(k)); };
+                                              "audio.mic", "emu.jit", "emu.speed", "emu.limiter", "emu.pacing", "audio.buffer_size", "audio.latency_frames", "emu.frameskip", "emu.frameskip_mode", "emu.frameskip_capture", "video.aa", "video.gpu_raster", "video.gpu_defer", "video.internal_res", "video.smooth3d", "emu.autosave_png", "emu.autoload", "cheevos.enabled", "cheevos.token_file", "cheevos.username"}) if (cli.has(k)) cfg.set(k, cli.str(k)); };
   apply_cli();
   const std::string bios9 = cfg.str("paths.bios9"), bios7 = cfg.str("paths.bios7");
   const std::string dsi_fw = cfg.str("paths.dsi_firmware");
@@ -1226,12 +1196,11 @@ static int run(int argc, char** argv) {
       else { ds::avoid_cpus(irq_cpus, &note); VLOG("gpu irq avoid: %s\n", note.c_str()); }
     }
   }
-  // Scheduler's constructor reads DS_IDLE_SKIP once; must be set before NDS is constructed.
-  if (cfg.has("emu.idle_skip") && !std::getenv("DS_IDLE_SKIP")) setenv("DS_IDLE_SKIP", cfg.str("emu.idle_skip").c_str(), 1);
-  if (cfg.num("emu.host_cores", 0) > 0 && !std::getenv("DS_HOST_CORES")) setenv("DS_HOST_CORES", cfg.str("emu.host_cores").c_str(), 1);
+  if (cfg.num("emu.host_cores", 0) > 0) ds::set_host_cores(static_cast<ds::u32>(cfg.num("emu.host_cores", 0)));   // DS_HOST_CORES still wins
   VLOG("host: %u cores\n", ds::host_cores());
 
   NDS nds;
+  if (cfg.has("emu.idle_skip") && !std::getenv("DS_IDLE_SKIP")) nds.sched.set_idle_skip(cfg.str("emu.idle_skip").c_str());   // DS_IDLE_SKIP wins
   ds::bios::UserSettings user;
   user.nickname = cfg.str("user.nickname", user.nickname);
   user.message = cfg.str("user.message", user.message);
@@ -1410,7 +1379,6 @@ static int run(int argc, char** argv) {
   bool audio_on = cfg.flag("audio.enabled", true), mic_on = cfg.flag("audio.mic", true);
   const bool jit = cfg.flag("emu.jit", true);
   const bool& dual_window = vs.dual_window;
-  const long quantum = cfg.num("emu.quantum", 0);   // event-bound interleave; faster than lockstep
   using Disp = ds::sdl::Display;
   using Menu = ds::sdl::Menu;
   Disp::Layout& layout = vs.layout;
@@ -1725,17 +1693,14 @@ sdl_ready:
   Session session;
   session.open(nds, cfg, rom_path, save_arg);
 
-  nds.sched.set_quantum(quantum);
-  nds.io.set_cart_bulk(cfg.flag("emu.fast_load", false));   // may introduce accuracy issues
   cfg.set("video.aa", kAaNames[aa_mode(cfg.str("video.aa", "off"))]);
   apply_aa(nds, aa_mode(cfg.str("video.aa", "off")));
   nds.gpu3d.renderer().set_smooth3d(cfg.flag("video.smooth3d", false));   // picked up when the raster opens below
   // Opt-in, allowed to decline (opens a Vulkan device): print why once.
   if (cfg.flag("video.gpu_raster", false)) {
-    // Internal resolution (1..4); read as DS_VK_SCALE, explicit env wins.
-    if (!std::getenv("DS_VK_SCALE")) { const int ir = std::atoi(cfg.str("video.internal_res", "1").c_str()); if (ir >= 2 && ir <= 4) setenv("DS_VK_SCALE", std::to_string(ir).c_str(), 1); }
+    const int ir = std::atoi(cfg.str("video.internal_res", "1").c_str());   // internal resolution, 1..4
     std::string why;
-    const bool on = nds.gpu3d.renderer().set_gpu_raster(true, &why);
+    const bool on = nds.gpu3d.renderer().set_gpu_raster(true, &why, ir >= 1 && ir <= 4 ? static_cast<ds::u32>(ir) : 1u);
     std::fprintf(stderr, "gpu raster: %s%s%s\n", on ? "on" : "OFF -- software raster",
                  why.empty() ? "" : " -- ", why.c_str());
     if (on && cfg.flag("video.gpu_defer", false)) {
@@ -1750,13 +1715,8 @@ sdl_ready:
   if (!replay || rtc_host) nds.io.start_rtc_clock();
   else VLOG("rtc: frozen for the replay\n");
   if (replay && rtc_host) std::fprintf(stderr, "rtc: --rtc-host over a replay; this run is not reproducible\n");
-  // Checked once a frame, so it follows the DSi Menu starting/returning a title.
-  int cpu_oc_cfg = cpu_oc_mode(cfg.str("emu.cpu_tuning"));
-  int cpu_oc_applied = 0;
-  auto cpu_oc_wanted = [&](int mode) { return cpu_tuning_for(nds, mode); };
 #if DSPERATE_JIT
   if (jit && !ds::jit::attach(nds, true, true)) return 1;
-  if (jit) ds::jit::set_cpu_oc(static_cast<ds::jit::CpuOc>(cpu_oc_applied = cpu_oc_wanted(cpu_oc_cfg)));   // translate-time pricing, so before the first block
   // The DS menu boots under per-instruction budget checks: block-granularity
   // overshoot can intermittently stop it booting. Dropped once a game
   // launches; not the DSi Menu, which runs fine without it.
@@ -1799,13 +1759,13 @@ sdl_ready:
   if (!replay) lid.open();
   std::vector<s16> mic, mic_raw, mic_queue;
   // ADC sits well off zero; one-pole DC blocker, ~25 Hz at 32768 Hz.
-  // DS_MIC_GAIN scales what remains (default 0.25).
+  // audio.mic_gain scales what remains (default 0.25).
   double dc = 0.0;
   // Noise gate: floor is the slowest-rising rms seen; a frame under
-  // DS_MIC_GATE times it (default 5, 0 = off) is sent as silence.
-  const double mic_gate = std::getenv("DS_MIC_GATE") ? std::atof(std::getenv("DS_MIC_GATE")) : cfg.real("audio.mic_gate", 5.0);
+  // audio.mic_gate times it (default 5, 0 = off) is sent as silence.
+  const double mic_gate = cfg.real("audio.mic_gate", 5.0);
   double mic_floor = 1e9;
-  const double mic_gain = std::getenv("DS_MIC_GAIN") ? std::atof(std::getenv("DS_MIC_GAIN")) : cfg.real("audio.mic_gain", 0.25);
+  const double mic_gain = cfg.real("audio.mic_gain", 0.25);
   const size_t mic_per_frame = ds::spu::Spu::SAMPLE_RATE * ds::CYCLES_PER_FRAME / ds::ARM9_CLOCK_HZ;   // 547
 
   // Wall-clock pacing when there is no audio queue to pace against.
@@ -2500,19 +2460,6 @@ sdl_ready:
     const bool on = v == "1" || v == "true" || v == "yes" || v == "on";
     if (is("emu.frameskip")) { if (!net_live) fs_limit = std::atoi(v.c_str()); return; }
     if (is("emu.frameskip_mode")) { fs_adaptive = v != "fixed"; return; }
-    // ::ds::jit: a local `jit` (interpreter switch) shadows the namespace here.
-    // Pricing is baked in at translation, so the JIT cache must flush.
-    if (is("emu.cpu_tuning")) {
-      const int mode = cpu_oc_mode(v);
-      cpu_oc_cfg = mode;
-      cpu_oc_applied = cpu_oc_wanted(mode);
-#if DSPERATE_JIT
-      ::ds::jit::set_cpu_oc(static_cast<::ds::jit::CpuOc>(cpu_oc_applied));
-      ::ds::jit::flush_all();
-#endif
-      return;
-    }
-    if (is("emu.fast_load")) { nds.io.set_cart_bulk(on); return; }
     if (is("emu.dsi_nand_shortcuts")) {
       shortcuts_note = sync_nand_shortcuts(on);   // shown by the frame loop's toast
       if (boot_firmware && nds.cart) games = enumerate_library(cfg);
@@ -2608,16 +2555,12 @@ sdl_ready:
   // Set when a guest heard nobody: see begin_guest_scan below.
   bool guest_retry_armed = false, radio_was_on = false, scanning = false;
   bool knobs_held = false;
-  std::string held_cpu_oc = "false", held_timing_oc = "false", held_fast_load = "false";   // the values, as emu.cpu_tuning has three
   int held_speed = 100; std::string held_limiter = "auto";
   int  held_fs_limit = 0;
   bool held_ff_toggle = false;
   auto take_away_for_session = [&] {
     if (knobs_held) return;
     knobs_held = true;
-    held_cpu_oc = cpu_oc_mode(cfg.str("emu.cpu_tuning")) == 2 ? "underclock" : cpu_oc_mode(cfg.str("emu.cpu_tuning")) ? "overclock" : "false";
-    held_timing_oc = cfg.flag("emu.timing_oc", false) ? "true" : "false";
-    held_fast_load = cfg.flag("emu.fast_load", false) ? "true" : "false";
     held_fs_limit = fs_limit;
     held_ff_toggle = ff_toggle;
     held_speed = speed_pct;
@@ -2638,12 +2581,6 @@ sdl_ready:
       std::fprintf(stderr, "net: fast forward is off for this session\n");
       ff_toggle = false;
     }
-    for (const char* k : {"emu.cpu_tuning", "emu.timing_oc", "emu.fast_load"})
-      if (cpu_oc_mode(cfg.str(k)) != 0) {   // "on" for the two booleans, either tier for cpu_tuning
-        std::fprintf(stderr, "net: %s is off for this session -- the network keeps time, so the machine cannot fake it\n", k);
-        cfg.set(k, "false");       // in memory, not in the player's file
-        host.apply(k, "false");    // and into the running machine
-      }
   };
   auto give_back_after_session = [&] {
     if (!knobs_held) return;
@@ -2656,14 +2593,6 @@ sdl_ready:
       apply_limiter();
       std::fprintf(stderr, "net: the frame limiter is back where it was -- the session is over\n");
     }
-    const std::pair<const char*, const std::string*> knobs[] = {
-      {"emu.cpu_tuning", &held_cpu_oc}, {"emu.timing_oc", &held_timing_oc}, {"emu.fast_load", &held_fast_load}};
-    for (const auto& [k, held] : knobs)
-      if (*held != "false") {
-        std::fprintf(stderr, "net: %s is back on -- the session is over\n", k);
-        cfg.set(k, *held);
-        host.apply(k, *held);
-      }
   };
   set_net_mode = [&](const std::string& mode) {
     // Down first: a guest says goodbye rather than going silent.
@@ -3526,10 +3455,10 @@ sdl_ready:
         if (SDL_GetTicks() - scan_began_ms >= kScanMs) finish_guest_scan();
       }
     }
-    // DS_WIFI_SLICE=1: spread the frame's emulation across its period in
-    // 1 ms slices ending just before the pacer's deadline, so a peer's CMD
-    // is answered within a slice. Off by default.
-    if (lan && !fast && std::getenv("DS_WIFI_SLICE")) {
+    // LAN session: spread the frame's emulation across its period in 1 ms
+    // slices ending just before the pacer's deadline, so a peer's CMD is
+    // answered within a slice.
+    if (lan && !fast) {
       const Uint64 frame_end = std::max(pacer.next(), SDL_GetPerformanceCounter() - static_cast<Uint64>(frame_ns * ticks_per_ns / 2)) + static_cast<Uint64>(frame_ns * ticks_per_ns);
       constexpr u64 slice = ds::ARM9_CLOCK_HZ / 1000;
       constexpr int slices = static_cast<int>(ds::CYCLES_PER_FRAME / slice) + 1;
@@ -3577,16 +3506,6 @@ sdl_ready:
       }
     }
 
-#if DSPERATE_JIT
-    // Follows the DSi Menu and the title it starts (cpu_tuning_for).
-    if (jit && cpu_oc_cfg != 0 && cpu_oc_wanted(cpu_oc_cfg) != cpu_oc_applied) {
-      cpu_oc_applied = cpu_oc_wanted(cpu_oc_cfg);
-      VLOG("cpu tuning: %s (%s)\n", cpu_oc_applied == 2 ? "underclock" : cpu_oc_applied ? "overclock" : "off",
-           !nds.dsi_title_running ? "the DSi Menu" : cpu_oc_applied ? "its title started" : "not for PictoChat or Download Play");
-      ds::jit::set_cpu_oc(static_cast<ds::jit::CpuOc>(cpu_oc_applied));
-      ds::jit::flush_all();
-    }
-#endif
     if (nds.exit_requested) {
       std::fprintf(stderr, "dsi: the title has left (a soft reset); quitting\n");
       flush_save();

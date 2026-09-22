@@ -24,16 +24,14 @@ public:
   ~TextureCache();
 
   void begin_frame(u64 frame);
-  // Decoded texels (width*height words); nullptr when the cache is disabled.
+  // Decoded texels (width*height words); nullptr for fmt 0.
   const u32* lookup(const VramMap& vm, u32 fmt, u32 base, u32 width, u32 height, u32 texpal, u32 alpha0);
   // Same, plus identity: `id` is stable for the entry's life, `version` counts
   // decodes, so a caller keeping its own copy can tell if it's stale.
   struct Ref { const u32* texels = nullptr; u32 words = 0; u32 id = 0; u32 version = 0; bool transparent = false; };   // transparent: any texel has alpha 0
   Ref lookup_ref(const VramMap& vm, u32 fmt, u32 base, u32 width, u32 height, u32 texpal, u32 alpha0);
   void clear();
-  bool enabled() const { return enabled_; }
   u32  decodes_this_frame() const { return decodes_; }
-  void set_enabled(bool on) { enabled_ = on; if (!on) clear(); }
 
 private:
   struct Source { u32 addr = 0, len = 0; bool palette = false; };   // a validated range
@@ -62,7 +60,6 @@ private:
   u64 frame_ = 0;
   u32 gate_hits_ = 0;   // DS_TEXCACHE_VERIFY report: gate-only hits
   u32 decodes_ = 0;
-  bool enabled_ = true;
 };
 
 } // namespace ds::gpu

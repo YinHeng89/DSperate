@@ -8,12 +8,11 @@
 namespace ds::sdl {
 
 // Microphone via direct ALSA, bypassing SDL/PipeWire: on the handhelds
-// PipeWire's only capture "source" is a monitor of the speaker. DS_MIC_DEV
-// selects the ALSA device (default plughw:0,0). libasound is dlopen'd; on
-// failure open() returns false and the SDL path is used.
+// PipeWire's only capture "source" is a monitor of the speaker. libasound is
+// dlopen'd; on failure open() returns false and the SDL path is used.
 class MicAlsa {
 public:
-  bool open(u32 rate, const char* device = nullptr);   // null/empty device = DS_MIC_DEV or plughw:0,0
+  bool open(u32 rate, const char* device = nullptr);   // null/empty device = plughw:0,0
   void close();
   bool active() const { return pcm_ != nullptr; }
   // True if the PCM opened but rejected our params: device is busy/restricted,

@@ -57,8 +57,6 @@ bool Config::load(const std::string& path) {
   std::ifstream f(path);
   if (!f) return false;
   std::string line, section;
-  std::string cpu_oc;           // emu.cpu_oc value, if present (old name for cpu_tuning)
-  bool cpu_tuning = false;      // whether emu.cpu_tuning is present
   while (std::getline(f, line)) {
     line = trim(line);
     if (line.empty() || line[0] == '#' || line[0] == ';') continue;
@@ -68,16 +66,7 @@ bool Config::load(const std::string& path) {
     std::string k = trim(line.substr(0, eq)), v = trim(line.substr(eq + 1));
     if (const size_t c = v.find_first_of("#;"); c != std::string::npos) v = trim(v.substr(0, c));
     const std::string key = section.empty() ? k : section + "." + k;
-    if (key == "emu.cpu_oc") cpu_oc = v;
-    if (key == "emu.cpu_tuning") cpu_tuning = true;
     kv_[key] = v;
-  }
-  // cpu_oc is the old spelling; "true"/on/yes/1 maps to the overclock tier.
-  if (!cpu_tuning && !cpu_oc.empty()) kv_["emu.cpu_tuning"] = cpu_oc;
-  if (const auto it = kv_.find("emu.cpu_tuning"); it != kv_.end()) {
-    const std::string& t = it->second;
-    if (t == "1" || t == "true" || t == "yes" || t == "on") it->second = "overclock";
-    else if (t == "0" || t == "no" || t == "off") it->second = "false";
   }
   return true;
 }
@@ -308,7 +297,7 @@ R"(# DSperate settings. Command-line flags override this file. Two files next
                                 # a gap. auto starts at 50 ms and raises it only when the machine is
                                 # keeping up and still ran the queue dry -- depth answers an
                                 # occasional hitch, never a machine that cannot keep up, where the
-                                # fix is frameskip or cpu_tuning. Replaces latency_frames, which
+                                # fix is frameskip. Replaces latency_frames, which
                                 # counted whole DS frames (~16.7 ms each) and is still read here
 # mic = true                    # open the microphone
 # mic_dev = plughw:0,0          # ALSA capture device
@@ -346,37 +335,6 @@ R"(# DSperate settings. Command-line flags override this file. Two files next
                                 # governor is in charge. No system setting is changed either way
 # host_cores = 0                # cores the emulator's threads size themselves for; 0 = detect
 # jit = true                    # false = interpreter (much slower; for comparison)
-# quantum = 0                   # CPU interleave: 0 = event-bound (fastest) | 128 = melonDS lockstep
-#
-# cpu_tuning, timing_oc and fast_load trade accuracy for speed. They are off by
-# default and no game needs them; they exist to squeeze a slow device. If a
-# game misbehaves (hangs, desyncs, glitches), turn these off first.
-# cpu_tuning = false            # "CPU TUNING": false | underclock | overclock (cpu_oc, its old name, and
-                                # true for overclock are still read). overclock: the recompiler
-                                # prices every memory access at one constant (a cached main-RAM
-                                # load) instead of by region. underclock: for the harder to run games
-                                # and/or the lowest end devices -- stores and the whole ARM7 at main
-                                # RAM's bus cost, so the game's CPUs run slower than a console's and
-                                # there is less to emulate a frame (a game waiting on its own clock
-                                # can miss a VBlank). On a DSi it waits for the DSi Menu to start its
-                                # title. Less
-                                # accurate than timing_oc: timer-race titles drift. Usually a
-                                # sizable FPS increase. Also moves the 3D geometry engine to its
-                                # own thread with every polygon priced as if drawn (the FIFO, its
-                                # level and the stall are kept; the engine only drains a little
-                                # slower than hardware).
-# gx_worker = false             # The geometry engine on its own thread, with the GX FIFO, its level,
-                                # the stall and the swap timing KEPT: the half-way house between exact
-                                # and timing_oc. Only the cost of a culled polygon is estimated (from
-                                # the previous frame's cull ratio), so games pacing on the FIFO keep
-                                # their ordering. Most of timing_oc's speed on 3D-heavy games.
-# timing_oc = false             # "Timing OC": drop the GX FIFO and geometry timing (DraStic's model),
-                                # and run the geometry engine on its own thread.
-                                # A few percent faster on 3D-heavy games; USE WITH CAUTION! games that
-                                # pace on the FIFO or the swap WILL break. HARD. Turn THIS off first if
-                                # something breaks.
-# fast_load = false             # cart DMA reads ROM at full speed instead of on the card's clock.
-                                # Faster loading screens; games that race the card can misbehave
 # idle_skip = 1                 # skip a CPU busy-wait: 0 = never | 1 = only the GXSTAT swap poll |
                                 # all = every proven poll loop
 # autosave = false              # on quit, save a state to the hidden "auto" slot

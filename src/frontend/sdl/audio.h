@@ -47,7 +47,7 @@ public:
 
   // [audio] buffer_size = auto: grows the target only while the machine keeps
   // up and still runs dry (an isolated hitch, which depth can fix). Behind
-  // real time it leaves the target alone -- that's a frameskip/cpu_tuning
+  // real time it leaves the target alone -- that's a frameskip
   // problem, and a deeper queue would just detune the output.
   void set_buffer_auto();
   bool buffer_auto() const { return auto_; }

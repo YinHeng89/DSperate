@@ -12,7 +12,6 @@
 
 #include <atomic>
 #include <cstdio>
-#include <cstdlib>
 #include <condition_variable>
 #include <mutex>
 #include <thread>
@@ -91,9 +90,7 @@ private:
     name_current_thread("line-worker");
     u32 last = 0;
     for (;;) {
-      // DS_2D_SPIN: spin budget before parking. Default 20000 (~line gap);
-      // 500 pairs better with DS_2D_LAG=1's whole-line slack.
-      static const int kSpin = [] { const char* e = std::getenv("DS_2D_SPIN"); return e ? std::atoi(e) : 20000; }();
+      static constexpr int kSpin = 20000;   // spin budget before parking (~line gap)
       int spins = kSpin;
       u32 r = req_.load(std::memory_order_acquire);
       while (r == last) {

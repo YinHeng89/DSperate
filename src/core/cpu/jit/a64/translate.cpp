@@ -323,7 +323,6 @@ inline u32 rotr(u32 v, u32 n) { n &= 31; return n ? (v >> n) | (v << (32 - n)) :
 
 class Translator {
 public:
-  // thread_local for the pre-translation worker.
   static u8* cold_scratch() {
     static thread_local std::unique_ptr<u8[]> buf;
     if (!buf) buf.reset(new u8[COLD_CAP]);
@@ -466,27 +465,13 @@ private:
     }
     return t7_[thumb_ ? 1 : 3];
   }
-  // CD/CDI charge for a translate-time data cost (pc-relative literal, --cpu-oc).
-  // Must mirror emit_charge_data_body; ARM7 data is taken as main RAM (--cpu-oc only).
-  u32 const_charge(u32 nd, bool cdi) const {
+  // ARM9 CD charge for a translate-time data cost (pc-relative literal).
+  // Must mirror emit_charge_data.
+  u32 const_charge(u32 nd) const {
+    assert(a9_);
+    const s32 nc = static_cast<s32>(numC(pc_));
     const s32 d = static_cast<s32>(nd);
-    if (rt().fastcost) return (a9_ ? numC(pc_) : numC_nonseq7()) + nd;   // DS_JIT_FASTCOST's inexact numC + numD
-    if (a9_) { const s32 nc = static_cast<s32>(numC(pc_)); return max3(nc + d - 6, nc, d); }
-    const s32 nc = static_cast<s32>(numC_nonseq7());
-    if (code_region7_ == 0x02) return static_cast<u32>(d + nc);
-    const s32 ncx = nc + (cdi ? 1 : 0);
-    return max3(ncx, d, d + ncx - 3);
-  }
-  // --cpu-oc data cost. ARM9: main RAM LOAD entry for loads and stores (bus
-  // cost would overcharge DTCM/IO/VRAM stores). ARM7: WRAM entry.
-  u32 oc_data_cost(bool word, bool seq, bool store) const {
-    if (rt().cpu_oc == CpuOc::Underclock) {
-      if (a9_) return store ? cpu_.nds->bus.timing().bus9_data(0x02000000u, word, seq) : cpu_.timing9[0x02000000u >> 12][seq ? 3 : (word ? 2 : 1)];
-      return cpu_.timing7[0x02000000u >> 15][seq ? (word ? 3 : 1) : (word ? 2 : 0)];
-    }
-    (void)store;
-    if (a9_) return cpu_.timing9[0x02000000u >> 12][seq ? 3 : (word ? 2 : 1)];
-    return cpu_.timing7[0x03800000u >> 15][seq ? (word ? 3 : 1) : (word ? 2 : 0)];
+    return max3(nc + d - 6, nc, d);
   }
   u32 numC_nonseq7() const { return t7_[thumb_ ? 0 : 2]; }
   u32 numC_internal() const { return a9_ ? numC(pc_) : numC_nonseq7(); }   // CI base cost
@@ -693,7 +678,6 @@ private:
     }
     call_stub(jc_.link);
     e().word(make_key(target, to_thumb));
-    if (blk_.nsucc < 4) blk_.succ[blk_.nsucc++] = make_key(target, to_thumb);
     ended_ = true;
   }
   void emit_branch_indirect(u32 wtarget, bool interwork, bool cdi = false) {
@@ -717,18 +701,6 @@ private:
     case Mem::Ld16: case Mem::Ld16S: case Mem::St16: return 1;
     default: return 2;
     }
-  }
-
-  // DS_JIT_MEMPROBE: duplicate page-table walk; writes only x2/x3, which the real walk overwrites.
-  bool memprobe_on() const {
-    const int c = rt().memprobe;
-    return c == 1 || (c == 9 && a9_) || (c == 7 && !a9_);
-  }
-  void emit_walk_probe(u32 waddr) {
-    if (!memprobe_on()) return;
-    e().lsr_imm(SCRATCH2, waddr, mem::PAGE_SHIFT);
-    e().ldr_x_reg(SCRATCH2, R_PT, SCRATCH2, true, true);
-    e().lsl_imm(SCRATCH3, SCRATCH2, 2, true);
   }
 
   // Page entry -> x2 (clobbers x3). Under fastmem R_PT holds the view, not the table.
@@ -768,7 +740,6 @@ private:
 
   // On success x3 = pre-biased host base. Clobbers x2, x3.
   void emit_page_lookup(u32 waddr, bool store, FailList& fail) {
-    emit_walk_probe(waddr);
     emit_entry_load(waddr);
     if (store) {
       e().lsr_imm(SCRATCH3, SCRATCH2, 62, true);
@@ -805,24 +776,17 @@ private:
     default: break;
     }
   }
-  // DS_JIT_COSTPROBE selects both CPUs (1) or one of them (9 / 7).
-  bool costprobe_on() const {
-    const int c = rt().costprobe;
-    return c == 1 || (c == 9 && a9_) || (c == 7 && !a9_);
-  }
   void emit_data_cost(u32 waddr, u32 wcost, bool word, bool seq, bool store) {
     // ARM9 entries are 8 bytes: loads at [1..3], stores at [5..7].
     const u32 k = a9_ ? ((store ? 4 : 0) + (seq ? 3 : (word ? 2 : 1))) : (seq ? (word ? 3 : 1) : (word ? 2 : 0));
-    for (int rep = (costprobe_on() && (rt().costprobe_part & 1)) ? 1 : 0; rep >= 0; --rep) {
-      e().lsr_imm(wcost, waddr, a9_ ? 12 : 15);
-      e().add_reg(wcost, R_TIM, wcost, LSL, a9_ ? 3 : 2, true);
-      e().ldrb(wcost, wcost, k);
-    }
+    e().lsr_imm(wcost, waddr, a9_ ? 12 : 15);
+    e().add_reg(wcost, R_TIM, wcost, LSL, a9_ ? 3 : 2, true);
+    e().ldrb(wcost, wcost, k);
   }
 
   // Precomputed ARM7 cost-table slot, or -1 to use the inline model.
   int cost7_slot(bool cdi, bool word) const {
-    if (a9_ || rt().nocost7) return -1;
+    if (a9_) return -1;
     const int ni = cpu_.nds->bus.timing().nc7_index(numC_nonseq7());
     if (ni < 0) return -1;
     return static_cast<int>(mem::Timing::cost7_offset(code_region7_ == 0x02, cdi, static_cast<u32>(ni), word));
@@ -836,20 +800,10 @@ private:
   // `wd` (w6) = data cost; waddr for the ARM7 main-RAM rule. Temps w4 (ARM9) / w2-w5 (ARM7).
   void emit_charge_data(u32 wd, u32 waddr, bool cdi) {
     flush_pending();
-    // DS_JIT_COSTPROBE: extra copy charged to a dead scratch.
-    if (costprobe_on() && (rt().costprobe_part & 2)) emit_charge_data_body(wd, waddr, cdi, SCRATCH3);
-    emit_charge_data_body(wd, waddr, cdi, R_BUDGET);
-  }
-  void emit_charge_data_body(u32 wd, u32 waddr, bool cdi, u32 wbudget) {
-    if (rt().fastcost) {   // DS_JIT_FASTCOST: inexact numC + numD
-      e().add_imm(SCRATCH5, wd, a9_ ? numC(pc_) : numC_nonseq7());
-      e().sub_reg(wbudget, wbudget, SCRATCH5);
-      return;
-    }
     if (a9_) {
       // max(nc + nd - 6, nc, nd), nd >= 1.
       const u32 nc = numC(pc_);
-      if (nc <= 1) { e().sub_reg(wbudget, wbudget, wd); return; }
+      if (nc <= 1) { e().sub_reg(R_BUDGET, R_BUDGET, wd); return; }
       if (nc <= 6) {
         e().sub_imm(SCRATCH4, wd, nc);
         e().bic_reg(SCRATCH4, SCRATCH4, SCRATCH4, ASR, 31);
@@ -859,7 +813,7 @@ private:
         e().bic_reg(SCRATCH4, SCRATCH4, SCRATCH4, ASR, 31);
         e().add_imm(SCRATCH4, SCRATCH4, nc);
       }
-      e().sub_reg(wbudget, wbudget, SCRATCH4);
+      e().sub_reg(R_BUDGET, R_BUDGET, SCRATCH4);
       return;
     }
     // ARM7: w7 holds a writeback value.
@@ -889,15 +843,14 @@ private:
       e().add_imm(SCRATCH5, wd, nc + (cdi ? 1 : 0));
     }
     e().bind(done);
-    e().sub_reg(wbudget, wbudget, SCRATCH5);
+    e().sub_reg(R_BUDGET, R_BUDGET, SCRATCH5);
   }
   // One access at w1. const_nd >= 0: translate-time data cost, charged before
   // the access (nothing observes the budget in between).
   void emit_single(Mem m, u32 wdata, u32 dst, bool wb, u32 wb_reg, bool cdi, int const_nd = -1) {
     const bool word = is_word(m);
-    if (rt().cpu_oc != CpuOc::Off && const_nd < 0) const_nd = static_cast<int>(oc_data_cost(word, false, !is_load(m)));
     const bool const_cost = const_nd >= 0;
-    if (const_cost) add_pending(const_charge(static_cast<u32>(const_nd), cdi));
+    if (const_cost) add_pending(const_charge(static_cast<u32>(const_nd)));
     flush_pending();
     const int slot7 = const_cost ? -1 : cost7_slot(cdi, word);
     auto cost = [&] {
@@ -919,7 +872,6 @@ private:
     const bool fast = fm_fast();
     size_t patch = 0;
     if (!fast) {
-      emit_walk_probe(SCRATCH1);
       emit_entry_load(SCRATCH1);
     }
     cost();
@@ -997,21 +949,15 @@ private:
   void emit_block_slow(u32 list, bool load, bool writeback, u32 rn, u32 n, bool user_bank, u32 pc_store_value) {
     e().and_imm(SCRATCH1, SCRATCH1, ~3u);
     // Cost first (stubs preserve only x1/x7), per word since words span pages.
-    if (rt().cpu_oc == CpuOc::Off) {
-      for (u32 k = 0; k < n; ++k) {
-        if (k == 0) emit_data_cost(SCRATCH1, SCRATCH6, true, false, !load);
-        else {
-          e().add_imm(SCRATCH3, SCRATCH1, k * 4, true);
-          emit_data_cost(SCRATCH3, SCRATCH5, true, true, !load);
-          e().add_reg(SCRATCH6, SCRATCH6, SCRATCH5);
-        }
+    for (u32 k = 0; k < n; ++k) {
+      if (k == 0) emit_data_cost(SCRATCH1, SCRATCH6, true, false, !load);
+      else {
+        e().add_imm(SCRATCH3, SCRATCH1, k * 4, true);
+        emit_data_cost(SCRATCH3, SCRATCH5, true, true, !load);
+        e().add_reg(SCRATCH6, SCRATCH6, SCRATCH5);
       }
-      emit_charge_data(SCRATCH6, SCRATCH1, load);
-    } else {
-      const u32 nd = oc_data_cost(true, false, !load) + (n - 1) * oc_data_cost(true, true, !load);
-      e().mov_imm(SCRATCH6, const_charge(nd, load));
-      e().sub_reg(R_BUDGET, R_BUDGET, SCRATCH6);
     }
+    emit_charge_data(SCRATCH6, SCRATCH1, load);
     bool first = true;
     for (u32 i = 0; i < 16; ++i) {
       if (!(list & (1u << i))) continue;
@@ -1100,21 +1046,16 @@ private:
       if (writeback) e().mov(host_reg(rn), SCRATCH7);
     }
     // N + (n - 1) S
-    const bool oc = rt().cpu_oc != CpuOc::Off;
-    u32 oc_nd = 0;
-    if (oc) oc_nd = oc_data_cost(true, false, !load) + (n - 1) * oc_data_cost(true, true, !load);
-    else {
-      emit_data_cost(SCRATCH1, SCRATCH6, true, false, !load);
-      if (n > 1) {
-        emit_data_cost(SCRATCH1, SCRATCH5, true, true, !load);
-        e().mov_imm(SCRATCH4, n - 1);
-        e().madd(SCRATCH6, SCRATCH5, SCRATCH4, SCRATCH6);
-      }
+    emit_data_cost(SCRATCH1, SCRATCH6, true, false, !load);
+    if (n > 1) {
+      emit_data_cost(SCRATCH1, SCRATCH5, true, true, !load);
+      e().mov_imm(SCRATCH4, n - 1);
+      e().madd(SCRATCH6, SCRATCH5, SCRATCH4, SCRATCH6);
     }
     if (load && pc_in_list) {
       // CDI charged by the stub after the jump: w1 = numD, w2 = data address.
       e().mov(SCRATCH2, SCRATCH1);
-      if (oc) e().mov_imm(SCRATCH1, oc_nd); else e().mov(SCRATCH1, SCRATCH6);
+      e().mov(SCRATCH1, SCRATCH6);
       emit_branch_indirect(SCRATCH0, interwork_pc, true);
       cold_begin(fail);
       const size_t fb = cold_.size();
@@ -1124,8 +1065,7 @@ private:
       ended_ = true;
       return;
     }
-    if (oc) { add_pending(const_charge(oc_nd, load)); flush_pending(); }
-    else emit_charge_data(SCRATCH6, SCRATCH1, load);
+    emit_charge_data(SCRATCH6, SCRATCH1, load);
     const size_t join = hot_.size();
     cold_begin(fail);
     const size_t fb = cold_.size();
@@ -1539,7 +1479,7 @@ void Translator::translate_arm(u32 instr) {
   size_t skip = 0;
   const bool conditional = cond != 0xE;
   // csel form: result in x6, committed by the select; cost charged unconditionally.
-  const bool csel_form = conditional && !rt().nocsel && use_csel_op(op, instr);
+  const bool csel_form = conditional && use_csel_op(op, instr);
   const bool precharged = conditional && !csel_form && arm_simple_cost(op);
   if (conditional && !csel_form) {
     if (precharged) { const u32 c = numC(pc_); add_pending(c); flush_pending(); charged_ahead_ = c; }
@@ -1911,8 +1851,6 @@ void Translator::translate_thumb(u16 instr) {
 bool Translator::run() {
   const u32 start = key_pc(key_);
   if (!a9_) { t7_ = cpu_.timing7[start >> 15]; code_region7_ = start >> 24; }
-  // --cpu-oc baked costs are untracked: die on any retime.
-  if (rt().cpu_oc != CpuOc::Off) blk_.dep_overflow = true;
 
   u32 addr = start;
   for (u32 i = 0; i < MAX_INSTRS; ++i) {

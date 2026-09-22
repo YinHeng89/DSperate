@@ -3,9 +3,6 @@
 #include "core/cart/rom_source.h"
 
 #include <cerrno>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
 #include <cstring>
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -17,43 +14,7 @@ namespace ds::cart {
 static constexpr u64 MAX_ROM = 512ull << 20;   // a DS card tops out at 512 MB
 
 RomSource::~RomSource() {
-  if (worker_.joinable()) { stop_ = true; worker_.join(); }
   if (map_) munmap(map_, map_len_);
-}
-
-// MemAvailable, or free + page cache on kernels without it.
-static u64 mem_available() {
-  FILE* f = std::fopen("/proc/meminfo", "r");
-  if (!f) return 0;
-  u64 avail = 0, free_kb = 0, cached = 0; char line[128];
-  while (std::fgets(line, sizeof line, f)) {
-    unsigned long long v = 0;
-    if (std::sscanf(line, "MemAvailable: %llu", &v) == 1) avail = v;
-    else if (std::sscanf(line, "MemFree: %llu", &v) == 1) free_kb = v;
-    else if (std::sscanf(line, "Cached: %llu", &v) == 1) cached = v;
-  }
-  std::fclose(f);
-  return (avail ? avail : free_kb + cached) << 10;
-}
-
-bool RomSource::prefetch(u64 margin) {
-  if (!map_ || worker_.joinable()) return false;
-  const char* e = std::getenv("DS_CART_PREFETCH");
-  if (!e || std::atoi(e) == 0) return false;
-  if (mem_available() < static_cast<u64>(map_len_) + margin) return false;
-  worker_ = std::thread([this] {
-    // madvise is a hint; the touch after forces the read where it's ignored.
-    constexpr size_t STEP = 4u << 20;
-    volatile u8 sink = 0;
-    u8* base = static_cast<u8*>(map_);
-    for (size_t off = 0; off < map_len_ && !stop_; off += STEP) {
-      const size_t n = map_len_ - off < STEP ? map_len_ - off : STEP;
-      madvise(base + off, n, MADV_WILLNEED);
-      for (size_t p = 0; p < n && !stop_; p += PAGE) sink = base[off + p];
-    }
-    (void)sink;
-  });
-  return true;
 }
 
 const u8* RomSource::ff_page() {

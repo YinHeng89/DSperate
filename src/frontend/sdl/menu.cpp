@@ -974,8 +974,6 @@ int Menu::table_slot() const {
   }
 }
 
-int Menu::settings_rows() const { return settings_count(table()); }
-
 // Walks past rows the host has switched off, and stops at the ends rather than wrapping.
 bool Menu::move_setting_row(int delta) {
   const Setting* t = table();
@@ -1110,10 +1108,7 @@ void Menu::draw_settings(const Canvas& d) const {
     const bool on = host_->enabled(s);
     const bool is_sel = top + i == sel;
     if (is_sel) fill_rect(d, f.px0 + m.list_s * 4, ry - m.list_s * 2, f.w - m.list_s * 14, m.list_row_h, kSel);
-    // A setting that trades accuracy for speed is coloured, not just noted.
-    u32 ink = kInk;
-    if (!on) ink = kPanelEdgeDim;
-    else if (!is_sel && (s.flags & FlagInexact)) ink = kEdgeText;
+    const u32 ink = on ? kInk : kPanelEdgeDim;
     draw_text(d, f.text_x, ry, m.list_s, ink, fit(s.label, m.list_s, f.avail - value_w).c_str());
     const std::string v = on ? display_value(s, host_->get(s.key)) : "--";
     // A text field is opened, not stepped, so it gets no arrows.

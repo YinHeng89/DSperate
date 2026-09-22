@@ -11,7 +11,6 @@ layout(location = 0) flat in uint v_poly;
 layout(location = 1) in vec3 v_rgb;
 layout(location = 2) in vec2 v_st;
 layout(location = 3) noperspective in float v_z;
-layout(location = 4) in float v_w;
 layout(location = 5) in float v_zp;
 layout(location = 0) out uint o_col;     // the 3D layer record: RGB666 + alpha5 << 24
 layout(location = 1) out uint o_attr;    // the attribute plane the final pass reads
@@ -45,16 +44,13 @@ uint row_edge(GpuPoly p, int x, int y, out uint cov, out bool inside, out GpuRow
   }
   return yedge;
 }
-#ifndef DS_AA_PASS
-layout(location = 4) out uint o_touch;   // native tail pass (DS_FF_TAIL1X): 1 where the tail wrote the pixel, for expand.comp
-#endif
 #include "ds_shade.glsl"
 struct Frag { uint src; uint alpha; uint polyattr; uint depth; };
 Frag shade_fragment(GpuPoly p) {
   Frag o;
   uint blendmode = (p.attr >> 4) & 3u;
   uint polyalpha = (p.attr >> 16) & 0x1Fu;
-  bool textured = (p.flags & DS_PF_TEXTURED) != 0u && (pc.f.flags & DS_FF_NOTEX) == 0u;
+  bool textured = (p.flags & DS_PF_TEXTURED) != 0u;
   o.src = shade_pixel(p, blendmode, polyalpha, textured,
                       int(round(v_rgb.r)), int(round(v_rgb.g)), int(round(v_rgb.b)),
                       int(floor(v_st.x + 0.01)), int(floor(v_st.y + 0.01)));

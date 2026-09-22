@@ -22,8 +22,7 @@ namespace ds::gpu {
 // engine with the display line they first affect; the frame renders in one
 // batch at the last line's HBlank, replaying the journal per line. A trapped
 // VRAM store, VRAMCNT remap, or captured LCDC bank catches lines up and
-// forces a per-line burst before re-batching. DS_2D_LAZY=0 forces per-line
-// rendering always; must produce identical frames.
+// forces a per-line burst before re-batching.
 //
 // Framebuffers: 256x192 u32 per screen, 0xAARRGGBB, 8-bit channels expanded
 // from the hardware's 6 bits.
@@ -78,7 +77,7 @@ public:
   void vram_store_trap(Cpu cpu, u32 addr);
   bool vram_remap_begin(u32 moved_2d);  // before a VRAMCNT remap: catch up, lift the trap; returns whether it was set
   void vram_remap_end(bool trapped);  // after: re-arm it
-  void set_lazy(bool on) { lazy_enabled_ = on; }   // DS_2D_LAZY
+  void set_lazy(bool on) { lazy_enabled_ = on; }   // off: per-line rendering (tests)
 
   const u32* framebuffer(int screen) const { return fb_[screen].data(); }   // 0 = top, 1 = bottom
 
@@ -100,9 +99,7 @@ public:
   // a multiple of it (1 = no alternation).
   u8 display_phase_period() const { return phase_period_; }
   bool lines_in_flight() const { return inflight_[0] || inflight_[1] || scale_inflight_; }
-  bool lag_active() const { return lag_frame_ && par_2d_ && !lazy_frame_; }
-  // Time spent in join_worker since the last take (ns); read by the 3D shape controller at VBlank.
-  u64 take_join_wait_ns() { const u64 v = join_wait_ns_; join_wait_ns_ = 0; return v; }
+  bool lag_active() const { return lag_frame_ && !lazy_frame_; }
   // Bus::vram_read on an LCDC page under the capture read trap: join in-flight lines if reading the bank capture writes.
   bool lcdc_read_trapped() const { return read_trap_bank_ >= 0; }
   void lcdc_read_hit(u32 addr) {
@@ -282,7 +279,7 @@ private:
   const u32* line3d_ = nullptr;   // 3D output for the line being drawn (whichever thread draws engine A)
 
   // Lazy-2D state for the frame in progress.
-  bool lazy_enabled_ = true;      // DS_2D_LAZY != 0
+  bool lazy_enabled_ = true;
   bool lazy_frame_ = false;       // this frame may batch
   // Per engine, kept in lockstep: a trapped store takes BOTH engines out of batched mode.
   bool per_line_[2] = {false, false};
@@ -296,10 +293,8 @@ private:
     if (addr >= 0x06800000) return trap_lcdc_ ? 1 : 0;
     return ((addr >> 21) & 1) ? 2 : 1;
   }
-  // Capture frames batch too (DS_2D_LAZY_CAPTURE=0 forces per line). A
-  // trapped store renders LAZY_BURST_LINES per line, then re-arms; past
-  // LAZY_BURST_LIMIT bursts the frame stays per line.
-  bool lazy_capture_ = true;
+  // Capture frames batch too. A trapped store renders LAZY_BURST_LINES per
+  // line, then re-arms; past LAZY_BURST_LIMIT bursts the frame stays per line.
   bool burst_[2] = {false, false};   // per-line for the current burst of stores
   u32  burst_left_[2] = {0, 0};      // display lines left before re-batching
   u32  lazy_bursts_[2] = {0, 0};
@@ -344,7 +339,7 @@ private:
   // A here and hand engine B's lines to the worker, as before.
   //
   // The two engines share no mutable state, so a line sees exactly the state
-  // the sequential order would. DS_2D_THREAD=0 forces sequential for comparison.
+  // the sequential order would.
   LineWorker worker_;
 public:
   // DS_WATCHDOG: where the display pipeline stands when a frame stalls.
@@ -352,7 +347,6 @@ public:
 private:
   // The job: per engine, a run of lines (first > last = nothing for it).
   u32  job_first_[2] = {1, 1}, job_last_[2] = {0, 0};
-  bool par_2d_ = false;
   bool inflight_[2] = {false, false};   // that engine's lines are on the worker
   bool a_deferred_ = false;             // engine A's whole-frame batch is in flight past line 191 (finish_a at the join)
   // Frame-level capture state latched at each render_ranges: DISPCAPCNT's
@@ -374,14 +368,12 @@ private:
   u32  bscale_n_ = 0;                   // lines stashed for the job being built / in flight
   bool bscale_defer_ = false;           // output_engine stashes engine B's line instead of scaling it
   bool scale_inflight_ = false;         // the worker holds a stash to scale
-  bool defer_join_ = true;              // DS_2D_DEFER=0: join engine A's batch at once (bisecting tool)
   Renderer3D::FrameRef ref3d_;          // the 3D frame these display lines read (begin_frame)
-  // Lag mode (DS_2D_LAG): per-line frames hand BOTH engines' line to the
+  // Lag mode: per-line frames hand BOTH engines' line to the
   // worker at its HBlank without waiting, joining at that line's HBlank or
   // earlier if observed. The last display line always joins. Past
   // LAG_TRAP_LIMIT joining stores in a frame, lag is dropped and the trap
   // lifted. Display FIFO frames stay on this thread.
-  bool lag_enabled_ = true;       // DS_2D_LAG=0 disables
   bool lag_frame_ = false;        // this frame's per-line lines may stay in flight
   u32  lag_trap_hits_ = 0;
   static constexpr u32 LAG_TRAP_LIMIT = 4096;

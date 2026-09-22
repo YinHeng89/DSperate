@@ -54,8 +54,7 @@ bool in_vram(u32 addr) { return (addr >> 24) == 0x06; }
 } // namespace
 
 void init() {
-  const char* e = std::getenv("DS_FASTMEM_CENSUS");
-  g_on = e && std::atoi(e) != 0;
+  g_on = prof::census_env("DS_FASTMEM_CENSUS") && std::atoi(std::getenv("DS_FASTMEM_CENSUS")) != 0;
   if (g_on && !g_st) g_st = new State;
 }
 

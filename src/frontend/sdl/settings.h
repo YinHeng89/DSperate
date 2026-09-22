@@ -19,7 +19,6 @@ enum Flag : u8 {
   FlagLive    = 0,        // takes effect as soon as it is set
   FlagDeferred = 1u << 0, // applied when the menu closes, not per-step (layout changes)
   FlagRestart = 1u << 1,  // only read at startup; the row says so
-  FlagInexact = 1u << 2,  // trades accuracy for speed; drawn as a warning
 };
 
 // Why a row might be switched off; the menu asks the host rather than
@@ -40,8 +39,8 @@ enum class Dep : u8 {
   Net,                // the build has the Wi-Fi transports (DSPERATE_NET)
   NetInternet,        // net.mode is internet: the DNS choice means nothing otherwise
   // No network session is up (not just none requested): frameskip, fast
-  // forward and the inexact speed knobs are meaningless once pacing is
-  // controlled by a peer or server instead of the emulator.
+  // forward, speed and limiter are meaningless once pacing is controlled by
+  // a peer or server instead of the emulator.
   NetSession,
   ShortcutsPath,      // a folder for NAND title shortcuts: paths.dsi_shortcuts, else paths.games
   GpuRaster,          // video.gpu_raster on (the row is restart-only, so the config, not the session)

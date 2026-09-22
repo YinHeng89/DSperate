@@ -64,11 +64,9 @@ u64 census_list_hash(const Polygon* const* polys, u32 n, const Vertex* vram) {
   return h;
 }
 
-// DS_R3D_SKIPDUP (default on): reuse the last frame if the new list matches
-// the previous bank's. Compares live fields only: vtx/z/w tails beyond
-// nverts are stale, and vtx indices are bank-biased.
-bool skip_dup() { static const bool on = [] { const char* e = std::getenv("DS_R3D_SKIPDUP"); return !e || std::atoi(e) != 0; }(); return on; }
-
+// Whether the new list matches the previous bank's (the last frame is then
+// reused). Compares live fields only: vtx/z/w tails beyond nverts are stale,
+// and vtx indices are bank-biased.
 bool lists_equal(const Polygon* a, const Polygon* b, u32 npoly, u32 abase, u32 bbase, const Vertex* vram) {
   for (u32 i = 0; i < npoly; ++i) {
     const Polygon& p = a[i]; const Polygon& q = b[i];
@@ -1124,7 +1122,7 @@ void Gpu3D::vblank() {
     const bool same_et    = rstate_.edge == edge_ && rstate_.toon == toon_;
     const bool same_regs  = same_disp && same_clear && same_fog && same_et;
     if (swapped_) {   // the list was finalised at the SWAP command
-      render_identical_ = skip_dup() && same_regs && list_same_;
+      render_identical_ = same_regs && list_same_;
     } else {
       render_identical_ = same_regs;
       if (prof::enabled) {
@@ -1190,9 +1188,6 @@ const u32* Gpu3D::split_line(const Renderer3D::FrameRef& f, u32 y) {
 const u32* Gpu3D::line(const Renderer3D::FrameRef& f, u32 y) {
   if (f.shape) renderer_.shape_sync(f);   // edge shaping reads across bands and repaints, once before the first line read
   renderer_.sync_line(f, static_cast<s32>(y));
-#if DSPERATE_VULKAN
-  if (f.gpu && f.scale > 1) f.gpu->reduce_line(f.out, y);   // the native plane, built as it is read
-#endif
   const u32* raw = f.line(y);
   const u32 xpos = render_xpos_;
   if (xpos == 0) return raw;

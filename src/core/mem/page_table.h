@@ -30,11 +30,11 @@ inline void code_written(u8* host, u32 len) { if (code_write_hook) code_write_ho
 // Silent-store elimination: a value identical to what's already there is not
 // reported (whether a block actually covers the bytes is the hook's business).
 struct CodeStoreStats { u64 silent = 0, changed = 0; };
-extern CodeStoreStats code_store_stats;
+extern CodeStoreStats code_store_stats;   // census builds only; reported by DS_JIT_CHURN
 inline void store_code(u8* host, const void* v, u32 len) {
-  if (std::memcmp(host, v, len) == 0) { ++code_store_stats.silent; return; }
+  if (std::memcmp(host, v, len) == 0) { if (prof::census) ++code_store_stats.silent; return; }
   std::memcpy(host, v, len);
-  ++code_store_stats.changed;
+  if (prof::census) ++code_store_stats.changed;
   code_written(host, len);
 }
 

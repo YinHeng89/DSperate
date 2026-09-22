@@ -984,16 +984,9 @@ void test_setting_steps() {
   // A number says what it counts.
   CHECK(ds::sdl::display_value(ff, "4") == "4X");
   // A boolean wraps, because a two-entry list has to.
-  const ds::sdl::Setting& fl = find("emu.fast_load");
+  const ds::sdl::Setting& fl = find("emu.autosave");
   CHECK(ds::sdl::step_value(fl, "false", +1, h) == "true");
   CHECK(ds::sdl::step_value(fl, "true", +1, h) == "false");
-  // CPU TUNING has three, OFF / UNDERCLOCK / OVERCLOCK.
-  const ds::sdl::Setting& oc = find("emu.cpu_tuning");
-  CHECK(std::strcmp(oc.label, "CPU TUNING") == 0);
-  CHECK(ds::sdl::step_value(oc, "false", +1, h) == "underclock");
-  CHECK(ds::sdl::display_value(oc, "underclock") == "UNDERCLOCK");
-  CHECK(ds::sdl::step_value(oc, "underclock", +1, h) == "overclock");
-  CHECK(ds::sdl::display_value(oc, "overclock") == "OVERCLOCK");
   // GAME SPEED is a whole percent in the file, as --speed and the frontend
   // read it. As a 0..1 percent row it showed 100 as 10000% and wrote 1.
   const ds::sdl::Setting& sp = find("emu.speed");
@@ -1100,10 +1093,9 @@ void test_network_features_row() {
   // for the session, not one the session forbids.
   CHECK(dns->depends != ds::sdl::Dep::NetSession);
 
-  // Eight rows hang off Dep::NetSession, and it is one gate rather than two:
+  // Five rows hang off Dep::NetSession, and it is one gate rather than two:
   // the frame limiter and game speed set the emulator's pace outright,
-  // frameskip and fast forward let it set its own, the three inexact speed
-  // knobs change how long its work appears to take, and under a session the
+  // frameskip and fast forward let it set its own, and under a session the
   // pace is kept outside the emulator either way -- by a peer holding every
   // frame to its timestamp, or by a server with its own timeouts. It keys on
   // the session having actually started, not on a mode having been asked
@@ -1111,9 +1103,8 @@ void test_network_features_row() {
   int session_gated = 0;
   for (int i = 0; i < ds::sdl::settings_count(t); ++i)
     if (t[i].depends == ds::sdl::Dep::NetSession) ++session_gated;
-  CHECK(session_gated == 8);
+  CHECK(session_gated == 5);
   for (const char* k : {"emu.frameskip", "emu.ff_speed", "emu.ff_skip",
-                        "emu.cpu_tuning", "emu.timing_oc", "emu.fast_load",
                         "emu.limiter", "emu.speed"}) {
     const ds::sdl::Setting* row = nullptr;
     for (int i = 0; i < ds::sdl::settings_count(t); ++i)
@@ -1126,14 +1117,6 @@ void test_network_features_row() {
     // machine boots.
     CHECK(!(row->flags & (ds::sdl::FlagRestart | ds::sdl::FlagDeferred)));
   }
-  // The three speed knobs are the inexact ones, and still say so.
-  for (const char* k : {"emu.cpu_tuning", "emu.timing_oc", "emu.fast_load"}) {
-    const ds::sdl::Setting* row = nullptr;
-    for (int i = 0; i < ds::sdl::settings_count(t); ++i)
-      if (!std::strcmp(t[i].key, k)) row = &t[i];
-    CHECK(row != nullptr);
-    CHECK(row->flags & ds::sdl::FlagInexact);
-  }
   // A host with a session up refuses every one of them, and says why.
   struct SessionOn final : FakeHost {
     const char* disabled_reason(const ds::sdl::Setting& s) const override {
@@ -1144,8 +1127,8 @@ void test_network_features_row() {
   int refused = 0;
   for (int i = 0; i < ds::sdl::settings_count(t); ++i)
     if (t[i].depends == ds::sdl::Dep::NetSession) { CHECK(!session.enabled(t[i])); ++refused; }
-  CHECK(refused == 8);
-  // And with no session up, all six are usable: the gate is the session, so
+  CHECK(refused == 5);
+  // And with no session up, all five are usable: the gate is the session, so
   // an ordinary run is untouched by any of this.
   for (int i = 0; i < ds::sdl::settings_count(t); ++i)
     if (t[i].depends == ds::sdl::Dep::NetSession) CHECK(h.enabled(t[i]));

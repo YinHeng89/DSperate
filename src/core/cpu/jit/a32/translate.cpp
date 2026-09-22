@@ -398,25 +398,11 @@ private:
     return t7_[thumb_ ? 1 : 3];
   }
   u32 numC_nonseq7() const { return t7_[thumb_ ? 0 : 2]; }
-  // CD/CDI charge for a translate-time data cost; mirrors emit_charge.
-  u32 const_charge(u32 nd, bool cdi) const {
-    const s32 d = static_cast<s32>(nd);
-    if (a9_) { const s32 nc = static_cast<s32>(numC(pc_)); return max3(nc + d - 6, nc, d); }
-    const s32 nc = static_cast<s32>(numC_nonseq7());
-    if (code_region7_ == 0x02) return static_cast<u32>(d + nc);
-    const s32 ncx = nc + (cdi ? 1 : 0);
-    return max3(ncx, d, d + ncx - 3);
-  }
-  // --cpu-oc: translate-time price of a data access of this width.
-  u32 oc_data_cost(bool word, bool seq, bool store) const {
-    if (rt().cpu_oc == CpuOc::Underclock) {
-      // ARM9 stores bus-priced: timing9's store entry is a cache hit on DSi.
-      if (a9_) return store ? cpu_.nds->bus.timing().bus9_data(0x02000000u, word, seq) : cpu_.timing9[0x02000000u >> 12][seq ? 3 : (word ? 2 : 1)];
-      return cpu_.timing7[0x02000000u >> 15][seq ? (word ? 3 : 1) : (word ? 2 : 0)];
-    }
-    (void)store;
-    if (a9_) return cpu_.timing9[0x02000000u >> 12][seq ? 3 : (word ? 2 : 1)];
-    return cpu_.timing7[0x03800000u >> 15][seq ? (word ? 3 : 1) : (word ? 2 : 0)];
+  // ARM9 CD charge for a translate-time data cost; mirrors emit_charge.
+  u32 const_charge(u32 nd) const {
+    assert(a9_);
+    const s32 d = static_cast<s32>(nd), nc = static_cast<s32>(numC(pc_));
+    return max3(nc + d - 6, nc, d);
   }
   // Slot in mem::Timing's ARM7 cost table, or -1 if not covered (use fallback).
   int cost7_slot(bool cdi, bool word) const {
@@ -504,15 +490,6 @@ private:
     return t;
   }
   u32 reg_read(u32 r, u32 pc_value) { return r == 15 ? pc_const(pc_value) : cache_.read(r); }
-  // Cold paths only: assumes every other slot register is free.
-  static u32 free_reg_except(u32 a, u32 b) {
-    for (u32 r : RegCache::HOST) if (r != a && r != b) return r;
-    return SCRATCH4;
-  }
-  static u32 free_reg_except3(u32 a, u32 b, u32 c) {
-    for (u32 r : RegCache::HOST) if (r != a && r != b && r != c) return r;
-    return SCRATCH4;
-  }
 
   // ---- memory ----
   enum class Mem { Ld32, Ld16, Ld8, Ld16S, Ld8S, St32, St16, St8 };
@@ -524,18 +501,6 @@ private:
     case Mem::Ld16: case Mem::Ld16S: case Mem::St16: return 1;
     default: return 2;
     }
-  }
-  // DS_JIT_MEMPROBE: emit a dead duplicate page-table walk (en is overwritten later).
-  bool memprobe_on() const {
-    const int c = rt().memprobe;
-    return c == 1 || (c == 9 && a9_) || (c == 7 && !a9_);
-  }
-  void emit_walk_probe(u32 a, u32 en) {
-    if (!memprobe_on()) return;
-    if (live_) { e().mrs_apsr(en); e().msr_apsr_nzcvq(en); }
-    e().lsr_imm(en, a, mem::PAGE_SHIFT);
-    e().ldr_reg(en, R_PT, en, LSL, 2);
-    e().dp_reg(MOV, false, en, 0, en, LSL, 2);
   }
   // ---- fastmem ----
   bool fm_fast() const { return jc_.fastmem && !rt().fm_is_slow(fm_key(a9_, pc_, thumb_)); }
@@ -606,12 +571,6 @@ private:
     e().add_reg(c, t, c, LSL, 5);
     e().ldrb(c, c, static_cast<u32>(slot));
   }
-  // t = max(t, u) without flags: t + max(u - t, 0)
-  void emit_max_into(u32 t, u32 u, u32 tmp) {
-    e().sub_reg(tmp, u, t);
-    e().dp_reg(BIC, false, tmp, tmp, tmp, ASR, 31);
-    e().add_reg(t, t, tmp);
-  }
   // Flag-neutral.
   void emit_charge(u32 c, u32 a, u32 t0, u32 t1, bool cdi) {
     if (a9_) {
@@ -675,12 +634,11 @@ private:
   }
 
   // `a`: locked temp, base writeback already done. `const_nd` >= 0: data cost
-  // known at translate time (pc-relative literal, --cpu-oc).
+  // known at translate time (ARM9 pc-relative literal).
   void emit_single(Mem m, u32 a, u32 data, u32 rd, bool cdi, int const_nd = -1) {
     const bool load = is_load(m), word = is_word(m);
-    if (rt().cpu_oc != CpuOc::Off && const_nd < 0) const_nd = static_cast<int>(oc_data_cost(word, false, !load));
     const bool const_cost = const_nd >= 0;
-    if (const_cost) add_pending(const_charge(static_cast<u32>(const_nd), cdi));
+    if (const_cost) add_pending(const_charge(static_cast<u32>(const_nd)));
     flush_pending();
     const int slot7 = const_cost ? -1 : cost7_slot(cdi, word);
     assert(a9_ || const_cost || slot7 >= 0);
@@ -688,7 +646,6 @@ private:
     const bool fast = fm_fast();
     const u32 f = fast ? 0xFFu : flags_begin();
     const u32 en = cache_.temp();
-    if (!fast) emit_walk_probe(a, en);
     const RegCache::State s0 = cache_.save();
     std::vector<size_t> fail;
     size_t patch = 0;
@@ -832,16 +789,13 @@ private:
     if (pc_in_list) {
       // CDI cost depends on the post-jump pc: charged by the stub.
       const u32 c = cache_.temp(), t = cache_.temp();
-      if (rt().cpu_oc != CpuOc::Off) e().mov_imm(c, oc_data_cost(true, false, false) + (n - 1) * oc_data_cost(true, true, false));
-      else {
-        emit_data_cost(a, c, t, true, false, false);
-        if (n > 1) {
-          const u32 c2 = cache_.temp();
-          emit_data_cost(a, c2, t, true, true, false);
-          e().mov_imm(t, n - 1);
-          e().mla(c, c2, t, c);
-          cache_.release(c2);
-        }
+      emit_data_cost(a, c, t, true, false, false);
+      if (n > 1) {
+        const u32 c2 = cache_.temp();
+        emit_data_cost(a, c2, t, true, true, false);
+        e().mov_imm(t, n - 1);
+        e().mla(c, c2, t, c);
+        cache_.release(c2);
       }
       cache_.release(t);
       emit_branch_indirect(hpc, interwork_pc, true, c, a);
@@ -854,26 +808,20 @@ private:
       if (fast) { cold_begin({}); fm_cold_walk(a, en, patch, !load, fb); cur_ = &hot_; }
       return;
     }
-    if (rt().cpu_oc != CpuOc::Off) {
-      const u32 nd = oc_data_cost(true, false, !load) + (n - 1) * oc_data_cost(true, true, !load);
-      add_pending(const_charge(nd, load));
-      flush_pending();
-    } else {
-      const u32 c = cache_.temp(), t = cache_.temp();
-      emit_data_cost(a, c, t, true, false, !load);
-      if (n > 1) {
-        const u32 c2 = cache_.temp();
-        emit_data_cost(a, c2, t, true, true, !load);
-        e().mov_imm(t, n - 1);
-        e().mla(c, c2, t, c);
-        cache_.release(c2);
-      }
-      const u32 t1 = cache_.temp();
-      emit_charge(c, a, t, t1, load);
-      cache_.release(t1);
-      cache_.release(t);
-      cache_.release(c);
+    const u32 c = cache_.temp(), t = cache_.temp();
+    emit_data_cost(a, c, t, true, false, !load);
+    if (n > 1) {
+      const u32 c2 = cache_.temp();
+      emit_data_cost(a, c2, t, true, true, !load);
+      e().mov_imm(t, n - 1);
+      e().mla(c, c2, t, c);
+      cache_.release(c2);
     }
+    const u32 t1 = cache_.temp();
+    emit_charge(c, a, t, t1, load);
+    cache_.release(t1);
+    cache_.release(t);
+    cache_.release(c);
     const size_t join = hot_.size();
     const RegCache::State s1 = cache_.save();
     cold_begin(fail);
@@ -928,7 +876,6 @@ private:
     }
     call_stub(jc_.link);
     e().word(make_key(target, to_thumb));
-    if (blk_.nsucc < 4) blk_.succ[blk_.nsucc++] = make_key(target, to_thumb);
     ended_ = true;
   }
   // Parallel move dst[i] <- src[i]; cache must be flushed (cycles use a free slot).
@@ -1658,7 +1605,7 @@ bool Translator::run() {
   const u32 start = key_pc(key_);
   if (!a9_) { t7_ = cpu_.timing7[start >> 15]; code_region7_ = start >> 24; }
   blk_.ndep = 0;
-  blk_.dep_overflow = rt().cpu_oc != CpuOc::Off;   // main RAM costs baked in: invalidate on any retime
+  blk_.dep_overflow = false;
 
   u32 addr = start;
   for (u32 i = 0; i < MAX_INSTRS; ++i) {

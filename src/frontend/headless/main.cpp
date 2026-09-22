@@ -249,11 +249,9 @@ int main(int argc, char** argv) {
   int dump_from = 0, dump_count = 0;   // --dump-from/--dump-count: window of a large dump
   int frames = 60; bool direct = false;
 #if DSPERATE_JIT
-  bool jit9 = true, jit7 = true;
-  long quantum = ds::LOCKSTEP_QUANTUM;   // the harness compares against melonDS: lockstep unless asked otherwise
+  bool jit = true;                    // both CPUs; --interp clears it
 #else
-  bool jit9 = false, jit7 = false;
-  long quantum = ds::LOCKSTEP_QUANTUM;
+  bool jit = false;
 #endif
   TraceState ts;
   bool rtc_host = false;              // --rtc-host: free-running clock seeded from the wall
@@ -262,7 +260,6 @@ int main(int argc, char** argv) {
   bool gpu_raster = false, gpu_ab = false;   // --gpu-ab: draw every frame both ways and compare
   const char* gpu_ab_dump = nullptr;
   bool gpu_gate = false, gpu_coverage = false, gpu_defer = false;
-  int cpu_oc = 0;   // jit::CpuOc: 0 off, 1 overclock, 2 underclock
   bool frames_given = false;
   const char* cheat_db = nullptr;      // a usrcheat.dat to load this ROM's codes from
   const char* bios9i = nullptr; const char* bios7i = nullptr; const char* dsi_boot = nullptr; const char* dsi_nand = nullptr; bool dsi_nand_boot = false; bool dsi_nand_write = false; const char* dsi_persist = nullptr; const char* dsi_install = nullptr; bool dsi_hide_installed = false; const char* dsi_tmd = nullptr; bool dsi_offline = false; bool dsi_autoload = false; bool dsi_hle = false; ds::u32 dsi_title_lo = 0; ds::bios::UserSettings user; const char* dsi_font = nullptr; const char* dsi_sd = nullptr; ds::u64 dsi_autoload_id = 0; const char* dsi_shortcuts = nullptr; bool dsi_shortcuts_on = true;
@@ -339,8 +336,7 @@ int main(int argc, char** argv) {
     else if (flag("--list-cheats")) list_cheats = true;     // print them (with their index) and exit
     else if (arg("--cheat")) enable_cheats.push_back(argv[++i]);   // enable one by name, or by "#N" from --list-cheats
     else if (!std::strcmp(argv[i], "--direct")) direct = true;
-    else if (!std::strcmp(argv[i], "--interp")) jit9 = jit7 = false;          // interpreter for both CPUs
-    else if (arg("--quantum")) quantum = std::atol(argv[++i]);                // CPU interleave in ARM9 cycles; 0 = event-bound (the frontends' mode)
+    else if (!std::strcmp(argv[i], "--interp")) jit = false;
     else if (flag("--rtc-host")) rtc_host = true;                            // INEXACT by construction: runs stop being reproducible
     else if (arg("--firmware-override")) fw_override = argv[++i];            // load it, and write back what the firmware changed
     else if (flag("--no-aa")) no_aa = true;                                  // 3D anti-aliasing off (Renderer3D::set_aa); inexact, for measurement
@@ -350,10 +346,6 @@ int main(int argc, char** argv) {
     else if (flag("--gpu-raster")) gpu_raster = true;                        // rasterise 3D on the GPU (Vulkan compute) where the frame allows it
     else if (flag("--gpu-ab")) { gpu_raster = true; gpu_ab = true; }         // draw every frame both ways and report the differences
     else if (arg("--gpu-ab-dump")) { gpu_ab_dump = argv[++i]; gpu_raster = gpu_ab = true; }  // PREFIX: write the differing frames as PREFIX-cpu.bin / PREFIX-gpu.bin
-    else if (flag("--cpu-oc")) cpu_oc = 1;                                   // INEXACT: JIT data accesses priced as main RAM at translate time; see jit::set_cpu_oc
-    else if (flag("--cpu-uc")) cpu_oc = 2;                                   // INEXACT: --cpu-oc's underclock tier (stores and the ARM7 at main RAM's bus cost)
-    else if (!std::strcmp(argv[i], "--jit9")) { jit9 = true; jit7 = false; }  // recompile the ARM9 only
-    else if (!std::strcmp(argv[i], "--jit7")) { jit9 = false; jit7 = true; }
     else if (arg("--load-state")) load_state = argv[++i];                   // restore a save state before running
     else if (arg("--frameskip")) frameskip = std::atoi(argv[++i]);          // skip drawing N of every N+1 frames (Gpu::set_frame_skip); a dump of a skipped frame is stale
     else if (flag("--frameskip-capture")) frameskip_capture = true;          // INEXACT: skip frames that display-capture too
@@ -520,7 +512,6 @@ int main(int argc, char** argv) {
       std::fprintf(stderr, "note: DSi-capable ROM without --bios9i/--bios7i: running as a DS\n");
     }
   }
-  nds.sched.set_quantum(quantum);
   nds.gpu3d.renderer().set_aa(!no_aa && !subpixel);   // the SDL frontend's video.aa = smooth: never with the hardware blend
   nds.gpu.set_subpixel(subpixel);
   nds.gpu.set_shape(shape && !subpixel);
@@ -543,7 +534,7 @@ int main(int argc, char** argv) {
     // A device without Vulkan falls back to the CPU raster rather than failing.
     std::string why;
     const bool on = nds.gpu3d.renderer().set_gpu_raster(true, &why);
-    if (on) std::fprintf(stderr, "gpu raster: %u completion bands (DS_VK_BANDS)\n",
+    if (on) std::fprintf(stderr, "gpu raster: %u completion bands\n",
                          nds.gpu3d.renderer().gpu_bands());
     std::fprintf(stderr, "gpu raster: %s%s%s\n", on ? "on" : "OFF -- software raster",
                  why.empty() ? "" : " -- ", why.c_str());
@@ -628,19 +619,9 @@ int main(int argc, char** argv) {
     }
   }
 #if DSPERATE_JIT
-  if ((jit9 || jit7) && !ds::jit::attach(nds, jit9, jit7)) return 1;
-  // DSi NAND boot: underclock waits for dsi_title_running; PictoChat/Download
-  // Play (HNE?/HND?) run with neither tier.
-  const auto cpu_oc_wanted = [&]() -> int {
-    if (cpu_oc == 0 || !nds.dsi || !nds.dsi_nand_boot) return cpu_oc;
-    if (!nds.dsi_title_running) return cpu_oc == 2 ? 0 : cpu_oc;
-    const char* c = nds.dsi_title_code;
-    return (c[0] == 'H' && c[1] == 'N' && (c[2] == 'E' || c[2] == 'D')) ? 0 : cpu_oc;
-  };
-  int cpu_oc_applied = cpu_oc_wanted();
-  if ((jit9 || jit7) && cpu_oc_applied) ds::jit::set_cpu_oc(static_cast<ds::jit::CpuOc>(cpu_oc_applied));
+  if (jit && !ds::jit::attach(nds, true, true)) return 1;
 #else
-  (void)jit9; (void)jit7; (void)cpu_oc;
+  (void)jit;
 #endif
   ds::prof::enabled = std::getenv("DS_PROFILE") != nullptr;
   std::fprintf(stderr, "host: %u cores\n", ds::host_cores());
@@ -819,8 +800,13 @@ int main(int argc, char** argv) {
       const int cycle = skip + period;
       nds.gpu.set_frame_skip(skip > 0 && static_cast<int>((i + 1) % cycle) < skip);
     }
+    // DS_DSI_SOFT_RESET_AT=<frame>: BPTWL soft reset (like a guest write of 1 to reg 0x11).
+    if (static const int sr = std::getenv("DS_DSI_SOFT_RESET_AT") ? std::atoi(std::getenv("DS_DSI_SOFT_RESET_AT")) : -1; nds.dsi && i == sr) {
+      nds.dsi_soft_reset_pending = true;
+      nds.cpu(ds::Cpu::ARM7).halted = true;
+    }
 #if DSPERATE_NET
-    if (lan && pace && !std::getenv("DS_NO_SLICE")) {   // DS_NO_SLICE=1: plain per-frame pacer
+    if (lan) {   // --lan-* implies --pace
       // Spread the frame in 1 ms slices so a peer's CMD is answered promptly.
       const auto frame_end = pace_start + std::chrono::microseconds(static_cast<long long>((i + 1) * 1000000.0 / 59.8261));
       constexpr ds::u64 slice = ds::ARM9_CLOCK_HZ / 1000;
@@ -829,11 +815,6 @@ int main(int argc, char** argv) {
         std::this_thread::sleep_until(frame_end - std::chrono::microseconds(static_cast<long long>(16700.0 * (slices - k) / slices)));
     } else
 #endif
-    // DS_DSI_SOFT_RESET_AT=<frame>: BPTWL soft reset (like a guest write of 1 to reg 0x11).
-    if (static const int sr = std::getenv("DS_DSI_SOFT_RESET_AT") ? std::atoi(std::getenv("DS_DSI_SOFT_RESET_AT")) : -1; nds.dsi && i == sr) {
-      nds.dsi_soft_reset_pending = true;
-      nds.cpu(ds::Cpu::ARM7).halted = true;
-    }
     nds.run_frame();
     if (!write_state(i + 1)) return 1;
     if (static const bool fh = std::getenv("DS_FRAME_HASH") != nullptr; fh) {
@@ -868,7 +849,7 @@ int main(int argc, char** argv) {
       while ((n = nds.spu.take(buf, 2048)) != 0) std::fwrite(buf, 4, n, audio_out);
     } else nds.spu.drain();
 #if DSPERATE_JIT
-    if (i == stats_from && (jit9 || jit7)) ds::jit::density_reset();
+    if (i == stats_from && jit) ds::jit::density_reset();
 #endif
     if (i >= stats_from) {
       frame_ms.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
@@ -877,15 +858,6 @@ int main(int argc, char** argv) {
       if (series) std::fprintf(series, "%.3f %u %llu\n", frame_ms.back(), nds.gpu3d.render_polygon_count(),
                                (unsigned long long)nds.gpu3d.last_raster_ns());
     }
-#if DSPERATE_JIT
-    if ((jit9 || jit7) && cpu_oc != 0 && cpu_oc_wanted() != cpu_oc_applied) {
-      cpu_oc_applied = cpu_oc_wanted();
-      std::fprintf(stderr, "cpu tuning: %s at frame %d (%.4s)\n", cpu_oc_applied == 2 ? "underclock" : cpu_oc_applied ? "overclock" : "off", i,
-                   nds.dsi_title_running ? nds.dsi_title_code : "menu");
-      ds::jit::set_cpu_oc(static_cast<ds::jit::CpuOc>(cpu_oc_applied));
-      ds::jit::flush_all();
-    }
-#endif
     if (nds.exit_requested) { std::fprintf(stderr, "exit requested at frame %d: ending the run\n", i); break; }
     if (nds.power_off) {
       // No cart: firmware settings-pages exit, save and reboot as power would.
@@ -896,7 +868,7 @@ int main(int argc, char** argv) {
           if (!nds.save_firmware_override(fw_override, err)) std::fprintf(stderr, "firmware override: cannot save: %s\n", err.c_str());
         }
 #if DSPERATE_JIT
-        if (jit9 || jit7) ds::jit::flush_all();
+        if (jit) ds::jit::flush_all();
 #endif
         nds.reset();   // clears power_off, re-seeds the clock if --rtc-host
       } else {
@@ -930,7 +902,7 @@ int main(int argc, char** argv) {
                  ts.count[0], ts.executed[0], ts.count[1], ts.executed[1], ts.max); }
   ds::prof::report();
 #if DSPERATE_JIT
-  if (ds::prof::enabled && (jit9 || jit7)) ds::jit::report(stderr);
+  if (ds::prof::enabled && jit) ds::jit::report(stderr);
 #endif
 #if DSPERATE_NET
   if (lan) std::fprintf(stderr, "lan: reply/host waits %u, total %.1f ms, max %.1f ms, timeouts %u\n", lan->wait_count(), lan->wait_total_ms(), lan->wait_max_ms(), lan->wait_timeouts());

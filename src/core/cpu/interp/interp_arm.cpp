@@ -1,4 +1,3 @@
-#include <cstdlib>
 // SPDX-License-Identifier: GPL-3.0-or-later
 // DSperate - Nintendo DS emulator. Copyright (C) 2026 DSperate contributors.
 //
@@ -189,9 +188,6 @@ void ldm_stm(CpuContext& cpu, u32 instr, bool load) {
       if (i == 15) v += 4;
       // STM Rn-in-list: first reg stores original base, later ones the writeback value.
       if (i == rn && !first && w) v = wb;
-      // DS_MELON_STM=1: match melonDS's non-hardware ARM7 STM Rn-in-list quirk.
-      static const bool melon_stm = std::getenv("DS_MELON_STM") != nullptr;
-      if (melon_stm && i == rn && !first && !is_arm9(cpu)) v = addr;
       mem_write32(cpu, addr, v, !first); addr += 4;
       first = false;
     }

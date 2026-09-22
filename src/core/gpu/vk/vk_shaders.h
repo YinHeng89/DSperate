@@ -24,12 +24,7 @@ Spirv shader_tri_vert();     // triangle path: polygons as fans through the hard
 Spirv shader_tri_opaque();   // ... its opaque-prefix fragment stage
 Spirv shader_tri_tail();     // ... and the ordered translucent tail
 Spirv shader_downsample();   // native plane from the hi-res layer (S >= 2)
-Spirv shader_expand();       // native tail back into the hi-res planes
-Spirv shader_tri_opaque_aa(); // anti-aliasing pass: the prefix on the two-deep pixel stack
-Spirv shader_tri_tail_aa();   // ... and the tail
-Spirv shader_tri_pre();      // depth prepass: alpha test only (DS_VK_TRI_PREPASS)
 Spirv shader_tri_mask();     // shadow-mask draw: run id into the shadow plane where the depth test fails
-Spirv shader_tri_flat();     // opaque draw with a constant colour, no texel
 
 } // namespace ds::gpu::vk
 

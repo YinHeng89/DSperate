@@ -17,6 +17,13 @@ namespace ds::prof {
 bool enabled = false;
 bool async_window = false;
 bool census_same_list = false;
+
+bool census_env(const char* var) {
+  if (!std::getenv(var)) return false;
+  if (!census) std::fprintf(stderr, "[profile] %s needs a -DDSPERATE_CENSUS=1 build; ignored\n", var);
+  return census;
+}
+
 // "Of which" stages nest inside another scope; excluded from the sum. See profile.h.
 inline bool of_which(Stage s) { return s == JIT_TX || s == GX_RUN || s == W2D_JOIN || s == R3D_STEAL; }
 
@@ -38,7 +45,7 @@ const char* const stage_keys[COUNT] = {
   "jit_tx",
   "w2d_join",
   "sched", "events", "gpu_line", "join0", "begin_frame", "gx_vblank",
-  "journal", "r3d_line", "r3d_prep", "gpu_upload",
+  "journal", "r3d_line", "r3d_prep", "gpu_upload", "r3d_steal",
 };
 
 const char* const count_names[] = {"3d polygon lines", "3d span pixels", "3d resolved pixels",
@@ -48,10 +55,9 @@ const char* const count_names[] = {"3d polygon lines", "3d span pixels", "3d res
   "cycles total", "cycles both halted", "cycles arm9 halted only", "cycles arm7 halted only", "cycles neither halted",
   "cycles arm9 awake+spinning", "cycles arm7 awake+spinning", "cycles one spinning, other halted", "cycles all idle (halt or spin)",
   "host ns arm9 in spin slices", "host ns arm7 in spin slices", "host ns arm9 working", "host ns arm7 working", "cycles skipped by idle-loop detect", "idle veto: dma", "idle veto: gx busy", "idle veto: irq pending", "idle veto: pc filter", "idle veto: arm9 not a loop", "idle veto: arm7 not a loop", "idle skip allowed", "arm7 spi poll: slices slept", "arm7 spi poll: cycles slept",
-  "idle survey: slices vetoed by dma/gx", "idle survey: WOULD have skipped", "idle survey: irq pending", "idle survey: pc filter", "idle survey: not a loop",
-  "idle survey: vetoed by GX alone", "idle survey: GX-vetoed WOULD have skipped",
+  "idle survey: slices vetoed by dma", "idle survey: WOULD have skipped", "idle survey: irq pending", "idle survey: pc filter", "idle survey: not a loop",
   "2d lines rendered", "2d text bg lines", "2d affine bg lines", "2d extended bg lines", "2d 3d-layer lines", "2d lines with sprites", "2d lines with windows", "2d lines with colour effect", "2d lines where an effect can apply", "2d flat lines (no effect possible)", "2d plane selects",
-  "2d lines: 0 layers", "2d lines: 1 layer", "2d lines: 2 layers", "2d lines: 3 layers", "2d lines: 4+ layers", "2d lines: 1 layer, fully opaque", "2d lines with obj pixels", "2d lines with 3d pixels", "2d lines with a window", "2d bg lines 16-colour text", "2d bg lines 256-colour text", "2d bg lines direct colour", "2d bg lines empty (transparent row)", "2d 3d-layer lines with nothing visible", "2d fast lines: backdrop only", "2d fast lines: one opaque layer", "2d full lines: effect mode live", "2d full lines: translucent 3d", "2d full lines: semi/bitmap sprites", "2d full lines: second target needed", "2d full lines: fade only", "3d spans: constant colour", "3d spans: interpolated colour", "3d band 0 ns", "3d band 1 ns", "3d band 2 ns", "3d band 3 ns", "3d band phase ns (slowest band)", "3d band ns summed (all bands)", "async probe: frames measured", "async probe: texture vram changed by next line 0", "async probe: texture vram changed by next swap", "async probe: vramcnt rewritten by next line 0", "async probe: vramcnt rewritten by next swap", "3d raster force-joined (vram touched)", "3d bins drawn by the thread that would have waited", "3d frames at 1 worker", "3d frames at 2 workers", "3d frames at 3 workers", "3d frames at 4 workers", "3d batches flushed", "3d spans batched", "3d pixels batched",
+  "2d lines: 0 layers", "2d lines: 1 layer", "2d lines: 2 layers", "2d lines: 3 layers", "2d lines: 4+ layers", "2d lines: 1 layer, fully opaque", "2d lines with obj pixels", "2d lines with 3d pixels", "2d lines with a window", "2d bg lines 16-colour text", "2d bg lines 256-colour text", "2d bg lines empty (transparent row)", "2d 3d-layer lines with nothing visible", "2d fast lines: backdrop only", "2d fast lines: one opaque layer", "2d full lines: effect mode live", "2d full lines: translucent 3d", "2d full lines: semi/bitmap sprites", "2d full lines: second target needed", "2d full lines: fade only", "3d spans: constant colour", "3d spans: interpolated colour", "3d band 0 ns", "3d band 1 ns", "3d band 2 ns", "3d band 3 ns", "3d band phase ns (slowest band)", "3d band ns summed (all bands)", "async probe: frames measured", "async probe: texture vram changed by next line 0", "async probe: texture vram changed by next swap", "async probe: vramcnt rewritten by next line 0", "async probe: vramcnt rewritten by next swap", "3d raster force-joined (vram touched)", "3d bins drawn by the thread that would have waited", "3d batches flushed", "3d spans batched", "3d pixels batched",
   "gx swap_buffers (new list)", "gx swaps whose list is unchanged", "gx vblanks with no swap", "gx no-swap frames rejected by the register compare",
   "gx reject cause: dispcnt/alpha_ref", "gx reject cause: clear attrs", "gx reject cause: fog", "gx reject cause: edge/toon",
   "gx polygons submitted (summed over swaps)", "gx vertices submitted (summed over swaps)", "gx polygons in the largest swap", "gx vertices in the largest swap",
@@ -72,13 +78,12 @@ const char* const count_names[] = {"3d polygon lines", "3d span pixels", "3d res
   "  ...of those, on an alternating-phase frame", "  ...of those, the in-flight job is a capture", "  ...of those, on a clean frame (neither)",
   "frames with an alternating display phase", "frames with capture on", "frames total",
   "2d join ns: catch_up", "2d join ns: vram trap", "2d join ns: journal full", "2d join ns: line 0", "2d join ns: vram remap", "2d join ns: render_ranges pre", "2d join ns: render_ranges post", "2d join ns: other",
-  "3d resolve kernel calls", "3d resolve parts entered",
   "3d polygon-chunk entries",
   "3d spans empty (no pixels)", "3d spans fully occluded by depth", "3d spans that draw",
-  "gx reg reads", "gx reads of GXSTAT", "gx GXSTAT reads while busy (bit27)", "gx GXSTAT reads with pipe non-empty", "gx GXSTAT reads with fifo non-empty", "gx run_to_slow calls", "gx run_to_slow calls that executed", "gx worker queue full (producer waited)",
+  "gx reg reads", "gx reads of GXSTAT", "gx GXSTAT reads while busy (bit27)",
   "3d drawn spans: plain", "3d drawn pixels: plain", "3d drawn spans: toon/highlight", "3d drawn pixels: toon/highlight", "3d drawn spans: shadow (scalar)", "3d drawn pixels: shadow (scalar)", "3d drawn spans: wireframe (scalar)", "3d drawn pixels: wireframe (scalar)",
-  "2d compares: bg palette (512B)", "2d compares: bg ext palette (512B)", "2d compares: obj palette (512B)", "2d compares: obj ext palette (512B)", "2d compares: oam (1024B)",
-  "2d compares that differed: bg palette", "2d compares that differed: bg ext palette", "2d compares that differed: obj palette", "2d compares that differed: obj ext palette", "2d compares that differed: oam",
+  "2d compares: bg ext palette (512B)", "2d compares: obj ext palette (512B)",
+  "2d compares that differed: bg ext palette", "2d compares that differed: obj ext palette",
   "dma transfers started", "dma dispatch loop entries (a run or one unit)",
   "dma gxfifo words (run)", "dma gxfifo words (per word)", "dma gxfifo bulk runs",
   "dma page-to-page runs", "dma units in word runs", "dma units in halfword runs", "dma words through the bus", "dma halfwords through the bus",
@@ -94,7 +99,6 @@ const char* const count_names[] = {"3d polygon lines", "3d span pixels", "3d res
   "3d resolve empty groups: under-layer candidates only", "3d resolve empty groups: a top lane passed depth",
   "3d resolve groups: every lane opaque and drawing", "3d resolve pixels in every-lane-opaque groups",
   "jit retime invalidations", "jit blocks killed by retimes",
-  "slices arm9 gx-stalled",
   "bus vram remaps", "bus tcm updates", "bus gba slot retimes", "timing cpu9 range rebuilds",
   "gx lists dropped unrendered", "gx lists identical to the last", "gx lists that reached a render"};
 

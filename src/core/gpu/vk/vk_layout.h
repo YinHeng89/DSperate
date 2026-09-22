@@ -17,12 +17,8 @@ using uint = u32;
 
 // Tiles. One workgroup per tile, one invocation per pixel: W*H must stay
 // inside the GPU's invocation limit; narrow tiles bin fewer polygons per pixel loop.
-#ifndef DS_TILE_W
 #define DS_TILE_W 8
-#endif
-#ifndef DS_TILE_H
 #define DS_TILE_H (256 / DS_TILE_W)
-#endif
 #define DS_TILES_X (256 / DS_TILE_W)
 #define DS_TILES_Y (192 / DS_TILE_H)
 #define DS_TILE_COUNT (DS_TILES_X * DS_TILES_Y)
@@ -125,22 +121,12 @@ struct GpuFrame {
 #define DS_FF_FACE_BACK  0x4u  // triangle path opaque draw, back-facing only
 #define DS_FF_FACE_FRONT 0x8u  // ... front-facing only, drawn second, LESS_OR_EQUAL (wins ties over opaque back-facing)
 #define DS_FF_RUN_SHIFT 16u  // bits 16-31: shadow-mask run this draw belongs to
-#define DS_FF_ONLY_PLAIN 0x40u  // triangle path: only polygons WITHOUT DS_PF_TEX_ALPHA (depth prepass + its EQUAL shaded pass)
-#define DS_FF_ONLY_ALPHA 0x80u  // ... only WITH it (drawn after, normal test, skips the prepass)
-#define DS_FF_SORTED   0x100u  // triangle path: instance i is polygon order[i] (opaque prefix near to far)
-#define DS_FF_TAIL1X   0x200u  // translucent tail drawn at native resolution on the shrunk planes
-#define DS_FF_SHRINK3  0x400u  // downsample.comp: shrink attribute and depth too (before the native tail)
-#define DS_FF_SPANCULL 0x1000u // AA pass: tri.vert grows polygons by a pixel, fragment shader trims to the DS span
 #define DS_FF_ROWS     0x2000u // span table holds this frame's rows (edge flags/coverage for edge marking, fast AA)
 #define DS_FF_AAFAST   0x4000u // post.comp: fast AA, edge pixels blended with outside neighbour, two stages
 #define DS_FF_POST2    0x8000u // post.comp: stage 2 of fast AA (stage 1 wrote fogged/marked pixels to the scratch plane)
 // Smooth-3D present filter: fast AA's stage 2 writes each pixel's edge
 // record to the edge plane instead of blending; present stage splits it.
 #define DS_FF2_SMOOTH  0x1u
-#define DS_FF_AA       0x800u  // AA pass ran: the final pass blends edge pixels with the layer underneath
-#define DS_FF_TEX0     0x20u  // debug (DS_VK_TRI_TEX0=1): every texel fetch reads the polygon's first texel
-#define DS_FF_NOTEX    0x10u  // debug (DS_VK_TRI_NOTEX=1): shade every polygon as untextured
-#define DS_FF_IDCOLOUR 0x2u  // debug (DS_VK_TRI_IDCOL=1): the opaque draw writes the polygon INDEX as its colour (r = i & 63, g = i >> 6 & 63, b = i >> 12 & 63)
 
 // Render state too large for push constants (fog table, edge colours, toon
 // table). Uploaded every frame, 320 bytes, cheaper than tracking changes.

@@ -44,8 +44,6 @@ void Io::reset() {
   lcd_irq_pending[0] = lcd_irq_pending[1] = 0;
   // DSi raises LCD IRQs at the DISPSTAT event itself; DS delays two bus cycles.
   lcd_irq_delay = nds_.dsi ? 0 : 4;
-  if (const char* e = std::getenv("DS_LCD_IRQ_DELAY")) lcd_irq_delay = static_cast<u32>(std::atoi(e));
-  if (const char* e = std::getenv("DS_CART_BULK")) cart_bulk_ = std::atoi(e) != 0;
   cpu_io[0] = CpuIo{}; cpu_io[1] = CpuIo{};
   dispstat[0] = dispstat[1] = 0; vcount = 0;
   wramcnt = 0; std::memset(vramcnt, 0, sizeof vramcnt);
@@ -125,9 +123,8 @@ void Io::ipc_sync_write(Cpu cpu, u16 value) {
   CpuIo& me = cpu_io[ci(cpu)];
   CpuIo& them = cpu_io[ci(other(cpu))];
   // DSi-loader handshake: ARM7's IPCSYNC 0 applies the RAM size ARM9
-  // requested via SCFG_EXT; ARM9's IPCSYNC 0 after that starts the title.
+  // requested via SCFG_EXT.
   if (nds_.dsi && cpu == Cpu::ARM7 && !(value & 0x0F00) && ((dsi.scfg_ext[0] ^ dsi.scfg_ext[1]) & 0xC000u)) dsi_apply_ram_size();
-  if (nds_.dsi && cpu == Cpu::ARM9 && !(value & 0x0F00) && nds_.dsi_loader_scfg_seen) { nds_.dsi_loader_scfg_seen = false; nds_.dsi_title_running = true; nds_.dsi_note_title(); }
   me.ipc_sync = (me.ipc_sync & 0x000F) | (value & 0x4F00);
   them.ipc_sync = (them.ipc_sync & 0x4F00) | ((value >> 8) & 0xF);
   if ((value & 0x2000) && (them.ipc_sync & 0x4000)) request_irq(other(cpu), IRQ_IPC_SYNC);
@@ -189,7 +186,6 @@ static void timer_event(NDS& nds, u32 param) {
 }
 
 u16 Io::timer_value(Cpu cpu, int idx) {
-  nds_.sched.run_soft_timers(cpu);   // settle count-up chains first
   Timer& t = cpu_io[ci(cpu)].timers[idx];
   if (!t.running() || t.count_up()) return t.counter;
   u64 elapsed = (nds_.sched.now() - t.start_time) >> 1;   // 33 MHz system clock
@@ -227,7 +223,6 @@ void Io::timer_overflow(Cpu cpu, int idx) {
 }
 
 void Io::timer_write_control(Cpu cpu, int idx, u16 value) {
-  nds_.sched.run_soft_timers(cpu);   // settle count-up chains first
   Timer& t = cpu_io[ci(cpu)].timers[idx];
   const bool was = t.running();
   const u64 now = nds_.sched.now();
@@ -262,8 +257,6 @@ void Io::spi_done() {
 }
 
 u64 Io::nds_sched_now() const { return nds_.sched.now(); }
-
-void Io::set_cart_bulk(bool on) { if (!std::getenv("DS_CART_BULK")) cart_bulk_ = on; }
 
 u8 Io::spi_transfer(u8 value) {
   const int dev = (spicnt >> 8) & 3;
@@ -581,11 +574,7 @@ static int from_bcd(u8 v) { return (v >> 4) * 10 + (v & 0x0F); }
 static void rtc_ev(NDS& nds, u32) { nds.io.rtc_event(); }
 
 void Io::rtc_seed() {
-  // DS_RTC_EPOCH: pin the seed to a fixed Unix time (clock still runs, so
-  // power-lost stays clear and the firmware skips its setup wizard).
-  const char* pinned = std::getenv("DS_RTC_EPOCH");
-  const std::time_t t = pinned ? static_cast<std::time_t>(std::strtoll(pinned, nullptr, 0))
-                               : std::time(nullptr);
+  const std::time_t t = std::time(nullptr);
   std::tm lt{};
 #if defined(_WIN32)
   localtime_s(&lt, &t);
@@ -736,7 +725,7 @@ void Io::cart_write_romctrl(u32 value) {
   u32 size_code = (cart.romctrl >> 24) & 7;
   u32 bytes = size_code == 7 ? 4 : size_code ? (0x100u << size_code) : 0;
   cart.transfer_pos = 0; cart.transfer_len = bytes;
-  cart.fifo_count = 0; cart.late = false; cart.bulk = false;
+  cart.fifo_count = 0; cart.late = false;
   cart.romctrl &= ~0x00800000u;
   const u32 xfer = (cart.romctrl & (1u << 27)) ? 8 : 5;
   u32 cmddelay = 8 + (cart.romctrl & 0x1FFF);
@@ -809,24 +798,11 @@ void Io::cart_receive_word(u64 at) {
   if (cart_dma_armed()) {
     nds_.dma.check(Cpu::ARM9, dma::MODE9_CART);
     nds_.dma.check(Cpu::ARM7, dma::MODE7_CART);
-    // DS_CART_BULK: once a DMA is taking the words, the rest are produced as
-    // it reads them (cart_read_data), one event at the last word's nominal
-    // time for the done IRQ. Opt-in: shifts where the DMA's bus stall lands.
-    if (cart_bulk_ && cart.transfer_pos < cart.transfer_len) {
-      const u32 xfer = (cart.romctrl & (1u << 27)) ? 8 : 5, gap2 = (cart.romctrl >> 16) & 0x3F;
-      const u32 words = (cart.transfer_len - cart.transfer_pos) / 4;
-      const u32 blocks = ((cart.transfer_len + 0x1FF) >> 9) - ((cart.transfer_pos + 0x1FF) >> 9);
-      cart.next_word_at = at + 2 * xfer * (4 * words + gap2 * blocks);   // the last word's nominal arrival
-      cart.bulk = true; cart.event_armed = true;
-      nds_.sched.schedule(EventId::Cart, cart.next_word_at, cart_ev, 0);
-      return;
-    }
   }
   if (cart.fifo_count < 2) cart_schedule_receive(at); else cart.late = true;
 }
 
 void Io::cart_end_transfer() {
-  cart.bulk = false;
   cart.romctrl &= ~0x80000000u;
   cart.transfer_pos = cart.transfer_len = 0;
   if (cart.auxspicnt & 0x4000) request_irq((exmemcnt & 0x0800) ? Cpu::ARM7 : Cpu::ARM9, IRQ_CART_DONE);   // to slot owner (EXMEMCNT bit 11)
@@ -834,13 +810,6 @@ void Io::cart_end_transfer() {
 
 void Io::cart_event(u32 param) {
   cart.event_armed = false;
-  if (param == 0 && cart.bulk) {
-    // Bulk transfer's end; fall back to the exact model if the DMA stopped
-    // taking words mid-transfer.
-    cart.bulk = false;
-    if (cart.transfer_pos < cart.transfer_len) { if (cart.fifo_count < 2) cart_schedule_receive(nds_.sched.now()); else cart.late = true; return; }
-    if (cart.fifo_count) return;   // ends with the read that empties the FIFO
-  }
   if (param == 0) cart_end_transfer(); else cart_receive_word(nds_.dsi ? nds_.sched.event_base7() : nds_.sched.now());   // DSi: from ARM7's clock
 }
 
@@ -851,13 +820,9 @@ u32 Io::cart_read_data() {
   if (cart.fifo_count > 0) { cart.fifo_count--; cart.fifo_head ^= 1; }
   cart.romctrl &= ~0x00800000u;
   if (cart.transfer_pos < cart.transfer_len) {
-    if (cart.bulk) {   // the next word, now: the DMA's re-trigger test (cart_drq) sees it
-      cart.fifo[(cart.fifo_head + cart.fifo_count) & 1] = nds_.cart ? nds_.cart->command_receive() : 0;
-      cart.fifo_count++; cart.transfer_pos += 4;
-      cart.romctrl |= 0x00800000u;
-    } else if (cart.late) { cart.late = false; cart_schedule_receive(nds_.sched.now()); }
+    if (cart.late) { cart.late = false; cart_schedule_receive(nds_.sched.now()); }
   } else {
-    if (cart.fifo_count == 0 && !cart.bulk) cart_end_transfer();   // bulk: the end event carries the IRQ at the nominal time
+    if (cart.fifo_count == 0) cart_end_transfer();
     else if (cart.fifo_count) cart.romctrl |= 0x00800000u;
   }
   return v;
@@ -946,10 +911,10 @@ void Io::set_irq_line(Cpu cpu, u32 bit, bool on) {
 // r >= 0x1070 belong to no subsystem. One range test replaces three probes.
 static inline bool io_unowned(u32 r) { return (r - 0x70 < 0x2B0) || r >= 0x1070; }
 
-// DS_IO_CENSUS=1: histogram of I/O accesses by address and CPU, printed at exit.
+// DS_IO_CENSUS=1 (census builds): histogram of I/O accesses by address and CPU, printed at exit.
 namespace {
 struct IoCensus {
-  bool on = std::getenv("DS_IO_CENSUS") != nullptr;
+  bool on = prof::census_env("DS_IO_CENSUS");
   std::unordered_map<u32, u64> rd[2], wr[2];
   ~IoCensus() {
     if (!on) return;
@@ -971,10 +936,10 @@ struct IoCensus {
 };
 IoCensus g_ioc;
 }
-bool Io::census_on() { return g_ioc.on; }
+bool Io::census_env_on() { return g_ioc.on; }
 
 u32 Io::read(Cpu cpu, u32 addr, u32 width) {
-  if (g_ioc.on) g_ioc.rd[cpu == Cpu::ARM9 ? 0 : 1][addr]++;
+  if (prof::census && g_ioc.on) g_ioc.rd[cpu == Cpu::ARM9 ? 0 : 1][addr]++;
   if (cpu == Cpu::ARM7 && (addr & ~3u) != 0x040001C0) spi_poll_streak_ = 0;
   if (nds_.dsi && (addr & 0xFFFFF000) == 0x04004000) return dsi_read(cpu, addr, width);
   if (!io_unowned(addr - 0x04000000)) {
@@ -988,7 +953,7 @@ u32 Io::read(Cpu cpu, u32 addr, u32 width) {
 }
 
 void Io::write(Cpu cpu, u32 addr, u32 width, u32 value) {
-  if (g_ioc.on) g_ioc.wr[cpu == Cpu::ARM9 ? 0 : 1][addr]++;
+  if (prof::census && g_ioc.on) g_ioc.wr[cpu == Cpu::ARM9 ? 0 : 1][addr]++;
   if (cpu == Cpu::ARM7) spi_poll_streak_ = 0;
   if (nds_.dsi && (addr & 0xFFFFF000) == 0x04004000) { dsi_write(cpu, addr, width, value); return; }
   if (!io_unowned(addr - 0x04000000)) {
@@ -1635,7 +1600,6 @@ void Io::dsi_write(Cpu cpu, u32 addr, u32 width, u32 value) {
       if ((old0 ^ dsi.scfg_ext[0]) & 0xC000u) {
         if (!handshake) dsi_apply_ram_size();
       }
-      if (handshake) nds_.dsi_loader_scfg_seen = true;   // the loader stub: see NDS::dsi_title_running
     } else {
       dsi.scfg_ext[0] = (dsi.scfg_ext[0] & ~0x03000000u) | (value & 0x03000000u);
       dsi.scfg_ext[1] = (dsi.scfg_ext[1] & ~0x93FF0F07u) | (value & 0x93FF0F07u);
@@ -1790,7 +1754,15 @@ template <class S> void Io::sync_state(S& s) {
            cart.late, cart.next_word_at, cart.event_armed);
   s.fields(math.divcnt, math.sqrtcnt, math.div_num, math.div_den, math.div_quot, math.div_rem, math.sqrt_val, math.sqrt_res);
   wifi.sync_state_regs(s);
-  s.fields(math.div_ready_at, math.sqrt_ready_at, math.div_pending, math.sqrt_pending, spi_ready_at, cart.bulk);   // appended: older states leave them at rest
+  bool fast_load_state = false;   // a fast-load cart transfer in flight, from older states
+  s.fields(math.div_ready_at, math.sqrt_ready_at, math.div_pending, math.sqrt_pending, spi_ready_at, fast_load_state);   // appended: older states leave them at rest
+  if constexpr (S::reading) {
+    if (fast_load_state) {   // its pending Cart event is the transfer's end: resume per word instead
+      nds_.sched.cancel(EventId::Cart); cart.event_armed = false;
+      if (cart.transfer_pos < cart.transfer_len) { if (cart.fifo_count < 2) cart_schedule_receive(nds_.sched.now()); else cart.late = true; }
+      else if (cart.fifo_count == 0) cart_end_transfer();
+    }
+  }
   s.fields(wifi_power_on_pending);
   s.fields(rcnt);   // appended
   s.fields(wifiwaitcnt);   // appended

@@ -4,6 +4,7 @@
 #include "core/cpu/interp/interp_internal.h"
 #include "core/cpu/cpu_cycles.h"
 #include "core/nds.h"
+#include "core/profile.h"
 
 #include "core/cpu/arm_decode.h"
 
@@ -19,7 +20,7 @@ namespace ds { void (*g_census_access)(bool, u32, bool) = nullptr; }
 
 namespace ds::interp {
 
-// DS_CENSUS=1: count the executed guest instruction stream by shape.
+// DS_CENSUS=1 (census builds): count the executed guest instruction stream by shape.
 namespace census {
 
 struct Counts {
@@ -45,7 +46,8 @@ struct Counts {
   bool burst_counted = false;
 };
 inline Counts& at(bool a9) { static Counts c[2]; return c[a9 ? 0 : 1]; }
-inline bool on() { static const bool v = std::getenv("DS_CENSUS") != nullptr; return v; }
+const bool g_on = prof::census_env("DS_CENSUS");
+inline bool on() { return prof::census && g_on; }
 
 inline void note_access(bool a9, u32 addr, bool seq) {
   Counts& c = at(a9);

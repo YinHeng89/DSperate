@@ -158,7 +158,7 @@ void Timing::set_region9(u32 start, u32 end, Region r, int bus_width, int nonseq
     t[4] = static_cast<u8>(n16); t[5] = static_cast<u8>(s16); t[6] = static_cast<u8>(n32); t[7] = static_cast<u8>(s32);
     regions9_[i] = r;
   }
-  stamp.fetch_add(1, std::memory_order_release);
+  ++stamp;
 }
 
 void Timing::set_region7(u32 start, u32 end, Region r, int bus_width, int nonseq, int seq) {
@@ -174,7 +174,7 @@ void Timing::set_region7(u32 start, u32 end, Region r, int bus_width, int nonseq
   // timing divergence. A cost not in the nc slots falls back to the inline
   // model (nc7_index returns -1).
   if (cost7_ready_) build_cost7_range(first, last);
-  stamp.fetch_add(1, std::memory_order_release);
+  ++stamp;
 }
 
 // TCM windows are baked into the table (4 KB pages, both windows aligned to
@@ -187,9 +187,8 @@ void Timing::update_cpu9(const CpuContext& cpu, u32 start, u32 end, bool notify)
   // Stores ([5..7]): the ARM946E-S data cache doesn't allocate on write, so a
   // store to a cacheable page that misses goes out at bus speed; only TCMs
   // are free. DSi prices stores as cache hits instead (DSi PictoChat's boot
-  // heap needs it); DS_STORE_BUS=0/1 forces either way.
-  static const int store_bus_env = [] { const char* e = std::getenv("DS_STORE_BUS"); return e ? (std::atoi(e) != 0) : -1; }();
-  const bool store_bus = store_bus_env >= 0 ? store_bus_env != 0 : !(cpu.nds && cpu.nds->dsi);
+  // heap needs it).
+  const bool store_bus = !(cpu.nds && cpu.nds->dsi);
   const u32 first = start >> 12, last = (end == 0xFFFFFFFF) ? 0x100000 : (end >> 12);
   const u32 sh = clock9_shift;
   // One page's slot: depends on the 16 KB bus entry, the page's two PU

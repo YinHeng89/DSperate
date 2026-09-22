@@ -48,14 +48,6 @@ void flush_all();
 // NDS::trace before executing, exactly as the interpreter does.
 void set_trace(bool on);
 
-// --cpu-oc: price data accesses at a translate-time constant instead of the
-// per-page run-time cost. INEXACT; opt-in only; flushes both CPUs on change.
-//   Overclock:  main RAM cached-load cost for ARM9 (and stores), WRAM for ARM7.
-//   Underclock: ARM9 stores/all ARM7 at main-RAM bus cost, ARM9 loads as
-//               Overclock -- runs slower than hardware, may miss a VBlank.
-enum class CpuOc : u8 { Off, Overclock, Underclock };
-void set_cpu_oc(CpuOc mode);
-
 // DS_JIT_STRICT: per-instruction budget checks, lockstep with the
 // interpreter. Slower, exact. Flushes both CPUs on change.
 void set_strict(bool on);

@@ -9,7 +9,7 @@ namespace ds::interp {
 // Both CPUs share this entry point; ARMv5TE-only forms trap on the ARM7.
 void run(CpuContext& cpu);
 
-// DS_CENSUS=1: print the executed guest instruction census. `frames`
+// DS_CENSUS=1 (census builds): print the executed guest instruction census. `frames`
 // normalises the per-frame figures.
 void census_report(u64 frames);
 

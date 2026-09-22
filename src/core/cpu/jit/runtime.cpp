@@ -2,9 +2,8 @@
 // DSperate - Nintendo DS emulator. Copyright (C) 2026 DSperate contributors.
 //
 // Host-agnostic recompiler runtime: arena, block cache, linking, park-and-revive,
-// pre-translation worker, SMC tracking by host page. Host code emission is in backend::.
+// SMC tracking by host page. Host code emission is in backend::.
 #include "core/cpu/jit/jit_internal.h"
-#include "core/host_cores.h"
 #include "core/mem/fastmem_census.h"
 #include "core/mem/fastmem.h"
 #include "core/profile.h"
@@ -14,14 +13,8 @@
 #include "core/cpu/interp/interp_internal.h"
 #include "core/nds.h"
 
-#include <atomic>
-#include <condition_variable>
 #include <cstdio>
-#include <deque>
 #include <map>
-#include <mutex>
-#include <thread>
-#include <unordered_set>
 #include <vector>
 #include <algorithm>
 #include <type_traits>
@@ -75,9 +68,12 @@ static void report() {
   };
   auto pk = [](u64 n, const Key& k) { std::fprintf(stderr, "   %10llu  pc %08x %s arm%d\n", (unsigned long long)n, k.pc, k.dma ? "DMA" : "cpu", k.cpu); };
   auto pa = [](u64 n, u32 a) { std::fprintf(stderr, "   %10llu  %08x\n", (unsigned long long)n, a); };
-  std::fprintf(stderr, "[churn] frames %llu arena resets %llu invalidations %llu blocks killed %llu translations %llu | code-page stores: silent %llu changed %llu, changed-but-no-block %llu\n",
+  std::fprintf(stderr, "[churn] frames %llu arena resets %llu invalidations %llu blocks killed %llu translations %llu | code-page stores changed-but-no-block %llu\n",
                (unsigned long long)frames_seen, (unsigned long long)resets, (unsigned long long)inval, (unsigned long long)killed, (unsigned long long)trans,
-               (unsigned long long)mem::code_store_stats.silent, (unsigned long long)mem::code_store_stats.changed, (unsigned long long)range_miss);
+               (unsigned long long)range_miss);
+  if (prof::census)
+    std::fprintf(stderr, "[churn] code-page stores: silent %llu changed %llu\n",
+                 (unsigned long long)mem::code_store_stats.silent, (unsigned long long)mem::code_store_stats.changed);
   std::fprintf(stderr, "[churn] retimes %llu (%.2f/frame) blocks killed by retimes %llu (%.1f/frame)\n",
                (unsigned long long)retime_calls, frames_seen ? static_cast<double>(retime_calls) / static_cast<double>(frames_seen) : 0.0,
                (unsigned long long)retime_killed, frames_seen ? static_cast<double>(retime_killed) / static_cast<double>(frames_seen) : 0.0);
@@ -95,51 +91,6 @@ static void report() {
   }
 }
 }  // namespace churn
-
-// ---- pre-translation worker (DS_JIT_PRETX=1) ----
-// Translates Block::succ targets ahead of time; the emulation thread adopts
-// them on a lookup miss, so timing stays unobservable. `mu` guards the arena
-// frontier, queues and `gen`. Adoption re-checks guest bytes and timing stamp;
-// resets and timing rebuilds bump `gen` to orphan older work.
-namespace pretx {
-static bool on() { static const bool e = std::getenv("DS_JIT_PRETX") != nullptr && std::getenv("DS_JIT_DENSITY") == nullptr; return e; }
-struct Job  { JitCpu* jc; u32 key; };
-struct Done { JitCpu* jc; Block* b; u64 gen; u64 stamp; std::vector<u8> guest; };
-// Leaked on purpose: destroying cv/mu under the detached worker hangs at exit.
-static std::mutex& mu = *new std::mutex;
-static std::condition_variable& cv = *new std::condition_variable;
-static std::deque<Job>& jobs = *new std::deque<Job>;
-static std::vector<Done>& done = *new std::vector<Done>;
-// Kept unpublished until an actual miss: tagging pages as code early would
-// change slice interleaving.
-static std::map<u64, Done>& staged = *new std::map<u64, Done>;         // (cpu << 32) | key
-static std::unordered_set<u64>& seen = *new std::unordered_set<u64>;   // (cpu << 32) | key, ever queued
-static u64 gen = 0;
-// Worker is emitting without mu; purge() waits for it so a reset can't reclaim the chunk.
-static std::atomic<bool> in_flight{false};
-static u64 st_built = 0, st_adopted = 0, st_dropped = 0, st_skipped = 0;
-static void start();
-static void seed(JitCpu& jc, const Block& b);
-static Block* adopt(JitCpu& jc, u32 key);
-struct ArenaLock {
-  bool locked;
-  ArenaLock() : locked(on()) { if (locked) mu.lock(); }
-  ~ArenaLock() { if (locked) mu.unlock(); }
-};
-// Orphans all worker output. Call without mu held.
-static void purge() {
-  if (!on()) return;
-  std::lock_guard<std::mutex> lk(mu);
-  ++gen;
-  jobs.clear();
-  for (Done& d : done) { delete d.b; ++st_dropped; }
-  done.clear();
-  for (auto& kv : staged) { delete kv.second.b; ++st_dropped; }
-  staged.clear();
-  seen.clear();
-  while (in_flight.load(std::memory_order_acquire)) std::this_thread::yield();
-}
-} // namespace pretx
 
 // ---- code page tracking ----
 
@@ -202,7 +153,6 @@ void remove_from_page_lists(Block* b) {
 JitCpu& jc_of(Block* b) { return g_rt.cpus[b->owner]; }
 
 void reset_arena() {
-  pretx::purge();   // worker idle after this; frontier is ours
   if (churn::on()) ++churn::resets;
   Runtime& r = g_rt;
   for (JitCpu& jc : r.cpus) {
@@ -224,34 +174,27 @@ void reset_arena() {
 }
 
 // ARM9 timing table rebuilt (PU/TCM/EXMEMCNT write): kill only blocks whose
-// Block::dep_* bytes changed; parked/pre-translated blocks are all dropped.
+// Block::dep_* bytes changed; parked blocks are all dropped.
 void on_timing_changed(CpuContext& cpu) {
   if (!cpu.jit) return;
   JitCpu& jc = *static_cast<JitCpu*>(cpu.jit);
   mem::Timing& t = cpu.nds->bus.timing();
   if (churn::on()) { static bool reg = (std::atexit(churn::report), true); (void)reg; }
   u64 killed = 0;
-  if (g_rt.retime_all) {
-    for (Block* b : jc.all_blocks) if (!b->dead) ++killed;
-    t.retime_clear();
-    invalidate_cpu(jc);
-  } else {
-    pretx::purge();
-    if (t.retime_pending()) {
-      for (Block* b : jc.all_blocks) {
-        if (b->dead) continue;
-        bool hit = b->dep_overflow;
-        for (u32 i = 0; i < b->ndep && !hit; ++i) hit = (t.retime_flag(b->dep_page[i]) & b->dep_kind[i]) != 0;
-        if (!hit) continue;
-        remove_from_page_lists(b);
-        kill_block(jc, b);
-        ++killed;
-      }
+  if (t.retime_pending()) {
+    for (Block* b : jc.all_blocks) {
+      if (b->dead) continue;
+      bool hit = b->dep_overflow;
+      for (u32 i = 0; i < b->ndep && !hit; ++i) hit = (t.retime_flag(b->dep_page[i]) & b->dep_kind[i]) != 0;
+      if (!hit) continue;
+      remove_from_page_lists(b);
+      kill_block(jc, b);
+      ++killed;
     }
-    t.retime_clear();
-    jc.parked.clear();
-    if (killed) jc.ctx->hot.alerts |= ALERT_INVALIDATED;
   }
+  t.retime_clear();
+  jc.parked.clear();
+  if (killed) jc.ctx->hot.alerts |= ALERT_INVALIDATED;
   prof::add(prof::C_JIT_INVALIDATE_CPU, 1);
   prof::add(prof::C_JIT_INVALIDATE_CPU_KILLED, killed);
   if (churn::on()) { churn::retime_calls++; churn::retime_killed += killed; churn::frames_seen = cpu.nds->frame_count; }
@@ -357,7 +300,7 @@ static Block* revive(JitCpu& jc, u32 key) {
   auto it = jc.parked.find(key);
   if (it == jc.parked.end()) return nullptr;
   std::vector<Block*>& v = it->second;
-  const u64 stamp = jc.nds->bus.timing().stamp.load(std::memory_order_acquire);
+  const u64 stamp = jc.nds->bus.timing().stamp;
   for (size_t k = v.size(); k-- > 0;) {
     Block* b = v[k];
     if (b->stamp != stamp || b->guest_len != b->guest_copy_len || !guest_bytes_match(jc, b)) continue;
@@ -382,7 +325,7 @@ static void install(JitCpu& jc, Block* b) {
   }
   perf_map_add(b, jc.arm9);
   // Revival checks against these.
-  b->stamp = jc.nds->bus.timing().stamp.load(std::memory_order_acquire);
+  b->stamp = jc.nds->bus.timing().stamp;
   b->guest_copy_len = std::min<u32>(b->guest_len, GUEST_COPY_MAX);
   copy_guest_bytes(jc, key_pc(b->key), b->guest_copy, b->guest_copy_len);
   register_block(jc, b);
@@ -421,29 +364,24 @@ Block* translate(JitCpu& jc, u32 key) {
       churn::lead_n++; churn::lead_sum += dt;
     }
   }
-  Block* b;
-  {
-    pretx::ArenaLock lk;
-    if (r.pos + BLOCK_MARGIN > r.cap || r.blocks_live >= MAX_BLOCKS) return nullptr;   // caller resets the arena
-    b = &r.block_pool.emplace_back(Block{});
-    b->key = key;
-    b->owner = jc.arm9 ? 0 : 1;
-    b->pooled = true;
-    u32 size = 0;
+  if (r.pos + BLOCK_MARGIN > r.cap || r.blocks_live >= MAX_BLOCKS) return nullptr;   // caller resets the arena
+  Block* b = &r.block_pool.emplace_back(Block{});
+  b->key = key;
+  b->owner = jc.arm9 ? 0 : 1;
+  b->pooled = true;
+  u32 size = 0;
+  r.fm_new.clear();
+  if (!backend::translate_block(jc, key, r.arena + r.pos, BLOCK_MARGIN, *b, size)) { r.block_pool.pop_back(); r.fm_new.clear(); return nullptr; }
+  b->entry = r.arena + r.pos;
+  b->size = size;
+  if (!r.fm_new.empty()) {
+    r.fm_blocks.push_back({b->entry, b->size, static_cast<u32>(r.fm_rels.size()), static_cast<u32>(r.fm_new.size())});
+    r.fm_rels.insert(r.fm_rels.end(), r.fm_new.begin(), r.fm_new.end());
     r.fm_new.clear();
-    if (!backend::translate_block(jc, key, r.arena + r.pos, BLOCK_MARGIN, *b, size)) { r.block_pool.pop_back(); r.fm_new.clear(); return nullptr; }
-    b->entry = r.arena + r.pos;
-    b->size = size;
-    if (!r.fm_new.empty()) {
-      r.fm_blocks.push_back({b->entry, b->size, static_cast<u32>(r.fm_rels.size()), static_cast<u32>(r.fm_new.size())});
-      r.fm_rels.insert(r.fm_rels.end(), r.fm_new.begin(), r.fm_new.end());
-      r.fm_new.clear();
-    }
-    r.pos += (b->size + 15) & ~size_t{15};
   }
+  r.pos += (b->size + 15) & ~size_t{15};
   sync_icache(b->entry, b->size);
   install(jc, b);
-  pretx::seed(jc, *b);
   return b;
 }
 
@@ -451,166 +389,9 @@ const u8* find_native(JitCpu& jc, u32 key) {
   auto it = jc.blocks.find(key);
   if (it != jc.blocks.end()) { lut_insert(jc, it->second); return it->second->entry; }
   if (Block* b = revive(jc, key)) return b->entry;
-  if (Block* b = pretx::adopt(jc, key)) return b->entry;
   Block* b = translate(jc, key);
   return b ? b->entry : nullptr;
 }
-
-// ---- pre-translation worker body ----
-namespace {
-namespace pretx {
-
-static void seed(JitCpu& jc, const Block& b) {
-  if (!on() || !b.nsucc) return;
-  std::lock_guard<std::mutex> lk(mu);
-  bool queued = false;
-  for (u8 i = 0; i < b.nsucc; ++i) {
-    const u32 k = b.succ[i];
-    if (jc.blocks.count(k)) continue;
-    const u64 tag = (static_cast<u64>(jc.arm9 ? 0 : 1) << 32) | k;
-    if (!seen.insert(tag).second) continue;
-    jobs.push_back(Job{&jc, k});
-    queued = true;
-  }
-  if (queued) cv.notify_one();
-}
-
-static void worker() {
-  name_current_thread("jit-pretx");
-  Runtime& r = g_rt;
-  // Private arena chunk so translate_block runs without mu; purge orphans it until the next reset.
-  constexpr size_t CHUNK = 1u << 20;
-  u8* chunk = nullptr;
-  size_t used = 0, cap = 0;
-  u64 chunk_gen = ~u64{0};
-  for (;;) {
-    Job j;
-    u64 g, ts;
-    {
-      std::unique_lock<std::mutex> lk(mu);
-      cv.wait(lk, [] { return !jobs.empty(); });
-      j = jobs.front();
-      jobs.pop_front();
-      g = gen;
-      ts = j.jc->nds->bus.timing().stamp.load(std::memory_order_acquire);   // must precede the table reads
-      if (g != chunk_gen || cap - used < BLOCK_MARGIN) {
-        if (r.pos + CHUNK > r.cap) { ++st_skipped; continue; }
-        chunk = r.arena + r.pos;
-        r.pos += CHUNK;
-        used = 0; cap = CHUNK; chunk_gen = g;
-      }
-      in_flight.store(true, std::memory_order_release);
-    }
-    JitCpu& jc = *j.jc;
-    // Snapshot before translating (adoption compares against it); page-crossing blocks are skipped.
-    const u32 pc = key_pc(j.key);
-    const u8* src = jc.ctx->page_table.read_ptr(pc);
-    if (!src) { in_flight.store(false, std::memory_order_release); ++st_skipped; continue; }
-    u8 copy[1024];
-    const u32 avail = std::min<u32>(sizeof copy, mem::PAGE_SIZE - (pc & (mem::PAGE_SIZE - 1)));
-    std::memcpy(copy, src, avail);
-    Block* b = new Block{};
-    b->key = j.key;
-    b->owner = jc.arm9 ? 0 : 1;
-    u32 size = 0;
-    if (!backend::translate_block(jc, j.key, chunk + used, BLOCK_MARGIN, *b, size) || b->guest_len > avail) {   // pretx excludes fastmem
-      in_flight.store(false, std::memory_order_release);
-      delete b; ++st_skipped; continue;
-    }
-    b->entry = chunk + used;
-    b->size = size;
-    used += (b->size + 15) & ~size_t{15};
-    sync_icache(b->entry, b->size);     // the adopter issues the isb
-    in_flight.store(false, std::memory_order_release);
-    {
-      std::lock_guard<std::mutex> lk(mu);
-      if (gen == g) {
-        done.push_back(Done{&jc, b, g, ts, std::vector<u8>(copy, copy + b->guest_len)});
-        ++st_built;
-        for (u8 i = 0; i < b->nsucc; ++i) {
-          const u64 tag = (static_cast<u64>(jc.arm9 ? 0 : 1) << 32) | b->succ[i];
-          if (seen.insert(tag).second) jobs.push_back(Job{&jc, b->succ[i]});
-        }
-      } else { delete b; ++st_dropped; }
-    }
-  }
-}
-
-static Block* adopt(JitCpu& jc, u32 key) {
-  if (!on()) return nullptr;
-  Done d{};
-  u64 cur;
-  {
-    std::lock_guard<std::mutex> lk(mu);
-    for (Done& x : done) staged.emplace((static_cast<u64>(x.jc->arm9 ? 0 : 1) << 32) | x.b->key, std::move(x));
-    done.clear();
-    const auto it = staged.find((static_cast<u64>(jc.arm9 ? 0 : 1) << 32) | key);
-    if (it == staged.end()) return nullptr;
-    d = std::move(it->second);
-    staged.erase(it);
-    cur = gen;
-  }
-  const u8* src = jc.ctx->page_table.read_ptr(key_pc(key));
-  if (d.gen != cur || d.stamp != jc.nds->bus.timing().stamp.load(std::memory_order_acquire) ||
-      !src || std::memcmp(src, d.guest.data(), d.guest.size()) != 0) {
-    delete d.b; ++st_dropped;
-    return nullptr;
-  }
-  // DS_JIT_PRETX_VERIFY=1: diff against a fresh translation to catch state the byte check misses.
-  static const bool verify = std::getenv("DS_JIT_PRETX_VERIFY") != nullptr;
-  if (verify) {
-    Runtime& r = g_rt;
-    std::lock_guard<std::mutex> lk(mu);
-    if (r.pos + BLOCK_MARGIN <= r.cap) {
-      Block tmp{};
-      tmp.key = key; tmp.owner = jc.arm9 ? 0 : 1;
-      u32 fsize = 0;   // scratch at the frontier; pos not advanced
-      if (backend::translate_block(jc, key, r.arena + r.pos, BLOCK_MARGIN, tmp, fsize)) {
-        if (tmp.guest_len != d.b->guest_len || fsize != d.b->size || tmp.hot_size != d.b->hot_size)
-          std::fprintf(stderr, "[pretx] VERIFY shape mismatch key %08x: staged len/size/hot %u/%u/%u fresh %u/%u/%u frame %llu\n",
-                       key, d.b->guest_len, d.b->size, d.b->hot_size, tmp.guest_len, fsize, tmp.hot_size,
-                       (unsigned long long)jc.ctx->nds->frame_count);
-        else {
-          const u8* fresh = r.arena + r.pos;
-          u32 diffs = 0;
-          for (u32 i = 0; i < d.b->size; i += 4) {
-            u32 a, f;
-            std::memcpy(&a, d.b->entry + i, 4);
-            std::memcpy(&f, fresh + i, 4);
-            if (a == f) continue;
-            const u32 rel = backend::relative_branch_class(a);
-            if (rel && rel == backend::relative_branch_class(f)) continue;
-            if (++diffs <= 4)
-              std::fprintf(stderr, "[pretx] VERIFY word mismatch key %08x +%u: staged %08x fresh %08x frame %llu\n",
-                           key, i, a, f, (unsigned long long)jc.ctx->nds->frame_count);
-          }
-          if (diffs) {
-            std::fprintf(stderr, "[pretx] staged:");
-            for (u32 i = 0; i < d.b->size && i < 256; i += 4) { u32 w; std::memcpy(&w, d.b->entry + i, 4); std::fprintf(stderr, " %08x", w); }
-            std::fprintf(stderr, "\n[pretx] fresh: ");
-            for (u32 i = 0; i < d.b->size && i < 256; i += 4) { u32 w; std::memcpy(&w, fresh + i, 4); std::fprintf(stderr, " %08x", w); }
-            std::fputc('\n', stderr);
-          }
-        }
-      }
-    }
-  }
-  install(jc, d.b);
-  asm volatile("isb" ::: "memory");
-  ++st_adopted;
-  seed(jc, *d.b);
-  return d.b;
-}
-
-static void start() {
-  if (!on()) return;
-  static const bool started = [] { std::thread(worker).detach(); return true; }();
-  (void)started;
-}
-
-} // namespace pretx
-} // namespace
-
 
 void invalidate_host_range(const u8* host_page, const u8* lo, const u8* hi) {
   auto it = g_rt.code_pages.find(host_page);
@@ -625,15 +406,6 @@ void invalidate_host_range(const u8* host_page, const u8* lo, const u8* hi) {
   }
   if (victims.empty()) { churn::range_miss++; return; }
   if (list.empty()) { g_rt.code_pages.erase(it); set_code_tag(host_page, false); }
-  invalidate_blocks(host_page, std::move(victims));
-}
-
-void invalidate_host_page(const u8* host_page) {
-  auto it = g_rt.code_pages.find(host_page);
-  if (it == g_rt.code_pages.end()) return;
-  std::vector<Block*> victims = std::move(it->second.blocks);
-  g_rt.code_pages.erase(it);
-  set_code_tag(host_page, false);
   invalidate_blocks(host_page, std::move(victims));
 }
 
@@ -667,7 +439,6 @@ static void invalidate_blocks(const u8* host_page, std::vector<Block*> victims) 
 }
 
 void invalidate_cpu(JitCpu& jc) {
-  pretx::purge();
   for (Block* b : jc.all_blocks) if (!b->dead) { remove_from_page_lists(b); kill_block(jc, b); }
   jc.blocks.clear();
   jc.parked.clear();
@@ -884,13 +655,6 @@ bool attach(NDS& nds, bool arm9, bool arm7) {
     r.density = std::getenv("DS_JIT_DENSITY") != nullptr;
     r.census = std::getenv("DS_JIT_CENSUS") != nullptr;
     if (r.census) r.density = true;
-    r.fastcost = std::getenv("DS_JIT_FASTCOST") != nullptr;
-    r.retime_all = std::getenv("DS_JIT_RETIME_ALL") != nullptr;
-    r.nocsel  = std::getenv("DS_JIT_NOCSEL") != nullptr;
-    r.nocost7 = std::getenv("DS_JIT_NOCOST7") != nullptr;
-    if (const char* cp = std::getenv("DS_JIT_COSTPROBE")) r.costprobe = std::atoi(cp);
-    if (const char* pp = std::getenv("DS_JIT_COSTPROBE_PART")) r.costprobe_part = std::atoi(pp);
-    if (const char* mp = std::getenv("DS_JIT_MEMPROBE")) r.memprobe = std::atoi(mp);
     mem::PageTable::code_query = &code_query;
     mem::code_write_hook = &code_write_hook;
   }
@@ -905,11 +669,8 @@ bool attach(NDS& nds, bool arm9, bool arm7) {
     jc.arm9 = c == 0;
     jc.hot.pt = ctx.page_table.raw();
     jc.hot.table = ctx.page_table.raw();
-    // DS_FASTMEM_DSI=0: no fastmem in DSi mode.
     jc.fastmem = false;
-    static const bool dsi_ok = [] { const char* e = std::getenv("DS_FASTMEM_DSI"); return !e || std::atoi(e) != 0; }();
-    if (const mem::GuestView* v = nds.bus.view(c == 0 ? Cpu::ARM9 : Cpu::ARM7);
-        v && backend::fastmem_capable() && !pretx::on() && r.memprobe == 0 && (!nds.dsi || dsi_ok)) {
+    if (const mem::GuestView* v = nds.bus.view(c == 0 ? Cpu::ARM9 : Cpu::ARM7); v && backend::fastmem_capable()) {
 #if UINTPTR_MAX > 0xFFFFFFFFu
       jc.fastmem = true;
       jc.hot.pt = reinterpret_cast<mem::Entry*>(v->base());
@@ -936,7 +697,6 @@ bool attach(NDS& nds, bool arm9, bool arm7) {
     ctx.jit_timing_changed = &on_timing_changed;
     (c == 0 ? nds.run_arm9 : nds.run_arm7) = &run;
   }
-  pretx::start();
   return true;
 }
 
@@ -955,7 +715,6 @@ void detach(NDS& nds) {
 void flush(CpuContext& cpu) { if (cpu.jit) invalidate_cpu(*static_cast<JitCpu*>(cpu.jit)); }
 void flush_all() { reset_arena(); }
 void set_trace(bool on) { if (g_rt.trace != on) { g_rt.trace = on; for (JitCpu& jc : g_rt.cpus) if (jc.ctx) invalidate_cpu(jc); } }
-void set_cpu_oc(CpuOc mode) { if (g_rt.cpu_oc != mode) { g_rt.cpu_oc = mode; for (JitCpu& jc : g_rt.cpus) if (jc.ctx) invalidate_cpu(jc); } }
 void set_strict(bool on) { if (g_rt.strict != on) { g_rt.strict = on; for (JitCpu& jc : g_rt.cpus) if (jc.ctx) invalidate_cpu(jc); } }
 const Stats& stats() { return g_rt.stats; }
 
@@ -989,10 +748,6 @@ void report(std::FILE* out) {
     std::fprintf(out, "[jit] fastmem: %llu site faults (rewritten to the walk), %zu guest sites on the walk, %zu registered sites\n",
                  static_cast<unsigned long long>(g_rt.fm_faults), g_rt.fm_slow.size() + g_rt.fm_ring_n, g_rt.fm_rels.size());
   if (s.bios_sha1_blocks) std::fprintf(out, "[jit] DSi BIOS SHA-1 blocks run natively: %llu\n", (unsigned long long)s.bios_sha1_blocks);
-  if (pretx::on())
-    std::fprintf(out, "[jit] pretx: built %llu adopted %llu dropped %llu skipped %llu\n",
-                 (unsigned long long)pretx::st_built, (unsigned long long)pretx::st_adopted,
-                 (unsigned long long)pretx::st_dropped, (unsigned long long)pretx::st_skipped);
   std::fprintf(out, "[jit] code %llu KB (hot %llu KB): %.1f bytes per guest instruction, %.1f hot\n", (unsigned long long)(s.code_bytes >> 10), (unsigned long long)(s.hot_bytes >> 10),
                s.instrs_translated ? static_cast<double>(s.code_bytes) / static_cast<double>(s.instrs_translated) : 0.0,
                s.instrs_translated ? static_cast<double>(s.hot_bytes) / static_cast<double>(s.instrs_translated) : 0.0);

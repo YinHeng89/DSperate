@@ -148,8 +148,6 @@ private:
   Renderer3D renderer_;
 public:
   Renderer3D& renderer() { return renderer_; }   // tests
-  // Skip the identical-frame shortcut on the next render_frame (raster benchmarking).
-  void force_full_raster() { render_identical_ = false; }
 private:
 
   // cmd_log_: one byte/command. par_log_: its parameters as contiguous u32
@@ -278,7 +276,7 @@ private:
   bool census_have_prev_ = false;
   u32 census_prev_polys_ = 0, census_prev_verts_ = 0;
   bool census_have_prev_counts_ = false;
-  u32 prev_swap_polys_ = 0, prev_swap_verts_ = 0;   // DS_R3D_SKIPDUP: other bank's list size
+  u32 prev_swap_polys_ = 0, prev_swap_verts_ = 0;   // other bank's list size
   bool rendered_before_ = false;
 
   Vertex* cur_vram() { return &vram_[bank_ * VRAM_BANK]; }

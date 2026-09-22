@@ -16,7 +16,6 @@
 #include "core/nds.h"
 
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -87,13 +86,9 @@ bool decode_shape(CpuContext& cpu) {
 
 inline u32 max3c(s32 a, s32 b, s32 c) { return static_cast<u32>(std::max(a, std::max(b, c))); }
 
-// A word access's data cost as the translator prices it; see
-// Translator::oc_data_cost for the CPU-tuned constant paths.
-s32 data_cost(const CpuContext& cpu, u32 addr, bool seq, bool store, bool literal) {
-  const CpuOc oc = rt().cpu_oc;
-  if (literal || oc == CpuOc::Off) return cpu.timing9[addr >> 12][(store ? 4 : 0) + (seq ? 3 : 2)];
-  if (oc == CpuOc::Underclock && store) return static_cast<s32>(cpu.nds->bus.timing().bus9_data(0x02000000u, true, seq));
-  return cpu.timing9[0x02000000u >> 12][seq ? 3 : 2];
+// A word access's data cost as the translator prices it.
+s32 data_cost(const CpuContext& cpu, u32 addr, bool seq, bool store) {
+  return cpu.timing9[addr >> 12][(store ? 4 : 0) + (seq ? 3 : 2)];
 }
 
 // What the recompiled instructions charge, less the R1 loads (those follow r1).
@@ -106,13 +101,13 @@ u32 base_cost(const CpuContext& cpu, u32 sp, u32 r0) {
     s32 D = -1;
     switch (op.kind) {
     case Kind::Plain: break;
-    case Kind::Lit:     D = data_cost(cpu, static_cast<u32>(op.arg), false, false, true); break;
-    case Kind::SpLoad:  D = data_cost(cpu, sp + static_cast<u32>(op.arg), false, false, false); break;
-    case Kind::SpStore: D = data_cost(cpu, sp + static_cast<u32>(op.arg), false, true, false); break;
+    case Kind::Lit:     D = data_cost(cpu, static_cast<u32>(op.arg), false, false); break;
+    case Kind::SpLoad:  D = data_cost(cpu, sp + static_cast<u32>(op.arg), false, false); break;
+    case Kind::SpStore: D = data_cost(cpu, sp + static_cast<u32>(op.arg), false, true); break;
     case Kind::Ldm: case Kind::Stm: {
       const bool store = op.kind == Kind::Stm;
-      D = data_cost(cpu, r0, false, store, false);
-      for (u32 i = 1; i < op.count; ++i) D += data_cost(cpu, r0 + 4 * i, true, store, false);
+      D = data_cost(cpu, r0, false, store);
+      for (u32 i = 1; i < op.count; ++i) D += data_cost(cpu, r0 + 4 * i, true, store);
       break;
     }
     default: break;
@@ -128,7 +123,7 @@ u32 r1_cost(const CpuContext& cpu, u32 r1) {
     const u32 pc8 = op.pc + 8;
     const u8 cc = cpu.timing9[pc8 >> 12][0];
     const s32 C = cc == 0xFF ? (!(pc8 & 0x1F) ? 3 : 1) : cc;
-    const s32 D = data_cost(cpu, r1 + 4 * static_cast<u32>(op.arg), false, false, false);
+    const s32 D = data_cost(cpu, r1 + 4 * static_cast<u32>(op.arg), false, false);
     total += max3c(C + D - 6, C, D);
   }
   return total;
@@ -137,12 +132,10 @@ u32 r1_cost(const CpuContext& cpu, u32 r1) {
 inline u32 rol(u32 v, u32 n) { return (v << n) | (v >> (32 - n)); }
 inline u32 bswap(u32 v) { return __builtin_bswap32(v); }
 
-bool env_off() { static const bool off = std::getenv("DS_BIOS_SHA1_OFF") != nullptr; return off; }
-
 }  // namespace
 
 bool bios_sha1_hook_wanted(CpuContext& cpu, u32 pc, bool thumb) {
-  if (pc != LOOP || thumb || cpu.which != Cpu::ARM9 || !cpu.nds->dsi || env_off()) return false;
+  if (pc != LOOP || thumb || cpu.which != Cpu::ARM9 || !cpu.nds->dsi) return false;
   if (!g_shape.decoded) decode_shape(cpu);
   return g_shape.ok;
 }
@@ -177,9 +170,9 @@ bool compute(CpuContext& cpu, Iter& it) {
   }
 
   // Cycles, as the recompiled loop charges them.
-  static u64 cache_version = ~0ull; static u32 cache_sp = 0, cache_r0 = 0, cache_base = 0; static CpuOc cache_oc = CpuOc::Off;
-  if (cache_version != t.cpu9_version || cache_sp != sp || cache_r0 != r0 || cache_oc != rt().cpu_oc) {
-    cache_version = t.cpu9_version; cache_sp = sp; cache_r0 = r0; cache_oc = rt().cpu_oc;
+  static u64 cache_version = ~0ull; static u32 cache_sp = 0, cache_r0 = 0, cache_base = 0;
+  if (cache_version != t.cpu9_version || cache_sp != sp || cache_r0 != r0) {
+    cache_version = t.cpu9_version; cache_sp = sp; cache_r0 = r0;
     cache_base = base_cost(cpu, sp, r0);
   }
   const u32 r2 = R[2];
@@ -225,7 +218,7 @@ bool compute(CpuContext& cpu, Iter& it) {
 
 bool bios_sha1_run(CpuContext& cpu) {
   Runtime& r = rt();
-  if (r.strict || r.fastcost || cpu.thumb() || !g_shape.ok || mem::Bus::watch_active()) return false;
+  if (r.strict || cpu.thumb() || !g_shape.ok || mem::Bus::watch_active()) return false;
   bool ran = false;
   Iter it;
   while (compute(cpu, it)) {

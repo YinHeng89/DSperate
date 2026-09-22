@@ -3,7 +3,6 @@
 #pragma once
 #include <functional>
 #include <cstdio>
-#include <cstdlib>
 #include "core/types.h"
 #include "core/gpu/texcache.h"
 
@@ -87,7 +86,7 @@ public:
   // GPU 3D raster; may decline (no libvulkan/device/memory type, unfinished
   // pipeline). `why` takes the reason on failure.
   // Only ever called on the coordinator, never on a band worker.
-  bool set_gpu_raster(bool on, std::string* why = nullptr);
+  bool set_gpu_raster(bool on, std::string* why = nullptr, u32 scale = 1);   // scale: internal resolution 1..4
   bool gpu_raster_active() const;
 
   // A/B mode (--gpu-ab): draw every frame both ways and compare. Display still gets the CPU output.
@@ -164,11 +163,7 @@ private:
   NDS& nds_;
   // Holds a whole chunk of scanlines at once (render_chunk draws chunk at a
   // time): CHUNK lines plus a border line each side, power-of-two for masking.
-  // RING is a build-time knob (-DDS_R3D_RING=), must be pow2 and >= CHUNK+2.
-#ifndef DS_R3D_RING
-#define DS_R3D_RING 8
-#endif
-  static constexpr int W = 258, RING = DS_R3D_RING, CHUNK = RING - 2, RSIZE = W * RING;
+  static constexpr int W = 258, RING = 8, CHUNK = RING - 2, RSIZE = W * RING;
   static_assert((RING & (RING - 1)) == 0, "RING must be a power of two");
   static_assert(CHUNK >= 2, "CHUNK must leave room for the final pass lag");
   // Ring row of frame line y (-1, 192 are border rows); pixel (x,y) is row_of(y)+1+x.
@@ -448,18 +443,8 @@ private:
   // More bins than workers, each worker takes the next unclaimed one, so a
   // heavy bin is absorbed by others finishing early (a static split can't).
   static constexpr u32 MAX_BINS = 32;
-  // Bin sizing. Ascending suits bins == workers (all start at once); the
-  // others are for the binned regime. DS_R3D_SPLIT=stair|even|desc|taper.
-  enum class Split { Ascending, Even, Descending, Taper };
-  static Split split_mode();
   void compute_bins(u32 nbins, u32 workers);
   static u32 bin_count(u32 workers);
-  u32 adaptive_workers(u32 max_workers);
-  static bool threads_forced();
-  static bool adapt_enabled();
-  u32 workers_now_ = 0, quiet_frames_ = 0;
-  s64 wait_ema_ = 0;             // averaged block time, the regime signal
-  std::atomic<u64> wait_ns_{0};  // time blocked on the raster this frame (any thread: the compositor waits too)
   std::array<s32, MAX_BINS + 1> bin_y_{};
   u32 nbins_ = 0;
 
@@ -471,7 +456,7 @@ public:
   // What the display reads for one frame: output buffer, and the pool
   // generation's bands to wait on before reading a line. Taken at the start
   // of the display frame (Gpu::begin_frame); nbins is 0 when nothing is
-  // outstanding (rendered inline, kept, or ablated).
+  // outstanding (rendered inline or kept).
   //
   // A GPU-drawn frame carries `gpu` instead of a band cut: `out` names the
   // raster's own buffer, and sync_line waits on one fence, whole-frame
@@ -513,15 +498,11 @@ public:
   FrameRef frame_ref(bool allow_defer = false) const;
   void sync_line(const FrameRef& f, s32 y);   // any thread; each call waits for one band at most
   void sync_all();
-  bool raster_pending() const { return pending_bands_ != 0; }
   u64 last_band_sum_ns() const { return band_sum_ns_[0]; }   // serial raster cost of the last synced frame (sum over bands)
-  u64 take_owner_wait_ns() { return owner_wait_ns_.exchange(0, std::memory_order_relaxed); }   // shape controller input
-  void set_bands_next(u32 n) { bands_next_ = n; }   // next dispatch's workers (0 = default); overridden by DS_R3D_THREADS
 private:
   std::function<void(u32)> job_fn_;   // outlives the dispatch, unlike a local
   u32 pending_bands_ = 0;             // bins in flight (0 = nothing running)
   u64 gen_ = 0;                       // pool generation of the bands in flight
-  bool async_ = std::getenv("DS_R3D_SYNC") == nullptr;
 
   // GPU raster and device, coordinator-owned. unique_ptrs to incomplete
   // types keep render3d.h free of the Vulkan headers.
@@ -534,7 +515,7 @@ private:
   bool gpu_sync_is_frame_ = false;   // the sync_all at the top of render(), as against a forced one
   bool gpu_ab_ = false;
   mutable GpuStats gpu_stats_{};   // mutable: frame_ref is const and counts deferrals
-  // The GPU job thread (DS_GPU_THREAD=0 keeps the upload on the emulation thread).
+  // The GPU job thread: conversion, upload, submit and CPU fallback.
   std::thread gpu_thread_;
   mutable GpuJobSync gpu_job_;
   std::vector<const Polygon*> gpu_job_polys_;
@@ -606,7 +587,7 @@ private:
   u64 band_ns_[8] = {};                                 // last frame's per-band wall time (workers write their own slot)
   u64 band_sum_ns_[2] = {0, 0};                         // summed band time (serial raster cost) of the last two frames
   u32 last_nb_ = 0;                                     // workers given the last frame (slots of band_ns_ that are live)
-  static constexpr u64 kLagBandThresholdNs = 40'000'000; // serial raster cost two workers can still hide; below it a hot compositor gets the third core (DS_R3D_LAG_NS overrides)
+  static constexpr u64 kLagBandThresholdNs = 40'000'000; // serial raster cost two workers can still hide; below it a hot compositor gets the third core
   struct Pool;
 public:
   void debug_dump(FILE* f);   // DS_WATCHDOG: band hand-off state
@@ -635,10 +616,7 @@ private:
   struct StealBand { std::unique_ptr<Renderer3D> band; std::atomic<bool> busy{false}; u64 gen = ~u64{0}; };
   StealBand steal_[2];
   std::thread::id owner_;                // the thread render() dispatched from
-  std::atomic<u64> owner_wait_ns_{0};
-  u32 bands_next_ = 0;
   bool steal_bins(u64 gen, u32 upto);    // claim and draw unclaimed bins until bin `upto` is done; true if it is
-  static int steal_mode();   // DS_R3D_STEAL: 0 off, 1 (default) dispatching thread only, 2 any thread
 
   u32  fog_density(u32 addr) const;
   void final_pass(s32 y);

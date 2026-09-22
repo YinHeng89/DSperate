@@ -22,7 +22,7 @@ enum Stage : u32 {
   GPU_LINE,     // scanline-start/HBlank handlers, minus the pieces below and 2D draws
   JOIN0,        // waiting for the 2D worker at line 0
   BEGIN_FRAME,  // Gpu::begin_frame
-  GX_VBLANK,    // Gpu3D::vblank: swap, polygon sort, geometry worker join
+  GX_VBLANK,    // Gpu3D::vblank: swap, polygon sort
   JOURNAL,      // step_engine's journal replay, window and draw latches
   R3D_LINE,     // asking the 3D raster for a line
   R3D_PREP,     // Renderer3D::render up to the raster seam
@@ -31,11 +31,14 @@ enum Stage : u32 {
   COUNT
 };
 extern bool enabled;
-// Per-access-path census counters (-DDSPERATE_CENSUS=1); compiled out by default to avoid the always-on cost.
+// Per-access censuses (palette/OAM store counts, DS_CENSUS, DS_IO_CENSUS,
+// DS_FASTMEM_CENSUS, code-page store counts) need -DDSPERATE_CENSUS=1; compiled out by default.
 #ifndef DSPERATE_CENSUS
 #define DSPERATE_CENSUS 0
 #endif
 constexpr bool census = DSPERATE_CENSUS != 0;
+// A census env var: true only if set in a census build; a census-less build notes it is ignored.
+bool census_env(const char* var);
 // DS_ASYNC_PROBE: true during the window an async raster would be exposed to CPU writes.
 extern bool async_window;
 // DS_CENSUS_GX: set at swap when the list matches the previous one; read by
@@ -49,11 +52,10 @@ enum Counter : u32 { C_POLY_LINES, C_SPAN_PIXELS, C_RESOLVED_PIXELS, C_TEX_FAST,
   C_CYC_TOTAL, C_CYC_BOTH_HALTED, C_CYC_A9_ONLY_HALTED, C_CYC_A7_ONLY_HALTED, C_CYC_NEITHER_HALTED,
   C_CYC_A9_SPIN, C_CYC_A7_SPIN, C_CYC_ONE_SPIN_ONE_HALTED, C_CYC_BOTH_SPIN_OR_HALTED,
   C_NS_A9_SPIN, C_NS_A7_SPIN, C_NS_A9_WORK, C_NS_A7_WORK, C_CYC_IDLE_SKIPPED, C_IDLE_NO_DMA, C_IDLE_NO_GX, C_IDLE_NO_IRQ, C_IDLE_NO_FILTER, C_IDLE_NO_LOOP9, C_IDLE_NO_LOOP7, C_IDLE_OK, C_A7_SPI_SLEEP, C_CYC_A7_SPI_SLEPT,
-  // DS_IDLE_SURVEY=1: of slices the DMA/GX veto rejected, how many would the loop analyser accept?
+  // DS_IDLE_SURVEY=1: of slices the DMA veto rejected, how many would the loop analyser accept?
   C_IDLE_SURVEY_SEEN, C_IDLE_SURVEY_WOULD_SKIP, C_IDLE_SURVEY_NO_IRQ, C_IDLE_SURVEY_NO_FILTER, C_IDLE_SURVEY_NO_LOOP,
-  C_IDLE_SURVEY_GX_SEEN, C_IDLE_SURVEY_GX_WOULD_SKIP,   // GX veto alone
   C_2D_LINES, C_2D_BG_TEXT, C_2D_BG_AFFINE, C_2D_BG_EXT, C_2D_BG_3D, C_2D_OBJ_LINES, C_2D_WINDOW_LINES, C_2D_EFFECT_LINES, C_2D_EFFECT_LIVE, C_2D_FLAT_LINES, C_2D_SELECTS,
-  C_2D_L0, C_2D_L1, C_2D_L2, C_2D_L3, C_2D_L4P, C_2D_L1_FULL, C_2D_OBJ_PRESENT, C_2D_3D_PRESENT, C_2D_WIN_PRESENT, C_2D_BG_PAL16, C_2D_BG_PAL256, C_2D_BG_DIRECT, C_2D_BG_EMPTY, C_2D_BG_3D_EMPTY, C_2D_FAST_BACKDROP, C_2D_FAST_ONE, C_2D_FULL_MODE, C_2D_FULL_3D, C_2D_FULL_OBJ, C_2D_FULL_SECOND, C_2D_FULL_FADE, C_SPAN_FLAT_RGB, C_SPAN_LERP_RGB, C_BAND0_NS, C_BAND1_NS, C_BAND2_NS, C_BAND3_NS, C_BAND_MAX_NS, C_BAND_SUM_NS, C_ASYNC_FRAMES, C_ASYNC_DIRTY_L0, C_ASYNC_DIRTY_SWAP, C_ASYNC_VRAMCNT_L0, C_ASYNC_VRAMCNT_SWAP, C_R3D_SYNC_ALL, C_R3D_STOLEN, C_R3D_W1, C_R3D_W2, C_R3D_W3, C_R3D_W4, C_BATCHES, C_BATCH_SPANS, C_BATCH_PX,
+  C_2D_L0, C_2D_L1, C_2D_L2, C_2D_L3, C_2D_L4P, C_2D_L1_FULL, C_2D_OBJ_PRESENT, C_2D_3D_PRESENT, C_2D_WIN_PRESENT, C_2D_BG_PAL16, C_2D_BG_PAL256, C_2D_BG_EMPTY, C_2D_BG_3D_EMPTY, C_2D_FAST_BACKDROP, C_2D_FAST_ONE, C_2D_FULL_MODE, C_2D_FULL_3D, C_2D_FULL_OBJ, C_2D_FULL_SECOND, C_2D_FULL_FADE, C_SPAN_FLAT_RGB, C_SPAN_LERP_RGB, C_BAND0_NS, C_BAND1_NS, C_BAND2_NS, C_BAND3_NS, C_BAND_MAX_NS, C_BAND_SUM_NS, C_ASYNC_FRAMES, C_ASYNC_DIRTY_L0, C_ASYNC_DIRTY_SWAP, C_ASYNC_VRAMCNT_L0, C_ASYNC_VRAMCNT_SWAP, C_R3D_SYNC_ALL, C_R3D_STOLEN, C_BATCHES, C_BATCH_SPANS, C_BATCH_PX,
   // Census: how often the 3D frame resubmits unchanged (DS_CENSUS_GX=1 adds the content hash).
   C_GX_SWAP, C_GX_SWAP_SAME_CONTENT, C_GX_NOSWAP, C_GX_NOSWAP_REGS_DIFFER,
   C_GX_RD_DISPCNT, C_GX_RD_CLEAR, C_GX_RD_FOG, C_GX_RD_EDGETOON,
@@ -86,16 +88,14 @@ enum Counter : u32 { C_POLY_LINES, C_SPAN_PIXELS, C_RESOLVED_PIXELS, C_TEX_FAST,
   C_FRAMES_PHASE_ALT, C_FRAMES_CAPTURE, C_FRAMES_TOTAL,
   C_W2D_JOIN_NS_CATCHUP, C_W2D_JOIN_NS_TRAP, C_W2D_JOIN_NS_JOURNAL,
   C_W2D_JOIN_NS_LINE0, C_W2D_JOIN_NS_REMAP, C_W2D_JOIN_NS_RPRE, C_W2D_JOIN_NS_RPOST, C_W2D_JOIN_NS_OTHER,
-  C_RESOLVE_CALLS, C_RESOLVE_PARTS,
   C_CHUNK_ENTRIES,
   C_SPAN_EMPTY, C_SPAN_OCCLUDED, C_SPAN_DRAWN,
   // Census: geometry-engine register reads (ARM9 polling GXSTAT).
-  C_GX_READ, C_GX_READ_GXSTAT, C_GX_READ_GXSTAT_BUSY, C_GX_READ_GXSTAT_PIPE, C_GX_READ_GXSTAT_FIFO, C_GX_RUN_SLOW, C_GX_RUN_SLOW_EXEC, C_GX_WORKER_FULL,
+  C_GX_READ, C_GX_READ_GXSTAT, C_GX_READ_GXSTAT_BUSY,
   // Drawn spans/pixels by resolve reason, not by code path taken.
   C_RES_VEC_SPANS, C_RES_VEC_PX, C_RES_TOON_SPANS, C_RES_TOON_PX, C_RES_SHADOW_SPANS, C_RES_SHADOW_PX, C_RES_WIRE_SPANS, C_RES_WIRE_PX,
-  // Census: the per-scanline change-detection compares in engine2d.
-  C_2D_CMP_BGPAL, C_2D_CMP_BGEXT, C_2D_CMP_OBJPAL, C_2D_CMP_OBJEXT, C_2D_CMP_OAM,
-  C_2D_CMPD_BGPAL, C_2D_CMPD_BGEXT, C_2D_CMPD_OBJPAL, C_2D_CMPD_OBJEXT, C_2D_CMPD_OAM,
+  // Census: engine2d's per-scanline extended-palette compares, and those that differed.
+  C_2D_CMP_BGEXT, C_2D_CMP_OBJEXT, C_2D_CMPD_BGEXT, C_2D_CMPD_OBJEXT,
   // Census: DMA. `run` units move through a direct-mapped page-to-page run;
   // `slow` units go through the bus, one dispatch each.
   C_DMA_STARTS, C_DMA_LOOP,   // C_DMA_LOOP: outer-loop entries; a run counts once, a per-unit step counts one each
@@ -122,7 +122,6 @@ enum Counter : u32 { C_POLY_LINES, C_SPAN_PIXELS, C_RESOLVED_PIXELS, C_TEX_FAST,
   C_RK_FULL_OPAQUE, C_RK_FULL_OPAQUE_PX,
   // JIT retimes (ARM9 timing-table rebuilds): calls, and blocks each killed.
   C_JIT_INVALIDATE_CPU, C_JIT_INVALIDATE_CPU_KILLED,
-  C_SLICES_GX_STALLED,   // slices the ARM9 sat out with the geometry FIFO full
   // Memory-map/timing-table rebuilds: VRAMCNT remaps, TCM/PU window updates,
   // EXMEMCNT slot retimes, and ARM9 timing-range rebuilds from any of them.
   C_BUS_UPDATE_VRAM, C_BUS_UPDATE_TCM, C_BUS_GBA_TIMING, C_TIMING_UPDATE_CPU9,

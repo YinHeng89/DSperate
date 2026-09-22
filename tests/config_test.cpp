@@ -37,7 +37,7 @@ void test_parsing() {
         "frameskip = 2\n"
         "# a comment\n"
         "; another\n"
-        "cpu_oc = true      # trailing comments are cut\n"
+        "autosave = true    # trailing comments are cut\n"
         "empty =\n"
         "[video]\n"
         "  lcd_grid = 0.5  \n"          // surrounding space is trimmed
@@ -46,7 +46,7 @@ void test_parsing() {
   ds::sdl::Config c;
   CHECK(c.load(kPath));
   CHECK(c.num("emu.frameskip", 9) == 2);
-  CHECK(c.flag("emu.cpu_oc", false));
+  CHECK(c.flag("emu.autosave", false));
   CHECK(c.real("video.lcd_grid", 0.0) == 0.5);
   CHECK(c.str("video.chunky") == "mean");
   // A key with no value falls back for the typed readers, and the section is
@@ -82,28 +82,28 @@ void test_store_keeps_the_file() {
         "\n"
         "[emu]\n"
         "# frameskip = 0   the default\n"
-        "cpu_oc = false\n"
+        "autosave = false\n"
         "\n"
         "[video]\n"
         "lcd_grid = 0\n");
-  CHECK(ds::sdl::Config::store(kPath, "emu.cpu_oc", "true"));
+  CHECK(ds::sdl::Config::store(kPath, "emu.autosave", "true"));
   const std::string after = read();
   CHECK(has_line(after, "# leading comment"));
   CHECK(has_line(after, "# frameskip = 0   the default"));
-  CHECK(has_line(after, "cpu_oc = true"));
-  CHECK(!has_line(after, "cpu_oc = false"));
+  CHECK(has_line(after, "autosave = true"));
+  CHECK(!has_line(after, "autosave = false"));
   CHECK(has_line(after, "lcd_grid = 0"));
   // It goes back in as the value that was written.
   ds::sdl::Config c;
   CHECK(c.load(kPath));
-  CHECK(c.flag("emu.cpu_oc", false));
+  CHECK(c.flag("emu.autosave", false));
   CHECK(c.real("video.lcd_grid", 1.0) == 0.0);
 }
 
 // A key the file does not have yet joins its section; a section it does not
 // have is appended. Both happen the first time a setting is changed.
 void test_store_adds_keys_and_sections() {
-  write("[emu]\ncpu_oc = false\n\n[video]\nlcd_grid = 0\n");
+  write("[emu]\nautosave = false\n\n[video]\nlcd_grid = 0\n");
   CHECK(ds::sdl::Config::store(kPath, "emu.frameskip", "2"));
   CHECK(ds::sdl::Config::store(kPath, "user.nickname", "Ada"));
   const std::string after = read();
@@ -131,7 +131,7 @@ void test_round_trip() {
   const struct { const char* key; const char* value; } cases[] = {
     {"emu.frameskip", "3"},
     {"emu.ff_speed", "0"},                  // the UNLIMITED sentinel
-    {"emu.cpu_oc", "true"},
+    {"emu.autosave", "true"},
     {"video.chunky_cell", "auto"},          // the AUTO sentinel
     {"video.dominant_ratio", "auto"},
     {"video.lcd_grid", "0.5"},              // a percent row's double
@@ -164,51 +164,24 @@ void test_round_trip() {
 // Later loads win, which is how the per-game file overrides the global one
 // and the command line overrides both.
 void test_layering() {
-  write("[emu]\nframeskip = 1\ncpu_oc = false\n");
+  write("[emu]\nframeskip = 1\nautosave = false\n");
   ds::sdl::Config c;
   CHECK(c.load(kPath));
   write("[emu]\nframeskip = 3\n");
   CHECK(c.load(kPath));
   CHECK(c.num("emu.frameskip", 0) == 3);   // overridden
-  CHECK(!c.flag("emu.cpu_oc", true));      // and what the second file omits is kept
+  CHECK(!c.flag("emu.autosave", true));    // and what the second file omits is kept
   c.set("emu.frameskip", "0");
   CHECK(c.num("emu.frameskip", 9) == 0);
 }
 
-// emu.cpu_tuning, and emu.cpu_oc -- its old name -- standing in for it.
-void test_cpu_tuning_alias() {
-  {   // an old file: the key and "true" both carried over
-    write("[emu]\ncpu_oc = true\n");
-    ds::sdl::Config c;
-    CHECK(c.load(kPath));
-    CHECK(c.str("emu.cpu_tuning") == "overclock");
-  }
-  {
-    write("[emu]\ncpu_oc = underclock\n");
-    ds::sdl::Config c;
-    CHECK(c.load(kPath));
-    CHECK(c.str("emu.cpu_tuning") == "underclock");
-  }
-  {   // both in one file (a menu change added the new key): the new one wins
-    write("[emu]\ncpu_oc = true\ncpu_tuning = underclock\n");
-    ds::sdl::Config c;
-    CHECK(c.load(kPath));
-    CHECK(c.str("emu.cpu_tuning") == "underclock");
-  }
-  {   // the new key spelled as a boolean
-    write("[emu]\ncpu_tuning = on\n");
-    ds::sdl::Config c;
-    CHECK(c.load(kPath));
-    CHECK(c.str("emu.cpu_tuning") == "overclock");
-  }
-  {   // a later file's old key still overrides an earlier file's new one
-    ds::sdl::Config c;
-    write("[emu]\ncpu_tuning = overclock\n");
-    CHECK(c.load(kPath));
-    write("[emu]\ncpu_oc = false\n");
-    CHECK(c.load(kPath));
-    CHECK(c.str("emu.cpu_tuning") == "false");
-  }
+// Keys a release no longer reads (the retired CPU tuning, fast load, timing
+// OC and geometry worker) still load: an old file must not stop the emulator.
+void test_retired_keys_load() {
+  write("[emu]\ncpu_oc = true\ncpu_tuning = underclock\nfast_load = true\ntiming_oc = true\ngx_worker = true\nframeskip = 2\n");
+  ds::sdl::Config c;
+  CHECK(c.load(kPath));
+  CHECK(c.num("emu.frameskip", 0) == 2);
 }
 
 } // namespace
@@ -220,7 +193,7 @@ int main() {
   test_store_adds_keys_and_sections();
   test_round_trip();
   test_layering();
-  test_cpu_tuning_alias();
+  test_retired_keys_load();
   std::remove(kPath);
   std::printf("config: ok\n");
   return 0;

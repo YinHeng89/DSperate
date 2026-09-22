@@ -80,8 +80,6 @@ public:
   double wait_total_ms() const { return wait_total_ms_; }
   double wait_max_ms() const { return wait_max_ms_; }
   unsigned wait_timeouts() const { return wait_timeouts_; }   // waits that ran the whole recv timeout
-  void set_recv_timeout_ms(int ms) { recv_timeout_ms_ = ms; }
-  int  recv_timeout_ms() const { return recv_timeout_ms_; }
 
   // MpTransport
   void begin() override;
@@ -120,8 +118,8 @@ private:
   Player me_;
   u32 host_address_ = 0;
   u16 connected_mask_ = 0;
-  int recv_timeout_ms_ = 25;
-  u32 stale_ms_ = 64;               // DS_LAN_STALE_MS; melonDS uses 16
+  static constexpr int RECV_TIMEOUT_MS = 25;
+  static constexpr u32 STALE_MS = 64;   // stale-packet window; melonDS uses 16
   int last_host_id_ = -1;
   _ENetPeer* last_host_peer_ = nullptr;
   std::queue<_ENetPacket*> rx_;

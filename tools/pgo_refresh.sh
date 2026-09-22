@@ -159,7 +159,7 @@ rm -rf "$BUILD" "$BUILD-use"   # scratch directories: a stale cache (flags) woul
 cmake -S "$HERE" -B "$BUILD" "${CONF[@]}" -DDSPERATE_PGO=generate > /dev/null
 ninja -C "$BUILD" dsperate-headless > /dev/null
 G="$BUILD/src/frontend/headless/dsperate-headless"
-C=(--direct --quantum 0 --bios9 "$DS_BIOS/bios9.bin" --bios7 "$DS_BIOS/bios7.bin" --firmware "$DS_BIOS/firmware.bin")
+C=(--direct --bios9 "$DS_BIOS/bios9.bin" --bios7 "$DS_BIOS/bios7.bin" --firmware "$DS_BIOS/firmware.bin")
 train() { echo "  train: $1"; shift; $Q "$G" "${C[@]}" "$@" > /dev/null 2>&1 || echo "  (run failed: $*)"; }
 echo "== training"
 train mlbis  --save "$HERE/scenes/mlbis.sav"  --replay "$HERE/scenes/mlbis.dsin"  --frames 600 "$DS_ROMS/Mario & Luigi - Bowser's Inside Story.nds" &
@@ -179,7 +179,7 @@ if [ $DSI_OK = 1 ]; then
   # NAND, so this needs the four BIOS dumps and the DSi firmware but no NAND
   # image. --dsi-persist keeps the titles' saves out of the asset directory
   # and --dsi-offline makes sure a training run never reaches the network.
-  DC=(--direct --quantum 0 --bios9 "$DS_BIOS/bios9.bin" --bios7 "$DS_BIOS/bios7.bin"
+  DC=(--direct --bios9 "$DS_BIOS/bios9.bin" --bios7 "$DS_BIOS/bios7.bin"
       --bios9i "$DS_DSI/bios/biosdsi9.bin" --bios7i "$DS_DSI/bios/biosdsi7.bin"
       --firmware "$DS_DSI/bios/dsifirmware.bin"
       --dsi --dsi-hle-launch --dsi-offline --dsi-persist "$BUILD/dsi-saves")

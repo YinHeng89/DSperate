@@ -4,7 +4,6 @@
 #include "core/types.h"
 
 #include <algorithm>
-#include <atomic>
 #include <memory>
 #include <vector>
 
@@ -26,10 +25,9 @@ enum Region : u8 {
 //   [1] data N16, [2] data N32, [3] data S32, in ARM9 cycles.
 class Timing {
 public:
-  // Bumped after every retime (set_region9/7), seqlock-style: a JIT
-  // pre-translation worker that saw the stamp move mid-build discards its
-  // output rather than adopting a block baked from mixed table halves.
-  std::atomic<u64> stamp{0};
+  // Bumped after every retime (set_region9/7); a parked JIT block revives only
+  // under the stamp it was translated with.
+  u64 stamp = 0;
 
   // Bus cycles to ARM9 cycles: 1 on DS, 2 on DSi with SCFG_CLK9 bit 0 set.
   // Bus::set_clock9_shift changes it live.
@@ -93,10 +91,6 @@ public:
   void ndma_cost(bool arm9, u32 addr, u32& n32, u32& s32) const {
     if (arm9) { const u8* t = &bus9_[(addr >> 14) * 8]; n32 = t[2]; s32 = t[3]; }
     else      { const u8* t = &bus7()[(addr >> 15) * 4]; n32 = t[2]; s32 = t[3]; }
-  }
-  u32 bus9_data(u32 addr, bool word, bool seq) const {
-    const u8* t = &bus9_[(addr >> 14) * 8];
-    return static_cast<u32>(seq ? t[3] : word ? t[2] : t[0]) << clock9_shift;
   }
   void dma_cost(bool arm9, u32 addr, bool word, u32& n, u32& s) const {
     if (arm9) { const u8* t = &bus9_[(addr >> 14) * 8]; n = t[word ? 6 : 4]; s = t[word ? 7 : 5]; }

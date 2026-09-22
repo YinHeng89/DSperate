@@ -34,13 +34,6 @@ namespace ds::gpu {
 std::atomic<unsigned> g_gpu_stalls{0};
 
 
-// DS_EDGE_MOCK=<file>: enables sub-pixel edge mode, appends per-frame 3D
-// output + split map (2 u32/pixel). DS_EDGE_MOCK_FROM skips leading records.
-namespace edge_mock {
-const char* path() { static const char* p = std::getenv("DS_EDGE_MOCK"); return p; }
-bool on() { static const bool v = path() != nullptr; return v; }
-}
-
 #if DSPERATE_NEON
 // The A64-only NEON intrinsics the kernels use, in both spellings.
 namespace compat = kern::compat;
@@ -221,8 +214,8 @@ void Renderer3D::Slope<side>::edge_params(bool aa, s32* length, s32* coverage) c
 // Fixed pool of band workers, parked on a condition variable between frames.
 // dispatch() only publishes the job and notifies; the emulation thread never
 // rasters a band itself, it blocks on sync_line only when it needs one.
-// Pool(n) is n threads in addition to the emulation thread (DS_R3D_THREADS=N).
-// N=0: band_count is 0 and render() rasters inline with no pool.
+// Pool(n) is n threads in addition to the emulation thread; when band_count
+// is 0, render() rasters inline with no pool.
 struct Renderer3D::Pool {
   explicit Pool(u32 n) : start_(new std::condition_variable[n]) {
     threads_.reserve(n);
@@ -267,23 +260,19 @@ struct Renderer3D::Pool {
     done_.notify_all();
   }
 
-  // Blocks until `mask`'s bins of dispatch `gen` are done; returns ns blocked.
+  // Blocks until `mask`'s bins of dispatch `gen` are done.
   // Fast path (bin already drawn) takes no lock. A stale `gen` (superseded by
   // a later dispatch) returns immediately, since every bin of a generation is
   // done before the next dispatch -- without this check a wait for frame N
   // could hang on N+1's bits if N+1 has fewer bins.
-  u64 wait_bits(u64 gen, u64 mask) {
-    if (!mask) return 0;
-    if (generation_.load(std::memory_order_acquire) != gen) return 0;
-    if ((done_bits_.load(std::memory_order_acquire) & mask) == mask) return 0;
-    const auto t0 = std::chrono::steady_clock::now();
-    {
-      std::unique_lock<std::mutex> lk(m_);
-      done_.wait(lk, [this, gen, mask] {
-        return generation_.load(std::memory_order_relaxed) != gen || (done_bits_.load(std::memory_order_relaxed) & mask) == mask;
-      });
-    }
-    return static_cast<u64>((std::chrono::steady_clock::now() - t0).count());
+  void wait_bits(u64 gen, u64 mask) {
+    if (!mask) return;
+    if (generation_.load(std::memory_order_acquire) != gen) return;
+    if ((done_bits_.load(std::memory_order_acquire) & mask) == mask) return;
+    std::unique_lock<std::mutex> lk(m_);
+    done_.wait(lk, [this, gen, mask] {
+      return generation_.load(std::memory_order_relaxed) != gen || (done_bits_.load(std::memory_order_relaxed) & mask) == mask;
+    });
   }
 
   // Every worker has returned from the job, not merely finished its bins:
@@ -323,7 +312,6 @@ private:
     char name[16];
     std::snprintf(name, sizeof name, "r3d-band%u", index);
     name_current_thread(name);
-    if (pin_threads()) pin_current_thread(1 + index);
     u64 seen = 0;
     for (;;) {
       std::unique_lock<std::mutex> lk(m_);
@@ -1089,12 +1077,6 @@ void Renderer3D::setup_shade(Shade& sh, const Polygon& p) {
 
 #if DSPERATE_NEON
 namespace {
-// 15-bit colour channel -> 6-bit (c15_to_18 on lanes): bits 1-5 of the field, +1 when non-zero.
-inline uint32x4_t c15_to_18_4(uint32x4_t c, int shift) {
-  uint32x4_t v = shift == 0 ? vshlq_n_u32(c, 1) : (shift == 4 ? vshrq_n_u32(c, 4) : vshrq_n_u32(c, 9));
-  v = vandq_u32(v, vdupq_n_u32(0x3E));
-  return vaddq_u32(v, vandq_u32(vtstq_u32(v, v), vdupq_n_u32(1)));
-}
 // Exclusive prefix count of set lanes, and the total.
 inline uint32x4_t prefix_exclusive(uint32x4_t ones, u32* total) {
   const uint32x4_t zero = vdupq_n_u32(0);
@@ -1102,9 +1084,6 @@ inline uint32x4_t prefix_exclusive(uint32x4_t ones, u32* total) {
   s1 = vaddq_u32(s1, vextq_u32(zero, s1, 2));          // inclusive scan
   *total = vgetq_lane_u32(s1, 3);
   return vsubq_u32(s1, ones);
-}
-inline uint32x4_t pack_colour(uint32x4_t r, uint32x4_t g, uint32x4_t b, uint32x4_t a) {
-  return vorrq_u32(vorrq_u32(r, vshlq_n_u32(g, 8)), vorrq_u32(vshlq_n_u32(b, 16), vshlq_n_u32(a, 24)));
 }
 }
 
@@ -1117,7 +1096,6 @@ enum Wrap { CLAMP = 0, REPEAT = 1, FLIP = 2 };
 // Compressed format caches the last decoded 4x4 block's colour table in
 // `scratch` (adjacent lanes usually share one); other formats ignore it.
 struct Tex5Block { u32 key; u32 colour[4]; u32 alpha[4]; };
-using Gather4Fn = void (*)(const Renderer3D::Shade&, const s16*, const s16*, uint32x4_t&, uint32x4_t&, Tex5Block*);
 
 template <int wrap> inline int32x4_t wrap_lanes(int32x4_t v, int32x4_t size, int32x4_t size1) {
   if constexpr (wrap == REPEAT) return vandq_s32(v, size1);
@@ -1261,23 +1239,6 @@ template <int fmt> constexpr GatherNFn gatherN_wraps(int swrap, int twrap) {
     {gatherN_impl<fmt, CLAMP, CLAMP>,  gatherN_impl<fmt, CLAMP, REPEAT>,  gatherN_impl<fmt, CLAMP, FLIP>},
     {gatherN_impl<fmt, REPEAT, CLAMP>, gatherN_impl<fmt, REPEAT, REPEAT>, gatherN_impl<fmt, REPEAT, FLIP>},
     {gatherN_impl<fmt, FLIP, CLAMP>,   gatherN_impl<fmt, FLIP, REPEAT>,   gatherN_impl<fmt, FLIP, FLIP>},
-  };
-  return t[swrap][twrap];
-}
-constexpr Gather4Fn gather4_cached_wraps(int swrap, int twrap) {
-  constexpr Gather4Fn t[3][3] = {
-    {gather4_cached<CLAMP, CLAMP>,  gather4_cached<CLAMP, REPEAT>,  gather4_cached<CLAMP, FLIP>},
-    {gather4_cached<REPEAT, CLAMP>, gather4_cached<REPEAT, REPEAT>, gather4_cached<REPEAT, FLIP>},
-    {gather4_cached<FLIP, CLAMP>,   gather4_cached<FLIP, REPEAT>,   gather4_cached<FLIP, FLIP>},
-  };
-  return t[swrap][twrap];
-}
-
-template <int fmt> constexpr Gather4Fn gather4_wraps(int swrap, int twrap) {
-  constexpr Gather4Fn t[3][3] = {
-    {gather4_impl<fmt, CLAMP, CLAMP>,  gather4_impl<fmt, CLAMP, REPEAT>,  gather4_impl<fmt, CLAMP, FLIP>},
-    {gather4_impl<fmt, REPEAT, CLAMP>, gather4_impl<fmt, REPEAT, REPEAT>, gather4_impl<fmt, REPEAT, FLIP>},
-    {gather4_impl<fmt, FLIP, CLAMP>,   gather4_impl<fmt, FLIP, REPEAT>,   gather4_impl<fmt, FLIP, FLIP>},
   };
   return t[swrap][twrap];
 }
@@ -2963,16 +2924,6 @@ void Renderer3D::render(const Gpu3D& gx) {
   // even when it renders nothing.
   gpu_sync_is_frame_ = true;
   sync_all();
-  if (edge_mock::on()) {
-    set_subpixel(true);
-    static const u64 from = [] { const char* e = std::getenv("DS_EDGE_MOCK_FROM"); return e ? static_cast<u64>(std::atoll(e)) : 0ull; }();
-    static u64 rec = 0;
-    const u64 i = rec++;
-    if (std::FILE* f = i >= from ? std::fopen(edge_mock::path(), i == from ? "wb" : "ab") : nullptr) {
-      std::fwrite(out_[display_].data(), 4, 256 * 192, f); std::fwrite(split_[display_].data(), 4, 512 * 192, f);
-      std::fclose(f);
-    }
-  }
   gpu_sync_is_frame_ = false;
   // From here to the raster seam (identical-frame check, texcache validation,
   // resolve) is R3D_PREP; GPU upload and band dispatch account separately.
@@ -2987,9 +2938,6 @@ void Renderer3D::render(const Gpu3D& gx) {
   // Sum over workers (not the slowest): the serial raster cost, which doesn't
   // move with worker count, so the band-count choice below can't self-oscillate.
   { u64 sum = 0; for (u32 w = 0; w < last_nb_ && w < 8; ++w) sum += band_ns_[w]; band_sum_ns_[1] = band_sum_ns_[0]; band_sum_ns_[0] = sum; }
-  // DS_ABLATE bit 0: no rasterisation or texture work at all (see ablate() in gpu.cpp).
-  static const bool no_raster = [] { const char* e = std::getenv("DS_ABLATE"); return e && (std::atoi(e) & 1); }();
-  if (no_raster) return;
   rs_frame_ = gx.render_state();
   rs_ = &rs_frame_;
   game_aa_ = aa_ && (rs_->dispcnt & (1u << 4));
@@ -2998,15 +2946,13 @@ void Renderer3D::render(const Gpu3D& gx) {
   vm_ = &nds_.bus.vram_map();
   texv_ = &vm_->texture;
   palv_ = &vm_->texpal;
-  static const bool no_cache = std::getenv("DS_NO_TEXCACHE") != nullptr;
-  if (no_cache) texcache_.set_enabled(false);
   texcache_.begin_frame(nds_.frame_count);
   const Polygon* const* polys = gx.render_polygons();
   list_polys_ = polys; list_count_ = gx.render_polygon_count();
   // An unchanged polygon list + registers still needs every texture it uses
   // validated (a memcmp each) in case VRAM changed underneath; the previous
   // colour buffer is kept only if nothing needed re-decoding.
-  if (gx.render_identical() && texcache_.enabled() && rendered_once_ && aa_ == aa_rendered_ && subpix_ == subpix_rendered_ && shape_ == shape_rendered_) {
+  if (gx.render_identical() && rendered_once_ && aa_ == aa_rendered_ && subpix_ == subpix_rendered_ && shape_ == shape_rendered_) {
     for (u32 i = 0; i < gx.render_polygon_count(); ++i) {
       const Polygon& p = *polys[i];
       const u32 fmt = (p.texparam >> 26) & 7;
@@ -3071,7 +3017,6 @@ void Renderer3D::render(const Gpu3D& gx) {
       gpu_job_dst_ = out_[display_ ^ 1].data();
       gpu_job_fallback_ = false;
       pending_bands_ = 0;
-      wait_ns_.store(0, std::memory_order_relaxed);
       gpu_defer_ok_ = gpu_frame_prev_;
       gpu_frame_prev_ = true;
       gpu_frame_ = true;
@@ -3093,7 +3038,6 @@ void Renderer3D::render(const Gpu3D& gx) {
       ++gpu_stats_.frames;
       u32* const gdst = out_[display_ ^ 1].data();
       pending_bands_ = 0;
-      wait_ns_.store(0, std::memory_order_relaxed);
       if (!gpu_ab_) {
         // The display reads the raster's own buffer; out_[] is not written.
         gpu_defer_ok_ = gpu_frame_prev_;
@@ -3110,7 +3054,6 @@ void Renderer3D::render(const Gpu3D& gx) {
       build_edges();
       render_band(0, 192, gdst);
       vk_raster_->wait();
-      vk_raster_->reduce_all(vk_raster_->output());
       gpu_compare(gdst, vk_raster_->output());
       display_ ^= 1;
       return;
@@ -3128,42 +3071,35 @@ void Renderer3D::render(const Gpu3D& gx) {
   gpu_frame_ = false;
   gpu_frame_prev_ = false;
 
-  u32 maxb = band_count(live);
+  u32 nb = band_count(live);
   // Gpu lag mode: the compositor thread contends for the fourth core, so drop
   // to 2 workers if the recent raster cost (max of the last two frames, since
   // its workload alternates by phase) fits within 2 workers' budget.
-  if (maxb > 2 && !threads_forced() && nds_.gpu.lag_active()) {
+  if (nb > 2 && nds_.gpu.lag_active()) {
     const u64 recent = band_sum_ns_[0] > band_sum_ns_[1] ? band_sum_ns_[0] : band_sum_ns_[1];
-    static const u64 threshold = [] { const char* e = std::getenv("DS_R3D_LAG_NS"); return e ? static_cast<u64>(std::atoll(e)) : kLagBandThresholdNs; }();
-    if (recent < threshold) maxb = 2;
+    if (recent < kLagBandThresholdNs) nb = 2;
   }
   // Buffer the display isn't reading; becomes the displayed one after dispatch.
   u32* const dst = out_[display_ ^ 1].data();
   u32* const sdst = split_[display_ ^ 1].data();
   u8* const adst = split_any_[display_ ^ 1].data();
   ShapeDst shd; if (shape_) { const u32 i = display_ ^ 1; shd = {sh_pure_[i].data(), sh_depth_[i].data(), sh_attr_[i].data()}; ++sh_seq_[i]; }
-  if (maxb == 0) { pending_bands_ = 0; wait_ns_.store(0, std::memory_order_relaxed); build_edges(); split_dst_ = sdst; split_any_dst_ = adst; shape_dst_ = shd; render_band(0, 192, dst); display_ ^= 1; return; }
+  if (nb == 0) { pending_bands_ = 0; build_edges(); split_dst_ = sdst; split_any_dst_ = adst; shape_dst_ = shd; render_band(0, 192, dst); display_ ^= 1; return; }
 
-  // Pool is always max size; only `nb` gets work, so ramping the thread count
-  // costs a dispatch flag rather than creating/joining threads mid-scene.
-  if (bands_.size() < maxb - 1) {
-    while (bands_.size() < maxb - 1) bands_.push_back(std::make_unique<Renderer3D>(nds_));
+  // Pool is never shrunk; only `nb` gets work, so the lag cut costs a
+  // dispatch flag rather than creating/joining threads mid-scene.
+  if (bands_.size() < nb - 1) {
+    while (bands_.size() < nb - 1) bands_.push_back(std::make_unique<Renderer3D>(nds_));
   }
   for (auto& b : bands_) { b->aa_ = aa_; b->subpix_ = subpix_; b->shape_ = shape_; b->coverage_probe_ = coverage_probe_; }
   // Never replaced once big enough: the compositor may still be waiting on it
   // for the previous frame's bands (sync_line). Sized for 3 by default (the
   // usual max); unused workers are never woken (Pool::dispatch).
-  if (!pool_ || pool_->workers() < maxb) pool_ = std::make_unique<Pool>(maxb > 3 ? maxb : 3);
+  if (!pool_ || pool_->workers() < nb) pool_ = std::make_unique<Pool>(nb > 3 ? nb : 3);
 
-  u32 nb = (adapt_enabled() && !threads_forced()) ? adaptive_workers(maxb) : maxb;
-  if (bands_next_ && !threads_forced()) nb = bands_next_ < maxb ? bands_next_ : maxb;
   last_nb_ = nb;
-  wait_ns_.store(0, std::memory_order_relaxed);   // consumed by adaptive_workers; start the next frame's tally
-
-  // Bins are cut for the maximum, not `nb`, so a ramp changes only the thread
-  // count -- the same strips are drawn either way, no re-slicing per ramp.
-  nbins_ = bin_count(maxb);
-  compute_bins(nbins_, maxb);
+  nbins_ = bin_count(nb);
+  compute_bins(nbins_, nb);
   const Gpu3D& gxr = gx;
   // job_fn_ is a member since the job outlives this call. Workers claim bins
   // until exhausted (not one band each), so an uneven split costs nothing.
@@ -3183,7 +3119,6 @@ void Renderer3D::render(const Gpu3D& gx) {
     if (w < 8) band_ns_[w] = static_cast<u64>((std::chrono::steady_clock::now() - t0).count());
   };
   pending_bands_ = nbins_;
-  if (pin_threads() && owner_ != std::this_thread::get_id()) pin_current_thread(0);
   owner_ = std::this_thread::get_id();
   {
     // Next generation's slot; sync_all above guarantees no thief two back is still reading it.
@@ -3193,7 +3128,6 @@ void Renderer3D::render(const Gpu3D& gx) {
   }
   gen_ = pool_->dispatch(job_fn_, nb, nbins_);
   display_ ^= 1;
-  if (!async_) sync_all();
   // Emulation thread waits for the slowest band (not the sum); both recorded
   // so the gap shows what balancing the bands could recover.
   if (prof::enabled) {
@@ -3211,35 +3145,12 @@ void Renderer3D::render(const Gpu3D& gx) {
 // How many bins to cut the frame into for `workers` threads.
 // More bins than workers lets a heavy strip be absorbed by threads that
 // finish early, but every boundary duplicates two scanlines (final_pass reads
-// one line above/below) and re-runs seed_active. Default is one bin per
-// worker; DS_R3D_BINS raises it.
+// one line above/below) and re-runs seed_active. 8, or one per worker if more.
 u32 Renderer3D::bin_count(u32 workers) {
-  static const int forced = [] {
-    const char* e = std::getenv("DS_R3D_BINS");
-    return e ? std::atoi(e) : -1;
-  }();
-  u32 n = forced > 0 ? static_cast<u32>(forced) : 8;
+  u32 n = 8;
   if (n < workers) n = workers;
   if (n > MAX_BINS) n = MAX_BINS;
-  if (n > 192) n = 192;
   return n;
-}
-
-// DS_R3D_SPLIT=stair|even|desc|taper: how the bins are sized (see compute_bins).
-Renderer3D::Split Renderer3D::split_mode() {
-  static const Split mode = [] {
-    const char* e = std::getenv("DS_R3D_SPLIT");
-    if (e) {
-      if (!std::strcmp(e, "even")) return Split::Even;
-      if (!std::strcmp(e, "desc")) return Split::Descending;
-      if (!std::strcmp(e, "taper")) return Split::Taper;
-      if (!std::strcmp(e, "stair")) return Split::Ascending;
-    }
-    // Taper default: head bins keep the deadline ramp while they can still
-    // all start at once, tail stays flat so no bin strands a worker.
-    return Split::Taper;
-  }();
-  return mode;
 }
 
 // Cut points for `nbins` bins. Cost model: polygons per line, +1 for the
@@ -3281,21 +3192,14 @@ void Renderer3D::compute_bins(u32 nbins, u32 workers) {
   u32 wsum = 0;
   for (u32 b = 0; b < nbins; ++b) { weight[b] = 1; ++wsum; }
   split_with(weight, wsum);                       // equal work, to get deadlines
-  if (split_mode() == Split::Even) return;
 
-  // Ramp shapes, refined twice since deadlines depend on the split. Ascending
-  // is correct only when every bin starts at once (one bin per worker);
-  // beyond that a late bin's runway is already gone, so Descending sizes for
-  // when a bin starts rather than when it's due.
+  // Taper, refined twice since deadlines depend on the split: head bins keep
+  // the deadline ramp while they can all start at once, the tail stays flat
+  // so no bin strands a worker.
   for (int pass = 0; pass < 2; ++pass) {
     wsum = 0;
     for (u32 b = 0; b < nbins; ++b) {
-      u32 w;
-      switch (split_mode()) {
-      case Split::Descending: w = 48 + static_cast<u32>(192 - bin_y_[b + 1]); break;
-      case Split::Taper: w = 48 + static_cast<u32>(bin_y_[b < workers ? b : workers - 1]); break;   // ramp then flat
-      default: w = 48 + static_cast<u32>(bin_y_[b]); break;
-      }
+      const u32 w = 48 + static_cast<u32>(bin_y_[b < workers ? b : workers - 1]);
       weight[b] = w; wsum += w;
     }
     split_with(weight, wsum);
@@ -3303,7 +3207,7 @@ void Renderer3D::compute_bins(u32 nbins, u32 workers) {
 }
 
 void Renderer3D::debug_dump(FILE* f) {
-  std::fprintf(f, "  raster: async %d pending_bands %u gen %llu nbins %u display %u\n", async_ ? 1 : 0, pending_bands_, (unsigned long long)gen_, nbins_, display_);
+  std::fprintf(f, "  raster: pending_bands %u gen %llu nbins %u display %u\n", pending_bands_, (unsigned long long)gen_, nbins_, display_);
   if (pool_) pool_->debug_dump(f);
 }
 
@@ -3379,14 +3283,10 @@ void Renderer3D::sync_line(const FrameRef& f, s32 y) {
   u32 b = 0;
   while (b + 1 < f.nbins && y >= f.bin_y[b + 1]) ++b;
   if (pool_->done(f.gen, u64{1} << b)) return;   // fast path: one atomic load
-  const auto t0 = std::chrono::steady_clock::now();
-  const bool owner = std::this_thread::get_id() == owner_;
   if (!steal_bins(f.gen, b)) {
     DS_PROF(R3D_WAIT);
-    const u64 ns = pool_->wait_bits(f.gen, u64{1} << b);
-    if (ns) wait_ns_.fetch_add(ns, std::memory_order_relaxed);
+    pool_->wait_bits(f.gen, u64{1} << b);
   }
-  if (owner) owner_wait_ns_.fetch_add(static_cast<u64>((std::chrono::steady_clock::now() - t0).count()), std::memory_order_relaxed);
 }
 // Waits for all bands: before the next frame's raster, and before anything
 // that changes what workers are reading (Bus::update_vram is the only way
@@ -3413,19 +3313,12 @@ void Renderer3D::sync_all() {
   // there). Waiting on an idle pool costs one uncontended lock.
   u64 ns = 0;
   if (pool_ && (pending_bands_ || !pool_->idle())) {
-    const auto t0 = std::chrono::steady_clock::now();
     if (pending_bands_) steal_bins(gen_, nbins_ - 1);
-    { DS_PROF(R3D_WAIT); ns = pool_->wait_idle(); if (ns) wait_ns_.fetch_add(ns, std::memory_order_relaxed); }
-    if (std::this_thread::get_id() == owner_) owner_wait_ns_.fetch_add(static_cast<u64>((std::chrono::steady_clock::now() - t0).count()), std::memory_order_relaxed);
+    { DS_PROF(R3D_WAIT); ns = pool_->wait_idle(); }
   }
   if (!pending_bands_) return;
   if (ns) prof::add(prof::C_R3D_SYNC_ALL, 1);   // bands were still running: something waited for the whole raster
   pending_bands_ = 0;
-}
-
-int Renderer3D::steal_mode() {
-  static const int m = [] { const char* e = std::getenv("DS_R3D_STEAL"); return e ? std::atoi(e) : 1; }();
-  return m;
 }
 
 // Draw unclaimed bins on the calling thread until bin `upto` is done. Bins
@@ -3435,8 +3328,7 @@ int Renderer3D::steal_mode() {
 bool Renderer3D::steal_bins(u64 gen, u32 upto) {
   const u64 mask = u64{1} << upto;
   if (pool_->done(gen, mask)) return true;   // fast path: one atomic load
-  const int mode = steal_mode();
-  if (mode == 0 || (mode == 1 && std::this_thread::get_id() != owner_)) return false;
+  if (std::this_thread::get_id() != owner_) return false;   // only the dispatching thread steals
   // A band of this thread's own for the duration; none free means two
   // thieves are already at it, and this one waits like before.
   StealBand* sb = nullptr;
@@ -3465,76 +3357,12 @@ bool Renderer3D::steal_bins(u64 gen, u32 upto) {
   return result;
 }
 
-// How many workers to run this frame, from how long the emulation thread
-// spent blocked on the raster recently. Ramps up fast, falls back slow: a
-// busy scene should not stay under-threaded, but a quiet one shouldn't give
-// a worker back right before the next busy stretch needs it.
-u32 Renderer3D::adaptive_workers(u32 max_workers) {
-  constexpr u64 kFrameNs = 16715000;            // one DS frame
-  constexpr u32 kDownFrames = 120;              // ~2 s of quiet before giving a worker back
-  static const int kShift = [] {
-    const char* e = std::getenv("DS_R3D_ADAPT_SHIFT");
-    return e ? std::atoi(e) : 6;                // averaging window, ~64 frames (~1 s)
-  }();
-  static const u64 kBusyNs = [] {
-    const char* e = std::getenv("DS_R3D_ADAPT_BUSY");
-    const int pct = e ? std::atoi(e) : 18;
-    return kFrameNs * static_cast<u64>(pct) / 100;
-  }();
-  const u64 kIdleNs = kBusyNs / 2;
-
-  if (max_workers < 2) return max_workers;
-  if (workers_now_ == 0) { workers_now_ = 2; wait_ema_ = 0; }
-
-  // Long average (~1s), not a run of frames: separates sustained blocking
-  // from a burst that would trip a short window and latch the count high.
-  wait_ema_ += (static_cast<s64>(wait_ns_.load(std::memory_order_relaxed)) - wait_ema_) >> kShift;
-  const u64 avg = wait_ema_ > 0 ? static_cast<u64>(wait_ema_) : 0;
-
-  // Ramp up needs only the average to cross; giving a worker back needs it
-  // low *and* held there.
-  if (avg > kBusyNs) {
-    quiet_frames_ = 0;
-    if (workers_now_ < max_workers) ++workers_now_;
-  } else if (avg < kIdleNs) {
-    if (++quiet_frames_ >= kDownFrames && workers_now_ > 2) { --workers_now_; quiet_frames_ = 0; }
-  } else {
-    quiet_frames_ = 0;
-  }
-  if (workers_now_ > max_workers) workers_now_ = max_workers;
-  if (prof::enabled && workers_now_ <= 4) prof::add(static_cast<prof::Counter>(prof::C_R3D_W1 + workers_now_ - 1), 1);
-  return workers_now_;
-}
-
-// DS_R3D_ADAPT=1: ramps workers 2<->3 against band_count's default pin of 3,
-// so it can only ever take a worker away. Do not re-test without un-pinning
-// band_count first, since the two are not independent.
-bool Renderer3D::adapt_enabled() {
-  static const bool on = [] {
-    const char* e = std::getenv("DS_R3D_ADAPT");
-    return e && std::atoi(e) != 0;
-  }();
-  return on;
-}
-
-bool Renderer3D::threads_forced() {
-  static const bool on = std::getenv("DS_R3D_THREADS") != nullptr;
-  return on;
-}
-
 // How many band workers the frame gets; 0 draws it inline on the emulation
-// thread. DS_R3D_THREADS overrides the count. Only near-empty frames stay
-// inline: polygon *count* says nothing about raster cost (a skybox or a
-// full-screen quad is a full frame of spans).
+// thread. Only near-empty frames stay inline: polygon *count* says nothing
+// about raster cost (a skybox or a full-screen quad is a full frame of spans).
 u32 Renderer3D::band_count(u32 polygons) {
-  static const int forced = [] {
-    const char* e = std::getenv("DS_R3D_THREADS");
-    return e ? std::atoi(e) : -1;
-  }();
-  if (forced >= 0) return static_cast<u32>(forced);
   if (polygons < 2) return 0;
-  // Pinned at three on four+ cores (see adapt_enabled for the 2<->3 controller).
-  // Fewer cores: one worker per core; a single core draws inline.
+  // Three on three+ cores, two on two; a single core draws inline.
   const u32 cores = host_cores();
   return cores >= 3 ? 3 : cores >= 2 ? 2 : 0;
 }
@@ -3659,9 +3487,9 @@ void Renderer3D::render_band(s32 y0, s32 y1, u32* dst) {
 
 // ---- the GPU raster -------------------------------------------------------
 
-bool Renderer3D::set_gpu_raster(bool on, std::string* why) {
+bool Renderer3D::set_gpu_raster(bool on, std::string* why, u32 scale) {
 #if !DSPERATE_VULKAN
-  (void)on;
+  (void)on; (void)scale;
   if (why) *why = "built without Vulkan (-DDSPERATE_VULKAN=OFF, or no vulkan/vulkan.h at configure time)";
   return false;
 #else
@@ -3675,7 +3503,7 @@ bool Renderer3D::set_gpu_raster(bool on, std::string* why) {
     vk_dev_ = vk::Device::shared(&reason);
     if (!vk_dev_) { if (why) *why = reason; return false; }
   }
-  vk_raster_ = vk::Raster::create(*vk_dev_, &reason);
+  vk_raster_ = vk::Raster::create(*vk_dev_, scale, &reason);
   if (vk_raster_) vk_raster_->set_smooth(smooth3d_);
   if (!vk_raster_) { if (why) *why = reason; vk_dev_.reset(); return false; }
   if (!vk_raster_->ready()) {
@@ -3685,8 +3513,7 @@ bool Renderer3D::set_gpu_raster(bool on, std::string* why) {
     return false;
   }
   if (why) *why = vk_dev_->name();
-  static const bool threaded = [] { const char* e = std::getenv("DS_GPU_THREAD"); return !e || std::atoi(e) != 0; }();
-  if (threaded && !gpu_thread_.joinable()) {
+  if (!gpu_thread_.joinable()) {
     gpu_job_.quit = false;
     gpu_job_.state.store(GpuJobSync::Idle);
     gpu_thread_ = std::thread([this] { gpu_thread_main(); });
@@ -3701,7 +3528,7 @@ void Renderer3D::gpu_job_set(u32 state) {
 }
 
 void Renderer3D::gpu_job_wait(u32 min_state) const {
-  if (!gpu_thread_.joinable()) return;   // inline upload (DS_GPU_THREAD=0): nothing to wait for
+  if (!gpu_thread_.joinable()) return;   // raster not ready yet: nothing to wait for
   if (gpu_job_.state.load(std::memory_order_acquire) >= min_state) return;
   std::unique_lock<std::mutex> lk(gpu_job_.m);
   gpu_job_.cv.wait(lk, [&] { return gpu_job_.state.load(std::memory_order_acquire) >= min_state; });
@@ -4054,12 +3881,6 @@ bool Renderer3D::gpu_dispatch(const Polygon* const* polys, u32 npoly) {
   f.opaque_rows = use_vis ? opaque_rows : 0;
   f.nrows = nrows;
   for (u32 i = 0; i < npoly; ++i) if (!polys[i]->degenerate) { if (polys[i]->wbuffer) f.flags |= DS_FF_WBUFFER; break; }
-  static const bool idcol = std::getenv("DS_VK_TRI_IDCOL") != nullptr;   // debugging: which polygon owns a pixel (read the A/B dump's colour)
-  if (idcol) f.flags |= DS_FF_IDCOLOUR;
-  static const bool notex = std::getenv("DS_VK_TRI_NOTEX") != nullptr;   // attribution: the fragment stage without its texel fetch
-  if (notex) f.flags |= DS_FF_NOTEX;
-  static const bool tex0 = std::getenv("DS_VK_TRI_TEX0") != nullptr;    // attribution: the fetch from one address
-  if (tex0) f.flags |= DS_FF_TEX0;
   f.scale = vk_raster_->scale();
   f.dispcnt = dispcnt_;
   if (dispcnt_ & (1u << 5)) ++gpu_stats_.edge_frames;
@@ -4131,7 +3952,6 @@ void Renderer3D::gpu_snapshot_output() {
   gpu_job_wait_done();
   if (gpu_job_fallback_) return;   // already in out_[display_]
   vk_raster_->wait();
-  vk_raster_->reduce_all(vk_raster_->output());
   std::memcpy(out_[display_].data(), vk_raster_->output(), 256 * 192 * sizeof(u32));
 #endif
 }

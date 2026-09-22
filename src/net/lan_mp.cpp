@@ -52,7 +52,6 @@ u32 get32(const u8* p) { return p[0] | (p[1] << 8) | (p[2] << 16) | (u32(p[3]) <
 } // namespace
 
 LanMp::LanMp() {
-  if (const char* e = std::getenv("DS_LAN_STALE_MS")) stale_ms_ = static_cast<u32>(std::atoi(e));
   if (enet_initialize() != 0) { err_ = "enet_initialize failed"; return; }
   inited_ = true;
 }
@@ -385,15 +384,15 @@ void LanMp::process_lan(int type) {
   if (!host_) return;
   struct WaitClock {
     LanMp& l; int type; std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
-    ~WaitClock() { if (type != 2) return; const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(); l.wait_count_++; l.wait_total_ms_ += ms; if (ms > l.wait_max_ms_) l.wait_max_ms_ = ms; if (ms >= l.recv_timeout_ms_ - 1) l.wait_timeouts_++; }
+    ~WaitClock() { if (type != 2) return; const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(); l.wait_count_++; l.wait_total_ms_ += ms; if (ms > l.wait_max_ms_) l.wait_max_ms_ = ms; if (ms >= RECV_TIMEOUT_MS - 1) l.wait_timeouts_++; }
   } wait_clock{*this, type};
   u32 time_last = ms_now();
   while (!rx_.empty()) {
     ENetPacket* pkt = rx_.front();
     auto* h = reinterpret_cast<MpPacketHeader*>(pkt->data);
     const u32 packettime = h->magic;   // overwritten with the receive time on arrival
-    // Bounds the backlog rather than dropping on real-time lag (stale_ms_ widens it).
-    if (packettime > time_last || packettime < time_last - stale_ms_) { rx_.pop(); enet_packet_destroy(pkt); continue; }
+    // Bounds the backlog rather than dropping on real-time lag.
+    if (packettime > time_last || packettime < time_last - STALE_MS) { rx_.pop(); enet_packet_destroy(pkt); continue; }
     if (type == 2) return;
     if (type == 1) {
       if (h->type == 0) return;
@@ -401,7 +400,7 @@ void LanMp::process_lan(int type) {
     }
     break;
   }
-  int timeout = type == 2 ? recv_timeout_ms_ : 0;
+  int timeout = type == 2 ? RECV_TIMEOUT_MS : 0;
   time_last = ms_now();
   ENetEvent ev;
   while (enet_host_service(host_, &ev, static_cast<u32>(timeout)) > 0) {

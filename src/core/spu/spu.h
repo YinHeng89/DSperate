@@ -36,7 +36,6 @@ public:
   // Real mixer rate (not the nominal 32768 Hz): 67027964/2048 = 32728.5 Hz,
   // or 47605.1 Hz in DSi high-rate mode. Use for stream conversion.
   double output_rate_hz() const { return static_cast<double>(ARM9_CLOCK_HZ) / mix_period_; }
-  u32  output_rate() const { return static_cast<u32>(output_rate_hz() + 0.5); }
   void set_apply_bias(bool on) { apply_bias_ = on; }
   void catch_up();
 
@@ -115,8 +114,7 @@ private:
   u32  mix_period_ = MIX_PERIOD;         // MIX_PERIOD, or MIX_PERIOD_47K on a DSi with SNDEXCNT bit 13
   u32  timer_step_ = TIMER_STEP;         // mix_period_ / 4
   bool apply_bias_ = true;               // SOUNDBIAS: DS yes, DSi no
-  u32  batch_ = 16;                      // samples per mix event (DS_SPU_BATCH)
-  u32  cap_batch_ = 1;                   // ... while a capture runs (DS_SPU_CAP_BATCH; 1 = a sample per event, the conservative default)
+  u32  batch_ = 16;                      // samples per mix event
 
   static constexpr size_t RING_FRAMES = 16384;   // half a second
   std::array<s16, RING_FRAMES * 2> ring_{};

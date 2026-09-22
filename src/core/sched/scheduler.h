@@ -27,14 +27,10 @@ enum class EventId : u8 {
   RtcClock, CamIrq, SdMmc, Sdio, NWifi, CamTransfer, CartPower1, CartPower2, Count
 };
 
-// CPU interleave quantum in ARM9 cycles: the most one CPU runs before the
-// other catches up. 0 means event-bound: each CPU runs to the next scheduled
-// event, which is faster and what the frontends use.
-constexpr u32 LOCKSTEP_QUANTUM = 128;
-constexpr u32 INTERLEAVE_QUANTUM = LOCKSTEP_QUANTUM;
-// Event-bound is still capped: the SDK's IPCSYNC boot handshake times out on
-// the ARM7 side if it goes unanswered too long.
-constexpr u32 EVENT_BOUND_QUANTUM = 2048;
+// CPU interleave is event-bound: each CPU runs to the next scheduled event,
+// capped at SLICE_QUANTUM ARM9 cycles because the SDK's IPCSYNC boot
+// handshake times out on the ARM7 side if it goes unanswered too long.
+constexpr s64 SLICE_QUANTUM = 2048;
 
 using EventFn = void (*)(NDS& nds, u32 param);
 
@@ -51,10 +47,8 @@ public:
 
   void reset();
 
-  // Interleave quantum in ARM9 cycles; 0 = event-bound. DS_QUANTUM overrides.
-  void set_quantum(s64 q);
   // Set at reset, before set_clock9_shift.
-  void set_dsi(bool dsi) { dsi_ = dsi; arm9_carry_ = 0; slice_margin_ = dsi ? 16 : 0; cut_on_schedule_ = dsi; update_soft_mask(); }
+  void set_dsi(bool dsi) { dsi_ = dsi; arm9_carry_ = 0; slice_margin_ = dsi ? 16 : 0; cut_on_schedule_ = dsi; }
   // Timing::clock9_shift (1 or 2). On a DSi this can change mid-slice (SCFG_CLK9).
   void set_clock9_shift(u32 timing_shift);
   u32  clock9_shift() const { return shift9_; }   // 1 = DSi ARM9 at 134 MHz
@@ -70,8 +64,6 @@ public:
   void cancel(EventId id);
   // schedule() overwrites a live event rather than refusing to re-arm it.
   bool armed(EventId id) const { return (armed_ & (1u << static_cast<u32>(id))) != 0; }
-  // DSi: fires that CPU's due soft (timer) events now instead of at slice end. No-op for the DS.
-  void run_soft_timers(Cpu cpu);
 
   // Current time, including the running CPU's cycles consumed so far, so
   // events scheduled mid-instruction are stamped relative to its position.
@@ -88,7 +80,7 @@ public:
     return (running_base_ << (running_rshift_ - 1)) + c + running_carry_;
   }
   bool idle_skip_enabled() const { return idle_skip_ != 0; }
-  void set_idle_skip(u8 mode) { idle_skip_ = mode; }   // DS_IDLE_SKIP's 0/1/2
+  void set_idle_skip(const char* mode);   // DS_IDLE_SKIP / emu.idle_skip: "0", "1" or "all"/"2"
 
   // Called when an immediate DMA starts on `cpu`: it leaves its run loop
   // after the current instruction and the DMA takes over its slice, as a bus stall would.
@@ -98,18 +90,14 @@ public:
     cpu.hot.cycle_budget = 0;
   }
   // Called when `cpu` writes something the other CPU waits on with a tight
-  // timeout (IPCSYNC boot handshake): ends the slice so the other CPU runs
-  // next. Only above the lockstep quantum; below it the reader meets the timeout anyway.
+  // timeout (IPCSYNC boot handshake): ends the slice so the other CPU runs next.
   void yield(CpuContext& cpu) {
-    if (quantum_ <= LOCKSTEP_QUANTUM) return;
     if (running_ != &cpu || cpu.hot.cycle_budget <= 0) return;
     cpu.yielded = true;
     cpu.preempt_residual += cpu.hot.cycle_budget;
     cpu.hot.cycle_budget = 0;
   }
   u64 next_deadline() const { return next_; }
-  // Geometry FIFO filled under the ARM9: in event-bound mode it sits out
-  // until the FIFO drains, re-checking every LOCKSTEP_QUANTUM cycles.
   bool in_dma() const { return in_dma_; }
   void dma_progress(u32 used) { if (dsi_) dma_used_ = used; }   // DSi only
 
@@ -146,12 +134,10 @@ private:
   struct SliceState {
     u64 until = 0;
     bool until_frame = false;   // stop on NDS::frame_ready, not on `until`
-    int phase = 0, sub = 0;
+    int phase = 0;
     s64 slice = 0, ran9 = 0;
     s32 budget7 = 0;
-    s32 budget9 = 0;          // the ARM9's core-cycle budget for the slice (slice << shift9_, less the carry)
     bool skip9 = false, skip7 = false;   // proven idle loop: do not execute this slice
-    CpuContext* cpu = nullptr;
     std::chrono::steady_clock::time_point t0;
   } sl_;
   u64 run_until_native(u64 until, bool until_frame);
@@ -160,8 +146,6 @@ private:
   bool done(u64 until, bool until_frame) const;
   u64 next_ = ~u64{0};   // earliest armed deadline (cached)
   u64 firing_at_ = 0;    // deadline of the event being fired
-  s64  quantum_ = INTERLEAVE_QUANTUM;
-  bool quantum_forced_ = false;         // DS_QUANTUM given
   bool in_dma_ = false;                 // inside Dma::run (a preempt there would corrupt the DMA's budget)
   u32  dma_used_ = 0;                   // budget units the current Dma::run has consumed so far (see now())
   // DSi: an ARM9 DMA gets its own iteration, ARM7 catching up to where it stopped.
@@ -171,7 +155,7 @@ private:
   // ARM9 is in a poll loop on GXSTAT with a swap pending; 2 = "all": any
   // proven poll loop.
   u8 idle_skip_ = 1;
-  bool idle_survey_ = false;      // DS_IDLE_SURVEY: count what the dma/gx vetoes cost, change nothing
+  bool idle_survey_ = false;      // DS_IDLE_SURVEY: count what the dma veto costs, change nothing
   bool idle_analyse(bool& skip9, bool& skip7, bool survey) const;
   void advance_dma_only(CpuContext& cpu);   // a skipped CPU still lets its DMA run
   static constexpr u32 EVENT_COUNT = static_cast<u32>(EventId::Count);
@@ -211,26 +195,12 @@ private:
     arm9_carry_ -= sys << (shift9_ + 1);
     return sys << 1;
   }
-  // A slice may run up to a small margin past its quantum to land on an
+  // A slice may run up to a small margin past SLICE_QUANTUM to land on an
   // event rather than split off a tiny slice. 0 on DS, 16 on DSi.
   s64  slice_margin_ = 0;
   // DSi only: an event scheduled by the ARM9 earlier than its target
   // shortens the target so the ARM7 catches up only that far.
   bool cut_on_schedule_ = false;
-  // Soft timers fire at slice end, never shortening a slice. DSi at the
-  // lockstep quantum only (else an event-bound slice could hold an IRQ for thousands of cycles).
-  u32  soft_mask_ = 0;
-  // Earliest armed soft event per CPU, split because ARM7 is due against its
-  // own clock (overshoot included) and ARM9 against now_.
-  u64  next_soft9_ = ~u64{0}, next_soft7_ = ~u64{0};
-  static bool soft7(u32 i) { return i >= 6 && i <= 9; }   // EventId::Timer7_0..3
-  u64& next_soft(u32 i) { return soft7(i) ? next_soft7_ : next_soft9_; }
-  void update_soft_mask() {
-    constexpr u32 timers = (1u << static_cast<u32>(EventId::Timer0)) | (1u << static_cast<u32>(EventId::Timer1)) | (1u << static_cast<u32>(EventId::Timer2)) | (1u << static_cast<u32>(EventId::Timer3)) |
-                           (1u << static_cast<u32>(EventId::Timer7_0)) | (1u << static_cast<u32>(EventId::Timer7_1)) | (1u << static_cast<u32>(EventId::Timer7_2)) | (1u << static_cast<u32>(EventId::Timer7_3));
-    soft_mask_ = (dsi_ && quantum_ <= LOCKSTEP_QUANTUM) ? timers : 0;
-    rescan();
-  }
   u64  slice_end_ = 0;      // the running slice's end (now_ + slice)
   s32  budget9_ = 0;        // the ARM9's budget for the running slice, as cut
   void cut_arm9_at(u64 at);
@@ -254,7 +224,7 @@ private:
   static inline std::map<u32, u32>* spin_opcodes_ = nullptr;
   static inline std::map<u32, const char*>* spin_reject_ = nullptr;   // this slice's classification, for host-time attribution
   // Both CPUs halted with nothing pending that could wake them before the
-  // next event: the slice can run to the deadline instead of the quantum.
+  // next event: the slice can run to the deadline instead of SLICE_QUANTUM.
   bool both_idle() const;
   void run_cpu(CpuContext& cpu, RunFn run);
 };

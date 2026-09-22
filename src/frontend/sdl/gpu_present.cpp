@@ -532,8 +532,7 @@ bool GpuPresent::present(ScanoutOut& out, const u32* const fb[2], const View* vi
   // would actually differ (the filter or a hi-res layer; at 1x it wouldn't).
   const int ps = (slot + 1) % kSlots;
   bool prev_use[2] = {false, false};
-  static const bool no_pt = std::getenv("DS_GPU_NO_PT") != nullptr;   // bisecting
-  const bool passthru = !no_pt && (smooth || scale > 1 || d.comp_smooth[ps]) && d.frame > 0;
+  const bool passthru = (smooth || scale > 1 || d.comp_smooth[ps]) && d.frame > 0;
   if (passthru)
     for (int v = 0; v < std::min(nviews, 2); ++v) {
       const int sc = views[v].screen;
@@ -583,8 +582,7 @@ bool GpuPresent::present(ScanoutOut& out, const u32* const fb[2], const View* vi
   }
   Push pc{};
   pc.a[0] = d.w; pc.a[1] = d.h; pc.a[2] = static_cast<u32>(lw); pc.a[3] = static_cast<u32>(lh);
-  static const bool no_overlay = std::getenv("DS_GPU_NO_OVERLAY") != nullptr;   // bisecting
-  const bool has_over = !no_overlay && drawn.w > 0 && drawn.h > 0 && d.over[slot] && d.over_lw == lw && d.over_lh == lh;
+  const bool has_over = drawn.w > 0 && drawn.h > 0 && d.over[slot] && d.over_lw == lw && d.over_lh == lh;
   if (has_over) {
     d.over_dirty[slot] = drawn;
     const int y0 = std::max(0, drawn.y), y1 = std::min(lh, drawn.y + drawn.h);

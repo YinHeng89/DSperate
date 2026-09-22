@@ -30,16 +30,12 @@ static s16 psg_sample(u32 duty, u32 phase) { return phase < 7 - duty ? -0x7FFF :
 
 void Spu::reset() {
   dbg_ = std::getenv("DS_DEBUG_SPU") != nullptr;
-  if (const char* b = std::getenv("DS_SPU_BATCH")) batch_ = std::clamp(std::atoi(b), 1, 64);
-  // Capture writes ARM7 RAM, so the batch drops to one sample while one runs.
-  if (const char* b = std::getenv("DS_SPU_CAP_BATCH")) cap_batch_ = std::clamp(std::atoi(b), 1, 64);
   for (auto& c : ch_) c = Channel{};
   for (auto& cp : cap_) cp = Capture{};
   cnt_ = 0; bias_ = 0; master_ = 0; muted_ = true;
   rd_ = wr_ = 0;
   mix_period_ = MIX_PERIOD; timer_step_ = TIMER_STEP;
-  // DSi defaults to batch 1 (slice-aligned mix events); DS_SPU_BATCH overrides.
-  if (nds_.dsi && !std::getenv("DS_SPU_BATCH")) batch_ = 1;
+  batch_ = nds_.dsi ? 1 : 16;   // DSi: slice-aligned mix events
   mix_at_ = nds_.sched.now() + mix_period_;
   nds_.sched.schedule(EventId::Spu, mix_at_, ev_mix);
 }
@@ -316,7 +312,8 @@ void Spu::cap_run(Capture& cp, s32 sample) {
 void Spu::ev_mix(NDS& nds, u32) {
   Spu& s = nds.spu;
   s.run_to(nds.sched.event_time());
-  const u32 n = ((s.cap_[0].cnt | s.cap_[1].cnt) & 0x80) ? s.cap_batch_ : s.batch_;
+  // Capture writes ARM7 RAM, so the batch drops to one sample while one runs.
+  const u32 n = ((s.cap_[0].cnt | s.cap_[1].cnt) & 0x80) ? 1 : s.batch_;
   nds.sched.schedule(EventId::Spu, s.mix_at_ + (n - 1) * s.mix_period_, ev_mix);
 }
 
