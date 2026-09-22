@@ -798,7 +798,7 @@ struct VideoSetup {
   std::vector<ds::sdl::Display::Mode> layout_cycle;
   // Boot-only, see above.
   bool   use_disp = false, use_fbdev = false, gpu_present = false, smooth3d = false;
-  int    bottom_display = 1;
+  int    upper_display = 0, lower_display = 1;   // dual-window: SDL display per physical panel
 };
 
 constexpr const char* kDefaultLayoutCycle = "vertical,horizontal,single,pip,dominant_v,dominant_h";
@@ -893,9 +893,12 @@ bool open_displays(const VideoSetup& vs, ds::sdl::Display& display, ds::sdl::Dis
     display.set_chunky(vs.chunky != 0, vs.chunky_cell); display2.set_chunky(vs.chunky != 0, vs.chunky_cell);
     display.set_grid_strength(vs.linear ? 0.0 : vs.grid_s); display2.set_grid_strength(vs.linear ? 0.0 : vs.grid_s);
     display.set_integer_scale(vs.int_scale); display2.set_integer_scale(vs.int_scale);
-    if (!display.open("DSperate", vs.scale, vs.fullscreen, vs.linear, vs.vsync, vs.layout, 0, 1 - vs.bottom_display) ||
-        !display2.open("DSperate (Bottom)", vs.scale, vs.fullscreen, vs.linear, vs.vsync, vs.layout, 1, vs.bottom_display)) return false;
+    if (!display.open("DSperate", vs.scale, vs.fullscreen, vs.linear, vs.vsync, vs.layout, 0, vs.upper_display) ||
+        !display2.open("DSperate (Bottom)", vs.scale, vs.fullscreen, vs.linear, vs.vsync, vs.layout, 1, vs.lower_display)) return false;
     if (display.scaling() != display2.scaling()) { std::fprintf(stderr, "dual-window: mixed display modes\n"); return false; }
+    // MAIN SCREEN picks the DS screen on the upper panel.
+    display.set_only_screen(vs.layout.primary);
+    display2.set_only_screen(1 - vs.layout.primary);
     return true;
   }
   display.set_chunky(vs.chunky != 0, vs.chunky_cell);
@@ -1489,12 +1492,25 @@ static int run(int argc, char** argv) {
 sdl_ready:
 
   ds::sdl::Display display;
-  ds::sdl::Display display2;   // dual-window: the bottom screen's own window
+  ds::sdl::Display display2;   // dual-window: the lower panel's window
+  std::vector<ds::sdl::Input::TouchRoute> touch_routes;   // DS_DUAL_SCREENS
   if (dual_window) {
     if (SDL_GetNumVideoDisplays() < 2) { std::fprintf(stderr, "--dual-window needs two video displays\n"); SDL_Quit(); return 1; }
     // Under KMSDRM display 0 is DSI-1, the lower panel; sway orders the other way.
     const char* vd = SDL_GetCurrentVideoDriver();
-    vs.bottom_display = vd && !std::strcmp(vd, "KMSDRM") ? 0 : 1;
+    const bool kms = vd && !std::strcmp(vd, "KMSDRM");
+    vs.upper_display = kms ? 1 : 0;
+    vs.lower_display = kms ? 0 : 1;
+    if (const char* map = std::getenv("DS_DUAL_SCREENS"); map && *map) {
+      std::string err;
+      if (!ds::sdl::Input::parse_dual_screens(map, vs.upper_display, vs.lower_display, touch_routes, err)) {
+        std::fprintf(stderr, "DS_DUAL_SCREENS: %s\n", err.c_str()); SDL_Quit(); return 1;
+      }
+      const int nd = SDL_GetNumVideoDisplays();
+      if (vs.upper_display >= nd || vs.lower_display >= nd || vs.upper_display == vs.lower_display) {
+        std::fprintf(stderr, "DS_DUAL_SCREENS: displays %d/%d, %d available\n", vs.upper_display, vs.lower_display, nd); SDL_Quit(); return 1;
+      }
+    }
   }
   if (!open_displays(vs, display, display2)) { SDL_Quit(); return 1; }
   auto register_layer_export = [&] {
@@ -1539,6 +1555,7 @@ sdl_ready:
   };
 
   ds::sdl::Input input;
+  input.set_touch_routes(std::move(touch_routes));
   input.configure(cfg);
   input.open_controllers();
   std::vector<u32> menu_fb[2] = {std::vector<u32>(ds::SCREEN_W * ds::SCREEN_H), std::vector<u32>(ds::SCREEN_W * ds::SCREEN_H)};
@@ -1567,7 +1584,7 @@ sdl_ready:
           ? ds::gpu::Gpu::ScaleTarget{target[i].px, target[i].pitch, target[i].h, target[i].xrun_plain}
           : ds::gpu::Gpu::ScaleTarget{target[i].px, target[i].pitch, target[i].h, target[i].xrun, at_source || !target[i].grid ? 256u : grid, display.chunky_on(i) ? chunky : static_cast<u8>(0), chunky_thresh,
                                       at_source ? static_cast<u8>(0) : seam_blend, target[i].seam_w,
-                                      static_cast<const ds::gpu::Gpu::CellMap*>((dual_window && i == vs.bottom_display ? display2 : display).cell_map(i)),
+                                      static_cast<const ds::gpu::Gpu::CellMap*>((dual_window && display2.only_screen() == i ? display2 : display).cell_map(i)),
                                       vs.linear && !at_source, target[i].lin_sx, target[i].lin_wx};
       st.y_lo = target[i].y_lo; st.y_hi = target[i].y_hi;   // crop window (integer overscale)
       nds.gpu.set_scale_target(i, st);
@@ -2053,8 +2070,10 @@ sdl_ready:
     if (!parse_video(cfg, want)) return false;
     want.use_disp = vs.use_disp;
     want.use_fbdev = vs.use_fbdev;
-    want.bottom_display = vs.bottom_display;
+    want.upper_display = vs.upper_display;
+    want.lower_display = vs.lower_display;
     want.layout = display.current_layout();
+    if (dual_window) want.layout.primary = vs.layout.primary;   // the windows' own layouts don't track it
     const VideoSetup before = vs;
     display.close();
     if (dual_window) display2.close();
@@ -2453,7 +2472,16 @@ sdl_ready:
   // row's pending choice if one was made, else the live one (a hotkey or
   // loaded state may have moved it since the file was read).
   host.relayout = [&] {
-    if (dual_window) { host.pending_mode.clear(); return; }   // two windows, one screen each: nothing to lay out
+    if (dual_window) {   // two windows, one screen each: only which screen is on which panel
+      host.pending_mode.clear();
+      VideoSetup want;
+      if (!parse_video(cfg, want) || want.layout.primary == vs.layout.primary) return;
+      vs.layout.primary = want.layout.primary;
+      display.set_only_screen(vs.layout.primary);
+      display2.set_only_screen(1 - vs.layout.primary);
+      menu_dirty = true;
+      return;
+    }
     VideoSetup want;
     if (!parse_video(cfg, want)) { host.pending_mode.clear(); return; }
     want.layout.mode = host.effective_mode();
@@ -3216,7 +3244,14 @@ sdl_ready:
         break;
       }
       case A::ScreenSwap: {
-        if (dual_window) break;
+        if (dual_window) {
+          vs.layout.primary = 1 - vs.layout.primary;
+          display.set_only_screen(vs.layout.primary);
+          display2.set_only_screen(1 - vs.layout.primary);
+          menu_dirty = true;
+          if (!session.game_ini.empty()) ds::sdl::Config::store(session.game_ini, "video.screen", vs.layout.primary ? "bottom" : "top");
+          break;
+        }
         Disp::Layout l = display.current_layout();
         l.primary = 1 - l.primary;
         display.set_layout(l);

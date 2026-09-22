@@ -27,6 +27,15 @@ const char* action_name(Action a);
 class Input {
 public:
   void configure(const Config& cfg);
+
+  // DS_DUAL_SCREENS: "upper=<display>[:<touch>...],lower=...,none=<touch>..."
+  // gives each physical panel its SDL display and touch devices (a touch is a
+  // case-insensitive substring of SDL's device name, or #N for SDL's Nth).
+  // Panels, not DS screens: MAIN SCREEN decides which DS screen each shows.
+  enum class Panel : s8 { Unmapped = -1, Upper = 0, Lower = 1, None = 2 };
+  struct TouchRoute { std::string match; int index = -1; Panel panel = Panel::Lower; };
+  static bool parse_dual_screens(const char* s, int& upper, int& lower, std::vector<TouchRoute>& routes, std::string& err);
+  void set_touch_routes(std::vector<TouchRoute> r) { touch_routes_ = std::move(r); touch_cache_.clear(); }
   void open_controllers();
   void close();
 
@@ -149,6 +158,8 @@ private:
     if (down) { buttons_ |= 1u << b; pressed_ |= 1u << b; } else buttons_ &= ~(1u << b);
   }
   void touch_at(int wx, int wy, Display& display);
+  Panel touch_panel(SDL_TouchID id);   // DS_DUAL_SCREENS route for a device, cached on first sight
+  Display* finger_target(const SDL_TouchFingerEvent& f, Display& display, Display* second);
   void warn_collisions() const;   // bindings that shadow one another, at configure time
   bool reachable(int ds_button) const;   // is there a control for it on the hardware in hand?
   bool bound_and_present(int ds_button) const;   // bound to a control this hardware has
@@ -227,6 +238,8 @@ private:
   bool capturing_ = false, capture_pad_ = false;
   bool menu_open_ = false;
   u32  menu_faces_ = 0;
+  std::vector<TouchRoute> touch_routes_;
+  std::vector<std::pair<SDL_TouchID, Panel>> touch_cache_;
   std::string captured_;
   std::string captured_raw_axis_;
   bool capture_swallow_ = false;   // swallows release of whatever was captured

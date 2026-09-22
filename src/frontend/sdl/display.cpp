@@ -174,6 +174,7 @@ double Display::dominant_ratio() const {
 bool Display::open(const char* title, int scale, bool fullscreen, bool linear, bool vsync, const Layout& layout_mode, int only_screen, int display_index) {
   layout_ = layout_mode;
   only_screen_ = only_screen;
+  upper_panel_ = only_screen == 0;
   display_index_ = display_index;
   nviews_ = only_screen_ >= 0 ? 1 : SCREENS;
   int w = 0, h = 0;
@@ -349,10 +350,10 @@ void Display::layout() {
   if (only_screen_ >= 0) {
     const double sw = SCREEN_W, sh = SCREEN_H, s = snap_scale(std::min(w / sw, h / sh), int_scale_);
     const int dw = static_cast<int>(sw * s), dh = static_cast<int>(sh * s);
-    // Overscale crops away from the edge shared with the other panel: top
-    // screen keeps its bottom row, bottom screen the reverse.
+    // Overscale crops away from the edge shared with the other panel: the
+    // upper panel keeps its bottom row, the lower panel the reverse.
     int y = (h - dh) / 2;
-    if (dh > h) y = only_screen_ == 0 ? h - dh : 0;
+    if (dh > h) y = upper_panel_ ? h - dh : 0;
     views_[0] = View{only_screen_, SDL_Rect{(w - dw) / 2, y, dw, dh}, true, true};
     return;
   }

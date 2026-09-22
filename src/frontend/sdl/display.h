@@ -132,6 +132,10 @@ public:
   bool begin_frame(Target out[SCREENS]);
   void end_frame();   // unlock and present
   void on_resize() { layout(); build_scale(); margins_dirty_ = true; }
+  // Dual-window: which DS screen this window shows. The window stays on its
+  // panel (and keeps that panel's hinge-side alignment); only the screen moves.
+  void set_only_screen(int screen) { if (only_screen_ < 0 || screen == only_screen_) return; only_screen_ = screen; on_resize(); }
+  int  only_screen() const { return only_screen_; }
   void toggle_fullscreen();
   bool fullscreen() const { return fullscreen_; }
   // Resizes a windowed window to the new mode's natural size at the current
@@ -214,6 +218,7 @@ private:
   View          views_[SCREENS] = {};
   int           nviews_ = SCREENS;
   int           only_screen_ = -1;
+  bool          upper_panel_ = false;   // dual-window: this window is the upper panel
   IntScale      int_scale_ = IntScale::Off;
   int           display_index_ = 0;
   bool          fullscreen_ = false;

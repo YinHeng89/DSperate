@@ -314,6 +314,25 @@ void test_modifier_alone_is_a_hotkey() {
     CHECK(said); }
 }
 
+// DS_DUAL_SCREENS: a display index per panel, then touch devices by name
+// (case-insensitive substring) or #index; "none" takes touch devices only.
+void test_dual_screens_parse() {
+  using P = Input::Panel;
+  { int up = 0, lo = 1; std::vector<Input::TouchRoute> r; std::string err;
+    CHECK(Input::parse_dual_screens("upper=1,lower=0:Goodix:#2,none=pen", up, lo, r, err));
+    CHECK(up == 1 && lo == 0 && r.size() == 3);
+    CHECK(r[0].panel == P::Lower && r[0].match == "goodix" && r[0].index < 0);
+    CHECK(r[1].panel == P::Lower && r[1].index == 2);
+    CHECK(r[2].panel == P::None && r[2].match == "pen"); }
+  { int up = 0, lo = 1; std::vector<Input::TouchRoute> r; std::string err;
+    CHECK(Input::parse_dual_screens("lower=goodix", up, lo, r, err));   // touch only: displays untouched
+    CHECK(up == 0 && lo == 1 && r.size() == 1 && r[0].panel == P::Lower); }
+  for (const char* bad : {"middle=1", "none=3", "upper"}) {
+    int up = 0, lo = 1; std::vector<Input::TouchRoute> r; std::string err;
+    CHECK(!Input::parse_dual_screens(bad, up, lo, r, err) && !err.empty());
+  }
+}
+
 // The pen follows a stick, not one of its two axes, so the Controls page
 // stores which stick the player pushed rather than the axis event it saw.
 void test_stylus_axis_reads_the_stick() {
@@ -522,6 +541,7 @@ int main() {
   ds::sdl::test_hotkey_cannot_hide_a_from_the_menu();
   ds::sdl::test_menu_faces_ignore_bindings();
   ds::sdl::test_modifier_alone_is_a_hotkey();
+  ds::sdl::test_dual_screens_parse();
   ds::sdl::test_keyboard_capture_backs_out_on_pad_input();
   ds::sdl::test_stylus_axis_reads_the_stick();
   ds::sdl::test_extra_defaults_match_configure();

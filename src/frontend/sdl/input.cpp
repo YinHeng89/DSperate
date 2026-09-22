@@ -342,6 +342,84 @@ void Input::fake_mic_frame(std::vector<s16>& out) {
   }
 }
 
+bool Input::parse_dual_screens(const char* s, int& upper, int& lower, std::vector<TouchRoute>& routes, std::string& err) {
+  const std::string all = s;
+  size_t at = 0;
+  while (at <= all.size()) {
+    const size_t comma = std::min(all.find(',', at), all.size());
+    const std::string entry = all.substr(at, comma - at);
+    at = comma + 1;
+    if (entry.empty()) continue;
+    const size_t eq = entry.find('=');
+    if (eq == std::string::npos) { err = "\"" + entry + "\" is not <panel>=..."; return false; }
+    const std::string name = entry.substr(0, eq);
+    Panel panel;
+    if (name == "upper") panel = Panel::Upper;
+    else if (name == "lower") panel = Panel::Lower;
+    else if (name == "none") panel = Panel::None;
+    else { err = "panel \"" + name + "\" is not upper | lower | none"; return false; }
+    std::string rest = entry.substr(eq + 1);
+    // Leading digits: the SDL display index. Then ':'-separated touch devices.
+    size_t d = 0;
+    while (d < rest.size() && std::isdigit(static_cast<unsigned char>(rest[d]))) ++d;
+    if (d > 0 && (d == rest.size() || rest[d] == ':')) {
+      if (panel == Panel::None) { err = "none takes touch devices only"; return false; }
+      (panel == Panel::Upper ? upper : lower) = std::atoi(rest.substr(0, d).c_str());
+      rest = rest.substr(d);
+    }
+    size_t t = 0;
+    while (t <= rest.size()) {
+      const size_t colon = std::min(rest.find(':', t), rest.size());
+      std::string tok = rest.substr(t, colon - t);
+      t = colon + 1;
+      if (tok.empty()) continue;
+      TouchRoute r;
+      r.panel = panel;
+      if (tok[0] == '#') r.index = std::atoi(tok.c_str() + 1);
+      else { for (char& ch : tok) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch))); r.match = tok; }
+      routes.push_back(std::move(r));
+    }
+  }
+  return true;
+}
+
+Input::Panel Input::touch_panel(SDL_TouchID id) {
+  for (const auto& [tid, p] : touch_cache_) if (tid == id) return p;
+  int index = -1;
+  std::string name;
+  for (int i = 0; i < SDL_GetNumTouchDevices(); ++i)
+    if (SDL_GetTouchDevice(i) == id) {
+      index = i;
+#if SDL_VERSION_ATLEAST(2, 0, 22)
+      if (const char* n = SDL_GetTouchName(i)) name = n;
+#endif
+      break;
+    }
+  std::string lname = name;
+  for (char& ch : lname) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+  Panel p = Panel::Unmapped;
+  for (const TouchRoute& r : touch_routes_)
+    if (r.index >= 0 ? r.index == index : (!r.match.empty() && lname.find(r.match) != std::string::npos)) { p = r.panel; break; }
+  static const char* const kPanelNames[] = {"upper", "lower", "none"};
+  std::fprintf(stderr, "touch: #%d \"%s\" -> %s\n", index, name.c_str(), p == Panel::Unmapped ? "unmapped" : kPanelNames[static_cast<int>(p)]);
+  touch_cache_.emplace_back(id, p);
+  return p;
+}
+
+// Dual-window: the window a finger belongs to. SDL's evdev backend (KMSDRM)
+// attaches no window to touches, so an unmapped one goes to the lower panel.
+Display* Input::finger_target(const SDL_TouchFingerEvent& f, Display& display, Display* second) {
+  if (!second) return &display;
+  switch (touch_panel(f.touchId)) {
+  case Panel::None:  return nullptr;
+  case Panel::Upper: return &display;
+  case Panel::Lower: return second;
+  case Panel::Unmapped: break;
+  }
+  if (f.windowID == 0) return second;
+  return f.windowID == second->window_id() ? second : &display;
+}
+
 void Input::touch_at(int wx, int wy, Display& display) {
   int screen = 0, sx = 0, sy = 0;
   if (!display.map_point(wx, wy, screen, sx, sy) || screen != 1) return;   // bottom screen only
@@ -847,26 +925,32 @@ void Input::handle(const SDL_Event& e, Display& display, Display* second) {
     }
     break;
 
+  // Mouse copies of touches (SDL_TOUCH_MOUSEID) are skipped: the finger
+  // events carry the touch, and the copy goes to whichever window has focus.
   case SDL_MOUSEBUTTONDOWN:
-    if (e.button.button == SDL_BUTTON_LEFT) touch_at(e.button.x, e.button.y, owner(e.button.windowID));
+    if (e.button.which != SDL_TOUCH_MOUSEID && e.button.button == SDL_BUTTON_LEFT) touch_at(e.button.x, e.button.y, owner(e.button.windowID));
     break;
   case SDL_MOUSEMOTION:
-    if (e.motion.state & SDL_BUTTON_LMASK) touch_at(e.motion.x, e.motion.y, owner(e.motion.windowID));
+    if (e.motion.which != SDL_TOUCH_MOUSEID && (e.motion.state & SDL_BUTTON_LMASK)) touch_at(e.motion.x, e.motion.y, owner(e.motion.windowID));
     break;
   case SDL_MOUSEBUTTONUP:
-    if (e.button.button == SDL_BUTTON_LEFT) touching_ = false;
+    if (e.button.which != SDL_TOUCH_MOUSEID && e.button.button == SDL_BUTTON_LEFT) touching_ = false;
     break;
 
-  // SDL reports touch in normalised window coordinates.
+  // SDL reports touch normalised to the window, or to the device when it
+  // attaches none; either way it spans the target panel.
   case SDL_FINGERDOWN:
   case SDL_FINGERMOTION: {
-    Display& d = owner(e.tfinger.windowID);
+    Display* d = finger_target(e.tfinger, display, second);
+    if (!d) break;
     int w = 0, h = 0;
-    d.output_size(w, h);
-    touch_at(static_cast<int>(e.tfinger.x * w), static_cast<int>(e.tfinger.y * h), d);
+    d->output_size(w, h);
+    touch_at(static_cast<int>(e.tfinger.x * w), static_cast<int>(e.tfinger.y * h), *d);
     break;
   }
-  case SDL_FINGERUP: touching_ = false; break;
+  case SDL_FINGERUP:
+    if (finger_target(e.tfinger, display, second)) touching_ = false;
+    break;
 
   case SDL_WINDOWEVENT:
     if (e.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) owner(e.window.windowID).on_resize();
