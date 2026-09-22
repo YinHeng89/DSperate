@@ -40,8 +40,12 @@ inline void frame_report(const std::vector<double>& frame_ms, const char* label 
   const size_t n = v.size();
   auto pct = [&](double p) { return v[std::min(n - 1, static_cast<size_t>(p * n))]; };
   size_t over = 0; for (double x : v) if (x > kFrameBudgetMs) ++over;
-  std::fprintf(stderr, "%s ms: median %.3f mean %.3f p90 %.3f p99 %.3f max %.3f min %.3f total %.1f\n",
-               label, v[n / 2], sum / n, pct(0.90), pct(0.99), v.back(), v.front(), sum);
+  // p95 is the single-number tier the bar is set on (scoping doc SS3.33): a DS
+  // run is part loading screen and cart loads legitimately spend frame time,
+  // so p99 over such a run largely measures the loading. p99 and max stay
+  // here because that is where a driver stall shows, but they do not gate.
+  std::fprintf(stderr, "%s ms: median %.3f mean %.3f p90 %.3f p95 %.3f p99 %.3f max %.3f min %.3f total %.1f\n",
+               label, v[n / 2], sum / n, pct(0.90), pct(0.95), pct(0.99), v.back(), v.front(), sum);
   std::fprintf(stderr, "%s budget: %zu of %zu frames over %.3f ms (%.2f%%)\n",
                label, over, n, kFrameBudgetMs, 100.0 * static_cast<double>(over) / static_cast<double>(n));
 

@@ -251,8 +251,10 @@ void frame_breakdown(const std::vector<double>& frame_ms) {
   const char* label = std::getenv("DS_PROFILE_LABEL");
   if (close_out) std::fprintf(out, "%s", "");
   std::fprintf(out, "{\"label\":\"%s\",\"frames\":%zu", label ? label : "", n);
-  std::fprintf(out, ",\"ms\":{\"mean\":%.4f,\"median\":%.4f,\"p90\":%.4f,\"p99\":%.4f,\"max\":%.4f}",
-               m.ms, pct(0.50), pct(0.90), pct(0.99), frame_ms[order[n - 1]]);
+  // p95 is the bar's single-number tier (scoping doc SS3.33); p99 and max are
+  // kept because a driver stall shows there, and nowhere else.
+  std::fprintf(out, ",\"ms\":{\"mean\":%.4f,\"median\":%.4f,\"p90\":%.4f,\"p95\":%.4f,\"p99\":%.4f,\"max\":%.4f}",
+               m.ms, pct(0.50), pct(0.90), pct(0.95), pct(0.99), frame_ms[order[n - 1]]);
   // Typical group (the middle fifth): the emulation thread's critical path.
   std::fprintf(out, ",\"typ\":{");
   bool first = true;

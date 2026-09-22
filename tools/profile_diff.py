@@ -52,7 +52,11 @@ def main():
         ra, rb = a[lb], b[lb]
         print(f'== {lb or "(unlabelled)"} ==  {ra["frames"]} -> {rb["frames"]} frames')
         print(f'  {"":24s} {"before":>9s} {"after":>9s} {"delta":>9s} {"":>9s}')
-        for k in ('mean', 'median', 'p90', 'p99'):
+        # p95 is the bar (scoping doc SS3.33); fixtures recorded before it was
+        # emitted have no such key, so it is skipped rather than fatal.
+        for k in ('mean', 'median', 'p90', 'p95', 'p99'):
+            if k not in ra['ms'] or k not in rb['ms']:
+                continue
             print(f'  ms.{k:<21s} ' + fmt(ra['ms'][k], rb['ms'][k]))
         sa, sb = ra.get(args.group, {}), rb.get(args.group, {})
         rows = sorted(set(sa) | set(sb), key=lambda k: -abs(sb.get(k, 0.0) - sa.get(k, 0.0)))
