@@ -829,9 +829,35 @@ means a GLES present could be zero-copy there too, and GLES 3.1 compute would
 port `present.comp` almost directly — but its hardware is Bifrost with
 `mali_kbase` loaded and no ICD installed, so **installing a Vulkan ICD may
 cover the mid tier for near-zero engineering.** Probe that before writing a
-second backend. *Caveat:* `nm` does not exist on these busybox systems, so
-symbol-based capability checks return false negatives; the GLES levels above
-come from driver strings.
+second backend.
+
+**Verified at runtime by `tools/gles_probe.sh`** (two separate,
+dynamically-linked probes: separate because the EGL entry point and the Vulkan
+loader choose vendors independently, dynamic because a `dlopen` of a path we
+chose answers a question we did not ask). **On the RG DS Plus the GLES stack is
+the MALI BLOB, not Mesa** — and the filesystem suggests otherwise.
+`/usr/lib/libEGL.so.1` exports no `egl*` symbols at all: it is a shim with
+`NEEDED libmali-hook.so.1`, and that hook overrides four entry points and
+`dlsym`s the rest out of `libmali.so.1`. So `-lEGL` never reaches the
+`50_mesa.json` glvnd vendor, and Mesa's advertised export extension sits on a
+library that is never loaded.
+
+| | GLES/EGL (blob, `vendor=ARM`, ES 3.2) | Vulkan (1.3.303) |
+|---|---|---|
+| dma-buf **import** | **YES** (`EGL_EXT_image_dma_buf_import` + modifiers) | **YES** (all seven extensions present) |
+| dma-buf **export** | **no** (`EGL_MESA_image_dma_buf_export` absent) | **no** (importable, not exportable) |
+
+**Neither API can export a dma-buf here**, and they agree because it is the
+same blob underneath. Nothing current is blocked — the working pattern is to
+allocate from CMA/DRM and *import*, which is what the present stage does; only
+a design where GL allocates a layer and hands the buffer out would be. And
+**GLES 3.2 means compute shaders are available**, so a GLES port of the present
+stage stays open for devices with no Vulkan.
+
+*The caveat that produced two wrong readings before these probes existed:*
+`nm` does not exist on these busybox systems, so symbol checks returned false
+negatives, and library strings list what a library *knows about* rather than
+what the driver exposes. Use the probes.
 
 **SS3.35 — What the pipeline hands the raster, and why an upload costs what it
 does.** Driving the GPU costs **~1 ms a frame of emulation thread** on the
