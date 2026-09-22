@@ -741,7 +741,48 @@ spike (max 76.7 ms) and the one with 23 had the mildest (56.2). Nor is it the
 limiter (the period survives auto / 60 / off), the internal audio buffer
 (50 ms and 100 ms show no trend), or the device period.
 
-*What it is.* A **periodic, deadline-driven catch-up in the emulation thread**:
+*What it is: the SAME WORK, THREE TO FOUR TIMES SLOWER.* Measured by adding
+per-frame emulated-cycle and slice deltas to `frame_series`, with the median
+frame printed as the calibration line (a worst-frame figure means nothing
+without it). One DS frame is **1,120,380** cycles in this codebase's domain
+(`jit/runtime.cpp`), not 560,190 — getting that wrong once inverted the
+conclusion, which is why the median line is now printed beside it:
+
+| frame | wall | cyc | slices |
+|---|---|---|---|
+| median #929 | 16.68 ms | **0.99x** | **1081** |
+| worst #41 | 65.73 ms | **0.99x** | 1079 |
+| worst #719 | 61.90 ms | **0.99x** | 1081 |
+| worst #627 | 52.96 ms | **0.99x** | 1081 |
+
+**Identical emulated work in 3-4x the wall time.** So it is not a backlog being
+flushed and not extra work — **the emulation thread is losing 35-50 ms.** The
+stage that absorbs it varies (`sched slice loop` 23.5, `cpu arm9` 38.5,
+`gpu line hooks` 30.1), which is what a plain wall-clock scope does when its
+thread is descheduled; two of six worst frames are `2d worker join` at
+25-29 ms, which is a real wait and the same item as §0 step 2.
+
+**That makes it CPU contention**, not a subsystem's cost: four busy emulator
+threads plus audio, the compositor and the GPU driver's threads on four A55s,
+with the whole process at SCHED_RR 5. Consistent with everything else:
+
+* periodic at **~53-54 frames**, autocorrelation 0.575 at lag 54;
+* **gone at `--speed 50`** — the emulator then sleeps ~19 ms a frame instead of
+  ~3, so the competing work fits in the slack instead of preempting us;
+* **halved by `--no-audio`** (max 57.8 → 30.0) with median and p95 unchanged —
+  the audio threads are part of the competition, not the cause;
+* **the GPU-interrupt avoidance removed the max spikes** (SS3.37) — it takes us
+  off the contended CPU, which is why it worked while costing 7.1 ms of p95;
+* suppressed by `--quantum 128`, which yields more often.
+
+**So it belongs with the thread-topology refactor (SS3.30) and §0 step 3, not
+with 3e/3f.** Three threads instead of five is the structural cure; the
+`gpu_irq_avoid` result is the same medicine applied bluntly.
+
+*Superseded reading, kept because two commits asserted it:* this was first
+written up as a periodic deadline-driven catch-up amplified by the audio pump.
+The cycle counter refutes it — a catch-up would read above 1.00x and reads
+0.99x. The observations below are still the ones that constrain it:
 
 * periodic at **~53-54 frames**, autocorrelation 0.575 at lag 54 with a
   secondary at 101;

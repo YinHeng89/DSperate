@@ -130,10 +130,19 @@ Accum* make_acc() {
 // Reading the workers' counters here is a census, not a synchronisation:
 // a torn read costs one misattributed nanosecond slice, not a wrong answer.
 namespace {
-struct FrameNs { u64 ns[COUNT]; u64 workers; };
+// Per frame: the stages, the worker total, and the two counters that separate
+// a STALLED frame from a CATCH-UP one. A DS frame is a fixed number of
+// emulated cycles, so a long frame that ran the usual cycle count lost its
+// time to something outside the emulation, while one that ran several frames'
+// worth was working off a backlog. `slices` says how finely that was
+// interleaved. (SS3.38: the gsdd tail is periodic, deadline-driven and
+// carried by a different stage each time, which is what a backlog flush looks
+// like -- this is the instrument that tells the two apart.)
+struct FrameNs { u64 ns[COUNT]; u64 workers; u64 cyc; u64 slices; };
 std::vector<FrameNs> frame_series;
 u64 frame_last_ns[COUNT];
 u64 frame_last_workers;
+u64 frame_last_cyc, frame_last_slices;
 } // namespace
 
 void frame_mark() {
@@ -150,6 +159,13 @@ void frame_mark() {
   for (u32 i = 0; i < COUNT; ++i) { d.ns[i] = now[i] - frame_last_ns[i]; frame_last_ns[i] = now[i]; }
   d.workers = workers - frame_last_workers;
   frame_last_workers = workers;
+  {
+    u64 cyc = 0, slices = 0;
+    std::lock_guard<std::mutex> lk(detail::accs_mutex());
+    for (const Accum* a : detail::accs()) { cyc += a->count[C_CYC_TOTAL]; slices += a->count[C_SLICES]; }
+    d.cyc = cyc - frame_last_cyc; frame_last_cyc = cyc;
+    d.slices = slices - frame_last_slices; frame_last_slices = slices;
+  }
   frame_series.push_back(d);
 }
 
@@ -211,6 +227,16 @@ void frame_breakdown(const std::vector<double>& frame_ms) {
   // The worst individual frames, each with its heaviest stages: clusters with
   // one cause look alike here, mixed causes do not.
   const size_t worst_n = std::min<size_t>(6, n);
+  {
+    // The median frame, as the calibration line: a worst-frame cyc figure is
+    // meaningless without knowing what a normal frame reads. 1.00x is one
+    // frame of emulated time (1,120,380 cycles); a spike at 1.00x did the
+    // usual work slowly, one above 1.00x was working off a backlog.
+    const size_t md = order[n / 2];
+    std::fprintf(stderr, "[frames] median frame #%-5zu %7.3f ms  [cyc %.2fx slices %llu]\n",
+                 md, frame_ms[md], static_cast<double>(frame_series[md].cyc) / 1120380.0,
+                 static_cast<unsigned long long>(frame_series[md].slices));
+  }
   std::fprintf(stderr, "[frames] worst %zu frames:\n", worst_n);
   for (size_t k = 0; k < worst_n; ++k) {
     const size_t i = order[n - 1 - k];
@@ -221,7 +247,13 @@ void frame_breakdown(const std::vector<double>& frame_ms) {
     std::fprintf(stderr, "[frames]   #%-5zu %7.3f ms:", i, frame_ms[i]);
     for (size_t s = 0; s < 3 && frame_series[i].ns[top[s]]; ++s)
       std::fprintf(stderr, " %s %.3f", names[top[s]], frame_series[i].ns[top[s]] / 1e6);
-    std::fprintf(stderr, " untimed %.3f\n", frame_ms[i] - timed);
+    std::fprintf(stderr, " untimed %.3f", frame_ms[i] - timed);
+    // cyc/frame against the console's own ~560 k: at 1.0 the frame emulated
+    // exactly its own time and the wall time went elsewhere; above 1.0 it was
+    // catching up, and by how much.
+    std::fprintf(stderr, "  [cyc %.2fx slices %llu]\n",
+                 static_cast<double>(frame_series[i].cyc) / 1120380.0,
+                 static_cast<unsigned long long>(frame_series[i].slices));
   }
 
   // DS_PROFILE_LINE: the same run as one line of JSON, so a phase's claim is
