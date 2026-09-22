@@ -77,6 +77,7 @@ struct NDS {
   std::atomic<bool>* rom_cancel = nullptr;     // set from another thread to abandon the extraction
   std::string rom_cache_path;   // extracted image the current cart was mapped from, empty otherwise
   void normalise_touch_calibration();   // see nds.cpp; called by load_bios
+  void normalise_boot_mode();           // see nds.cpp; called by load_bios
   // Which of the firmware's three Wi-Fi slots holds DSperate's access point, -1 if none.
   int firmware_ap_slot = -1;
 

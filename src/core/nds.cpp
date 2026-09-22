@@ -45,6 +45,8 @@ NDS::NDS()
 NDS::~NDS() = default;
 
 void NDS::reset() {
+  normalise_touch_calibration();
+  normalise_boot_mode();
   sched.reset();
   sched.set_dsi(dsi);
   sched.set_clock9_shift(dsi ? 2 : 1);   // SCFG_CLK9 bit 0 is set at a DSi reset
@@ -92,6 +94,23 @@ void NDS::normalise_touch_calibration() {
   }
 }
 
+// Firmware auto-starts the card slot when bit 6 of the settings halfword is
+// set, which runs DSperate's loader-cart stub instead of showing the menu.
+// Mask it in memory only: the player's persisted setting stays untouched.
+void NDS::normalise_boot_mode() {
+  if (firmware.size() < 0x20000) return;
+  const u32 base = static_cast<u32>(firmware[0x20] | (firmware[0x21] << 8)) << 3;
+  for (u32 blk = 0; blk < 2; ++blk) {
+    const u32 off = base + blk * 0x100;
+    if (off + 0x74 > firmware.size()) continue;
+    u8* u = firmware.data() + off;
+    auto r16 = [](const u8* p) { return static_cast<u16>(p[0] | (p[1] << 8)); };
+    auto w16 = [](u8* p, u16 v) { p[0] = static_cast<u8>(v); p[1] = static_cast<u8>(v >> 8); };
+    w16(u + 0x64, static_cast<u16>(r16(u + 0x64) & ~0x0040));
+    w16(u + 0x72, bios::crc16(u, 0x70, 0xFFFF));
+  }
+}
+
 bool NDS::load_bios(const std::string& p9, const std::string& p7, const std::string& pfw,
                     const bios::UserSettings& user, std::string* err) {
   auto fail = [&](const std::string& m) { if (err) *err = m; return false; };
@@ -119,6 +138,7 @@ bool NDS::load_bios(const std::string& p9, const std::string& p7, const std::str
   fw_page_dirty.assign((firmware.size() + FW_PAGE - 1) / FW_PAGE, 0);
   fw_dirty_pages = 0;
   normalise_touch_calibration();
+  normalise_boot_mode();
   firmware_ap_slot = bios::stamp_access_point(firmware);
   return true;
 }
@@ -234,6 +254,7 @@ bool NDS::load_firmware_override(const std::string& path, std::string& err) {
   }
   // An override may carry a real calibration from the firmware's wizard; normalise again over it.
   normalise_touch_calibration();
+  normalise_boot_mode();
   firmware_ap_slot = bios::stamp_access_point(firmware);   // again, over the override's pages
   return true;
 }
