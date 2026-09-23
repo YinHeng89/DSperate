@@ -21,6 +21,7 @@ namespace ds::gpu {
 // Knobs read once in the constructor.
 namespace {
 bool g_dbg_join = false, g_dbg_gpu = false, g_dbg_vramnz = false, g_dbg_skip = false;
+bool g_no_lazy = false, g_no_lag = false;
 const char* g_dump_frame = nullptr;
 void read_knobs() {
   static bool done = false;
@@ -31,6 +32,8 @@ void read_knobs() {
   g_dbg_vramnz = std::getenv("DS_DEBUG_VRAMNZ") != nullptr;
   g_dbg_skip = std::getenv("DS_DEBUG_SKIP") != nullptr;
   g_dump_frame = std::getenv("DS_DEBUG_DUMP_FRAME");
+  g_no_lazy = std::getenv("DS_DEBUG_NOLAZY") != nullptr;   // every frame per-line (the lazy batch's reference)
+  g_no_lag = std::getenv("DS_DEBUG_NOLAG") != nullptr;     // per-line lines never stay in flight past their HBlank
 }
 }  // namespace
 
@@ -184,6 +187,13 @@ void Gpu::vram_store_trap(Cpu cpu, u32 addr) {
     return;
   }
   prof::add(prof::C_2D_TRAP_HITS, 1);
+  // One engine per-line with a lag line in flight, the other batching: the
+  // catch-up below only joins if the batching engine has lines due, so a store
+  // reaching the in-flight line waits for it here.
+  if (inflight_[0] || inflight_[1]) {
+    const u32 reach = reach_engines(addr);
+    if (((reach & 1) && inflight_[0]) || ((reach & 2) && inflight_[1])) join_worker(JoinSite::Trap);
+  }
   // Budget stays per engine, even though a store is charged to both.
   u32 burst_mask = 0;
   const u32 limit = lazy_probe_ ? LAZY_PROBE_BURSTS : LAZY_BURST_LIMIT;
@@ -193,7 +203,8 @@ void Gpu::vram_store_trap(Cpu cpu, u32 addr) {
     catch_up(burst_mask);
     for (int e = 0; e < 2; ++e)
       if (burst_mask & (1u << e)) { per_line_[e] = true; burst_[e] = true; burst_left_[e] = LAZY_BURST_LINES; }
-    if (per_line_[0] && per_line_[1]) disarm_trap();
+    // As in fall_back_per_line: a lag frame's in-flight line still needs the trap.
+    if (!lag_frame_ && per_line_[0] && per_line_[1]) disarm_trap();
     return;
   }
   lazy_limit_hit_ = true;
@@ -474,11 +485,11 @@ void Gpu::begin_frame() {
   if (skipping && --lazy_probe_in_ == 0) { lazy_probe_ = true; lazy_probe_in_ = lazy_probe_period_; if (g_dbg_skip) std::fprintf(stderr, "[lazy] probe at frame %llu period %u futile %u\n", (unsigned long long)nds_.frame_count, lazy_probe_period_, lazy_futile_); }
   else if (!skipping) lazy_probe_in_ = lazy_probe_period_;
   const bool futile = skipping && !lazy_probe_;
-  lazy_frame_ = lazy_enabled_ && !run_fifo_ && !futile;
+  lazy_frame_ = lazy_enabled_ && !g_no_lazy && !run_fifo_ && !futile;
   lazy_tried_ = lazy_frame_;
   if (futile) prof::add(prof::C_2D_LAZY_SKIPPED, 1);
   lazy_bursts_[0] = lazy_bursts_[1] = 0; burst_[0] = burst_[1] = false; burst_left_[0] = burst_left_[1] = 0;
-  lag_frame_ = !run_fifo_;
+  lag_frame_ = !run_fifo_ && !g_no_lag;
   lag_trap_hits_ = 0;
   if (lazy_frame_ || lag_frame_) arm_trap();
   if (lazy_frame_) prof::add(prof::C_2D_LAZY_FRAMES, 1);

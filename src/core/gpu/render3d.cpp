@@ -3084,6 +3084,30 @@ void Renderer3D::render(const Gpu3D& gx) {
   u32* const sdst = split_[display_ ^ 1].data();
   u8* const adst = split_any_[display_ ^ 1].data();
   ShapeDst shd; if (shape_) { const u32 i = display_ ^ 1; shd = {sh_pure_[i].data(), sh_depth_[i].data(), sh_attr_[i].data()}; ++sh_seq_[i]; }
+  // DS_DEBUG_R3D_BINS=fwd|each: with DS_HOST_CORES=1, draw inline as 8 bins in ascending order, on this
+  // one instance (fwd) or a fresh one per bin (each) -- the band path's seeding and overlap, reproducibly.
+  // Must equal one band. DS_DEBUG_R3D_BINS_LOG=1 prints the cuts.
+  static const char* const dbg_bins = std::getenv("DS_DEBUG_R3D_BINS");
+  if (nb == 0 && dbg_bins && live >= 2) {
+    pending_bands_ = 0; build_edges(); split_dst_ = sdst; split_any_dst_ = adst; shape_dst_ = shd;
+    compute_bins(8, 1);
+    static const bool log = std::getenv("DS_DEBUG_R3D_BINS_LOG") != nullptr;
+    if (log) { std::fprintf(stderr, "[bins] frame %llu", (unsigned long long)nds_.frame_count); for (u32 b = 0; b <= 8; ++b) std::fprintf(stderr, " %d", bin_y_[b]); std::fputc('\n', stderr); }
+    static std::unique_ptr<Renderer3D> fresh;
+    for (u32 b = 0; b < 8; ++b) {
+      if (bin_y_[b] >= bin_y_[b + 1]) continue;
+      Renderer3D* r = this;
+      if (dbg_bins[0] == 'e' && b > 0) {
+        if (!fresh) fresh = std::make_unique<Renderer3D>(nds_);
+        fresh->aa_ = aa_; fresh->subpix_ = subpix_; fresh->shape_ = shape_;
+        fresh->prepare_worker(gx, list_polys_, list_count_, &poly_texels_, &rs_frame_);
+        fresh->split_dst_ = sdst; fresh->split_any_dst_ = adst; fresh->shape_dst_ = shd;
+        r = fresh.get();
+      }
+      r->render_band(bin_y_[b], bin_y_[b + 1], dst);
+    }
+    display_ ^= 1; return;
+  }
   if (nb == 0) { pending_bands_ = 0; build_edges(); split_dst_ = sdst; split_any_dst_ = adst; shape_dst_ = shd; render_band(0, 192, dst); display_ ^= 1; return; }
 
   // Pool is never shrunk; only `nb` gets work, so the lag cut costs a
@@ -3421,7 +3445,13 @@ void Renderer3D::seed_active(s32 y) {
     if (t >= y || y >= p.ybot) continue;
     active_[active_count_++] = static_cast<u16>(i);
     Edge& e = built_edge(i);
-    if (p.ytop != p.ybot) { setup_left_edge(e, y); setup_right_edge(e, y); }
+    if (p.ytop != p.ybot) {
+      // Cursors only walk down. This instance may have stepped the edge past y
+      // already (the previous bin's overlap lines, across a vertex): restart it
+      // from the top, or its segment starts below y and extrapolates garbage.
+      if (gx_->vertex(p.vtx[e.cur_vl]).sy > y || gx_->vertex(p.vtx[e.cur_vr]).sy > y) rewind_edge(e);
+      setup_left_edge(e, y); setup_right_edge(e, y);
+    }
   }
 }
 
@@ -3475,7 +3505,13 @@ void Renderer3D::render_band(s32 y0, s32 y1, u32* dst) {
       lap(spans_ns);
     }
     s32 upto = rasterised - 1;
-    if (rasterised >= 192) { clear_border(192); upto = 192; lap(final_ns); }
+    if (rasterised >= 192) {
+      // The border row shares a ring slot with line 192 - RING: finish every
+      // line whose final pass still reads that line before overwriting it.
+      const s32 pre = y1 < 192 - RING + 2 ? y1 : 192 - RING + 2;
+      while (done < pre) { final_pass(done); ++done; }
+      clear_border(192); upto = 192; lap(final_ns);
+    }
     if (upto > y1) upto = y1;
     while (done < upto) { final_pass(done); ++done; }
     lap(final_ns);
