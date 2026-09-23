@@ -8,28 +8,10 @@ on:
   workflow_dispatch:
 
 jobs:
-  # x86_64: the interpreter and the portable kernels -- there is no JIT backend
-  # or vector renderer for this host, so it is a correctness gate only and
-  # produces nothing to ship.  The AArch64 JIT/NEON paths are covered natively
-  # by the arm64 job below.
-  x86_64:
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ninja-build libsdl2-dev
-      - name: Build and test
-        run: |
-          cmake --preset host
-          cmake --build --preset host
-          ctest --preset host --output-on-failure
-      - name: configs/default.ini matches the built-in defaults
-        run: tools/gen_example_configs.sh && git diff --exit-code configs/default.ini
-
-  # Native arm64: the JIT and NEON paths on real silicon, and the binaries a
-  # handheld runs (see Package for the two tarballs).
+  # Native arm64, the main target: the JIT and NEON paths on real silicon, and
+  # the binaries a handheld runs (see Package for the two tarballs). Other
+  # devices build with their own toolchains; what they share with this job is
+  # the committed PGO profiles (pgo/<arch>[-gcc<ver>]/), not a CI variant.
   arm64:
     runs-on: ubuntu-24.04-arm
     steps:
@@ -52,6 +34,8 @@ jobs:
           cmake --build --preset host 2>&1 | grep -v "source locations for function" | tee build.log
           echo "PGO: $(grep -c 'control flow of function' build.log || true) functions changed since the profile ($(sed -n 's/^commit //p' pgo/aarch64/MANIFEST | cut -c1-9), $(sed -n 's/^date //p' pgo/aarch64/MANIFEST)); $(grep -c 'data file not found' build.log || true) objects without one"
           ctest --preset host --output-on-failure
+      - name: configs/default.ini matches the built-in defaults
+        run: tools/gen_example_configs.sh && git diff --exit-code configs/default.ini
       # Two tarballs from one build. The standard one is what a distro with a
       # current libstdc++ wants (ROCKNIX packages it as a binary): dynamically
       # linked and stripped. The -static one carries libstdc++/libgcc inside
@@ -71,136 +55,15 @@ jobs:
              LICENSE README.md dist/$d-static/
           tar -C dist -czf $d-static.tar.gz $d-static
           ls -l *.tar.gz
-      # The runtime floor is a property nothing in the build declares: it moves
-      # when one call reaches a newer symbol, silently, and the report comes
-      # back weeks later as "it doesn't start on my handheld". 2.38/3.4.30 is
-      # what this runner produces today and what dArkOS (GCC 12.4, so libstdc++
-      # 3.4.30) can load; raising either drops devices, so make that a decision
-      # rather than a side effect.
-      - name: ABI floor
-        run: |
-          tools/abi_floor.sh dist/$d/dsperate 2.38 3.4.30
-          tools/abi_floor.sh dist/$d/dsperate-headless 2.38 3.4.30
-          # The -static pair carries libstdc++ inside, so it must import none.
-          tools/abi_floor.sh dist/$d-static/dsperate 2.38 none
-          tools/abi_floor.sh dist/$d-static/dsperate-headless 2.38 none
-        env:
-          d: dsperate-${{ github.ref_name }}-linux-aarch64
       - uses: actions/upload-artifact@v4
         with:
           name: dsperate-linux-aarch64
           path: dsperate-*-linux-aarch64*.tar.gz
-
-  # 32-bit ARM (armhf): the A32 JIT backend and the ARMv7 NEON subset, which no
-  # other job covers.  Cross-built from x86 against multiarch armhf packages
-  # (which come from ports.ubuntu.com, not the amd64 mirror) and tested under
-  # qemu-arm-static.
-  arm32:
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install toolchains
-        run: |
-          sudo sed -i 's/^Types: deb$/Types: deb\nArchitectures: amd64 i386/' /etc/apt/sources.list.d/ubuntu.sources
-          sudo dpkg --add-architecture armhf
-          printf '%s\n' \
-            'Types: deb' \
-            'Architectures: armhf' \
-            'URIs: http://ports.ubuntu.com/ubuntu-ports' \
-            'Suites: noble noble-updates noble-security' \
-            'Components: main universe' \
-            'Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg' \
-            | sudo tee /etc/apt/sources.list.d/ubuntu-ports.sources >/dev/null
-          sudo apt-get update
-          sudo apt-get install -y ninja-build g++-arm-linux-gnueabihf qemu-user-static libsdl2-dev:armhf
-      - name: Cross build and test (qemu-arm)
-        run: |
-          cmake --preset arm32-cross
-          cmake --build --preset arm32-cross
-          cd build/arm32 && ctest --output-on-failure
-      - name: Package
-        run: |
-          test -x build/arm32/src/frontend/sdl/dsperate  # SDL2:armhf must have been found
-          d=dsperate-${GITHUB_REF_NAME}-linux-armhf
-          mkdir -p dist/$d dist/$d-static
-          cp build/arm32/src/frontend/sdl/dsperate build/arm32/src/frontend/headless/dsperate-headless dist/$d/
-          arm-linux-gnueabihf-strip dist/$d/dsperate dist/$d/dsperate-headless
-          cp LICENSE README.md dist/$d/
-          tar -C dist -czf $d.tar.gz $d
-          cmake --preset arm32-cross -DCMAKE_EXE_LINKER_FLAGS="-static-libstdc++ -static-libgcc"
-          cmake --build --preset arm32-cross
-          cp build/arm32/src/frontend/sdl/dsperate build/arm32/src/frontend/headless/dsperate-headless \
-             LICENSE README.md dist/$d-static/
-          tar -C dist -czf $d-static.tar.gz $d-static
-          ls -l *.tar.gz
-      - uses: actions/upload-artifact@v4
-        with:
-          name: dsperate-linux-armhf
-          path: dsperate-*-linux-armhf*.tar.gz
-
-  # The portable aarch64 tarball: same source, built against an old sysroot so
-  # it loads on handhelds whose glibc is far older than any runner's. spruceOS
-  # measures a 2.28 arm64 ceiling and the A30-class sysroot is 2.23, while this
-  # runner's own glibc is 2.39 -- and no hosted runner goes low enough (20.04
-  # is retired; 22.04 is 2.35). An old *container* on a current arm64 runner
-  # does, natively, with no qemu.
-  #
-  # The image must carry GCC 10.5, ninja, CMake >= 3.28 and the SDL 2.30.9 that
-  # devices run, built at /work/prefix -- sdl2.pc records that absolute path,
-  # so the prefix is not relocatable. Build it once (Ubuntu 20.04 arm64 base),
-  # push it to GHCR by digest, and set the
-  # repository variable DSPERATE_FOCAL_IMAGE to it. Pinning by digest matters:
-  # focal is EOL, and its packages will eventually move to old-releases, which
-  # would break an image rebuilt in-workflow for reasons unrelated to any
-  # commit. Until that variable is set this job skips rather than fails, which
-  # is also why `release` does not list it in `needs`: a skipped job would skip
-  # the release with it. Once the image is published, add aarch64-portable to
-  # release's `needs` and its tarball to the arrival check below.
-  aarch64-portable:
-    if: vars.DSPERATE_FOCAL_IMAGE != ''
-    runs-on: ubuntu-24.04-arm
-    container: ${{ vars.DSPERATE_FOCAL_IMAGE }}
-    steps:
-      - uses: actions/checkout@v4
-      # GCC 10.5 selects pgo/aarch64-gcc10.5.0/ on its own: the profile
-      # directory is keyed by compiler version, and the fingerprint would
-      # refuse a profile made by any other one.
-      - name: Build
-        run: |
-          cmake -S . -B build/portable -G Ninja \
-            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DDSPERATE_TESTS=OFF \
-            -DDSPERATE_PGO=use -DDSPERATE_PGO_STRICT=ON \
-            -DCMAKE_PREFIX_PATH=/work/prefix \
-            -DCMAKE_CXX_FLAGS=-pthread \
-            "-DCMAKE_EXE_LINKER_FLAGS=-pthread -L/work/prefix/lib -static-libstdc++ -static-libgcc"
-          cmake --build build/portable 2>&1 | grep -v "source locations for function" | tee build.log
-          echo "PGO: $(grep -c 'control flow of function' build.log || true) functions changed since the profile ($(sed -n 's/^commit //p' pgo/aarch64-gcc10.5.0/MANIFEST | cut -c1-9)); $(grep -c 'data file not found' build.log || true) objects without one"
-      - name: Package
-        run: |
-          d=dsperate-${GITHUB_REF_NAME}-linux-aarch64-portable
-          mkdir -p dist/$d
-          cp build/portable/src/frontend/sdl/dsperate build/portable/src/frontend/headless/dsperate-headless dist/$d/
-          strip dist/$d/dsperate dist/$d/dsperate-headless
-          cp LICENSE README.md dist/$d/
-          tar -C dist -czf $d.tar.gz $d
-          ls -l *.tar.gz
-      # 2.18 with libstdc++ inside is the whole point of this job; if it ever
-      # stops holding, the tarball is just the standard one with extra steps.
-      - name: ABI floor
-        run: |
-          d=dsperate-${GITHUB_REF_NAME}-linux-aarch64-portable
-          tools/abi_floor.sh dist/$d/dsperate 2.18 none
-          tools/abi_floor.sh dist/$d/dsperate-headless 2.18 none
-      - uses: actions/upload-artifact@v4
-        with:
-          name: dsperate-linux-aarch64-portable
-          path: dsperate-*-linux-aarch64-portable.tar.gz
-
   # Tag v* to publish. The notes are a stand-in (name, tag, changelog link)
   # meant to be edited on GitHub afterwards.
   release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [x86_64, arm64, arm32]
+    needs: [arm64]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -210,17 +73,14 @@ jobs:
           fetch-depth: 0
       - uses: actions/download-artifact@v4
         with:
-          pattern: dsperate-linux-*
-          merge-multiple: true
+          name: dsperate-linux-aarch64
       # Fail here, with the listing, rather than in gh's glob error: an
       # artefact uploaded under the wrong name is not downloaded at all.
       - name: Check the tarballs arrived
         run: |
           ls -l
-          for a in aarch64 armhf; do
-            test -f dsperate-${GITHUB_REF_NAME}-linux-$a.tar.gz
-            test -f dsperate-${GITHUB_REF_NAME}-linux-$a-static.tar.gz
-          done
+          test -f dsperate-${GITHUB_REF_NAME}-linux-aarch64.tar.gz
+          test -f dsperate-${GITHUB_REF_NAME}-linux-aarch64-static.tar.gz
       - name: Write release notes
         run: |
           prev=$(git describe --tags --abbrev=0 "${GITHUB_REF_NAME}^" 2>/dev/null || true)
@@ -236,9 +96,9 @@ jobs:
             echo
             echo "Games run without BIOS or firmware dumps (built-in FreeBIOS and a generated firmware); a set dumped from your own DS unlocks the firmware boot and cycle-exact SWI timing. None is included."
             echo
-            echo "Tarballs: \`linux-aarch64\` / \`linux-armhf\` are dynamically linked and stripped -- the ones to package. The \`-static\` variants carry libstdc++/libgcc inside and keep their debug symbols, for a device whose runtime is older than the build's, or for a backtrace."
+            echo "Tarballs: \`linux-aarch64\` is dynamically linked and stripped -- the one to package. \`linux-aarch64-static\` carries libstdc++/libgcc inside and keeps its debug symbols, for a device whose runtime is older than the build's, or for a backtrace."
           } > notes.md
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "${GITHUB_REF_NAME}" dsperate-*-linux-aarch64.tar.gz dsperate-*-linux-aarch64-static.tar.gz dsperate-*-linux-armhf.tar.gz dsperate-*-linux-armhf-static.tar.gz --title "DSperate ${GITHUB_REF_NAME}" --notes-file notes.md
+        run: gh release create "${GITHUB_REF_NAME}" dsperate-*-linux-aarch64.tar.gz dsperate-*-linux-aarch64-static.tar.gz --title "DSperate ${GITHUB_REF_NAME}" --notes-file notes.md

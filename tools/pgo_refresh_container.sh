@@ -1,12 +1,12 @@
 #!/bin/bash
-# Refresh the portable aarch64 profile inside the old-sysroot container.
+# Refresh the old-sysroot aarch64 profile inside its container.
 #
 #   DS_ROMS=<rom dir> DS_BIOS=<bios dir> DS_SDL_PREFIX=<sdl dir> [DS_DSI=<dsi dir>] \
 #     tools/pgo_refresh_container.sh [extra pgo_refresh.sh args]
 #
-# The portable tarball is built against an old glibc so it runs on spruceOS
-# and the other handhelds (an Ubuntu 20.04 arm64 image): an old sysroot means an
-# old compiler, and a .gcda is tied to the compiler's version, so that build
+# Old-sysroot builds (made downstream with their own toolchains) target an old
+# glibc so they run on spruceOS and similar handhelds (here, an Ubuntu 20.04
+# arm64 image): an old sysroot means an old compiler, and a .gcda is tied to the compiler's version, so that build
 # needs its own profile. This runs tools/pgo_refresh.sh --native --gcc 10
 # inside that image, which writes pgo/aarch64-gcc<version>/ -- the directory
 # CMakeLists prefers whenever a build uses that compiler.

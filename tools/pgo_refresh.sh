@@ -33,7 +33,7 @@
 # --native builds for the machine it is running on instead of cross-building:
 #          no toolchain file and no qemu, so the training runs at native speed.
 #          Meant for running this script *inside* an aarch64 container, which
-#          is how the portable tarball's profile is made -- the low glibc floor
+#          is how an old-sysroot profile is made -- the low glibc floor
 #          that spruceOS and the A30 need comes from an old sysroot, and an old
 #          sysroot means an old compiler, which means its own profile. Combine
 #          with --gcc N to pick that container's compiler and key the profile
