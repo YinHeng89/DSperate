@@ -126,6 +126,7 @@ set(CMAKE_INTERPROCEDURAL_OPTIMIZATION ON)
 add_compile_options(-Wall -Wextra -Wno-unused-parameter)
 
 add_subdirectory(src/core)
+add_subdirectory(src/frontend/video)
 if(DSPERATE_CHEEVOS)
   add_subdirectory(src/cheevos)
 endif()

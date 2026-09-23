@@ -3,6 +3,7 @@
 #pragma once
 #include "frontend/sdl/gpu_present.h"
 #include "core/gpu/gpu.h"
+#include "frontend/video/layout.h"
 #include "core/types.h"
 #include "display_disp.h"
 #include "display_drm.h"  // complete types for the unique_ptr
@@ -24,40 +25,21 @@ class Display {
 public:
   static constexpr int SCREENS = 2;
 
-  // How the two screens share the window; `primary` is the screen shown
-  // alone (Single), large (Pip) or dominant (DominantV/H), else first in the
-  // stack/row. DominantV/H: primary fitted to width/height, secondary
-  // `dominant` times its size. With `dominant_auto`, the primary instead
-  // takes the largest whole scale leaving the secondary >= `dominant_min`.
-  enum class Mode : u8 { Vertical, Horizontal, Single, Pip, DominantV, DominantH, Count };
-  enum class Corner : u8 { TopLeft, TopRight, BottomLeft, BottomRight, Count };
-  struct Layout {
-    Mode   mode = Mode::Vertical;
-    int    primary = 0;
-    Corner corner = Corner::BottomRight;
-    double pip = 1.0 / 3.0;      // inset size relative to the large screen
-    double dominant = 0.5;       // secondary size relative to the dominant screen
-    bool   dominant_auto = true; // pick the primary's whole scale instead (see above); a ratio when false
-    double dominant_min = 0.25;  // auto: the smallest secondary the primary may leave
-    double pip_alpha = 1.0;      // inset opacity at rest, 0..1 (see set_inset_alpha)
-    int    gap = 0;              // video.screen_gap: pixels between the two screens of a pair (negative overlaps)
-  };
-  // Forced integer scaling of full-size views (PiP inset / dominant
-  // secondary keep their own ratio). Under: largest whole scale that fits,
-  // letterboxed. Over: smallest that covers, cropped and centred (a stacked
-  // pair keeps its shared edge).
-  enum class IntScale : u8 { Off, Under, Over };
-  static const char* int_scale_name(IntScale m);
-  static bool parse_int_scale(const std::string& s, IntScale& m);
-  static double snap_scale(double s, IntScale m);
+  // Screen layout (frontend/video/layout.h), under the names callers use.
+  using Mode = frontend::Mode;
+  using Corner = frontend::Corner;
+  using Layout = frontend::Layout;
+  using IntScale = frontend::IntScale;
+  static const char* int_scale_name(IntScale m) { return frontend::int_scale_name(m); }
+  static bool parse_int_scale(const std::string& s, IntScale& m) { return frontend::parse_int_scale(s, m); }
+  static double snap_scale(double s, IntScale m) { return frontend::snap_scale(s, m); }
   void set_integer_scale(IntScale m) { int_scale_ = m; }
   IntScale integer_scale() const { return int_scale_; }
-  static const char* mode_name(Mode m);      // "vertical" ... "dominant_h"
-  static bool parse_mode(const std::string& s, Mode& m);
-  static const char* corner_name(Corner c);  // "tl" "tr" "bl" "br"
-  static bool parse_corner(const std::string& s, Corner& c);
-  // The window size that shows the layout at `scale` window pixels per DS pixel.
-  static void natural_size(const Layout& l, double scale, int& w, int& h);
+  static const char* mode_name(Mode m) { return frontend::mode_name(m); }
+  static bool parse_mode(const std::string& s, Mode& m) { return frontend::parse_mode(s, m); }
+  static const char* corner_name(Corner c) { return frontend::corner_name(c); }
+  static bool parse_corner(const std::string& s, Corner& c) { return frontend::parse_corner(s, c); }
+  static void natural_size(const Layout& l, double scale, int& w, int& h) { frontend::natural_size(l, scale, w, h); }
 
   bool open(const char* title, int scale, bool fullscreen, bool linear, bool vsync, const Layout& layout, int only_screen = -1, int display_index = 0);
   void close();
@@ -192,11 +174,8 @@ public:
   // `direct`: the core scales straight into the window at `rect`. Otherwise
   // into side_[screen] (an inset or hidden screen needs its own target),
   // which end_frame() copies into place if `shown`.
-  struct View { int screen; SDL_Rect rect; bool direct; bool shown; };
-  // Where the two screens go in a w x h output under `l`, draw order (later
-  // on top). Shared with the screenshot writer.
-  static void place(const Layout& l, int w, int h, View out[SCREENS], IntScale snap = IntScale::Off);
-  static void dominant_auto(const Layout& l, int w, int h, bool across, IntScale snap, double& s, double& s2);
+  using View = frontend::View;
+  static void place(const Layout& l, int w, int h, View out[SCREENS], IntScale snap = IntScale::Off) { frontend::place(l, w, h, out, snap); }
 
 private:
   void layout();

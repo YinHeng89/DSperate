@@ -4,7 +4,7 @@ add_executable(dsperate main.cpp config.cpp display.cpp audio.cpp input.cpp pad_
 # Required on older glibc toolchains where pthread symbols are not in libc.
 set(THREADS_PREFER_PTHREAD_FLAG ON)
 find_package(Threads REQUIRED)
-target_link_libraries(dsperate PRIVATE dsperate_core ${SDL2_LIBRARIES} ${CMAKE_DL_LIBS} Threads::Threads)
+target_link_libraries(dsperate PRIVATE dsperate_core dsperate_frontend_video ${SDL2_LIBRARIES} ${CMAKE_DL_LIBS} Threads::Threads)
 # GCC < 9 requires a separate library for C++17 std::filesystem.
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND
    CMAKE_CXX_COMPILER_VERSION VERSION_LESS 9)

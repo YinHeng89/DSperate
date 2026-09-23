@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstddef>
 #include <cstring>
 
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
@@ -17,6 +18,10 @@
 #endif
 
 namespace ds::sdl {
+
+// View rects go to SDL as SDL_Rect.
+static_assert(sizeof(frontend::Rect) == sizeof(SDL_Rect) && offsetof(frontend::Rect, w) == offsetof(SDL_Rect, w) && offsetof(frontend::Rect, h) == offsetof(SDL_Rect, h),
+              "frontend::Rect must match SDL_Rect");
 
 // ---- rotation ----------------------------------------------------------------
 // Same mapping the display-engine tier uses (display_disp.cpp), so DS_ROTATE
@@ -114,55 +119,6 @@ namespace {
 // The same DS_VERBOSE gate as main.cpp's VLOG.
 bool verbose() { static const bool v = std::getenv("DS_VERBOSE") != nullptr; return v; }
 } // namespace
-
-namespace {
-const char* const kModeNames[] = {"vertical", "horizontal", "single", "pip", "dominant_v", "dominant_h"};
-const char* const kCornerNames[] = {"tl", "tr", "bl", "br"};
-}
-
-const char* Display::mode_name(Mode m) { return kModeNames[static_cast<int>(m)]; }
-const char* Display::corner_name(Corner c) { return kCornerNames[static_cast<int>(c)]; }
-bool Display::parse_mode(const std::string& s, Mode& m) {
-  for (int i = 0; i < static_cast<int>(Mode::Count); ++i) if (s == kModeNames[i]) { m = static_cast<Mode>(i); return true; }
-  return false;
-}
-bool Display::parse_corner(const std::string& s, Corner& c) {
-  for (int i = 0; i < static_cast<int>(Corner::Count); ++i) if (s == kCornerNames[i]) { c = static_cast<Corner>(i); return true; }
-  return false;
-}
-
-const char* Display::int_scale_name(IntScale m) {
-  switch (m) { case IntScale::Under: return "under"; case IntScale::Over: return "over"; default: return "off"; }
-}
-bool Display::parse_int_scale(const std::string& s, IntScale& m) {
-  if (s == "off" || s == "false" || s == "0") { m = IntScale::Off; return true; }
-  if (s == "under" || s == "true" || s == "1") { m = IntScale::Under; return true; }
-  if (s == "over") { m = IntScale::Over; return true; }
-  return false;
-}
-double Display::snap_scale(double s, IntScale m) {
-  if (m == IntScale::Off || s <= 0.0) return s;
-  const double f = std::floor(s + 1e-9);          // handle 2.9999 from a division
-  if (f == s || (s - f) < 1e-9) return f;
-  return m == IntScale::Under ? std::max(1.0, f) : f + 1.0;
-}
-
-void Display::natural_size(const Layout& l, double scale, int& w, int& h) {
-  const double sw = SCREEN_W * scale, sh = SCREEN_H * scale;
-  double fw = sw, fh = sh;
-  switch (l.mode) {
-    case Mode::Vertical:   fh = sh * 2; break;
-    case Mode::Horizontal: fw = sw * 2; break;
-    case Mode::Single: case Mode::Pip: break;
-    case Mode::DominantV:  fh = sh * (1 + (l.dominant_auto ? l.dominant_min : l.dominant)); break;
-    case Mode::DominantH:  fw = sw * (1 + (l.dominant_auto ? l.dominant_min : l.dominant)); break;
-    case Mode::Count: break;
-  }
-  // The gap is not scaled: a distance on the glass, not part of the DS.
-  if (l.mode == Mode::Vertical || l.mode == Mode::DominantV) fh += l.gap;
-  if (l.mode == Mode::Horizontal || l.mode == Mode::DominantH) fw += l.gap;
-  w = std::max(1, static_cast<int>(fw)); h = std::max(1, static_cast<int>(fh));
-}
 
 double Display::dominant_ratio() const {
   if (layout_.mode != Mode::DominantV && layout_.mode != Mode::DominantH) return 1.0;
@@ -348,13 +304,7 @@ void Display::layout() {
   int w = 0, h = 0;
   if (!out_size(w, h)) return;
   if (only_screen_ >= 0) {
-    const double sw = SCREEN_W, sh = SCREEN_H, s = snap_scale(std::min(w / sw, h / sh), int_scale_);
-    const int dw = static_cast<int>(sw * s), dh = static_cast<int>(sh * s);
-    // Overscale crops away from the edge shared with the other panel: the
-    // upper panel keeps its bottom row, the lower panel the reverse.
-    int y = (h - dh) / 2;
-    if (dh > h) y = upper_panel_ ? h - dh : 0;
-    views_[0] = View{only_screen_, SDL_Rect{(w - dw) / 2, y, dw, dh}, true, true};
+    views_[0] = frontend::place_single(only_screen_, w, h, int_scale_, upper_panel_);
     return;
   }
   place(layout_, w, h, views_, int_scale_);
@@ -362,92 +312,6 @@ void Display::layout() {
     std::fprintf(stderr, "video: view %d screen %d at %d,%d %dx%d%s (%dx%d, integer %s%s)\n", i, views_[i].screen, views_[i].rect.x, views_[i].rect.y, views_[i].rect.w, views_[i].rect.h,
                  views_[i].shown ? "" : " hidden", w, h, int_scale_name(int_scale_), layout_.dominant_auto && (layout_.mode == Mode::DominantV || layout_.mode == Mode::DominantH) ? ", dominant auto" : "");
   if (disp_) for (int i = 0; i < nviews_; ++i) disp_->set_view(i, views_[i].rect.x, views_[i].rect.y, views_[i].rect.w, views_[i].rect.h, views_[i].shown);
-}
-
-// Auto dominant: the primary's scale `s` is the largest whole number that
-// leaves the secondary at least `dominant_min` of it; the secondary `s2`
-// is then the largest that fits the room left beside it (the whole
-// width/height, not a ratio of the primary -- the point is a crisp primary,
-// the secondary takes what remains), capped at the primary's size. Under
-// an integer-scale setting the secondary is floored too, when that leaves
-// it at least one panel pixel per DS pixel. When no whole scale leaves
-// room enough the fractional fit at `dominant_min` is what is left.
-void Display::dominant_auto(const Layout& l, int w, int h, bool across, IntScale snap, double& s, double& s2) {
-  const double sw = SCREEN_W, sh = SCREEN_H;
-  const double along = across ? w / sw : h / sh;      // room along the pair, in screens
-  const double side  = across ? h / sh : w / sw;      // room across it
-  for (int k = static_cast<int>(std::floor(std::min(along, side) + 1e-9)); k >= 1; --k) {
-    double rest = std::min(along - k, side);          // the secondary's fit in the leftover
-    rest = std::min(rest, static_cast<double>(k));
-    if (snap != IntScale::Off && rest >= 1.0) rest = std::floor(rest + 1e-9);
-    if (rest + 1e-9 >= k * l.dominant_min) { s = k; s2 = rest; return; }
-  }
-  const double r = l.dominant_min;
-  s = snap_scale(std::min(across ? w / (sw * (1 + r)) : w / sw, across ? h / sh : h / (sh * (1 + r))), snap);
-  s2 = s * r;
-}
-
-void Display::place(const Layout& layout_, int w, int h, View views_[SCREENS], IntScale snap) {
-  const double sw = SCREEN_W, sh = SCREEN_H;
-  // The fit is snapped whole here, so every rect below -- and the scale
-  // tables, touch map and margins built from them -- follows. The pair and
-  // dominant layouts stay centred as a whole, so an overscale crop takes
-  // equally from the outer edges and the edge between the screens is kept.
-  // video.screen_gap: the pair is fitted into the room the gap leaves along
-  // it, and the second screen starts that much further on. Single and PiP
-  // have no pair to part.
-  const bool pair_across = layout_.mode == Mode::Horizontal || layout_.mode == Mode::DominantH;
-  const bool pair = pair_across || layout_.mode == Mode::Vertical || layout_.mode == Mode::DominantV;
-  const int gap = pair ? layout_.gap : 0;
-  const int fw = pair_across ? std::max(1, w - gap) : w, fh = pair && !pair_across ? std::max(1, h - gap) : h;
-  auto fit = [&](double cols, double rows) { return snap_scale(std::min(fw / (sw * cols), fh / (sh * rows)), snap); };
-  auto rect = [&](double x, double y, double s) { return SDL_Rect{static_cast<int>(x), static_cast<int>(y), static_cast<int>(sw * s), static_cast<int>(sh * s)}; };
-  const int p = layout_.primary, q = 1 - p;
-  switch (layout_.mode) {
-    case Mode::Vertical: case Mode::Horizontal: {
-      const bool across = layout_.mode == Mode::Horizontal;
-      const double s = across ? fit(2, 1) : fit(1, 2);
-      const double dw = sw * s, dh = sh * s;
-      const double x = (w - dw * (across ? 2 : 1) - (across ? gap : 0)) / 2, y = (h - dh * (across ? 1 : 2) - (across ? 0 : gap)) / 2;
-      for (int i = 0; i < SCREENS; ++i) {
-        const int screen = i == 0 ? p : q;
-        views_[i] = View{screen, across ? rect(x + (dw + gap) * i, y, s) : rect(x, y + (dh + gap) * i, s), true, true};
-      }
-      break;
-    }
-    case Mode::Single: case Mode::Pip: {
-      const double s = fit(1, 1);
-      const SDL_Rect big = rect((w - sw * s) / 2, (h - sh * s) / 2, s);
-      views_[0] = View{p, big, true, true};
-      if (layout_.mode == Mode::Single) {
-        views_[1] = View{q, SDL_Rect{0, 0, static_cast<int>(SCREEN_W), static_cast<int>(SCREEN_H)}, false, false};
-      } else {
-        const double s2 = s * layout_.pip;
-        const int iw = static_cast<int>(sw * s2), ih = static_cast<int>(sh * s2);
-        const bool right = layout_.corner == Corner::TopRight || layout_.corner == Corner::BottomRight;
-        const bool bottom = layout_.corner == Corner::BottomLeft || layout_.corner == Corner::BottomRight;
-        views_[1] = View{q, SDL_Rect{right ? big.x + big.w - iw : big.x, bottom ? big.y + big.h - ih : big.y, iw, ih}, false, true};
-      }
-      break;
-    }
-    case Mode::DominantV: case Mode::DominantH: {
-      const bool across = layout_.mode == Mode::DominantH;
-      double s = 0, s2 = 0;    // the primary's and the secondary's scale
-      if (!layout_.dominant_auto) { s = across ? fit(1 + layout_.dominant, 1) : fit(1, 1 + layout_.dominant); s2 = s * layout_.dominant; }
-      else dominant_auto(layout_, fw, fh, across, snap, s, s2);
-      const double sc[2] = {p == 0 ? s : s2, p == 1 ? s : s2};
-      if (!across) {
-        double y = (h - sh * (s + s2) - gap) / 2;
-        for (int i = 0; i < SCREENS; ++i) { views_[i] = View{i, rect((w - sw * sc[i]) / 2, y, sc[i]), true, true}; y += sh * sc[i] + gap; }
-      } else {
-        double x = (w - sw * (s + s2) - gap) / 2;
-        const double bottom = (h - sh * s) / 2 + sh * s;
-        for (int i = 0; i < SCREENS; ++i) { views_[i] = View{i, rect(x, bottom - sh * sc[i], sc[i]), true, true}; x += sw * sc[i] + gap; }
-      }
-      break;
-    }
-    case Mode::Count: break;
-  }
 }
 
 bool Display::try_gpu_present() {
@@ -481,7 +345,7 @@ void Display::draw_gpu(const u32* const fb[SCREENS]) {
   int lw = 0, lh = 0;
   out_size(lw, lh);
   GpuPresent::View v[SCREENS];
-  for (int i = 0; i < nviews_; ++i) v[i] = GpuPresent::View{views_[i].screen, views_[i].rect, views_[i].shown, !views_[i].direct, grid_on(views_[i].screen)};
+  for (int i = 0; i < nviews_; ++i) v[i] = GpuPresent::View{views_[i].screen, SDL_Rect{views_[i].rect.x, views_[i].rect.y, views_[i].rect.w, views_[i].rect.h}, views_[i].shown, !views_[i].direct, grid_on(views_[i].screen)};
   const u32 grid = grid_strength_ > 0.0 ? static_cast<u32>(std::lround((1.0 - grid_strength_) * 256.0)) : 256u;
   gpu_->present(*out_, fb, v, nviews_, rot_, lw, lh, inset_alpha_, gpu_layer_, gpu_layer_bytes_, gpu_layer_scale_, gpu_layer_screen_, canvas_drawn_, smooth3d_ ? gpu_layer_edge_ : 0, grid);
   canvas_drawn_ = SDL_Rect{0, 0, 0, 0};
@@ -508,7 +372,7 @@ void Display::draw(const u32* const fb[SCREENS]) {
     // the inset's copy or a screen swap would carry it to the large view.
     const bool translucent = !v.direct && inset_alpha_ < 255;
     if (translucent) { SDL_SetTextureBlendMode(tex_[v.screen], SDL_BLENDMODE_BLEND); SDL_SetTextureAlphaMod(tex_[v.screen], inset_alpha_); }
-    SDL_RenderCopy(ren_, tex_[v.screen], nullptr, &v.rect);
+    SDL_RenderCopy(ren_, tex_[v.screen], nullptr, reinterpret_cast<const SDL_Rect*>(&v.rect));
     if (translucent) { SDL_SetTextureAlphaMod(tex_[v.screen], 255); SDL_SetTextureBlendMode(tex_[v.screen], SDL_BLENDMODE_NONE); }
   }
   SDL_RenderPresent(ren_);
