@@ -73,9 +73,8 @@ void test_slot_delete() {
 }
 
 
-// With a network session up the three state rows come off the page entirely
-// (docs/wifi-scoping.md, phase 3): a state freezes this machine and not the
-// one it is talking to, and nothing in a state file restores a session. The
+// With a network session up the three state rows come off the page entirely:
+// a state freezes this machine and not the one it is talking to, and nothing in a state file restores a session. The
 // rows that remain must still be reachable in order -- hiding rows shifts
 // every index below them, which is exactly the kind of thing that breaks
 // quietly.
@@ -1046,9 +1045,8 @@ void test_layout_page_rows() {
 }
 
 // Local wireless is one row on the Emulation page rather than a page of its
-// own (docs/wifi-scoping.md, "The menu row as built"): five values, and
-// restart-only because the console's MAC is randomized before it boots.
-// INTERNET joined it in phase 3, which is what makes the two exclusive --
+// own: five values, and restart-only because the console's MAC is randomized before it boots.
+// INTERNET joined it later, which is what makes the two exclusive --
 // one row cannot ask for both, and the radio only has one use at a time.
 void test_network_features_row() {
   FakeHost h;

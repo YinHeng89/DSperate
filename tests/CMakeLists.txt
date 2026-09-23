@@ -104,7 +104,7 @@ add_executable(test_rom_source rom_source_test.cpp)
 target_link_libraries(test_rom_source PRIVATE dsperate_core)
 add_test(NAME rom_source COMMAND test_rom_source)
 
-# The RetroAchievements hash (docs/retroachievements-scoping.md, phase 1).
+# The RetroAchievements hash.
 # Guarded because the vendored rcheevos is only built with the feature.
 if(DSPERATE_CHEEVOS)
   add_executable(test_cheevos_hash cheevos_hash_test.cpp)
@@ -125,7 +125,7 @@ if(DSPERATE_CHEEVOS)
   add_test(NAME cheevos_client COMMAND test_cheevos_client)
 endif()
 
-# The internet driver (docs/wifi-scoping.md, phase 3): the DNS rewrite's
+# The internet driver: the DNS rewrite's
 # checksum arithmetic, and the DS's first conversation with the user-mode
 # stack. Guarded because libslirp is only vendored in with the feature; no
 # traffic leaves the machine.

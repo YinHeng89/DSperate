@@ -1,8 +1,8 @@
 # DraStic's game-specific behaviour — a list to review
 
-Compiled 2026-08-29 from the decompilation (`dsperate-research/ghidra_export/decomp`,
-`apply_cycle_adjustment_hacks_0010fa20.c` and the readers of its flag block) and
-from `binary/drastic_readme.txt`'s changelog. Two different things live here and
+Compiled 2026-08-29 from the Ghidra decompilation (`apply_cycle_adjustment_hacks`
+at `0x0010fa20` and the readers of its flag block) and from the changelog in
+DraStic's bundled `drastic_readme.txt`. Two different things live here and
 they are kept apart: **(1) the per-game hack table** — fourteen titles keyed on the
 ROM game code, each flipping one of eight flags — and **(2) general fixes the
 changelog attributes to a particular game**, which are not per-game code paths at

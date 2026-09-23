@@ -6,7 +6,7 @@
 # F:x,y presses the screen at (x,y) from frame F for N frames (default 10);
 # kF:MASK holds the button mask (bit 0 A, 1 B, 2 Select, 3 Start, 4 Right,
 # 5 Left, 6 Up, 7 Down, 8 R, 9 L, 10 X, 11 Y) likewise -- the same arguments
-# trace_melonds takes as --touch / --key, so one script drives both.
+# a melonDS trace harness can take as --touch / --key, so one script drives both.
 import struct, sys
 # usage: mkdsin.py out.dsin frames [F:x,y[:N]]... [kF:mask[:N]]...  (touch, or key mask held)
 out=sys.argv[1]; n=int(sys.argv[2]); taps=[]; keys=[]

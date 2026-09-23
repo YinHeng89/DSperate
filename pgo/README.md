@@ -1,7 +1,7 @@
 # Profile-guided optimisation data
 
 `aarch64/` holds the GCC profile (`.gcda` files, one per object, plus a
-`MANIFEST`) that CI and `tools/pgo_build.sh` apply with `-DDSPERATE_PGO=use`.
+`MANIFEST`) that CI and any `-DDSPERATE_PGO=use` build apply.
 It is produced by `tools/pgo_refresh.sh` on a machine that has the ROMs, BIOS
 and firmware the training runs need, so the public build never does.
 

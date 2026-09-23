@@ -106,7 +106,7 @@ bool NDS::load_dsi_bios(const std::string& p9i, const std::string& p7i, std::str
 
 bool NDS::load_dsi_boot_blobs(const std::string& path, std::string* err) {
   std::vector<u8> b = slurp_file(path);
-  if (b.size() != 0x128 + 0x14 + 0x18) { if (err) *err = path + ": not a 0x154-byte DSi boot blob (tools/dsi_nand.py bootblobs)"; return false; }
+  if (b.size() != 0x128 + 0x14 + 0x18) { if (err) *err = path + ": not a 0x154-byte DSi boot blob"; return false; }
   dsi_boot_blobs = std::move(b);
   return true;
 }

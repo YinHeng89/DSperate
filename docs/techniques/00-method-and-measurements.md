@@ -152,8 +152,8 @@ split cleanly:
 - [03 — The 2D engines and the scanline pipeline](03-2d-engines-and-scanline-pipeline.md)
 - [04 — The scheduler, deferred rendering, DMA and the memory system](04-scheduler-deferral-and-memory.md)
 - [05 — The SPU and audio output](05-spu-and-audio-output.md)
-- [06 — Implementation checklist](06-implementation-checklist.md) — every
-  high-level item above in one table, for auditing DSperate against it
+- [06 — Game-specific behaviour](06-drastic-game-specific.md) — DraStic's
+  per-game hack table and title-specific fixes, as a list to review
 
 ## Confidence
 

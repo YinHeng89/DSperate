@@ -2,7 +2,7 @@
 # Regenerate the committed PGO profile (pgo/<arch>/), or check whether it has
 # drifted from the tree it will be applied to.
 #
-#   DS_ROMS=<rom dir> DS_BIOS=<bios dir> [DS_DSI=<dsi-binary dir>] \
+#   DS_ROMS=<rom dir> DS_BIOS=<bios dir> [DS_DSI=<dsi dir>] [DS_A30_TOOLCHAIN=<dir>] \
 #     tools/pgo_refresh.sh [--check] [--no-dsi] [--arm32] [--gcc N] [--native]
 #                          [build-dir] [extra cmake args]
 #
@@ -12,16 +12,15 @@
 #          made (each edited function silently loses its profile). Exit 1 if
 #          the compiler/flags differ, 2 if only sources moved, 0 if current.
 # default  an instrumented aarch64 cross build, trained under qemu on the
-#          recorded scenes, the two save-state scenes, one cart boot from
-#          frame 0 and (where the dumps are there) two DSiWare titles, writes
+#          recorded scenes, three cart boots from frame 0 and (where the dumps are there) two DSiWare titles, writes
 #          the .gcda files into pgo/aarch64/ and a MANIFEST; then a "use" build
 #          from the committed profile in a *different* directory, reporting how
 #          many functions failed to find their profile (should be none straight
 #          after a refresh). ~20 minutes on a desktop. Commit pgo/ afterwards.
 # --no-dsi trains the DS scenes only, for a profile to ship without the DSi
 #          dumps to hand. The DSi scenes are also skipped on their own when
-#          DS_DSI (default: the dsi-binary directory beside this checkout) has
-#          no BIOS pair in it. MANIFEST records which scenes actually ran.
+#          DS_DSI is unset or has no bios/ pair in it (it wants bios/ with
+#          biosdsi9/7.bin and dsifirmware.bin, and games/ with the titles). MANIFEST records which scenes actually ran.
 # --gcc N  builds a *secondary* aarch64 profile with that GCC major version
 #          (aarch64-linux-gnu-g++-N, installed alongside the default one) into
 #          pgo/aarch64-gcc<full version>/, which CMakeLists prefers whenever a
@@ -46,15 +45,14 @@
 #          builds the ARM32 release, so a profile from any other compiler would
 #          be refused by the fingerprint check at configure time. Each
 #          architecture keeps its own profile directory, MANIFEST and scratch
-#          build dir, so the two never collide. DS_A30_TOOLCHAIN overrides
-#          where that toolchain lives (default: toolchains/a30 beside this
-#          checkout).
+#          build dir, so the two never collide. DS_A30_TOOLCHAIN names where
+#          that toolchain lives (the directory holding tc-a30.cmake).
 #
-# Two of the scenes are here for paths the replays cannot reach: `nsmb` boots
-# the cart from frame 0, which is the only training for the boot path and for
-# the cold translation burst that follows it, and runs long enough to reach the
-# attract-mode demo (the hardest sustained scene in the suite -- ~19-21 ms a
-# frame on an RK3566, see docs/cpu-governor-scoping.md); the DSiWare pair
+# Some scenes are here for paths the replays cannot reach: `nsmb`, `gsdd` and
+# `st` boot the cart from frame 0, the only training for the boot path and for
+# the cold translation burst that follows it, and run long enough to reach
+# their attract-mode demos (NSMB's is the hardest sustained scene in the suite
+# -- ~19-21 ms a frame on an RK3566); the DSiWare pair
 # trains the DSi memory map, NWRAM, NDMA and the launcher hand-off, none of
 # which a DS scene executes at all.
 #
@@ -95,11 +93,11 @@ case $ARCH in
     fi
     ;;
   armv7l)
-    A30=${DS_A30_TOOLCHAIN:-$HERE/../toolchains/a30}
+    A30=${DS_A30_TOOLCHAIN:?set DS_A30_TOOLCHAIN to the A30 toolchain directory (holding tc-a30.cmake)}
     TOOLCHAIN="$A30/tc-a30.cmake"
     PGO_CXX="$A30/a30/bin/arm-a30-linux-gnueabihf-g++"
     Q="qemu-arm-static -L $A30/a30/arm-a30-linux-gnueabihf/sysroot"
-    [ -x "$PGO_CXX" ] || { echo "no ARM32 toolchain at $A30 (set DS_A30_TOOLCHAIN); see toolchains/a30"; exit 1; }
+    [ -x "$PGO_CXX" ] || { echo "no ARM32 toolchain at $A30 (set DS_A30_TOOLCHAIN)"; exit 1; }
     ;;
   *) echo "unknown --arch $ARCH (aarch64 | armv7l)"; exit 1 ;;
 esac
@@ -145,9 +143,10 @@ fi
 : "${DS_ROMS:?set DS_ROMS}"; : "${DS_BIOS:?set DS_BIOS}"
 # The DSi scenes are opt-out and self-disabling: a checkout without the dumps
 # still produces a valid DS-only profile rather than failing halfway through.
-DS_DSI=${DS_DSI:-$HERE/../dsi-binary}
+DS_DSI=${DS_DSI:-}
 DSI_OK=0; DSI_WHY=""
 if [ $DSI = 0 ]; then DSI_WHY="--no-dsi"
+elif [ -z "$DS_DSI" ]; then DSI_WHY="DS_DSI not set"
 elif [ ! -f "$DS_DSI/bios/biosdsi9.bin" ] || [ ! -f "$DS_DSI/bios/biosdsi7.bin" ]; then DSI_WHY="no DSi BIOS pair in $DS_DSI/bios"
 elif [ ! -f "$DS_DSI/bios/dsifirmware.bin" ]; then DSI_WHY="no DSi firmware in $DS_DSI/bios"
 else DSI_OK=1
@@ -167,8 +166,10 @@ train sm64   --replay "$HERE/scenes/sm64.dsin"   --frames 600 "$DS_ROMS/Super Ma
 train etody  --replay "$HERE/scenes/etody.dsin"  --frames 600 "$DS_ROMS/Etrian Odyssey.nds" &
 train dbori  --replay "$HERE/scenes/dbori.dsin" --frames 600 "$DS_ROMS/Dragon Ball - Origins.nds" &
 train meteos --replay "$HERE/scenes/meteos.dsin" --frames 600 "$DS_ROMS/Meteos.nds" &
-train gsdd   --load-state "$HERE/scenes/gsdd-phase2.dss" --frames 400 "$DS_ROMS/Golden Sun - Dark Dawn.nds" &
-train st     --load-state "$HERE/scenes/st-intro.dss" --frames 600 "$DS_ROMS/Legend of Zelda, The - Spirit Tracks.nds" &
+# Boots, like nsmb below: both reach their attract mode from a direct boot
+# with no input, which is the heavy stretch the old save-state scenes stood in for.
+train gsdd   --frames 2400 "$DS_ROMS/Golden Sun - Dark Dawn.nds" &
+train st     --frames 2400 "$DS_ROMS/Legend of Zelda, The - Spirit Tracks.nds" &
 # From frame 0: the boot path, the cold translation burst, and then the
 # attract-mode demo, which starts around frame 1200 -- hence the frame count,
 # and hence this being the longest run of the batch.

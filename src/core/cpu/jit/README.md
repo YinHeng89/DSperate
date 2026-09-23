@@ -31,8 +31,7 @@ the stubs and the translator behind the `backend` interface in
 | `a32/stubs.cpp` | the ARMv7 stubs (AAPCS32: `blx` to Thumb-2 helpers, struct return in memory, 8-byte stack frames) |
 | `a32/translate.cpp` | ARMv7 translator: register cache, data processing / multiplies / branches (static and indirect) by field substitution with native flags and predication, single loads/stores and same-page LDM/STM (pc included) with a page-table fast path, same-mode MSR; the rest through the fallback stub; same block shape as a64 |
 
-The ARMv7 backend is scoped in `docs/arm32-jit-scoping.md`. Its gates, run
-after every step: `test_jit` under qemu-arm (1600 trials), the five replay
+The ARMv7 backend's gates, run after every step: `test_jit` under qemu-arm (1600 trials), the five replay
 scenes' 300-frame hashes against the AArch64 JIT's, and strict mode against
 the interpreter. Phase 2 step 2 (2026-09-03, memory inline): all five
 scenes identical to the AArch64 JIT (etody included, once memory stopped
@@ -311,9 +310,8 @@ so an address can appear more than once; perf takes the last entry.
 The permanent stubs are named too (`jit_stub_<name>`, per-CPU ones
 `jit_stub9_`/`jit_stub7_`: dispatch, link, fallback, branch_indirect…), so
 dispatch and call overhead shows up under its own names rather than as bare
-arena addresses. `tools/profile_categories.py` sums a `perf report` listing
-into subsystem buckets (JIT code / JIT stubs / JIT runtime / 3D / 2D /
-scheduler / memory …).
+arena addresses, and a `perf report` listing can be bucketed by subsystem
+(JIT code / JIT stubs / JIT runtime / 3D / 2D / scheduler / memory …).
 
 Measured this way on the RK3566 over 60 s of real gameplay, translated code
 is 6-11 % of the process and extremely diffuse — the hottest single block is

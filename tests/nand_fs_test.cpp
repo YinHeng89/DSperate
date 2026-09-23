@@ -9,7 +9,7 @@
 // title's save and the FAT12 inside it, the dump's tickets through ES
 // decryption, and a write that stays in the session's memory. With
 // DS_TEST_DSI_NAND_COPY naming a scratch copy as well, that write goes into
-// the copy, for tools/dsi_nand.py to read back independently. The same variables
+// the copy, for an independent tool to read back. The same variables
 // run the save/system-file persistence round trip (io/dsi_nand_persist).
 #include "core/crypto/sha1.h"
 #include "core/io/dsi_nand_fs.h"

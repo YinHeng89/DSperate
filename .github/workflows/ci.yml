@@ -146,9 +146,9 @@ jobs:
   # does, natively, with no qemu.
   #
   # The image must carry GCC 10.5, ninja, CMake >= 3.28 and the SDL 2.30.9 that
-  # toolchains/rg35xxsp/build-sdl.sh builds, at /work/prefix -- sdl2.pc records
-  # that absolute path, so the prefix is not relocatable. Build it once from
-  # toolchains/rg35xxsp/Dockerfile, push it to GHCR by digest, and set the
+  # devices run, built at /work/prefix -- sdl2.pc records that absolute path,
+  # so the prefix is not relocatable. Build it once (Ubuntu 20.04 arm64 base),
+  # push it to GHCR by digest, and set the
   # repository variable DSPERATE_FOCAL_IMAGE to it. Pinning by digest matters:
   # focal is EOL, and its packages will eventually move to old-releases, which
   # would break an image rebuilt in-workflow for reasons unrelated to any

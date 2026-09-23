@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // The internet driver: the DNS rewrite's checksum arithmetic, and the DS's
 // first conversation with the user-mode stack -- ARP for the gateway, then
-// DHCP for an address. docs/wifi-scoping.md, phase 3.
+// DHCP for an address.
 //
 // No traffic leaves this machine: everything here is between the driver and
 // libslirp's own emulated network, so the test runs the same on a build

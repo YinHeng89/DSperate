@@ -6,7 +6,7 @@ compile_commands.json
 *.nds
 
 # the recorded scenes need their battery saves: without them the replay diverges
-# (M&L and Meteos most of all -- see docs)
+# (M&L most of all)
 !scenes/*.sav
 
 # Python bytecode from the tools/ scripts; one of these was committed by

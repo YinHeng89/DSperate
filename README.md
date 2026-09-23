@@ -205,10 +205,9 @@ Environment variables (`DS_VERBOSE`, `DS_FRAME_STATS`, `DS_FPS`, `DS_PROFILE`,
 they are read. `ctest` runs the unit tests in
 [tests/](tests/): interpreter, recompiler against interpreter, NEON kernels
 against portable references, page table, scheduler, I/O, SPU, 2D/3D pipelines
-and the texture cache. [tools/](tools/) holds the frame/trace/audio comparison
-scripts, the exactness checks over the recorded scenes, the PGO refresh
-scripts, `edge_mock.py` for looking at what the smooth-edge mode decided per
-pixel, and `mkcart.py` for building a custom loader cart.
+and the texture cache. [tools/](tools/) holds the PGO refresh scripts, the shader and example-config
+generators, the release ABI-floor check, `mkdsin.py` for scripting an input
+replay, and `mkcart.py` for building a custom loader cart.
 
 ## Licence
 

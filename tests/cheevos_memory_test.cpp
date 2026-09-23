@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // DSperate - Nintendo DS emulator. Copyright (C) 2026 DSperate contributors.
 //
-// The RetroAchievements memory window and the condition runtime on top of it
-// (docs/retroachievements-scoping.md, phase 2). Everything here is local: no
-// session, no server, no network.
+// The RetroAchievements memory window and the condition runtime on top of it.
+// Everything here is local: no session, no server, no network.
 //
 // Three things are being pinned down, and each has a failure mode that is
 // silent rather than loud:

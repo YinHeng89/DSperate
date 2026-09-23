@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // DSperate - Nintendo DS emulator. Copyright (C) 2026 DSperate contributors.
 //
-// The credential sidecar (docs/retroachievements-scoping.md, phase 3). No
+// The credential sidecar. No
 // network: what is tested is that the token is stored the way a credential has
 // to be, because the token alone is enough to act as the player on
 // RetroAchievements.

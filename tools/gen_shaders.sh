@@ -9,8 +9,7 @@
 #   tools/gen_shaders.sh
 #
 # The compiler is, in order of preference:
-#   $GLSLANG                          an explicit override
-#   toolchains/glslang/bin/...        the vendored prebuilt (see toolchains/README)
+#   $GLSLANG                          an explicit path (e.g. a prebuilt glslangValidator)
 #   glslangValidator / glslc          whatever is on PATH
 # Blobs are validated with spirv-val when it is available, because a shader
 # that compiles is not necessarily one the driver will accept.
@@ -20,14 +19,13 @@ SRC="$DIR/src/core/gpu/vk/shaders"
 INC="$DIR/src/core/gpu/vk"
 
 if [ -n "$GLSLANG" ]; then GV="$GLSLANG"
-elif [ -x "$DIR/../toolchains/glslang/bin/glslangValidator" ]; then GV="$DIR/../toolchains/glslang/bin/glslangValidator"
 elif command -v glslangValidator >/dev/null 2>&1; then GV=glslangValidator
 elif command -v glslc >/dev/null 2>&1; then GV=glslc
 else
   echo "gen_shaders: no GLSL compiler found." >&2
-  echo "  fetch one:  mkdir -p toolchains/glslang && cd toolchains/glslang &&" >&2
+  echo "  fetch a prebuilt one and point GLSLANG at its bin/glslangValidator:" >&2
   echo "              curl -sSL -o g.zip https://github.com/KhronosGroup/glslang/releases/download/master-tot/glslang-master-linux-Release.zip &&" >&2
-  echo "              unzip -oq g.zip && rm g.zip" >&2
+  echo "              unzip -oq g.zip -d glslang && rm g.zip" >&2
   exit 1
 fi
 
