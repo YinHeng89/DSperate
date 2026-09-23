@@ -178,8 +178,11 @@ void Gpu::vram_store_trap(Cpu cpu, u32 addr) {
     const u32 reach = reach_engines(addr);
     const bool b_joined = ((reach & 1) && inflight_[0]) || ((reach & 2) && inflight_[1]);
     if (b_joined) { prof::add(prof::C_2D_LAG_STORE_JOINS, 1); join_worker(JoinSite::Trap); }
-    // Past the limit, drop lag and lift the trap unless the other engine is still batching.
-    if (b_joined && ++lag_trap_hits_ >= LAG_TRAP_LIMIT) {
+    // Past either limit, drop lag and lift the trap unless the other engine is still
+    // batching. Nothing may stay in flight once the trap is gone.
+    const bool over = (b_joined && ++lag_trap_hits_ >= LAG_TRAP_LIMIT) || ++lag_trap_stores_ >= LAG_STORE_LIMIT;
+    if (over && lag_frame_) {
+      if (!b_joined) join_worker(JoinSite::Trap);
       lag_frame_ = false;
       if (per_line_[0] && per_line_[1]) disarm_trap();
       prof::add(prof::C_2D_LAG_DROPPED, 1);
@@ -490,7 +493,7 @@ void Gpu::begin_frame() {
   if (futile) prof::add(prof::C_2D_LAZY_SKIPPED, 1);
   lazy_bursts_[0] = lazy_bursts_[1] = 0; burst_[0] = burst_[1] = false; burst_left_[0] = burst_left_[1] = 0;
   lag_frame_ = !run_fifo_ && !g_no_lag;
-  lag_trap_hits_ = 0;
+  lag_trap_hits_ = 0; lag_trap_stores_ = 0;
   if (lazy_frame_ || lag_frame_) arm_trap();
   if (lazy_frame_) prof::add(prof::C_2D_LAZY_FRAMES, 1);
   if (lag_frame_ && !lazy_frame_) prof::add(prof::C_2D_LAG_FRAMES, 1);

@@ -325,6 +325,8 @@ u32 Dma::run_channel_impl(Channel& c, u32 budget) {
           prof::add(prof::C_DMA_VRAM_TRAP, 1); if (prof::enabled) prof::add(dma_zone(c.cur_dst, true), 1);
           nds_.gpu.vram_store_trap(Cpu::ARM9, c.cur_dst);
           pd = nds_.cpu(c.cpu).page_table.write_ptr(c.cur_dst, &code);
+          // A lag-mode trap stays armed once satisfied: write the run through it.
+          if (!pd && nds_.gpu.vram_trap_settled()) pd = nds_.cpu(c.cpu).page_table.trapped_write_ptr(c.cur_dst, &code);
         }
         if (pd && !code) {
           u32 room = (mem::PAGE_SIZE - (c.cur_src & (mem::PAGE_SIZE - 1))) >> 2;
@@ -388,6 +390,8 @@ u32 Dma::run_channel_impl(Channel& c, u32 budget) {
           prof::add(prof::C_DMA_VRAM_TRAP, 1); if (prof::enabled) prof::add(dma_zone(c.cur_dst, true), 1);
           nds_.gpu.vram_store_trap(Cpu::ARM9, c.cur_dst);
           pd = nds_.cpu(c.cpu).page_table.write_ptr(c.cur_dst, &code);
+          // A lag-mode trap stays armed once satisfied: write the run through it.
+          if (!pd && nds_.gpu.vram_trap_settled()) pd = nds_.cpu(c.cpu).page_table.trapped_write_ptr(c.cur_dst, &code);
         }
         if (pd && !code) {
           u32 room = (mem::PAGE_SIZE - (c.cur_src & (mem::PAGE_SIZE - 1))) >> 1;

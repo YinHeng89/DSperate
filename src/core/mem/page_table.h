@@ -120,6 +120,15 @@ public:
     return base ? reinterpret_cast<u8*>(base + addr) : nullptr;
   }
 
+  // A write-trapped page's backing store (nullptr if it has none), for a caller that
+  // has already satisfied the trap.
+  inline u8* trapped_write_ptr(u32 addr, bool* is_code) const {
+    const Entry e = table_[addr >> PAGE_SHIFT];
+    *is_code = (e & TAG_CODE) != 0;
+    const Entry base = e << 2;
+    return base ? reinterpret_cast<u8*>(base + addr) : nullptr;
+  }
+
   // DS_FASTMEM: host view derived from this table. Every entry written from
   // here on is reported to it; nullptr detaches.
   void attach_view(GuestView* v);

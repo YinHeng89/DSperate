@@ -75,6 +75,10 @@ public:
   void palette_store(Cpu cpu, u32 addr, u32 width, u32 value);
   void oam_store(Cpu cpu, u32 addr, u32 width, u32 value);
   void vram_store_trap(Cpu cpu, u32 addr);
+  // After vram_store_trap: nothing in flight and both engines per-line, so the rest of a
+  // DMA run on that page may write straight through a lag-mode trap (no hand-off until
+  // the next HBlank event, which cannot fire inside a run).
+  bool vram_trap_settled() const { return !inflight_[0] && !inflight_[1] && per_line_[0] && per_line_[1]; }
   bool vram_remap_begin(u32 moved_2d);  // before a VRAMCNT remap: catch up, lift the trap; returns whether it was set
   void vram_remap_end(bool trapped);  // after: re-arm it
   void set_lazy(bool on) { lazy_enabled_ = on; }   // off: per-line rendering (tests)
@@ -372,11 +376,13 @@ private:
   // Lag mode: per-line frames hand BOTH engines' line to the
   // worker at its HBlank without waiting, joining at that line's HBlank or
   // earlier if observed. The last display line always joins. Past
-  // LAG_TRAP_LIMIT joining stores in a frame, lag is dropped and the trap
-  // lifted. Display FIFO frames stay on this thread.
+  // LAG_TRAP_LIMIT joining stores, or LAG_STORE_LIMIT trapped stores of any
+  // kind (each is a slow-path store, whether or not it had to wait), in a frame,
+  // lag is dropped and the trap lifted. Display FIFO frames stay on this thread.
   bool lag_frame_ = false;        // this frame's per-line lines may stay in flight
-  u32  lag_trap_hits_ = 0;
+  u32  lag_trap_hits_ = 0, lag_trap_stores_ = 0;
   static constexpr u32 LAG_TRAP_LIMIT = 4096;
+  static constexpr u32 LAG_STORE_LIMIT = 1024;
   // Wait for whatever is on the worker. Engine A's deferred batch also ends
   // its frame here (finish_a), as render_ranges does for a frame finished on this thread.
   enum class JoinSite { CatchUp, Trap, Journal, Line0, Remap, RangesPre, RangesPost, Other };   // where a join was taken from, to attribute its wait
