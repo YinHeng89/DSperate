@@ -2,6 +2,7 @@
 // DSperate - Nintendo DS emulator. Copyright (C) 2026 DSperate contributors.
 #pragma once
 #include "frontend/sdl/gpu_present.h"
+#include "frontend/sdl/video/presenter.h"
 #include "core/gpu/gpu.h"
 #include "frontend/video/layout.h"
 #include "core/types.h"
@@ -160,7 +161,7 @@ public:
   void present();
   // After a present with no frame following (the pause menu): make sure the
   // scanout tier has put it on its way. See ScanoutOut::flush.
-  void flush() { if (gpu_ && out_) gpu_->flush(*out_); if (out_) out_->flush(); }
+  void flush() { if (gpu_) gpu_->flush(); else if (out_) out_->flush(); }
 
   // Where the frontend drew on the canvas this frame, so a scanout tier's
   // other buffers get it cleaned up too before reuse (an overlay isn't
@@ -222,7 +223,7 @@ private:
   bool              page_ = false;
   std::unique_ptr<ScanoutOut> out_;     // tier 1; null on the surface tier
   bool              gpu_wanted_ = false;
-  std::unique_ptr<GpuPresent> gpu_;     // the GPU present stage on top of out_; null otherwise
+  std::unique_ptr<FramePresenter> gpu_; // a GPU presenter (on top of out_ for the import one); null: software
   u64 gpu_layer_ = 0; size_t gpu_layer_bytes_ = 0; u32 gpu_layer_scale_ = 1; int gpu_layer_screen_ = 0; u64 gpu_layer_edge_ = 0;
   bool smooth3d_ = false;
   bool try_gpu_present();               // after out_ opened: import its buffers, switch draw() over

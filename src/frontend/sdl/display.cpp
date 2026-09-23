@@ -288,8 +288,7 @@ bool Display::open(const char* title, int scale, bool fullscreen, bool linear, b
 
 void Display::close() {
   if (disp_) { disp_->close(); disp_.reset(); }
-  if (gpu_ && out_) gpu_->flush(*out_);
-  gpu_.reset();
+  gpu_.reset();   // flushes what it has in flight
   if (out_) { out_->close(); out_.reset(); }
   frame_px_ = nullptr;
   surf_ = nullptr;   // owned by SDL, freed with the window
@@ -317,21 +316,19 @@ void Display::layout() {
 bool Display::try_gpu_present() {
   if (!gpu_wanted_ || !out_) return false;
   std::string why;
-  gpu_ = GpuPresent::open(*out_, &why);
+  gpu_ = open_vk_import_presenter(*out_, &why);
   if (!gpu_) { std::fprintf(stderr, "video.gpu_present: %s; scanline scaling instead\n", why.c_str()); return false; }
   scaled_ = false;
-  out_->set_gpu_writes(true);
   layout();
-  std::fprintf(stderr, "video: %s scanout, %s driver, GPU present on %s, rot %d\n",
-               std::strcmp(SDL_GetCurrentVideoDriver(), "KMSDRM") == 0 ? "kms" : "dmabuf", SDL_GetCurrentVideoDriver(), gpu_->device_name().c_str(), rot_);
+  std::fprintf(stderr, "video: %s, %s driver, rot %d\n", gpu_->name().c_str(), SDL_GetCurrentVideoDriver(), rot_);
   return true;
 }
 
 void Display::draw_gpu(const u32* const fb[SCREENS]) {
   int w = 0, h = 0;
   SDL_GetWindowSize(win_, &w, &h);
-  if (w != out_->width() || h != out_->height()) {
-    if (!out_->reopen(win_, w, h) || !gpu_->reimport(*out_)) {
+  switch (gpu_->fit(win_, w, h)) {
+    case FramePresenter::Fit::Lost:
       std::fprintf(stderr, "video: GPU present lost on resize; scanline scaling from here\n");
       gpu_.reset();
       scaled_ = true;
@@ -339,15 +336,19 @@ void Display::draw_gpu(const u32* const fb[SCREENS]) {
       layout();
       build_scale();
       return;   // this frame is dropped; the next takes begin_frame()
-    }
-    layout();
+    case FramePresenter::Fit::Changed: layout(); break;
+    case FramePresenter::Fit::Same: break;
   }
-  int lw = 0, lh = 0;
-  out_size(lw, lh);
-  GpuPresent::View v[SCREENS];
-  for (int i = 0; i < nviews_; ++i) v[i] = GpuPresent::View{views_[i].screen, SDL_Rect{views_[i].rect.x, views_[i].rect.y, views_[i].rect.w, views_[i].rect.h}, views_[i].shown, !views_[i].direct, grid_on(views_[i].screen)};
-  const u32 grid = grid_strength_ > 0.0 ? static_cast<u32>(std::lround((1.0 - grid_strength_) * 256.0)) : 256u;
-  gpu_->present(*out_, fb, v, nviews_, rot_, lw, lh, inset_alpha_, gpu_layer_, gpu_layer_bytes_, gpu_layer_scale_, gpu_layer_screen_, canvas_drawn_, smooth3d_ ? gpu_layer_edge_ : 0, grid);
+  FramePresenter::Params p;
+  out_size(p.lw, p.lh);
+  FramePresenter::View v[SCREENS];
+  for (int i = 0; i < nviews_; ++i) v[i] = FramePresenter::View{views_[i].screen, views_[i].rect, views_[i].shown, !views_[i].direct, grid_on(views_[i].screen)};
+  p.rot = rot_; p.inset_alpha = inset_alpha_;
+  p.hires = gpu_layer_; p.hires_bytes = gpu_layer_bytes_; p.scale = gpu_layer_scale_; p.hires_screen = gpu_layer_screen_;
+  p.drawn = frontend::Rect{canvas_drawn_.x, canvas_drawn_.y, canvas_drawn_.w, canvas_drawn_.h};
+  p.edge = smooth3d_ ? gpu_layer_edge_ : 0;
+  p.grid = grid_strength_ > 0.0 ? static_cast<u32>(std::lround((1.0 - grid_strength_) * 256.0)) : 256u;
+  gpu_->present(fb, v, nviews_, p);
   canvas_drawn_ = SDL_Rect{0, 0, 0, 0};
 }
 
