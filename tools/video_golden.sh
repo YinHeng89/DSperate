@@ -12,6 +12,9 @@
 # 64 of each screen's 0xAARRGGBB (headless --hash-frames).
 # HEADLESS=path overrides the binary (default build/host); DS_RUNNER=qemu-aarch64-static
 # runs a cross-built one. JOBS=N sets the parallelism (default nproc).
+# The JIT runs with DS_JIT_STRICT=1 (per-instruction budget checks: the mode in
+# which it interleaves the CPUs exactly as the interpreter does), so a JIT build's
+# hashes must equal the host interpreter's; DS_JIT_STRICT=0 checks the default mode.
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 cmd=${1:-}; dir=${2:-}
@@ -21,6 +24,8 @@ cmd=${1:-}; dir=${2:-}
 G=${HEADLESS:-$HERE/build/host/src/frontend/headless/dsperate-headless}
 R=${DS_RUNNER:-}
 JOBS=${JOBS:-$(nproc)}
+export DS_JIT_STRICT=${DS_JIT_STRICT-1}
+[ "$DS_JIT_STRICT" = 0 ] && unset DS_JIT_STRICT
 [ -x "$G" ] || { echo "no headless binary at $G"; exit 2; }
 
 # name|frames|extra args|rom
