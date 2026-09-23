@@ -35,6 +35,7 @@ add_library(dsperate_core STATIC
   gpu/gpu.cpp
   gpu/pow_compat.c
   gpu/engine2d.cpp
+  gpu/engine2d_regs.cpp
   gpu/vram_map.cpp
   gpu/gpu3d.cpp
   gpu/render3d.cpp

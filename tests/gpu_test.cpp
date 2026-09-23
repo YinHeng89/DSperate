@@ -129,6 +129,13 @@ static void test_sprites_and_window() {
   out = render_a(nds, 3);
   CHECK_EQ(out[10] & 0xFFFFFF, rgb18(0x7FFF));
   CHECK_EQ(out[30] & 0xFFFFFF, 0u);                          // outside window 0: OBJ hidden
+  // A wrapping window (x2 < x1) covers the left edge only from the second
+  // drawn line on: the x state is carried in from the line before.
+  w16(nds, 0x04000040, (200 << 8) | 20);                     // x1 = 200, x2 = 20
+  out = render_a(nds, 3);
+  CHECK_EQ(out[10] & 0xFFFFFF, 0u);                          // no carry yet: outside
+  out = render_a(nds, 3);
+  CHECK_EQ(out[10] & 0xFFFFFF, rgb18(0x7FFF));              // carried in from the drawn line
 }
 
 static void test_register_access() {
