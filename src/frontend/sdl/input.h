@@ -238,6 +238,11 @@ private:
   bool capturing_ = false, capture_pad_ = false;
   bool menu_open_ = false;
   u32  menu_faces_ = 0;
+  // pad.face_fix: SDL face button -> the positional one the kernel says it is
+  // (identity unless the mapping has a/b or x/y swapped); see pad_faces.h.
+  bool face_fix_ = true;
+  u8   face_remap_[4] = {0, 1, 2, 3};
+  void detect_faces();
   std::vector<TouchRoute> touch_routes_;
   std::vector<std::pair<SDL_TouchID, Panel>> touch_cache_;
   std::string captured_;

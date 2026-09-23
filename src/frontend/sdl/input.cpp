@@ -2,6 +2,7 @@
 #include "input.h"
 #include "config.h"
 #include "display.h"
+#include "pad_faces.h"
 #include "core/nds.h"
 
 #include <algorithm>
@@ -235,6 +236,15 @@ void Input::configure(const Config& cfg) {
       std::fprintf(stderr, "config: pad.stick_dpad and pad.stick_face are both the %s stick; it will work both the d-pad and X/B/Y/A\n", sf.c_str());
   }
   deadzone_ = cfg.num("pad.stick_deadzone", 12000);
+  {
+    const std::string ff = cfg.str("pad.face_fix", "auto");
+    if (ff != "auto" && ff != "off") std::fprintf(stderr, "config: pad.face_fix \"%s\" is not auto | off\n", ff.c_str());
+    // Only a change of the key re-checks: configure() reruns on every binding
+    // edit, and opening/unplugging a pad checks for itself.
+    const bool was = face_fix_;
+    face_fix_ = ff != "off";
+    if (face_fix_ != was) detect_faces();
+  }
   stick_ = stick_prev_ = face_stick_ = 0;   // a held stick re-asserts on its next motion
   dstick_x_ = dstick_y_ = 0;
   stylus_x_ = stylus_y_ = 0;
@@ -328,6 +338,16 @@ void Input::open_controllers() {
     pad_ = SDL_GameControllerOpen(i);
     if (pad_) std::fprintf(stderr, "controller: %s\n", SDL_GameControllerName(pad_));
   }
+  detect_faces();
+}
+
+void Input::detect_faces() {
+  for (u8 f = 0; f < 4; ++f) face_remap_[f] = f;
+  int phys[4];
+  if (!face_fix_ || !face_positions(pad_, phys)) return;
+  for (int f = 0; f < 4; ++f) face_remap_[f] = static_cast<u8>(phys[f]);
+  std::fprintf(stderr, "controller: SDL mapping has %s swapped against the kernel's button positions; correcting (pad.face_fix = off to keep it)\n",
+               phys[0] != 0 && phys[2] != 2 ? "a/b and x/y" : phys[0] != 0 ? "a/b" : "x/y");
 }
 
 void Input::close() {
@@ -756,7 +776,8 @@ bool Input::capture_event(const SDL_Event& e) {
     if (e.type != SDL_KEYDOWN || e.key.repeat) return e.type == SDL_KEYDOWN;
     // Escape cancels rather than binding itself (would otherwise be a trap).
     if (e.key.keysym.sym == SDLK_ESCAPE) { capturing_ = false; return true; }
-    if (is_key_mod(e.key.keysym.sym)) { capture_mod_ = true; return true; }
+    // Marked used: capture ends before its release, which must not fire "mod" alone.
+    if (is_key_mod(e.key.keysym.sym)) { capture_mod_ = true; key_mod_used_ = true; return true; }
     const char* n = SDL_GetKeyName(e.key.keysym.sym);
     captured_ = (capture_mod_ ? "mod+" : "") + std::string(n && *n ? n : "none");
     return true;
@@ -771,7 +792,7 @@ bool Input::capture_event(const SDL_Event& e) {
     return true;
   }
   if (e.type == SDL_CONTROLLERBUTTONDOWN) {
-    if (is_pad_mod_button(e.cbutton.button)) { capture_mod_ = true; return true; }
+    if (is_pad_mod_button(e.cbutton.button)) { capture_mod_ = true; pad_mod_used_ = true; return true; }
     if (const char* n = SDL_GameControllerGetStringForButton(static_cast<SDL_GameControllerButton>(e.cbutton.button)))
       captured_ = (capture_mod_ ? "mod+" : "") + std::string(n);
     return true;
@@ -886,7 +907,11 @@ std::vector<std::string> Input::collisions() const {
   return out;
 }
 
-void Input::handle(const SDL_Event& e, Display& display, Display* second) {
+void Input::handle(const SDL_Event& e0, Display& display, Display* second) {
+  // Face buttons by position (pad.face_fix), before capture, bindings or the menu see them.
+  SDL_Event e = e0;
+  if ((e.type == SDL_CONTROLLERBUTTONDOWN || e.type == SDL_CONTROLLERBUTTONUP) && e.cbutton.button < 4)
+    e.cbutton.button = face_remap_[e.cbutton.button];
   // Route window-addressed events to the window they happened on; keyboard
   // and controller input is global.
   auto owner = [&](u32 wid) -> Display& {
@@ -922,6 +947,7 @@ void Input::handle(const SDL_Event& e, Display& display, Display* second) {
   case SDL_CONTROLLERDEVICEREMOVED:
     if (pad_ && e.cdevice.which == SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(pad_))) {
       SDL_GameControllerClose(pad_); pad_ = nullptr;
+      detect_faces();
     }
     break;
 

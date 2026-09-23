@@ -434,6 +434,8 @@ R"(# DSperate settings. Command-line flags override this file. Two files next
                                 # laid out as the DS has them (up X, down B, left Y, right A).
                                 # The pen's stick (stylus_axis) keeps the pen in both cases.
 # stick_deadzone = 12000
+# face_fix = auto               # auto: if the controller's SDL mapping has a/b or x/y swapped against
+                                # the kernel's button positions, correct it (logged at startup); off: trust SDL
 # axis_leftx = leftx            # Axis remapping, for a pad whose mapping reports a stick rotated,
 # axis_lefty = lefty            # mirrored or on the wrong axis: each axis names the physical one
 # axis_rightx = rightx          # that feeds it, with a leading - to invert it, or none. E.g. a left

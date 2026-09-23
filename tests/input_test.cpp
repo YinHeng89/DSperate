@@ -8,6 +8,7 @@
 // Both are only correct if they stay quiet when nothing is wrong, which is
 // what most of this file checks.
 #include "frontend/sdl/input.h"
+#include "frontend/sdl/pad_faces.h"
 #include "frontend/sdl/config.h"
 #include "check.h"
 
@@ -312,6 +313,19 @@ void test_modifier_alone_is_a_hotkey() {
     bool said = false;
     for (const std::string& w : in.collisions()) said |= w.find("HIDES PAD") != std::string::npos;
     CHECK(said); }
+  // Binding a chord in the menu: capture ends on the chord, before the
+  // modifier comes up; that release must not fire "mod" (here: close the menu).
+  { Rig r; Input& in = r.set("padhotkeys.modifier", "guide").set("padhotkeys.pause", "mod").go();
+    in.begin_capture(true);
+    T::capture_pad(in, SDL_CONTROLLER_BUTTON_GUIDE, true);
+    T::capture_pad(in, SDL_CONTROLLER_BUTTON_START, true);
+    CHECK(in.take_capture() == "mod+start");
+    CHECK(!in.capturing());
+    T::pad(in, SDL_CONTROLLER_BUTTON_START, false);
+    T::pad(in, SDL_CONTROLLER_BUTTON_GUIDE, false);
+    CHECK(in.take_actions().empty());
+    T::tap_pad(in, SDL_CONTROLLER_BUTTON_GUIDE);                // the next lone press still works
+    CHECK(only(in, Action::Pause)); }
 }
 
 // DS_DUAL_SCREENS: a display index per panel, then touch devices by name
@@ -331,6 +345,29 @@ void test_dual_screens_parse() {
     int up = 0, lo = 1; std::vector<Input::TouchRoute> r; std::string err;
     CHECK(!Input::parse_dual_screens(bad, up, lo, r, err) && !err.empty());
   }
+}
+
+// pad.face_fix's check: SDL's evdev numbering, then each SDL face button's
+// kernel key against its position. Values from the RG DS Plus.
+void test_face_positions() {
+  // Keys: south east north west tl tr tl2 tr2 select start mode thumbl thumbr, dpad.
+  const std::vector<int> keys = {0x220, 0x221, 0x222, 0x223, 0x130, 0x131, 0x133, 0x134, 0x136, 0x137,
+                                 0x138, 0x139, 0x13a, 0x13b, 0x13c, 0x13d, 0x13e};
+  const std::vector<int> codes = sdl_button_codes(keys);
+  CHECK(codes.size() == 17 && codes[0] == 0x130 && codes[2] == 0x133 && codes[3] == 0x134 && codes[13] == 0x220);
+  int phys[4] = {0, 1, 2, 3};
+  { const int bind[4] = {0, 1, 2, 3};                          // ROCKNIX: x:b2 (north), y:b3 (west)
+    CHECK(face_positions_from(codes, bind, phys));
+    CHECK(phys[0] == 0 && phys[1] == 1 && phys[2] == 3 && phys[3] == 2); }
+  { const int bind[4] = {0, 1, 3, 2};                          // positional already: nothing to do
+    CHECK(!face_positions_from(codes, bind, phys)); }
+  { const int bind[4] = {1, 0, 2, 3};                          // both pairs by label
+    CHECK(face_positions_from(codes, bind, phys));
+    CHECK(phys[0] == 1 && phys[1] == 0 && phys[2] == 3 && phys[3] == 2); }
+  { const int bind[4] = {0, 2, 1, 3};                          // not a pair swap: left alone
+    CHECK(!face_positions_from(codes, bind, phys)); }
+  { const int bind[4] = {0, 1, 2, 8};                          // y on a shoulder: left alone
+    CHECK(!face_positions_from(codes, bind, phys)); }
 }
 
 // The pen follows a stick, not one of its two axes, so the Controls page
@@ -542,6 +579,7 @@ int main() {
   ds::sdl::test_menu_faces_ignore_bindings();
   ds::sdl::test_modifier_alone_is_a_hotkey();
   ds::sdl::test_dual_screens_parse();
+  ds::sdl::test_face_positions();
   ds::sdl::test_keyboard_capture_backs_out_on_pad_input();
   ds::sdl::test_stylus_axis_reads_the_stick();
   ds::sdl::test_extra_defaults_match_configure();

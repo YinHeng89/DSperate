@@ -75,7 +75,7 @@ add_test(NAME config COMMAND test_config)
 # only a test will keep true. Guarded because it needs SDL2's headers, which
 # the core tests do not.
 if(DSPERATE_SDL)
-  add_executable(test_input input_test.cpp ../src/frontend/sdl/input.cpp ../src/frontend/sdl/config.cpp)
+  add_executable(test_input input_test.cpp ../src/frontend/sdl/input.cpp ../src/frontend/sdl/pad_faces.cpp ../src/frontend/sdl/config.cpp)
   target_link_libraries(test_input PRIVATE dsperate_core ${SDL2_LIBRARIES})
   target_include_directories(test_input PRIVATE ${SDL2_INCLUDE_DIRS})
   add_test(NAME input COMMAND test_input)

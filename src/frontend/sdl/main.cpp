@@ -2238,7 +2238,8 @@ sdl_ready:
         }
         const char* name = ds::sdl::action_name(static_cast<ds::sdl::Action>(a));
         out.key = (pad ? "padhotkeys." : "hotkeys.") + std::string(name) + ds::sdl::Input::hot_suffix(slot);
-        out.label = upper(name) + (slot ? " (2)" : "");
+        // "FAST FORWARD TOGGLE" doesn't fit the row at the menu's size.
+        out.label = upper(std::strcmp(name, "fast_forward_toggle") == 0 ? "ff_toggle" : name) + (slot ? " (2)" : "");
         out.value = hot_value(pad, a, slot);
       }
       // Display only: the file keeps SDL's lower-case names; pad values also
