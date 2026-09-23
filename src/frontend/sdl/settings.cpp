@@ -123,7 +123,7 @@ const Setting kVideoSettings[] = {
   number("video.screen_gap", "SCREEN GAP", 0, 128, 4, "0", FlagDeferred, Dep::OneWindow,
          "PANEL PIXELS BETWEEN THE TWO SCREENS WHEN THEY ARE STACKED OR SIDE BY SIDE"),
   pick("video.aa", "ANTI-ALIASING", kAa, 3, "off", FlagLive, Dep::None,
-       "ACCURATE BLENDS 3D EDGES AS THE HARDWARE DID. ENHANCED ALSO SMOOTHS THE EDGES THE DS LEAVES JAGGED (IN DEVELOPMENT: CURRENTLY THE SAME AS ACCURATE)"),
+       "ACCURATE BLENDS 3D EDGES AS THE HARDWARE DID. ENHANCED ALSO SMOOTHS SILHOUETTES THE DS LEAVES JAGGED, IN EVERY GAME"),
   boolean("video.gpu_present", "GPU PRESENT", "true", FlagDeferred, Dep::None,
           "SCALE AND LAY OUT THE SCREENS ON THE GPU. NEEDS VULKAN AND A DIRECT-TO-PANEL DISPLAY"),
   boolean("video.fps", "FPS COUNTER", "false", FlagLive, Dep::None,

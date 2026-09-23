@@ -121,6 +121,80 @@ static void test_flat_quad() {
   CHECK_EQ(line[192] & 0x3F, 0u);
 }
 
+// video.aa = enhanced (Renderer3D::set_aa(2)). A red shape at z 0 over a blue
+// quad at z 0.5, DS AA on; returns how many pixels mix the two (red and blue
+// both present) in a window around the shape. `dup`: the red polygons are
+// drawn twice, as a back face under its front face would be. `quad`: the red
+// shape is two triangles sharing the diagonal x + y = 0 (a square), not one.
+static u32 mixed_pixels(int aa, bool dup, bool quad, u32* inner_blue = nullptr, u64* hash = nullptr, bool two_tone = false) {
+  NDS nds; power_on(nds);
+  nds.gpu3d.renderer().set_aa(aa);
+  w32(nds, 0x04000060, 1u << 4);                               // DS anti-aliasing, no texturing
+  w32(nds, 0x04000350, 0x001F0000);
+  ortho(nds);
+  auto v16 = [&](s16 x, s16 y, s16 z) { w32(nds, CMD(0x23), (static_cast<u32>(static_cast<u16>(y)) << 16) | static_cast<u16>(x)); w32(nds, CMD(0x23), static_cast<u16>(z)); };
+  w32(nds, CMD(0x29), 0x011F00C0);                             // id 1, alpha 31, both faces
+  w32(nds, CMD(0x2A), 0);
+  w32(nds, CMD(0x40), 1);                                      // quads
+  w32(nds, CMD(0x20), 0x7C00);                                 // blue
+  v16(-0xF00, -0xF00, 0x800); v16(0xF00, -0xF00, 0x800); v16(0xF00, 0xF00, 0x800); v16(-0xF00, 0xF00, 0x800);
+  w32(nds, CMD(0x41), 0);
+  for (int n = 0; n < (dup ? 2 : 1); ++n) {
+    w32(nds, CMD(0x29), 0x001F00C0);                           // id 0
+    w32(nds, CMD(0x40), 0);                                    // triangles
+    w32(nds, CMD(0x20), 0x001F);                               // red
+    v16(-0x800, -0x800, 0); v16(0x800, -0x800, 0); v16(-0x800, 0x800, 0);
+    if (quad) {
+      if (two_tone) w32(nds, CMD(0x20), 0x03E0);                 // the second triangle green
+      v16(0x800, -0x800, 0); v16(0x800, 0x800, 0); v16(-0x800, 0x800, 0);
+    }
+    w32(nds, CMD(0x41), 0);
+  }
+  advance(nds, 6000);
+  w32(nds, CMD(0x50), 0);
+  nds.sched.run_until(nds.sched.now() + CYCLES_PER_FRAME * 2);
+  u32 mixed = 0, blue_in = 0;
+  u64 h = 1469598103934665603ull;
+  for (int y = 40; y < 152; ++y) {
+    const u32* line = nds.gpu3d.line(nds.gpu3d.frame_ref(), static_cast<u32>(y));
+    for (int x = 0; x < 256; ++x) h = (h ^ line[x]) * 1099511628211ull;
+    for (int x = 56; x < 200; ++x) {
+      const u32 c = line[x], r = c & 0x3F, b = (c >> 16) & 0x3F;
+      if (r && b) ++mixed;
+      if (quad && b && x > 68 && x < 186 && y > 52 && y < 140) ++blue_in;   // well inside the square
+    }
+  }
+  if (inner_blue) *inner_blue = blue_in;
+  if (hash) *hash = h;
+  return mixed;
+}
+
+static void test_aa_enhanced() {
+  const u32 acc = mixed_pixels(1, false, false);
+  const u32 acc_dup = mixed_pixels(1, true, false);
+  const u32 enh_dup = mixed_pixels(2, true, false);
+  // The DS blends a lone silhouette, loses it under a repeat of its own
+  // surface; enhanced keeps it.
+  CHECK(acc > 40);
+  CHECK(acc_dup * 4 < acc);
+  CHECK(enh_dup * 5 >= acc * 4);
+  CHECK_EQ(mixed_pixels(2, false, false), acc);                // nothing to change without a repeat
+  // Two triangles of one square: the shared diagonal shows no blue.
+  u32 in_acc = 0, in_enh = 0;
+  mixed_pixels(1, false, true, &in_acc);
+  mixed_pixels(2, false, true, &in_enh);
+  CHECK_EQ(in_acc, 0u);
+  CHECK_EQ(in_enh, 0u);
+  // Where two polygons of a surface meet from opposite sides the hardware's
+  // blend of the two is right (a red/green square's diagonal): enhanced
+  // leaves it exactly as accurate draws it.
+  u64 h_acc = 0, h_enh = 0;
+  mixed_pixels(1, false, true, nullptr, &h_acc, true);
+  mixed_pixels(2, false, true, nullptr, &h_enh, true);
+  CHECK_EQ(h_enh, h_acc);
+  std::printf("aa: silhouette mixed px accurate %u, repeated %u, enhanced repeated %u\n", acc, acc_dup, enh_dup);
+}
+
 static void test_final_pass() {
   NDS nds; power_on(nds);
   // Each pass alone (AA, edge marking, fog with and without colour), then all together.
@@ -138,6 +212,7 @@ int main() {
   test_matrix_stack();
   test_flat_quad();
   test_final_pass();
+  test_aa_enhanced();
   if (failures) { std::fprintf(stderr, "%d failure(s)\n", failures); return 1; }
   std::puts("gpu3d: ok");
   return 0;

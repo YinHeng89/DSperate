@@ -177,7 +177,8 @@ const char* kUsage =
     "  --timing M      CPU cycle model: fast (default: constant memory and jump costs, much cheaper)\n"
     "                  | exact (melonDS's per-access model); emu.timing\n"
     "  --aa [off|accurate|enhanced] / --no-aa  3D edges; video.aa, off by default. accurate (bare --aa):\n"
-    "                  the hardware's blend. enhanced: in development, currently the same as accurate\n"
+    "                  the hardware's blend. enhanced: that blend in every game, plus silhouettes the DS\n"
+    "                  leaves jagged where a surface covers its own edge\n"
     "  --frameskip N   skip drawing up to N frames in N+1 (0 = off); emu.frameskip. Skipping runs\n"
     "                  in whole display periods, so on a game that drives its screens on\n"
     "                  alternate frames the limit counts pairs (DS_DEBUG_SKIP=1 shows the period)\n"
@@ -283,7 +284,7 @@ std::string save_path(const std::string& rom, const std::string& dir) {
   return dir.empty() ? rom_stem(rom) + ".sav" : dir + "/" + base_name(rom_stem(rom)) + ".sav";
 }
 
-// video.aa: 0 off, 1 accurate (hw AA), 2 enhanced (for now the same as accurate).
+// video.aa: 0 off, 1 accurate (hw AA), 2 enhanced (Renderer3D::set_aa).
 // Old boolean config reads as accurate/off, the retired smooth as enhanced.
 constexpr const char* kAaNames[3] = {"off", "accurate", "enhanced"};
 int aa_mode(const std::string& v) {
@@ -292,7 +293,7 @@ int aa_mode(const std::string& v) {
   return 0;
 }
 void apply_aa(NDS& nds, int mode) {
-  nds.gpu3d.renderer().set_aa(mode >= 1);
+  nds.gpu3d.renderer().set_aa(mode);
 }
 
 void load_save(NDS& nds, const std::string& path) {

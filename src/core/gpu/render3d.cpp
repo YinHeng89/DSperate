@@ -29,6 +29,9 @@
 
 namespace ds::gpu {
 
+bool aa_debug();              // DS_AA_DEBUG: see final_pass_debug
+void aa_debug_frame(u32 dispcnt);
+
 #if DSPERATE_NEON
 // The A64-only NEON intrinsics the kernels use, in both spellings.
 namespace compat = kern::compat;
@@ -940,9 +943,36 @@ void Renderer3D::render_shadow_mask_line(Edge& e, s32 y) {
   e.xr = e.right.step();
 }
 
+// The frame's AA as the raster honours it: the game's DISP3DCNT.4 unless
+// video.aa is off; enhanced forces it on, and a game that never asked for AA
+// keeps its edge-marking outlines solid rather than the hardware's 50%.
+void Renderer3D::set_frame_aa() {
+  const bool asked = rs_->dispcnt & (1u << 4);
+  game_aa_ = aa_ && asked;
+  dispcnt_ = rs_->dispcnt & (aa_ ? ~0u : ~(1u << 4));
+  mark_cov_ = 0x1000;
+  if (aa_ == 2) { game_aa_ = true; dispcnt_ |= 1u << 4; if (!asked) mark_cov_ = 0x1F00; }
+}
+
+// Two depths of one surface: within 1/64 of the nearer plus a small constant
+// (depth steps across a polygon edge and the fill-rule overlap stay inside).
+static inline bool same_surface(s32 za, s32 zb) { const s32 d = za > zb ? za - zb : zb - za; return d <= (std::min(za, zb) >> 6) + 0x200; }
+// Enhanced AA: the top pixel (attr ta, colour tc, depth tz) is an opaque edge
+// of the surface a new opaque edge pixel (attr pa, depth z) belongs to --
+// same polygon id, same depth -- and on the same side of it (left or right
+// run on both). Both then cover the same part of the pixel: a back face under
+// its front face's silhouette, or neighbouring triangles at a silhouette
+// vertex. The DS stacks the surface on itself there and loses what is behind
+// it. Where two polygons of a surface meet from opposite sides, the pixel is
+// split between them and the hardware's stacking blends them correctly, so
+// that case is left alone.
+static inline bool same_edge(u32 ta, u32 tc, s32 tz, u32 pa, s32 z) {
+  return (ta & pa & 0x3) && (tc >> 24) && !(ta & (1u << 22)) && !((ta ^ pa) & 0x3F000000u) && same_surface(tz, z);
+}
+
 // Per-pixel resolve of [xa, xb): stencil, depth test (top then under pixel),
 // shading, alpha test, opaque/translucent writes. part: 0=left edge, 1=inside, 2=right edge.
-template <int mode, bool textured, bool aa, bool shadow>
+template <int mode, bool textured, int aa, bool shadow>
 void Renderer3D::resolve_span(const Shade& sh, const SpanBuf& sb, s32 y, s32 xa, s32 xb, int part, int edge, s32 l_cov, s32 r_cov, s32& xcov) {
   const u32 polyattr = sh.polyattr;
   const u8* stencil = &stencil_[256 * static_cast<u32>((y + 1) & (RING - 1))];
@@ -987,6 +1017,19 @@ void Renderer3D::resolve_span(const Shade& sh, const SpanBuf& sb, s32 y, s32 xa,
           }
           attr |= ((cov & 0x1F) << 8);
           push = true;
+        }
+      }
+      if constexpr (aa == 2 && !shadow) {
+        // Enhanced: an edge over the same edge of its surface neither pushes
+        // the surface under nor lands under it (see same_edge), so the under
+        // layer keeps what is behind the surface; the larger coverage stands.
+        const u32 top = addr < static_cast<u32>(RSIZE) ? addr : addr - RSIZE;
+        const u32 ta = attr_[top];
+        if (same_edge(ta, color_[top], static_cast<s32>(depth_[top]), attr, z)) {
+          const u32 cov = std::max((ta >> 8) & 0x1F, (attr >> 8) & 0x1F);
+          if (top != addr) { attr_[top] = (ta & ~0x1F00u) | (cov << 8); continue; }   // lost to it: only the coverage counts
+          attr = (attr & ~0x1F00u) | (cov << 8);
+          push = false;
         }
       }
       if (push && addr < static_cast<u32>(RSIZE)) {
@@ -1047,6 +1090,10 @@ void Renderer3D::setup_shade(Shade& sh, const Polygon& p) {
   if (!p.facing) sh.polyattr |= (1 << 4);
   sh.polyattr_z = (p.attr & (1 << 11)) != 0;
   sh.polyalpha = (p.attr >> 16) & 0x1F;
+  // DS_AA_DEBUG: bit 23 tags an opaque polygon whose texture can cut pixels
+  // out (colour 0 transparent, fmt 5's transparent entries, fmt 7's bit 15).
+  if (aa_debug() && sh.polyalpha == 31 && sh.textured && ((sh.fmt >= 2 && sh.fmt <= 4 && sh.alpha0 == 0) || sh.fmt == 5 || sh.fmt == 7))
+    sh.polyattr |= 1u << 23;
   sh.wireframe = sh.polyalpha == 0;
   sh.shadow = p.shadow;
   sh.dispcnt = dispcnt_;   // AA bit as the raster honours it, not as written
@@ -1076,6 +1123,7 @@ void Renderer3D::setup_shade(Shade& sh, const Polygon& p) {
   sh.gather4 = nullptr;
   sh.vec = false;
 #endif
+  sh.aa_plus = aa_ == 2;
   sh.always_fill = (sh.dispcnt & ((1 << 4) | (1 << 5))) || (sh.polyalpha < 31 && (sh.dispcnt & (1 << 3))) || sh.wireframe;
   // Provably all-opaque: alpha 31 + (decal, or a format whose texel alpha is
   // only 0-or-31); alpha-0 lanes never reach the resolve (span_shade narrows
@@ -1447,7 +1495,7 @@ void Renderer3D::rk_census(u64 kinds, u64 p8) {
   ++rk_groups_;
 }
 
-template <int mode, bool textured, bool aa, bool opq>
+template <int mode, bool textured, int aa, bool opq>
 [[gnu::always_inline]] inline void Renderer3D::resolve_span_vec(const Shade& sh, const SpanBuf& sb, s32 y, s32 xa, s32 xb, int part, int edge, s32 l_cov, s32 r_cov, s32& xcov) {
   // The profiling flag is read once per span, not once per eight-pixel
   // group: prof::add tests the global inside the innermost loop otherwise
@@ -1532,6 +1580,18 @@ template <int mode, bool textured, bool aa, bool opq>
     return static_cast<u64>(vget_lane_u64(vreinterpret_u64_u8(vmovn_u16(vcombine_u16(vmovn_u32(a), vmovn_u32(b)))), 0));
   };
   constexpr u64 HALF[2] = {0x00000000FFFFFFFFull, 0xFFFFFFFF00000000ull};
+  // Enhanced AA: same_edge() on four lanes (top attr, colour, depth vs the new
+  // edge's; the new edge's side is the span part's, attr_base & 3).
+  [[maybe_unused]] const uint32x4_t own_mask = vdupq_n_u32(0x3F400000u), own_id = vdupq_n_u32(polyattr & 0x3F000000u);
+  [[maybe_unused]] const uint32x4_t side = vdupq_n_u32(attr_base & 0x3);
+  [[maybe_unused]] auto same_edge_v = [&](uint32x4_t ta, uint32x4_t tc, int32x4_t tz, int32x4_t zz) __attribute__((always_inline)) {
+    const uint32x4_t live = vandq_u32(vtstq_u32(tc, vdupq_n_u32(0xFF000000u)), vtstq_u32(ta, side));
+    const uint32x4_t mine = vceqq_u32(vandq_u32(ta, own_mask), own_id);   // same id, not translucent
+    const int32x4_t thr = vaddq_s32(vshrq_n_s32(vminq_s32(tz, zz), 6), vdupq_n_s32(0x200));
+    return vandq_u32(vandq_u32(live, mine), vcleq_s32(vabdq_s32(tz, zz), thr));
+  };
+  [[maybe_unused]] auto cov_of = [](uint32x4_t at) __attribute__((always_inline)) { return vandq_u32(vshrq_n_u32(at, 8), vdupq_n_u32(0x1F)); };
+  [[maybe_unused]] auto with_cov = [](uint32x4_t at, uint32x4_t cov) __attribute__((always_inline)) { return vorrq_u32(vbicq_u32(at, vdupq_n_u32(0x1F00)), vshlq_n_u32(cov, 8)); };
   const bool untextured_passes = !textured && sh.polyalpha > sh.alpha_ref;
   if (!textured && !untextured_passes) return;   // alpha test fails for every pixel
   // Edge runs (1-3 pixels wide, handed separately by the three-part walk)
@@ -1620,20 +1680,42 @@ template <int mode, bool textured, bool aa, bool opq>
           if (kinds & (0x0101010101010101ull & HALF[k])) {
             const uint32x4_t dstcol = vld1q_u32(&color_[ak]);
             const int32x4_t dstz = vld1q_s32(reinterpret_cast<const s32*>(&depth_[ak]));
+            uint32x4_t pm = mo1[k], at = attr[k];
+            if constexpr (aa == 2) {
+              // Enhanced: an edge over the same edge of its surface doesn't
+              // push it under; the larger coverage stands (see resolve_span).
+              if (attr_base & 0x3) {
+                const uint32x4_t same = vandq_u32(mo1[k], same_edge_v(dstattr[k], dstcol, dstz, z[k]));
+                pm = vbicq_u32(mo1[k], same);
+                at = vbslq_u32(same, with_cov(attr[k], vmaxq_u32(cov_of(dstattr[k]), cov_of(attr[k]))), attr[k]);
+              }
+            }
             if (push) {
-              vst1q_u32(&color_[uk], vbslq_u32(mo1[k], dstcol, vld1q_u32(&color_[uk])));
-              vst1q_s32(reinterpret_cast<s32*>(&depth_[uk]), vbslq_s32(mo1[k], dstz, vld1q_s32(reinterpret_cast<const s32*>(&depth_[uk]))));
-              vst1q_u32(&attr_[uk], vbslq_u32(mo1[k], dstattr[k], vld1q_u32(&attr_[uk])));
+              vst1q_u32(&color_[uk], vbslq_u32(pm, dstcol, vld1q_u32(&color_[uk])));
+              vst1q_s32(reinterpret_cast<s32*>(&depth_[uk]), vbslq_s32(pm, dstz, vld1q_s32(reinterpret_cast<const s32*>(&depth_[uk]))));
+              vst1q_u32(&attr_[uk], vbslq_u32(pm, dstattr[k], vld1q_u32(&attr_[uk])));
             }
             vst1q_s32(reinterpret_cast<s32*>(&depth_[ak]), vbslq_s32(mo1[k], z[k], dstz));
             vst1q_u32(&color_[ak], vbslq_u32(mo1[k], colour[k], dstcol));
-            vst1q_u32(&attr_[ak], vbslq_u32(mo1[k], attr[k], dstattr[k]));
+            vst1q_u32(&attr_[ak], vbslq_u32(mo1[k], at, dstattr[k]));
           }
           if constexpr (two) {
             if (kinds & (0x0808080808080808ull & HALF[k])) {
-              vst1q_s32(reinterpret_cast<s32*>(&depth_[uk]), vbslq_s32(mo2[k], z[k], vld1q_s32(reinterpret_cast<const s32*>(&depth_[uk]))));
-              vst1q_u32(&color_[uk], vbslq_u32(mo2[k], colour[k], vld1q_u32(&color_[uk])));
-              vst1q_u32(&attr_[uk], vbslq_u32(mo2[k], attr[k], vld1q_u32(&attr_[uk])));
+              uint32x4_t m2k = mo2[k];
+              if constexpr (aa == 2) {
+                // Lost to the same edge of its surface: no under write, the
+                // larger coverage goes to the top pixel. Lanes are disjoint
+                // from mo1's, so the top read back here is the one just stored.
+                if (attr_base & 0x3) {
+                  const uint32x4_t ta = vld1q_u32(&attr_[ak]);
+                  const uint32x4_t same = vandq_u32(mo2[k], same_edge_v(ta, vld1q_u32(&color_[ak]), vld1q_s32(reinterpret_cast<const s32*>(&depth_[ak])), z[k]));
+                  vst1q_u32(&attr_[ak], vbslq_u32(same, with_cov(ta, vmaxq_u32(cov_of(ta), cov_of(attr[k]))), ta));
+                  m2k = vbicq_u32(mo2[k], same);
+                }
+              }
+              vst1q_s32(reinterpret_cast<s32*>(&depth_[uk]), vbslq_s32(m2k, z[k], vld1q_s32(reinterpret_cast<const s32*>(&depth_[uk]))));
+              vst1q_u32(&color_[uk], vbslq_u32(m2k, colour[k], vld1q_u32(&color_[uk])));
+              vst1q_u32(&attr_[uk], vbslq_u32(m2k, attr[k], vld1q_u32(&attr_[uk])));
             }
           }
         }
@@ -2007,8 +2089,22 @@ Renderer3D::ResolveFn Renderer3D::select_resolve(const Shade& sh) {
     DS_V(0), DS_V(1), DS_V(2), DS_V(3)
 #undef DS_V
   };
-  if (sh.vec) return kResolveVec[sh.mode][sh.textured][(sh.dispcnt >> 4) & 1][sh.opaque];
+  // Enhanced AA: its own instantiations, so accurate's stay as they are.
+  static constexpr ResolveFn kResolveVec2[4][2][2] = {
+#define DS_V2(m) {{&Renderer3D::resolve_batch_vec<m, false, 2, false>, &Renderer3D::resolve_batch_vec<m, false, 2, true>},  \
+                  {&Renderer3D::resolve_batch_vec<m, true, 2, false>,  &Renderer3D::resolve_batch_vec<m, true, 2, true>}}
+    DS_V2(0), DS_V2(1), DS_V2(2), DS_V2(3)
+#undef DS_V2
+  };
+  if (sh.vec) return sh.aa_plus ? kResolveVec2[sh.mode][sh.textured][sh.opaque] : kResolveVec[sh.mode][sh.textured][(sh.dispcnt >> 4) & 1][sh.opaque];
 #endif
+  static constexpr ResolveFn kResolve2[4][2][2] = {
+#define DS_R2(m) {{&Renderer3D::resolve_batch<m, false, 2, false>, &Renderer3D::resolve_batch<m, false, 2, true>},  \
+                  {&Renderer3D::resolve_batch<m, true, 2, false>,  &Renderer3D::resolve_batch<m, true, 2, true>}}
+    DS_R2(0), DS_R2(1), DS_R2(2), DS_R2(3)
+#undef DS_R2
+  };
+  if (sh.aa_plus) return kResolve2[sh.mode][sh.textured][sh.shadow];
   return kResolve[sh.mode][sh.textured][(sh.dispcnt >> 4) & 1][sh.shadow];
 }
 
@@ -2038,7 +2134,7 @@ template <typename Range>
 // job loop, so the kernel's 272-byte frame, its twelve register-pair saves
 // and every piece of setup that depends only on the Shade are paid once for
 // the whole batch and lifted out of the loop by the compiler.
-template <int mode, bool textured, bool aa, bool shadow>
+template <int mode, bool textured, int aa, bool shadow>
 void Renderer3D::resolve_batch(const Shade& sh, const SpanJob* jobs, u32 n) {
   const SpanBuf& sb = spanbuf_;
   for (u32 k = 0; k < n; ++k)
@@ -2048,7 +2144,7 @@ void Renderer3D::resolve_batch(const Shade& sh, const SpanJob* jobs, u32 n) {
 }
 
 #if DSPERATE_NEON
-template <int mode, bool textured, bool aa, bool opq>
+template <int mode, bool textured, int aa, bool opq>
 void Renderer3D::resolve_batch_vec(const Shade& sh, const SpanJob* jobs, u32 n) {
   const SpanBuf& sb = spanbuf_;
   rk_or_ = 0; rk_mixed_ = false; rk_groups_ = 0;
@@ -2225,8 +2321,128 @@ u32 Renderer3D::fog_density(u32 addr) const {
   return d;
 }
 
-// Whether two depths lie on one surface (a depth-scaled tolerance); reused by the targeted AA.
-[[maybe_unused]] static inline bool same_surface(s32 za, s32 zb) { const s32 d = za > zb ? za - zb : zb - za; return d <= (std::min(za, zb) >> 6) + 0x200; }
+
+// ---- DS_AA_DEBUG: where the 3D anti-aliasing leaves edges jagged ----------
+// Headless diagnostic for the enhanced AA work. DS AA is forced on and every
+// 3D pixel is classed by what the AA blend does with it; the class is painted
+// over the picture (the rest dimmed) and the counts are printed at exit.
+//   1: edges the blend handles, and the misses -- a surface stacked on itself
+//      (red), unflagged boundaries (yellow), cut-out texture outlines (magenta)
+//   2: every 3D-on-3D edge, by what makes it one (id change, depth jump,
+//      crease, cut-out, translucent on top)
+// Frames are not the game's picture while it is set: never quote a hash or a
+// timing from such a run.
+bool aa_debug() { static const bool on = std::getenv("DS_AA_DEBUG") != nullptr; return on; }
+// DS_AA_DEBUG=2: every potential 3D-on-3D edge instead, by what makes it one.
+static int aa_debug_mode() { static const int m = [] { const char* e = std::getenv("DS_AA_DEBUG"); return e ? std::atoi(e) : 0; }(); return m; }
+
+namespace {
+enum AaClass : u8 { AC_NONE, AC_CLEAR, AC_BLEND, AC_SAME, AC_BOUND, AC_CUT, AC_SAME_IN,
+                   E_COVERED, E_ID, E_DEPTH, E_CREASE, E_CUT, E_TRANS, AC_COUNT };
+constexpr const char* kAaClassNames[AC_COUNT] = {"", "edge over clear (alpha blend)", "edge blended with another surface",
+  "edge blended with its own surface (DS miss, 2a)", "boundary without edge flags (DS miss, 2b)", "cut-out texture boundary (DS miss, 1)", "edge blended with its own surface inside the mesh (harmless)",
+  "3D-3D edge the DS blends", "3D-3D edge: polygon id change, unblended", "3D-3D edge: same id, depth jump, unblended",
+  "3D-3D edge: depth crease (surfaces meeting at an angle), unblended", "3D-3D edge: cut-out texture", "3D-3D edge: translucent on top"};
+constexpr u32 kAaClassColor[AC_COUNT] = {0, 0x3F2000u, 0x003F00u, 0x00003Fu, 0x003F3Fu, 0x3F003Fu, 0x101010u,
+                                         0x003F00u, 0x00003Fu, 0x003F3Fu, 0x00203Fu, 0x3F003Fu, 0x3F3F00u};   // 6-bit r | g << 8 | b << 16
+struct AaStats {
+  std::atomic<u64> px[AC_COUNT] = {};
+  std::atomic<u64> frames = 0, frames_game_aa = 0, frames_marking = 0;
+  ~AaStats() {
+    if (!frames) return;
+    std::fprintf(stderr, "aa-debug: %llu frames, game AA (DISP3DCNT.4) on %llu, edge marking on %llu\n",
+                 static_cast<unsigned long long>(frames.load()), static_cast<unsigned long long>(frames_game_aa.load()), static_cast<unsigned long long>(frames_marking.load()));
+    for (int c = AC_CLEAR; c < AC_COUNT; ++c)
+      std::fprintf(stderr, "aa-debug: %10.1f px/frame  %s\n", static_cast<double>(px[c].load()) / static_cast<double>(frames.load()), kAaClassNames[c]);
+  }
+};
+AaStats g_aa_stats;
+} // namespace
+
+void aa_debug_frame(u32 dispcnt) {
+  ++g_aa_stats.frames;
+  if (dispcnt & (1u << 4)) ++g_aa_stats.frames_game_aa;
+  if (dispcnt & (1u << 5)) ++g_aa_stats.frames_marking;
+}
+
+void Renderer3D::final_pass_debug(s32 y) {
+  // Classed from the stack as the raster left it, before marking and the blend.
+  u8 cls[256] = {};
+  const u32 row = row_of(y) + 1, up = row_of(y - 1) + 1, dn = row_of(y + 1) + 1;
+  u64 n[AC_COUNT] = {};
+  if (aa_debug_mode() == 2) {
+    for (int x = 0; x < 256; ++x) {
+      const u32 addr = row + x;
+      const u32 attr = attr_[addr];
+      if (!(color_[addr] >> 24)) continue;
+      const s32 z = static_cast<s32>(depth_[addr]);
+      const u32 id = attr >> 24;
+      u8 c = AC_NONE;
+      const bool covered = (attr & 0xF) && ((attr >> 8) & 0x1F) != 0x1F && (color_[addr + RSIZE] >> 24) &&
+        !((attr_[addr + RSIZE] >> 24) == id && same_surface(z, static_cast<s32>(depth_[addr + RSIZE])));
+      const u32 nb[4] = {addr - 1, addr + 1, up + x, dn + x};
+      for (const u32 q : nb) {
+        if (!(color_[q] >> 24)) continue;   // 3D against the clear is not this pass's business
+        const u32 qa = attr_[q];
+        const s32 qz = static_cast<s32>(depth_[q]);
+        if (qz < z) continue;   // near side only
+        if ((qa >> 24) != id) { c = E_ID; break; }
+        if (!same_surface(z, qz)) { c = E_DEPTH; break; }
+      }
+      if (c == AC_NONE) {
+        // Crease: depth's second difference across the pixel, either axis,
+        // against a slope-relative threshold -- two faces meeting at an angle.
+        auto bend = [&](u32 a, u32 b) {
+          if (!(color_[a] >> 24) || !(color_[b] >> 24)) return false;
+          const s64 d2 = static_cast<s64>(depth_[a]) + depth_[b] - 2 * static_cast<s64>(z);
+          const s64 slope = std::llabs(static_cast<s64>(depth_[a]) - depth_[b]);
+          return std::llabs(d2) > (slope >> 1) + (z >> 8) + 0x40;
+        };
+        if (bend(addr - 1, addr + 1) || bend(up + x, dn + x)) c = E_CREASE;
+      }
+      if (c != AC_NONE) {
+        if (attr & (1u << 22)) c = E_TRANS;
+        else if (covered) c = E_COVERED;
+        else if (attr & (1u << 23)) c = E_CUT;
+      }
+      cls[x] = c; ++n[c];
+    }
+  } else
+  for (int x = 0; x < 256; ++x) {
+    const u32 addr = row + x;
+    const u32 attr = attr_[addr];
+    if (!(color_[addr] >> 24) || (attr & (1u << 22))) continue;   // clear, or translucent on top
+    const u32 cov = (attr >> 8) & 0x1F;
+    u8 c = AC_NONE;
+    // A neighbour of another surface that is farther away: this pixel is the
+    // near side of a visible boundary.
+    const u32 id = attr >> 24, z = depth_[addr];
+    const u32 nb[4] = {addr - 1, addr + 1, up + x, dn + x};
+    u32 far_attr = 0; bool far = false;
+    for (const u32 q : nb) {
+      const u32 qa = attr_[q];
+      if (!(color_[q] >> 24)) continue;   // against the clear it shows as the DS draws it
+      if ((qa >> 24) == id && same_surface(static_cast<s32>(z), static_cast<s32>(depth_[q]))) continue;
+      if (depth_[q] <= z) continue;
+      far = true; far_attr = qa; break;
+    }
+    if ((attr & 0xF) && cov != 0x1F) {
+      const u32 ua = attr_[addr + RSIZE];
+      if (!(color_[addr + RSIZE] >> 24)) c = AC_CLEAR;
+      else if ((ua >> 24) == (attr >> 24) && !(ua & (1u << 22)) && same_surface(static_cast<s32>(depth_[addr]), static_cast<s32>(depth_[addr + RSIZE]))) c = far ? AC_SAME : AC_SAME_IN;
+      else c = AC_BLEND;
+    } else if (far) c = ((attr | far_attr) & (1u << 23)) ? AC_CUT : AC_BOUND;
+    cls[x] = c;
+    ++n[c];
+  }
+  for (int c = AC_CLEAR; c < AC_COUNT; ++c) if (n[c]) g_aa_stats.px[c] += n[c];
+  final_pass_ref(y);
+  u32* out = &out_dst_[y * 256];
+  for (int x = 0; x < 256; ++x) {
+    const u32 v = out[x];
+    out[x] = cls[x] ? (kAaClassColor[cls[x]] | 0x1F000000u) : ((v & 0x3E3E3Eu) >> 1) | (v & 0xFF000000u);   // classes painted, the rest dimmed
+  }
+}
 
 // The scalar passes: the specification the NEON final_pass is checked against
 // (selftest_final_pass), and the whole of final_pass on non-NEON builds.
@@ -2254,7 +2470,7 @@ void Renderer3D::final_pass_ref(s32 y) {
           (id != (attr_[up + x] >> 24) && z < depth_[up + x]) || (id != (attr_[dn + x] >> 24) && z < depth_[dn + x])) {
         u32 r, g, b; rgb15_to_666(rs_->edge[id >> 3], r, g, b);
         color_[addr] = r | (g << 8) | (b << 16) | (color_[addr] & 0xFF000000);
-        attr_[addr] = (attr & 0xFFFFE0FF) | 0x00001000;    // coverage broken for the AA pass
+        attr_[addr] = (attr & 0xFFFFE0FF) | mark_cov_;    // coverage broken for the AA pass (0x10; solid under forced AA)
       }
     }
   }
@@ -2312,6 +2528,7 @@ void Renderer3D::final_pass_ref(s32 y) {
 
 #if DSPERATE_NEON
 void Renderer3D::final_pass(s32 y) {
+  if (aa_debug()) { final_pass_debug(y); return; }
   const u32 dispcnt = dispcnt_;
   // Edge marking and anti-aliasing act on polygon pixels (edge flags); fog
   // on the fog bit, which the clear can set too. A line nothing touched
@@ -2360,7 +2577,7 @@ void Renderer3D::final_pass(s32 y) {
       c.val[2] = vbslq_u8(mark, compat::tbl1q_u8(ebl, idx), c.val[2]);
       vst4q_u8(cb + addr * 4, c);
       // attr = (attr & 0xFFFFE0FF) | 0x1000: byte 1 keeps bits 5-7, coverage 0x10.
-      at.val[1] = vbslq_u8(mark, vorrq_u8(vandq_u8(at.val[1], vdupq_n_u8(0xE0)), vdupq_n_u8(0x10)), at.val[1]);
+      at.val[1] = vbslq_u8(mark, vorrq_u8(vandq_u8(at.val[1], vdupq_n_u8(0xE0)), vdupq_n_u8(static_cast<u8>(mark_cov_ >> 8))), at.val[1]);
       vst4q_u8(ab + addr * 4, at);
     }
   }
@@ -2471,7 +2688,7 @@ void Renderer3D::final_pass(s32 y) {
   std::memcpy(&out_dst_[y * 256], &color_[row_of(y) + 1], 256 * sizeof(u32));
 }
 #else
-void Renderer3D::final_pass(s32 y) { final_pass_ref(y); }
+void Renderer3D::final_pass(s32 y) { if (aa_debug()) final_pass_debug(y); else final_pass_ref(y); }
 #endif
 
 // Randomised buffers through final_pass and final_pass_ref with every pass
@@ -2603,8 +2820,8 @@ void Renderer3D::render(const Gpu3D& gx) {
   { u64 sum = 0; for (u32 w = 0; w < last_nb_ && w < 8; ++w) sum += band_ns_[w]; band_sum_ns_[1] = band_sum_ns_[0]; band_sum_ns_[0] = sum; }
   rs_frame_ = gx.render_state();
   rs_ = &rs_frame_;
-  game_aa_ = aa_ && (rs_->dispcnt & (1u << 4));
-  dispcnt_ = rs_->dispcnt & (aa_ ? ~0u : ~(1u << 4));
+  set_frame_aa();
+  if (aa_debug()) { aa_debug_frame(rs_->dispcnt); game_aa_ = true; dispcnt_ |= 1u << 4; }
   expand_toon();
   vm_ = &nds_.bus.vram_map();
   texv_ = &vm_->texture;
@@ -2904,8 +3121,8 @@ void Renderer3D::prepare_worker(const Gpu3D& gx, const Polygon* const* polys, u3
   gx_ = &gx;
   list_polys_ = polys; list_count_ = npoly;
   rs_ = rs;
-  game_aa_ = aa_ && (rs_->dispcnt & (1u << 4));
-  dispcnt_ = rs_->dispcnt & (aa_ ? ~0u : ~(1u << 4));
+  set_frame_aa();
+  if (aa_debug()) { game_aa_ = true; dispcnt_ |= 1u << 4; }
   expand_toon();
   vm_ = &nds_.bus.vram_map();
   texv_ = &vm_->texture;

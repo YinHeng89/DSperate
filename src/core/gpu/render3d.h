@@ -63,8 +63,10 @@ public:
 
   // Anti-aliasing (DISP3DCNT bit 4). Off clears the bit frame-wide: no
   // coverage, pixel-stack push, under-layer depth test, or AA blend.
-  void set_aa(bool on) { aa_ = on; }
-  bool aa() const { return aa_; }
+  // video.aa: 0 off, 1 accurate (the hardware blend, when the game asks), 2 enhanced
+  // (forced AA, and a surface doesn't stack on itself: see same_owner).
+  void set_aa(int level) { aa_ = static_cast<u8>(level); }
+  int aa() const { return aa_; }
 private:
   NDS& nds_;
   // Holds a whole chunk of scanlines at once (render_chunk draws chunk at a
@@ -141,6 +143,7 @@ public:
     bool opaque;
     // Edges all fill under AA, edge marking, blended translucency or wireframe; fixed per polygon.
     bool always_fill;
+    bool aa_plus;   // video.aa = enhanced: the resolve's same-surface rule
     bool attrs_constant, rgb_constant;   // uniform across the polygon; checked once
   };
 private:
@@ -202,7 +205,9 @@ private:
   const Gpu3D* gx_ = nullptr;
   const RenderState* rs_ = nullptr;
   bool game_aa_ = false;                  // AA blend runs (game asked and aa_ allows)
-  bool aa_ = true, aa_rendered_ = true;   // aa_rendered_: the setting the kept frame was drawn with
+  u8 aa_ = 1, aa_rendered_ = 1;           // aa_rendered_: the setting the kept frame was drawn with
+  u32 mark_cov_ = 0x1000;                 // coverage edge marking leaves on a pixel (set_frame_aa)
+  void set_frame_aa();
   // rs_->dispcnt with bit 4 cleared when AA is off: kills the whole under
   // layer for the frame (AA blend, under-layer depth test, translucent plot,
   // fog, shadow stencil bit 2's under-layer writes).
@@ -279,12 +284,12 @@ private:
   template <int mode> bool depth_pass(u32 addr, s32 z, u32 dstattr) const;
   // One contiguous range of a span; called only from batch kernels and the
   // vector kernel's scalar fallback so it inlines into them.
-  template <int mode, bool textured, bool aa, bool shadow> void resolve_span(const Shade& sh, const SpanBuf& sb, s32 y, s32 xa, s32 xb, int part, int edge, s32 l_cov, s32 r_cov, s32& xcov);
-  template <int mode, bool textured, bool aa, bool shadow> void resolve_batch(const Shade& sh, const SpanJob* jobs, u32 n);
+  template <int mode, bool textured, int aa, bool shadow> void resolve_span(const Shade& sh, const SpanBuf& sb, s32 y, s32 xa, s32 xb, int part, int edge, s32 l_cov, s32 r_cov, s32& xcov);
+  template <int mode, bool textured, int aa, bool shadow> void resolve_batch(const Shade& sh, const SpanJob* jobs, u32 n);
 #if DSPERATE_NEON
   // Four pixels per step, same results as resolve_span; polygons without shadow/wireframe/toon only.
-  template <int mode, bool textured, bool aa, bool opq> [[gnu::always_inline]] inline void resolve_span_vec(const Shade& sh, const SpanBuf& sb, s32 y, s32 xa, s32 xb, int part, int edge, s32 l_cov, s32 r_cov, s32& xcov);
-  template <int mode, bool textured, bool aa, bool opq> void resolve_batch_vec(const Shade& sh, const SpanJob* jobs, u32 n);
+  template <int mode, bool textured, int aa, bool opq> [[gnu::always_inline]] inline void resolve_span_vec(const Shade& sh, const SpanBuf& sb, s32 y, s32 xa, s32 xb, int part, int edge, s32 l_cov, s32 r_cov, s32& xcov);
+  template <int mode, bool textured, int aa, bool opq> void resolve_batch_vec(const Shade& sh, const SpanJob* jobs, u32 n);
   // DS_PROFILE census: per 8-pixel group, is the resolve kind code uniform among drawing lanes?
   void rk_census(u64 kinds, u64 p8);
   u32 rk_or_ = 0, rk_groups_ = 0;
@@ -402,7 +407,7 @@ private:
     std::array<s32, MAX_BINS + 1> bin_y{};
     u32 nbins = 0;
     u32* dst = nullptr;
-    bool aa = false;
+    u8 aa = 0;
   };
   DispatchCtx ctx_[2];
   struct StealBand { std::unique_ptr<Renderer3D> band; std::atomic<bool> busy{false}; u64 gen = ~u64{0}; };
@@ -413,6 +418,7 @@ private:
   u32  fog_density(u32 addr) const;
   void final_pass(s32 y);
   void final_pass_ref(s32 y);
+  void final_pass_debug(s32 y);   // DS_AA_DEBUG: the final pass with each 3D edge pixel painted by what the AA does with it
 public:
   // final_pass against final_pass_ref on random buffers; 0 when identical.
   u32  selftest_final_pass(u32 seed, u32 dispcnt);
