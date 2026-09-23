@@ -239,7 +239,7 @@ void entry_snap_cb(ds::CpuContext& cpu, ds::u32, void* user) {
 int main(int argc, char** argv) {
   ds::mem::fmc::init();   // before any Bus exists: counts page-table churn from reset on
   bool subpixel = false, shape = false; int scaled_n = 0; const char* scaled_path = nullptr;
-  const char *rom = nullptr, *bios9 = nullptr, *bios7 = nullptr, *fw = nullptr, *trace = nullptr, *dump = nullptr, *dump_audio = nullptr, *replay = nullptr, *save = nullptr;
+  const char *rom = nullptr, *bios9 = nullptr, *bios7 = nullptr, *fw = nullptr, *trace = nullptr, *dump = nullptr, *hash_frames = nullptr, *dump_audio = nullptr, *replay = nullptr, *save = nullptr;
   const char* load_state = nullptr; const char* save_state_path = nullptr; int save_state_at = -1;
   const char* hide_screen = nullptr;
   int frameskip = 0;    // --frameskip N: skip drawing N of every N+1 frames (fixed; the SDL frontend also has the adaptive mode)
@@ -324,6 +324,7 @@ int main(int argc, char** argv) {
     else if (arg("--trace")) trace = argv[++i];
     else if (arg("--max")) ts.max = std::strtoull(argv[++i], nullptr, 0);
     else if (arg("--dump-frames")) dump = argv[++i];
+    else if (arg("--hash-frames")) hash_frames = argv[++i];   // FILE: "frame top bottom" per frame, FNV-1a 64 of each screen's 0xAARRGGBB (the video golden hashes)
     else if (flag("--enhanced") || flag("--shape")) shape = true;            // video.aa = enhanced: edge shaping on top of the hardware picture (Gpu::set_shape); only a scaled dump shows it
     else if (flag("--subpixel")) subpixel = true;                            // sub-pixel polygon edges (Gpu::set_subpixel), hardware AA off as video.aa = smooth has it; only a scaled dump shows them
     else if (arg("--dump-scaled")) { scaled_n = std::atoi(argv[++i]); scaled_path = argv[++i]; }   // N FILE: both screens through the scanline scaler at Nx, raw BGRA
@@ -634,6 +635,8 @@ int main(int argc, char** argv) {
   unsigned long long last9 = 0, last7 = 0;
   FILE* dump_out = dump ? std::fopen(dump, "wb") : nullptr;
   if (dump && !dump_out) { std::fprintf(stderr, "could not open %s\n", dump); return 1; }
+  FILE* hash_out = hash_frames ? std::fopen(hash_frames, "w") : nullptr;
+  if (hash_frames && !hash_out) { std::fprintf(stderr, "could not open %s\n", hash_frames); return 1; }
   ds::input::Log log;
   if (replay) {
     if (!log.open_read(replay)) { std::fprintf(stderr, "cannot read %s\n", replay); return 1; }
@@ -844,6 +847,10 @@ int main(int argc, char** argv) {
       std::fwrite(nds.gpu.framebuffer(0), 4, ds::SCREEN_W * ds::SCREEN_H, dump_out);
       std::fwrite(nds.gpu.framebuffer(1), 4, ds::SCREEN_W * ds::SCREEN_H, dump_out);
     }
+    if (hash_out) {
+      auto fnv = [](const ds::u32* p) { ds::u64 h = 1469598103934665603ull; for (ds::u32 k = 0; k < ds::SCREEN_W * ds::SCREEN_H; ++k) h = (h ^ p[k]) * 1099511628211ull; return h; };
+      std::fprintf(hash_out, "%d %016llx %016llx\n", i, (unsigned long long)fnv(nds.gpu.framebuffer(0)), (unsigned long long)fnv(nds.gpu.framebuffer(1)));
+    }
     if (audio_out) {
       ds::s16 buf[2048 * 2]; size_t n;
       while ((n = nds.spu.take(buf, 2048)) != 0) std::fwrite(buf, 4, n, audio_out);
@@ -886,6 +893,7 @@ int main(int argc, char** argv) {
     else std::fprintf(stderr, "firmware override: saved %s\n", fw_override);
   }
   if (dump_out) std::fclose(dump_out);
+  if (hash_out) std::fclose(hash_out);
   if (scaled_out) std::fclose(scaled_out);
   if (audio_out) std::fclose(audio_out);
   if (ts.pc_hist) {
