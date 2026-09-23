@@ -43,8 +43,6 @@ enum class Dep : u8 {
   // a peer or server instead of the emulator.
   NetSession,
   ShortcutsPath,      // a folder for NAND title shortcuts: paths.dsi_games, else paths.games
-  GpuRaster,          // video.gpu_raster on (the row is restart-only, so the config, not the session)
-  GpuPath,            // the GPU raster is running, the GPU present stage is up, and the 3D resolution is 1x
 };
 
 struct Setting {

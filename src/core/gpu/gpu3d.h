@@ -120,7 +120,7 @@ public:
   void render_frame();      // VCount 215: rasterise the latched frame
   // Force next frame to rasterise even if unchanged (frameskip left the picture stale).
   void note_raster_skipped() { render_stale_ = true; }
-  Renderer3D::FrameRef frame_ref(bool allow_defer = false) const { return renderer_.frame_ref(allow_defer); }
+  Renderer3D::FrameRef frame_ref() const { return renderer_.frame_ref(); }
   u64 last_raster_ns() const { return renderer_.last_band_sum_ns(); }
   const u32* line(const Renderer3D::FrameRef& f, u32 y);
   // Split map for line y, scrolled the same way (call after line(); null = none).

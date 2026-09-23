@@ -1,9 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // DSperate - Nintendo DS emulator. Copyright (C) 2026 DSperate contributors.
 #include "core/gpu/gpu3d.h"
-#if DSPERATE_VULKAN
-#include "core/gpu/vk/vk_raster.h"
-#endif
 #include "core/div64.h"
 #include "core/host_cores.h"
 #include "core/state/state.h"

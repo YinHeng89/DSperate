@@ -34,7 +34,7 @@ const char* const names[COUNT] = {
   "jit translate",
   "2d worker join (of which)",
   "sched slice loop", "events (timers, dma, fifo; not spu)", "gpu line hooks", "line-0 worker join", "begin_frame", "gx vblank (sort, join)",
-  "2d journal/latches", "3d line wait", "3d prep (texcache)", "gpu upload", "3d bins stolen (of which)",
+  "2d journal/latches", "3d line wait", "3d prep (texcache)", "3d bins stolen (of which)",
 };
 
 // Stable machine keys for DS_PROFILE_LINE; unlike `names`, must not change on rename.
@@ -45,7 +45,7 @@ const char* const stage_keys[COUNT] = {
   "jit_tx",
   "w2d_join",
   "sched", "events", "gpu_line", "join0", "begin_frame", "gx_vblank",
-  "journal", "r3d_line", "r3d_prep", "gpu_upload", "r3d_steal",
+  "journal", "r3d_line", "r3d_prep", "r3d_steal",
 };
 
 const char* const count_names[] = {"3d polygon lines", "3d span pixels", "3d resolved pixels",

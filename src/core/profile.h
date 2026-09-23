@@ -25,8 +25,7 @@ enum Stage : u32 {
   GX_VBLANK,    // Gpu3D::vblank: swap, polygon sort
   JOURNAL,      // step_engine's journal replay, window and draw latches
   R3D_LINE,     // asking the 3D raster for a line
-  R3D_PREP,     // Renderer3D::render up to the raster seam
-  GPU_UPLOAD,   // GPU raster's upload and submit
+  R3D_PREP,     // Renderer3D::render up to band dispatch
   R3D_STEAL,    // "of which": bins the caller drew instead of waiting for a worker
   COUNT
 };

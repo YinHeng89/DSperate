@@ -110,46 +110,30 @@ set_property(SOURCE io/dsi_font.cpp APPEND PROPERTY OBJECT_DEPENDS
              "${CMAKE_CURRENT_SOURCE_DIR}/io/dsi_font/TWLFontTable.dat"
              "${CMAKE_CURRENT_SOURCE_DIR}/io/dsi_font/TWLFontTable-cn.dat"
              "${CMAKE_CURRENT_SOURCE_DIR}/io/dsi_font/TWLFontTable-kr.dat")
-# The Vulkan device layer and GPU raster. Opt-in at build time and at run
-# time both: the backend loads libvulkan with dlopen, so a build with this on
-# still starts on a device with no driver -- Device::create returns null and
-# the software raster runs. Only the aarch64 handhelds have a GPU that can
-# host it at all (the A30's Mali-400 has no compute units).
-option(DSPERATE_VULKAN "Build the Vulkan compute 3D raster" ON)
+# The Vulkan device layer behind the frontend's dma-buf import presenter
+# (frontend/sdl/gpu_present.cpp). Opt-in at build time and at run time both:
+# libvulkan is loaded with dlopen, so a build with this on still starts on a
+# device with no driver -- Device::create returns null and the frontend
+# presents on the CPU. 3D is always drawn on the CPU.
+option(DSPERATE_VULKAN "Build the Vulkan dma-buf import presenter" ON)
 if(DSPERATE_VULKAN)
   # The Vulkan headers are architecture-independent and nothing is linked
   # against (vk_device.cpp dlopens libvulkan on the device), so a cross build
   # may use the host's copy: without NO_CMAKE_FIND_ROOT_PATH the aarch64
   # toolchain looks only inside its sysroot and silently builds the handhelds
-  # -- the only targets with a GPU that can run this -- without the raster.
+  # without the presenter.
   find_path(DSPERATE_VULKAN_INCLUDE vulkan/vulkan.h)
   if(NOT DSPERATE_VULKAN_INCLUDE AND CMAKE_CROSSCOMPILING)
     find_path(DSPERATE_VULKAN_INCLUDE vulkan/vulkan.h NO_CMAKE_FIND_ROOT_PATH)
   endif()
   if(DSPERATE_VULKAN_INCLUDE)
-    target_sources(dsperate_core PRIVATE gpu/vk/vk_device.cpp gpu/vk/vk_raster.cpp gpu/vk/vk_shaders.cpp)
-    # SPIR-V is checked in and .incbin'd by vk_shaders.cpp (no shader compiler
-    # needed at build time); re-link when a blob changes.
-    set_property(SOURCE gpu/vk/vk_shaders.cpp APPEND PROPERTY COMPILE_DEFINITIONS
-                 DSPERATE_VK_SHADER_DIR="${CMAKE_CURRENT_SOURCE_DIR}/gpu/vk/shaders")
-    set_property(SOURCE gpu/vk/vk_shaders.cpp APPEND PROPERTY OBJECT_DEPENDS
-                 "${CMAKE_CURRENT_SOURCE_DIR}/gpu/vk/shaders/bin.spv"
-                 "${CMAKE_CURRENT_SOURCE_DIR}/gpu/vk/shaders/raster.spv"
-                 "${CMAKE_CURRENT_SOURCE_DIR}/gpu/vk/shaders/post.spv"
-                 "${CMAKE_CURRENT_SOURCE_DIR}/gpu/vk/shaders/span.spv"
-                 "${CMAKE_CURRENT_SOURCE_DIR}/gpu/vk/shaders/vis.spv"
-                 "${CMAKE_CURRENT_SOURCE_DIR}/gpu/vk/shaders/raster_vis.spv"
-                 "${CMAKE_CURRENT_SOURCE_DIR}/gpu/vk/shaders/tri_vert.spv"
-                 "${CMAKE_CURRENT_SOURCE_DIR}/gpu/vk/shaders/tri_opaque_frag.spv"
-                 "${CMAKE_CURRENT_SOURCE_DIR}/gpu/vk/shaders/tri_tail_frag.spv"
-                 "${CMAKE_CURRENT_SOURCE_DIR}/gpu/vk/shaders/downsample.spv"
-                 "${CMAKE_CURRENT_SOURCE_DIR}/gpu/vk/shaders/tri_mask_frag.spv")
+    target_sources(dsperate_core PRIVATE gpu/vk/vk_device.cpp)
     target_include_directories(dsperate_core PRIVATE ${DSPERATE_VULKAN_INCLUDE})
     target_compile_definitions(dsperate_core PUBLIC DSPERATE_VULKAN=1)
     # No link against libvulkan on purpose: vk_device.cpp dlopens it.
-    message(STATUS "DSperate: Vulkan compute raster enabled (headers at ${DSPERATE_VULKAN_INCLUDE})")
+    message(STATUS "DSperate: Vulkan presenter enabled (headers at ${DSPERATE_VULKAN_INCLUDE})")
   else()
     set(DSPERATE_VULKAN OFF)
-    message(STATUS "DSperate: Vulkan headers not found, GPU raster disabled")
+    message(STATUS "DSperate: Vulkan headers not found, Vulkan presenter disabled")
   endif()
 endif()

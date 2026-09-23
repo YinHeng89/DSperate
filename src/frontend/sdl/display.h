@@ -104,9 +104,6 @@ public:
   // the scanline scaler where the import works. Set before open().
   void set_gpu_present(bool on) { gpu_wanted_ = on; }
   bool gpu_present() const { return gpu_ != nullptr; }
-  // The frame's hi-res 3D layer for the GPU composite (Gpu::frame_hires): set before draw().
-  void set_gpu_layer(u64 handle, size_t bytes, u32 scale, int screen, u64 edge = 0) { gpu_layer_ = handle; gpu_layer_bytes_ = bytes; gpu_layer_scale_ = scale; gpu_layer_screen_ = screen; gpu_layer_edge_ = edge; }
-  void set_smooth3d(bool on) { smooth3d_ = on; }   // video.smooth3d: rebuild polygon edges at panel resolution
   // Present straight through /dev/fb0 (display_fbdev.h). Set before open().
   void set_fbdev(bool on) { fbdev_wanted_ = on; }
   const void* cell_map(int screen) const { return cells_[screen].x.cells ? &cells_[screen] : nullptr; }
@@ -224,8 +221,6 @@ private:
   std::unique_ptr<ScanoutOut> out_;     // tier 1; null on the surface tier
   bool              gpu_wanted_ = false;
   std::unique_ptr<FramePresenter> gpu_; // a GPU presenter (on top of out_ for the import one); null: software
-  u64 gpu_layer_ = 0; size_t gpu_layer_bytes_ = 0; u32 gpu_layer_scale_ = 1; int gpu_layer_screen_ = 0; u64 gpu_layer_edge_ = 0;
-  bool smooth3d_ = false;
   bool try_gpu_present();               // after out_ opened: import its buffers, switch draw() over
   void draw_gpu(const u32* const fb[SCREENS]);
   SDL_Surface*      surf_ = nullptr;    // window surface; owned by SDL

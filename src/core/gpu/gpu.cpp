@@ -454,11 +454,8 @@ void Gpu::begin_frame() {
   if (capcnt_ & (1u << 31)) capture_on_ = true;
   if (capture_on_) capture_recent_ = CAPTURE_STICKY; else if (capture_recent_) --capture_recent_;
   // 3D frame this display frame reads, latched here since the raster moves on
-  // at line 215 while the compositor may still be reading it. With
-  // video.gpu_defer, may take the frame before that one instead (removes the
-  // fence wait, at a frame of latency); never while capturing (stale 3D there is wrong emulation).
-  shown_hires_ = ref3d_.hires; shown_hires_bytes_ = ref3d_.hires_bytes; shown_scale_ = ref3d_.scale; shown_edge_ = ref3d_.edge;
-  ref3d_ = nds_.gpu3d.frame_ref(defer_3d_ && !capture_on_ && !capture_recent_ && !run_fifo_);
+  // at line 215 while the compositor may still be reading it.
+  ref3d_ = nds_.gpu3d.frame_ref();
   update_phase();
   if (prof::enabled) {
     prof::add(prof::C_FRAMES_TOTAL, 1);
@@ -716,11 +713,6 @@ void Gpu::output_engine(int e, u32 line) {
   if (screens_on_) {
     if (e == 0) {
       const u32 mode = (en.dispcnt() >> 16) & 3;
-      if (layer_.line) {
-        if (line == 0) layer_screen_ = screen;
-        layer_.line[line] = (en.bldcnt() & 0xFFFFu) | ((en.eva() & 0x1Fu) << 16) | ((en.evb() & 0x1Fu) << 21) | ((en.evy() & 0x1Fu) << 26);
-        layer_.mbright[line] = static_cast<u32>(en.master_bright()) | ((mode == 1 && en.line_exported()) ? (1u << 31) : 0u);
-      }
       if (mode == 1) kern::active::output_line(en.output(), en.master_bright(), dst);
       else if (mode >= 2) output_a(line, dst);      // VRAM / FIFO display: expanded inside
       else { output_a(line, dst); expand_colours(dst); }

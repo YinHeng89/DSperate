@@ -6,8 +6,6 @@
 #include "core/types.h"
 #include "core/gpu/texcache.h"
 
-#include <unordered_map>
-
 #include <array>
 #include <atomic>
 #include <condition_variable>
@@ -20,10 +18,6 @@
 namespace ds { struct NDS; }
 
 namespace ds::gpu {
-// Number of GPU raster line-wait stalls so far (DS_GPU_COMP_DUMP_ON_STALL).
-extern std::atomic<unsigned> g_gpu_stalls;
-
-namespace vk { class Device; class Raster; }
 
 class Gpu3D;
 struct Polygon;
@@ -79,86 +73,6 @@ public:
   bool shape() const { return shape_; }
   enum : u32 { SPLIT_NONE = 0, SPLIT_LEFT = 1, SPLIT_RIGHT = 2, SPLIT_UP = 3, SPLIT_DOWN = 4, SPLIT_GROW = 1u << 28, SPLIT_MARKED = 1u << 29, SPLIT_SPILL = 1u << 30, SPLIT_WEAK = 1u << 31 };
   bool aa() const { return aa_; }
-  // Smooth-3D present filter (video.smooth3d): GPU raster writes its edge plane.
-  void set_smooth3d(bool on);
-  bool smooth3d() const { return smooth3d_; }
-
-  // GPU 3D raster; may decline (no libvulkan/device/memory type, unfinished
-  // pipeline). `why` takes the reason on failure.
-  // Only ever called on the coordinator, never on a band worker.
-  bool set_gpu_raster(bool on, std::string* why = nullptr, u32 scale = 1);   // scale: internal resolution 1..4
-  bool gpu_raster_active() const;
-
-  // A/B mode (--gpu-ab): draw every frame both ways and compare. Display still gets the CPU output.
-  void set_gpu_ab(bool on) { gpu_ab_ = on; }
-  // Why a frame went to the CPU instead, reported per reason.
-  enum GpuReject : u32 {
-    GpuOk = 0, GpuAA, GpuEdgeMark, GpuFog, GpuRearBitmap,
-    GpuShadow, GpuToon, GpuDepthEqual, GpuWireframe, GpuRejectCount
-  };
-  static const char* gpu_reject_name(u32 r);
-
-  struct GpuStats {
-    u64 frames = 0;       // frames the GPU drew (or, in A/B, drew alongside)
-    u64 eligible = 0;     // frames the gate would accept, whether or not one was drawn
-    u64 rejected = 0;     // frames the feature gate sent to the CPU
-    u64 failed = 0;       // frames the GPU accepted but could not dispatch
-    const char* last_fail = nullptr;
-    struct Fail { const char* why = nullptr; u64 n = 0; } fails[8];   // refusals by reason
-    u64 kept = 0;             // frames the identical-frame path kept, drawing nothing
-    // upload: CPU converts+submits; wait_line: compositor waits on a
-    // still-drawing frame; wait_frame: next dispatch finds prev unfinished;
-    // wait_forced: other (chiefly VRAM bank moving under the raster).
-    u64 upload_ns = 0, wait_line_ns = 0, wait_frame_ns = 0, wait_forced_ns = 0;
-    u64 submit_ns = 0;        // of upload_ns: Raster::submit itself
-    u64 job_lat_ns = 0, job_lat_max_ns = 0, stalls = 0;   // job thread wake-up latency; stalls = line waits over 50 ms
-    u64 edge_frames = 0, fog_frames = 0;   // frames dispatched with edge marking / fog on
-    u64 polys_textured = 0, polys_may_alpha = 0, polys_alpha = 0;   // textured; format could carry alpha 0; texture actually does
-    u64 wait_forced_n = 0, texel_words = 0;
-    u64 span_rows = 0;        // rows the span table held, summed
-    // order-free prefix (vk_layout.h GpuFrame::first_ordered) size, and how
-    // often a shadow mask/polygon cut it short instead of first translucent.
-    u64 opaque_polys = 0, tail_polys = 0, opaque_rows = 0, prefix_cut_by_shadow = 0;
-    u64 tail_area = 0;        // tail bounding-box area in pixels, summed
-    u32 span_rows_max = 0;
-    u64 deferred = 0;         // display frames shown a frame late, never waited for
-    u64 undeferred = 0;       // those that could not be, so paid the fence
-    u64 defer_no_caller = 0;  // caller refused (capture, or the knob is off)
-    u64 defer_no_prev = 0;    // frame before was not GPU-drawn
-    u64 reject[GpuRejectCount] = {};   // rejections by first reason found
-    u64 ab_checked = 0;   // frames compared
-    u64 ab_bad = 0;       // of those, frames with any differing pixel
-    u64 ab_pixels = 0;    // differing pixels, summed
-    u32 ab_worst = 0;     // most differing pixels in one frame
-    s32 ab_first_frame = -1;
-  };
-  const GpuStats& gpu_stats() const { return gpu_stats_; }
-  // GPU time per pass (DS_VK_TIMING=1): ns[] summed over `frames`; false when not timing.
-  bool gpu_pass_times(u64 ns[5], u64* frames) const;
-  u32 gpu_bands() const;   // completion checkpoints the GPU frame is cut into
-
-  // --gpu-coverage: counts, over real frames, pixels the software raster
-  // (18-bit slope stepping, its own fill rules) draws outside what a
-  // pixel-centre-in-polygon test would accept.
-  void set_coverage_probe(bool on) { coverage_probe_ = on; }
-  struct CoverageStats {
-    u64 drawn = 0;        // pixels the raster drew
-    u64 outside = 0;      // of those, pixels a pixel-centre test says are not in the polygon
-    u64 spans = 0;        // scanline spans examined
-    u64 spans_bad = 0;    // spans with at least one such pixel
-    u32 worst_run = 0;    // longest run of them in one span
-    u64 bucket[6] = {};   // spans by outside-pixel count: 1, 2, 3-4, 5-8, 9-16, >16
-    u64 spans_all_out = 0;   // spans with no pixel inside the polygon at all
-  };
-  static const CoverageStats& coverage_stats();
-
-  // Run the feature gate over every frame and count what it would take, without drawing anything differently.
-  void set_gpu_gate_dryrun(bool on) { gpu_gate_dryrun_ = on; }
-
-  // Where a differing A/B frame goes: two 0xAARRGGBB streams (top, bottom),
-  // 3D layer in top screen, bottom blank; only differing frames written.
-  void set_gpu_ab_dump(const char* ref_path, const char* cand_path);
-
 private:
   NDS& nds_;
   // Holds a whole chunk of scanlines at once (render_chunk draws chunk at a
@@ -307,7 +221,6 @@ private:
   bool shape_ = false, shape_rendered_ = false;
   bool game_aa_ = false;                  // AA blend runs (game asked and aa_ allows)
   bool aa_ = true, aa_rendered_ = true;   // aa_rendered_: the setting the kept frame was drawn with
-  bool smooth3d_ = false;
   // rs_->dispcnt with bit 4 cleared when AA is off: kills the whole under
   // layer for the frame (AA blend, under-layer depth test, translucent plot,
   // fog, shadow stencil bit 2's under-layer writes).
@@ -457,22 +370,6 @@ public:
   // generation's bands to wait on before reading a line. Taken at the start
   // of the display frame (Gpu::begin_frame); nbins is 0 when nothing is
   // outstanding (rendered inline or kept).
-  //
-  // A GPU-drawn frame carries `gpu` instead of a band cut: `out` names the
-  // raster's own buffer, and sync_line waits on one fence, whole-frame
-  // granularity (a tile raster has no per-scanline completion).
-  // GPU job thread hand-off: render() hands over a stable polygon list/render
-  // state, the thread converts/uploads/submits. A refused upload (full bin or
-  // arena) falls back to the CPU raster on the same thread into out_[].
-  struct GpuJobSync {
-    enum : u32 { Idle = 0, Pending, Running, Submitted, Fallback, FallbackDone };
-    std::mutex m;
-    std::condition_variable cv;
-    std::atomic<u32> state{Idle};
-    std::atomic<u64> t_pending{0};   // steady_clock ns when the job was handed over (the thread's wake-up latency)
-    bool quit = false;
-  };
-  u64 gpu_job_last_lat_ns_ = 0, gpu_job_last_upload_ns_ = 0;   // the last job's wake-up latency and upload time (the stall report)
   struct FrameRef {
     const u32* out = nullptr;
     const u32* split = nullptr;               // null unless the frame was rendered in sub-pixel mode
@@ -481,21 +378,10 @@ public:
     u64 gen = 0;
     u32 nbins = 0;
     bool shape = false; u32 shape_idx = 0, shape_seq = 0;   // edge shaping: which buffer, and which dispatch into it (shape_sync)
-    vk::Raster* gpu = nullptr;
-    GpuJobSync* job = nullptr;   // a fallback frame still being drawn on the GPU job thread
-    u64 hires = 0;               // the GPU frame's hi-res layer (opaque VkBuffer), for the present stage's composite
-    size_t hires_bytes = 0;
-    u64 edge = 0;                // ... and its edge plane for the smooth filter (0 when none)
-    u32 scale = 1;
     std::array<s32, MAX_BINS + 1> bin_y{};
     const u32* line(u32 y) const { return out + y * 256; }
   };
-  // `allow_defer`: caller accepts showing the frame before the one just
-  // drawn, giving the GPU an extra frame to finish (removes the compositor
-  // wait). Costs a frame of latency; unsafe for display-capture (stale VRAM
-  // readback is wrong emulation). Only a GPU frame defers, and only if the
-  // frame before it was also GPU-drawn.
-  FrameRef frame_ref(bool allow_defer = false) const;
+  FrameRef frame_ref() const;
   void sync_line(const FrameRef& f, s32 y);   // any thread; each call waits for one band at most
   void sync_all();
   u64 last_band_sum_ns() const { return band_sum_ns_[0]; }   // serial raster cost of the last synced frame (sum over bands)
@@ -503,57 +389,6 @@ private:
   std::function<void(u32)> job_fn_;   // outlives the dispatch, unlike a local
   u32 pending_bands_ = 0;             // bins in flight (0 = nothing running)
   u64 gen_ = 0;                       // pool generation of the bands in flight
-
-  // GPU raster and device, coordinator-owned. unique_ptrs to incomplete
-  // types keep render3d.h free of the Vulkan headers.
-  std::shared_ptr<vk::Device>  vk_dev_;   // the process-wide context (vk::Device::shared)
-  std::unique_ptr<vk::Raster>  vk_raster_;
-  bool gpu_frame_ = false;    // the last render() went to the GPU: out_[] is not where the picture is
-  bool gpu_live_ = false;     // the backend can draw: latched once per frame, before the texture resolve reads it
-  bool gpu_frame_prev_ = false;   // the render before the last one also went to the GPU
-  bool gpu_defer_ok_ = false;     // ... and so the previous GPU buffer is the frame before this one
-  bool gpu_sync_is_frame_ = false;   // the sync_all at the top of render(), as against a forced one
-  bool gpu_ab_ = false;
-  mutable GpuStats gpu_stats_{};   // mutable: frame_ref is const and counts deferrals
-  // The GPU job thread: conversion, upload, submit and CPU fallback.
-  std::thread gpu_thread_;
-  mutable GpuJobSync gpu_job_;
-  std::vector<const Polygon*> gpu_job_polys_;
-  u32  gpu_job_n_ = 0;
-  u32* gpu_job_dst_ = nullptr;         // out_[] slot a fallback frame is drawn into
-  bool gpu_job_fallback_ = false;      // the last job fell back to the CPU raster
-  void gpu_thread_main();
-  void gpu_job_set(u32 state);
-  void gpu_job_wait(u32 min_state) const;   // block until state >= min_state (Submitted/Fallback = decided)
-  void gpu_job_wait_done() const;           // until nothing is running on the thread
-  void gpu_thread_stop();
-  // Whole frames only: pixel stack, edge marking, translucent polygon ids are
-  // frame-global, so splitting a frame across both rasters would be wrong.
-  u32 gpu_supported(const Polygon* const* polys, u32 npoly) const;
-  bool gpu_gate_dryrun_ = false;
-  bool coverage_probe_ = false;
-  void probe_coverage(const Polygon& p, const SpanJob& j) const;
-  // Converts the frame's polygon list into the shader layout in mapped GPU
-  // memory and submits it; false (CPU draws instead) on texture-cache miss,
-  // bin overflow, or list past buffer sizes.
-  bool gpu_dispatch(const Polygon* const* polys, u32 npoly);
-  const char* gpu_fail_ = nullptr;   // last refusal reason, for the report
-  std::vector<u32> gpu_tile_use_;         // per-tile polygon count, for the overflow check
-  std::vector<u8>  gpu_line_mask_;        // "the last polygon on this line was a shadow mask", while uploading
-  std::vector<u32> gpu_line_run_;         // and which mask run that line is up to
-  // Persistent across frames: a decoded texture is copied in once, keyed by
-  // cache entry id + decode version, so a frame copies only re-decodes.
-  // Bump-allocated; refuses the frame and resets on fill.
-  struct GpuResident { u32 off = 0, words = 0, version = 0; };
-  std::unordered_map<u32, GpuResident> gpu_resident_;
-  u32 gpu_arena_top_ = 0;
-  bool gpu_arena_reset_ = false;          // start over at the next frame (the arena filled)
-  std::vector<TextureCache::Ref> poly_texref_;   // per polygon, the GPU path's view of its texture
-  void gpu_compare(const u32* cpu, const u32* gpu);
-  void gpu_ab_write(FILE* f, const u32* layer);
-  FILE* ab_ref_ = nullptr;
-  FILE* ab_cand_ = nullptr;
-  void gpu_snapshot_output();   // bring a GPU frame into out_[] for a save state
 
   u32  edge_count_ = 0;
   u32* out_dst_ = nullptr;                              // where final_pass writes

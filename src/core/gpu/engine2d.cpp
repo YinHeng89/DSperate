@@ -194,14 +194,6 @@ void Engine2D::render_line(u32 line) {
     if (cur_.dispcnt & 0xE000) prof::add(prof::C_2D_WIN_PRESENT, 1);
   }
   { DS_PROF(WINDOW); build_window_plane(); apply_sprite_mosaic_x(); }
-  line_exported_ = false;
-  if (exp_top_ && !num_ && (cur_.dispcnt & 8) && bg_[0].any) {
-    // The GPU composite wants resolved planes for every 3D line.
-    { DS_PROF(SELECT); select_layers(); }
-    export_planes(line);
-    { DS_PROF(EFFECTS); colour_effects(); }
-    return;
-  }
   if (!effect_possible()) {
     // No colour effect touches this line: skip second-layer bookkeeping and
     // pick the cheapest applicable pass below.
@@ -1028,17 +1020,6 @@ void Engine2D::select_layers_top() {
   select_top_only();
   const bool is3d = !num_ && (cur_.dispcnt & 8);
   kern::active::resolve16_top(top16_.data(), top_tid_.data(), tables_, is3d ? line3d_ : nullptr, top_.data(), top_id_.data());
-}
-
-void Engine2D::export_planes(u32 line) {
-  const size_t o = static_cast<size_t>(line) * 256;
-  std::memcpy(exp_top_ + o, top_.data(), 256 * sizeof(u32));
-  std::memcpy(exp_second_ + o, second_.data(), 256 * sizeof(u32));
-  for (u32 i = 0; i < 256; ++i) {
-    exp_meta_[o + i] = static_cast<u32>(top_id_[i]) | (static_cast<u32>(top_kind_[i]) << 8) | (static_cast<u32>(top_alpha_[i]) << 16) | (static_cast<u32>(second_id_[i]) << 24);
-    exp_win_[o + i] = win_[i];
-  }
-  line_exported_ = true;
 }
 
 void Engine2D::colour_effects() {

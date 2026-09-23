@@ -26,10 +26,7 @@ public:
     int rot = 0;                 // presented = logical rotated by this
     int lw = 0, lh = 0;          // the logical (unrotated) frame the rects are laid out in
     u8 inset_alpha = 255;
-    // Hi-res 3D layer (Gpu::frame_hires) composited into `hires_screen` when non-zero.
-    u64 hires = 0; size_t hires_bytes = 0; u32 scale = 1; int hires_screen = 0;
     frontend::Rect drawn;        // where the frontend drew on overlay() this frame
-    u64 edge = 0;                // smooth-3D edge plane, or 0
     u32 grid = 256;              // LCD grid brightness on a seam, 0..256 (256 = off)
   };
 

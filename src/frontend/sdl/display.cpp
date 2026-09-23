@@ -344,9 +344,7 @@ void Display::draw_gpu(const u32* const fb[SCREENS]) {
   FramePresenter::View v[SCREENS];
   for (int i = 0; i < nviews_; ++i) v[i] = FramePresenter::View{views_[i].screen, views_[i].rect, views_[i].shown, !views_[i].direct, grid_on(views_[i].screen)};
   p.rot = rot_; p.inset_alpha = inset_alpha_;
-  p.hires = gpu_layer_; p.hires_bytes = gpu_layer_bytes_; p.scale = gpu_layer_scale_; p.hires_screen = gpu_layer_screen_;
   p.drawn = frontend::Rect{canvas_drawn_.x, canvas_drawn_.y, canvas_drawn_.w, canvas_drawn_.h};
-  p.edge = smooth3d_ ? gpu_layer_edge_ : 0;
   p.grid = grid_strength_ > 0.0 ? static_cast<u32>(std::lround((1.0 - grid_strength_) * 256.0)) : 256u;
   gpu_->present(fb, v, nviews_, p);
   canvas_drawn_ = SDL_Rect{0, 0, 0, 0};

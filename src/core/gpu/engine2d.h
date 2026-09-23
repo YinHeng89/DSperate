@@ -74,10 +74,6 @@ public:
   // Engine A: 256 RGB666 with 5-bit alpha in bits 24-28 (0 = transparent), or null.
   void set_3d_line(const Pixel* line) { line3d_ = line; }
 
-  // While set, 3D-layer lines also export pre-effect planes (256x192) for GPU compositing.
-  // meta = top_id | kind << 8 | alpha << 16 | second_id << 24.
-  void set_layer_export(u32* top, u32* second, u32* meta, u32* win) { exp_top_ = top; exp_second_ = second; exp_meta_ = meta; exp_win_ = win; }
-  bool line_exported() const { return line_exported_; }   // by the last render_line()
   u32 bldcnt() const { return regs_.bldcnt(); }
   u32 eva() const { return regs_.eva(); }
   u32 evb() const { return regs_.evb(); }
@@ -140,9 +136,6 @@ private:
   alignas(16) std::array<u8, 256> top_id_{}, top_kind_{}, top_alpha_{}, second_id_{};
   alignas(16) std::array<Pixel, 256> out_{};
   const Pixel* line3d_ = nullptr;
-  u32* exp_top_ = nullptr; u32* exp_second_ = nullptr; u32* exp_meta_ = nullptr; u32* exp_win_ = nullptr;
-  bool line_exported_ = false;
-  void export_planes(u32 line);
 
   const VramMap& vram() const;
   const VramView& bg_vram() const;

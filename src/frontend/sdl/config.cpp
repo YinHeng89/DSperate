@@ -26,6 +26,14 @@ void split_key(const std::string& key, std::string& sec, std::string& name) {
   name = dot == std::string::npos ? key : key.substr(dot + 1);
 }
 
+// Keys of the GPU 3D raster, which is gone: still read so an old file loads,
+// but only to say they do nothing now.
+bool retired(const std::string& key) {
+  for (const char* k : {"video.gpu_raster", "video.gpu_defer", "video.internal_res", "video.smooth3d", "emu.gpu_irq_avoid"})
+    if (key == k) return true;
+  return false;
+}
+
 } // namespace
 
 std::string Config::dir() {
@@ -66,6 +74,7 @@ bool Config::load(const std::string& path) {
     std::string k = trim(line.substr(0, eq)), v = trim(line.substr(eq + 1));
     if (const size_t c = v.find_first_of("#;"); c != std::string::npos) v = trim(v.substr(0, c));
     const std::string key = section.empty() ? k : section + "." + k;
+    if (retired(key)) { std::fprintf(stderr, "config: %s is retired (3D is drawn on the CPU only) and is ignored (%s)\n", key.c_str(), path.c_str()); continue; }
     kv_[key] = v;
   }
   return true;
@@ -265,13 +274,6 @@ R"(# DSperate settings. Command-line flags override this file. Two files next
                                 # pixel-exact. true / false still read as accurate / off, and the older
                                 # smooth (a polygon's edge drawn where it really falls inside a DS pixel,
                                 # unblended) is still read from a file though the menu no longer offers it
-# gpu_raster = false            # draw 3D on the GPU (Vulkan) where the frame allows it; the software
-                                # raster stays the exact reference and takes the frames the GPU declines
-# internal_res = 1              # with gpu_raster: 3D drawn at 1..4 times the DS's resolution (read at start)
-# smooth3d = false              # with gpu_raster and gpu_present: polygon edges rebuilt at the panel's
-                                # resolution from the DS's own edge coverage, so a 4x upscale shows a
-                                # slanted edge instead of a four-pixel staircase. Textures, interiors
-                                # and everything the 2D engines draw stay pixel-exact
 # disp = auto                   # present through the display engine's hardware scaler (Miyoo A30 and
                                 # other Allwinner boards): auto (wherever /dev/disp answers) | true | false
 # fbdev = auto                  # present straight through /dev/fb0 (the H700 handhelds' mali-only SDL2):
@@ -324,12 +326,6 @@ R"(# DSperate settings. Command-line flags override this file. Two files next
                                 # thread dead for up to 50 ms. A scene with no slack to sleep in
                                 # wears that as a hitch about every second. This gives the same 5 %
                                 # back ~0.8 ms at a time instead. false = let the kernel take it
-# gpu_irq_avoid = true          # with realtime on and video.gpu_raster on: keep the emulator off
-                                # the CPU that services the GPU's interrupts. The Mali driver grows
-                                # its tiler heap through page faults handled by a worker on that
-                                # CPU; a real-time thread there starves it until the bandwidth cap
-                                # opens, and a GPU frame lands up to a second late. Only when a
-                                # core of equal capacity remains (big.LITTLE keeps its big cores)
 # pacing = auto                 # auto | sleep | busy: how the wait for the next frame is spent.
                                 # A governor that sets the CPU clock from how busy the last few
                                 # milliseconds looked (ondemand, conservative, powersave) reads

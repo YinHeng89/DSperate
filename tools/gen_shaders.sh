@@ -1,8 +1,8 @@
 #!/bin/sh
-# Compile the GPU raster's compute shaders to SPIR-V and check the blobs in.
+# Compile the frontend's Vulkan present shader to SPIR-V and check the blob in.
 #
 # The .spv files next to the .comp sources are generated but tracked, so a
-# build needs no shader compiler -- vk_shaders.cpp .incbin's them, the way
+# build needs no shader compiler -- gpu_present.cpp .incbin's them, the way
 # io/dsi_font.cpp does its font tables. Run this after editing any .comp and
 # commit the .spv beside it.
 #
@@ -15,8 +15,6 @@
 # that compiles is not necessarily one the driver will accept.
 set -e
 DIR=$(cd "$(dirname "$0")/.." && pwd)
-SRC="$DIR/src/core/gpu/vk/shaders"
-INC="$DIR/src/core/gpu/vk"
 
 if [ -n "$GLSLANG" ]; then GV="$GLSLANG"
 elif command -v glslangValidator >/dev/null 2>&1; then GV=glslangValidator
@@ -35,23 +33,6 @@ for f in "$DIR"/src/frontend/sdl/shaders/*.comp; do
   case "$GV" in
     *glslc) "$GV" -O --target-env=vulkan1.1 "$f" -o "$out" ;;
     *)      log=$("$GV" -V --target-env vulkan1.1 "$f" -o "$out") || { echo "$log" >&2; echo "gen_shaders: $f FAILED" >&2; exit 1; } ;;
-  esac
-  if command -v spirv-val >/dev/null 2>&1; then spirv-val "$out"; fi
-done
-for f in "$SRC"/*.vert "$SRC"/*.frag; do
-  [ -e "$f" ] || continue
-  out="${f%.*}_${f##*.}.spv"
-  case "$GV" in
-    *glslc) "$GV" -O --target-env=vulkan1.1 "-I$INC" "$f" -o "$out" ;;
-    *)      log=$("$GV" -V --target-env vulkan1.1 "-I$INC" "$f" -o "$out") || { echo "$log" >&2; echo "gen_shaders: $f FAILED" >&2; exit 1; } ;;
-  esac
-  if command -v spirv-val >/dev/null 2>&1; then spirv-val "$out"; fi
-done
-for f in "$SRC"/*.comp; do
-  out="${f%.comp}.spv"
-  case "$GV" in
-    *glslc) "$GV" -O --target-env=vulkan1.1 "-I$INC" "$f" -o "$out" ;;
-    *)      log=$("$GV" -V --target-env vulkan1.1 "-I$INC" "$f" -o "$out") || { echo "$log" >&2; echo "gen_shaders: $f FAILED" >&2; exit 1; } ;;
   esac
   if command -v spirv-val >/dev/null 2>&1; then spirv-val "$out"; fi
   printf '%-16s %6d bytes\n' "$(basename "$out")" "$(wc -c < "$out")"

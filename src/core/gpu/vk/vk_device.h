@@ -7,19 +7,19 @@
 #include <memory>
 #include <string>
 
-// A compute-only Vulkan context for the GPU 3D raster: no surface, no
-// swapchain, no DRM master, so it can't conflict with the present tiers'
-// ownership of the panel. libvulkan is dlopen'd and resolved through
-// vkGetInstanceProcAddr; create() returns null on a driverless machine
-// rather than failing to start.
+// A compute-only Vulkan context for the frontend's dma-buf import presenter
+// (frontend/sdl/gpu_present.cpp): no surface, no swapchain, no DRM master, so
+// it can't conflict with the present tiers' ownership of the panel. libvulkan
+// is dlopen'd and resolved through vkGetInstanceProcAddr; create() returns
+// null on a driverless machine rather than failing to start.
 
 namespace ds::gpu::vk {
 
-struct DeviceInternal;   // vk_internal.h; the backend's view of this context
+struct DeviceInternal;   // vk_internal.h; the presenter's view of this context
 
 // Both are DEVICE_LOCAL on a unified part; the difference is the CPU mapping's cacheability.
 enum class Access {
-  CpuRead,    // DEVICE_LOCAL | HOST_VISIBLE | HOST_CACHED, near-malloc CPU reads. Needs invalidate() before reading. What the 2D compositor's 3D layer must be.
+  CpuRead,    // DEVICE_LOCAL | HOST_VISIBLE | HOST_CACHED, near-malloc CPU access.
   CpuWrite,   // DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT, typically write-combine (slow CPU reads). Write-only buffers.
 };
 
@@ -28,7 +28,7 @@ enum class Access {
 struct Buffer {
   void*  ptr  = nullptr;
   size_t size = 0;
-  u64    handle = 0;      // opaque VkBuffer, for the backend
+  u64    handle = 0;      // opaque VkBuffer
   u64    memory = 0;      // opaque VkDeviceMemory
   explicit operator bool() const { return ptr != nullptr; }
 };
@@ -38,9 +38,8 @@ public:
   // Null when there's no usable Vulkan (no libvulkan/device/compute
   // queue/CpuRead memory type). Never throws or aborts.
   static std::unique_ptr<Device> create(std::string* why = nullptr);
-  // The process's one context, shared by the 3D raster and present stage so
-  // the raster's output can be bound without leaving the device. Created on
-  // first use; a failed creation is not cached.
+  // The process's one context, shared by every presenter (both windows of a
+  // dual-window layout). Created on first use; a failed creation is not cached.
   static std::shared_ptr<Device> shared(std::string* why = nullptr);
   ~Device();
 
@@ -53,42 +52,19 @@ public:
   Buffer alloc(size_t size, Access access);
   void   free(Buffer& b);
 
-  // Makes GPU writes visible to a CPU read of a CpuRead buffer. Pass the
-  // range actually read, not the whole allocation.
-  void invalidate(const Buffer& b, size_t offset, size_t size);
-
-  // Binds an existing host allocation (VK_EXT_external_memory_host) so the
-  // GPU can read it with no staging copy (decoded texture cache is the
-  // intended user). `ptr` must be aligned to host_ptr_align(); empty Buffer if refused.
-  Buffer import_host(void* ptr, size_t size);
-  size_t host_ptr_align() const { return host_align_; }
-
-  // Makes a CPU write to a CpuWrite buffer visible to the GPU; always call
-  // this, it's a no-op when the mapping is already coherent. Rounds to
-  // nonCoherentAtomSize as vkFlushMappedMemoryRanges requires.
+  // Makes a CPU write visible to the GPU; always call this, it's a no-op when
+  // the mapping is already coherent. Rounds to nonCoherentAtomSize as
+  // vkFlushMappedMemoryRanges requires.
   void flush(const Buffer& b, size_t offset, size_t size);
 
-  // The dispatch table and handles, for vk_raster.cpp only.
+  // The dispatch table and handles, for the presenter only.
   const DeviceInternal* internal() const;
 
   struct Limits {
-    u32 max_workgroup_invocations = 0;
-    u32 max_shared_memory = 0;
-    u32 subgroup_size = 0;
-    u32 max_storage_range = 0;           // largest storage buffer the shader may bind
-    // VK_KHR_shader_atomic_int64 + shaderInt64: without it, the visibility
-    // pass's atomicMin owner key can't run and the ordered loop draws the whole list.
-    bool int64_atomics = false;
-    double timestamp_period_ns = 0;   // GPU timestamp ns/tick on the compute queue, 0 if none (DS_VK_TIMING=1)
     // dma-buf IMPORT: frontend scanout buffers bindable as images the GPU
     // writes. drm_modifier: LINEAR layout stated explicitly, else VK_IMAGE_TILING_LINEAR.
     bool dmabuf_import = false;
     bool drm_modifier = false;
-    // Queue does graphics + VK_EXT_rasterization_order_attachment_access:
-    // triangle path's translucent tail reads its own colour attachment in
-    // one draw; without it, a barrier per polygon (correct, slower).
-    bool graphics = false;
-    bool ordered_attachments = false;
   };
   const Limits& limits() const { return limits_; }
 
@@ -97,7 +73,6 @@ private:
   struct Impl;
   std::unique_ptr<Impl> d_;
   std::string name_;
-  size_t host_align_ = 4096;
   Limits limits_{};
 };
 
