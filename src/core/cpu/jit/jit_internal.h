@@ -130,6 +130,7 @@ struct JitCpu {
   u8*   fallback = nullptr;                  // `bl fallback; .word instr; .word key`: interpret one instr, poll, dispatch
   u8*   branch_indirect = nullptr;           // w0 = target (bit 0 = T): updates T, charges refill, dispatches
   u8*   branch_indirect_cdi = nullptr;       // same, plus LDM/POP pc's CDI charge: w1 = numD, w2 = data address
+  u8*   branch_indirect_poll = nullptr;      // same as branch_indirect, then leaves if an IRQ is now takeable (exception return)
 };
 
 struct Runtime {

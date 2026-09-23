@@ -398,55 +398,74 @@ void emit_stubs(Runtime& rt) {
     }
     size_t to_body = e.b_fwd();
 
+    // Updates T, charges the refill (w0 = key after); guest flags parked in x17.
+    auto refill_body = [&] {
+      size_t is_thumb = e.tbnz_fwd(0, 0);
+      e.and_imm(0, 0, ~3u);
+      e.bind(is_thumb);
+      e.ldr_w(1, R_CTX, OFF_CPSR);
+      e.bfi(1, 0, 5, 1);
+      e.str_w(1, R_CTX, OFF_CPSR);
+      e.and_imm(2, 0, ~1u);
+      if (c == 0) {
+        // ARM9 refill: ARM cost(a,B)+cost(a+4,S); Thumb a&2 ? cost(a-2,B)+cost(a+2,S) : cost(a,B).
+        // Byte from Timing's refill9 table: page of first = a - 2*odd; index by second =
+        // a + 4 - 2*T: 3 if dropped (T && !odd), 2 if page start, 1 if line start, else 0.
+        e.and_imm(4, 0, 1);                       // T
+        e.ubfx(5, 2, 1, 1);                       // odd
+        e.sub_reg(3, 2, 5, LSL, 1);
+        e.lsr_imm(3, 3, 12);
+        e.add_imm(7, 2, 4);
+        e.sub_reg(7, 7, 4, LSL, 1);
+        e.bic_reg(4, 4, 5);
+        e.tst_imm(7, 0xFFF);
+        e.cset(6, EQ);
+        e.tst_imm(7, 0x1F);
+        e.csinc(6, 6, 6, NE);
+        e.movz(1, 3);
+        e.cmp_imm(4, 0);
+        e.csel(6, 1, 6, NE);
+        e.add_reg(3, R_TIM, 3, LSL, 2, true);
+        e.add_imm(3, 3, mem::Timing::REFILL9_OFFSET, true);
+        e.ldrb_reg(3, 3, 6);
+      } else {
+        // ARM7 refill: t = timing7[a >> 15]; Thumb: t0 + t1; ARM: t2 + t3
+        e.lsr_imm(4, 2, 15);
+        e.add_reg(4, R_TIM, 4, LSL, 2, true);
+        size_t thumb = e.tbnz_fwd(0, 0);
+        e.ldrb(3, 4, 2);
+        e.ldrb(5, 4, 3);
+        size_t done = e.b_fwd();
+        e.bind(thumb);
+        e.ldrb(3, 4, 0);
+        e.ldrb(5, 4, 1);
+        e.bind(done);
+        e.add_reg(3, 3, 5);
+      }
+      e.sub_reg(R_BUDGET, R_BUDGET, 3);
+      e.msr_nzcv(17);
+    };
+
     // branch_indirect: w0 = target | T
     jc.branch_indirect = e.cur();
     e.mrs_nzcv(17);
     e.bind(to_body);
-    size_t is_thumb = e.tbnz_fwd(0, 0);
-    e.and_imm(0, 0, ~3u);
-    e.bind(is_thumb);
-    e.ldr_w(1, R_CTX, OFF_CPSR);
-    e.bfi(1, 0, 5, 1);
-    e.str_w(1, R_CTX, OFF_CPSR);
-    e.and_imm(2, 0, ~1u);
-    if (c == 0) {
-      // ARM9 refill: ARM cost(a,B)+cost(a+4,S); Thumb a&2 ? cost(a-2,B)+cost(a+2,S) : cost(a,B).
-      // Byte from Timing's refill9 table: page of first = a - 2*odd; index by second =
-      // a + 4 - 2*T: 3 if dropped (T && !odd), 2 if page start, 1 if line start, else 0.
-      e.and_imm(4, 0, 1);                       // T
-      e.ubfx(5, 2, 1, 1);                       // odd
-      e.sub_reg(3, 2, 5, LSL, 1);
-      e.lsr_imm(3, 3, 12);
-      e.add_imm(7, 2, 4);
-      e.sub_reg(7, 7, 4, LSL, 1);
-      e.bic_reg(4, 4, 5);
-      e.tst_imm(7, 0xFFF);
-      e.cset(6, EQ);
-      e.tst_imm(7, 0x1F);
-      e.csinc(6, 6, 6, NE);
-      e.movz(1, 3);
-      e.cmp_imm(4, 0);
-      e.csel(6, 1, 6, NE);
-      e.add_reg(3, R_TIM, 3, LSL, 2, true);
-      e.add_imm(3, 3, mem::Timing::REFILL9_OFFSET, true);
-      e.ldrb_reg(3, 3, 6);
-    } else {
-      // ARM7 refill: t = timing7[a >> 15]; Thumb: t0 + t1; ARM: t2 + t3
-      e.lsr_imm(4, 2, 15);
-      e.add_reg(4, R_TIM, 4, LSL, 2, true);
-      size_t thumb = e.tbnz_fwd(0, 0);
-      e.ldrb(3, 4, 2);
-      e.ldrb(5, 4, 3);
-      size_t done = e.b_fwd();
-      e.bind(thumb);
-      e.ldrb(3, 4, 0);
-      e.ldrb(5, 4, 1);
-      e.bind(done);
-      e.add_reg(3, 3, 5);
-    }
-    e.sub_reg(R_BUDGET, R_BUDGET, 3);
-    e.msr_nzcv(17);
+    refill_body();
     e.b(jc.dispatch);
+
+    // branch_indirect_poll: the same, then the interpreter's per-instruction IRQ
+    // check: an exception return (SUBS pc, lr / MOVS pc) may unmask a pending IRQ,
+    // taken before the target's first instruction.
+    jc.branch_indirect_poll = e.cur();
+    e.mrs_nzcv(17);
+    refill_body();
+    {
+      std::vector<size_t> leave;
+      emit_poll(e, leave);
+      e.b(jc.dispatch);
+      for (size_t f : leave) e.bind(f);
+      e.b(rt.exit_key);
+    }
   }
 
   rt.stubs_end = (e.size() + 63) & ~size_t{63};

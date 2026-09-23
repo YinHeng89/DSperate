@@ -680,14 +680,14 @@ private:
     e().word(make_key(target, to_thumb));
     ended_ = true;
   }
-  void emit_branch_indirect(u32 wtarget, bool interwork, bool cdi = false) {
+  void emit_branch_indirect(u32 wtarget, bool interwork, bool cdi = false, bool poll = false) {
     flush_pending();
     if (wtarget != SCRATCH0) e().mov(SCRATCH0, wtarget);
     if (!interwork) {
       if (thumb_) e().orr_imm(SCRATCH0, SCRATCH0, 1);
       else e().and_imm(SCRATCH0, SCRATCH0, ~1u);
     }
-    jump_stub(cdi ? jc_.branch_indirect_cdi : jc_.branch_indirect);
+    jump_stub(cdi ? jc_.branch_indirect_cdi : poll ? jc_.branch_indirect_poll : jc_.branch_indirect);
     ended_ = true;
   }
 
@@ -948,16 +948,6 @@ private:
   // (both preserved by the stubs). LDM with r15 never reaches here.
   void emit_block_slow(u32 list, bool load, bool writeback, u32 rn, u32 n, bool user_bank, u32 pc_store_value) {
     e().and_imm(SCRATCH1, SCRATCH1, ~3u);
-    // Cost first (stubs preserve only x1/x7), per word since words span pages.
-    for (u32 k = 0; k < n; ++k) {
-      if (k == 0) emit_data_cost(SCRATCH1, SCRATCH6, true, false, !load);
-      else {
-        e().add_imm(SCRATCH3, SCRATCH1, k * 4, true);
-        emit_data_cost(SCRATCH3, SCRATCH5, true, true, !load);
-        e().add_reg(SCRATCH6, SCRATCH6, SCRATCH5);
-      }
-    }
-    emit_charge_data(SCRATCH6, SCRATCH1, load);
     bool first = true;
     for (u32 i = 0; i < 16; ++i) {
       if (!(list & (1u << i))) continue;
@@ -978,6 +968,19 @@ private:
     // LDM loading its own base keeps the loaded value.
     if (load) { if (writeback && !(list & (1u << rn))) e().mov(host_reg(rn), SCRATCH7); }
     else if (writeback) e().mov(host_reg(rn), SCRATCH7);
+    // Cost after the transfers, as the interpreter and the single-access slow path
+    // charge it: an I/O access sees the time before this instruction's data cycles
+    // (DIVCNT polled after an STM to the divider). Per word, since words span pages.
+    e().sub_imm(SCRATCH1, SCRATCH1, n * 4, true);
+    for (u32 k = 0; k < n; ++k) {
+      if (k == 0) emit_data_cost(SCRATCH1, SCRATCH6, true, false, !load);
+      else {
+        e().add_imm(SCRATCH3, SCRATCH1, k * 4, true);
+        emit_data_cost(SCRATCH3, SCRATCH5, true, true, !load);
+        e().add_reg(SCRATCH6, SCRATCH6, SCRATCH5);
+      }
+    }
+    emit_charge_data(SCRATCH6, SCRATCH1, load);
   }
 
   void emit_block_transfer(u32 instr, u32 list, bool load, bool writeback, u32 rn, bool interwork_pc, u32 pc_store_value,
@@ -1123,7 +1126,7 @@ void Translator::emit_exc_return(u32 instr, u32 opcode, u32 rn) {
   call_stub(rt().call_pure);
   e().ldr_w(host_reg(13), R_CTX, off_reg(13));
   e().ldr_w(host_reg(14), R_CTX, off_reg(14));
-  emit_branch_indirect(SCRATCH0, true);   // restored T in bit 0
+  emit_branch_indirect(SCRATCH0, true, false, true);   // restored T in bit 0; I may now be clear
 }
 
 void Translator::arm_data_processing(u32 instr, AOp op) {
