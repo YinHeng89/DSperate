@@ -156,11 +156,11 @@ const char* kUsage =
     "  --chunky-cell C panel pixels per chunky cell: auto (default; the smallest of 4..16 that divides the\n"
     "                  screen, 4 on a 640x480 panel = 160x120 cells) | pair (2x2 DS pixels) | N (the\n"
     "                  nearest size at or below N that divides the screen)\n"
-    "  --disp / --no-disp  present through the display engine's scaler layer (Miyoo A30 class\n"
-    "                  devices; the default is auto: wherever /dev/disp answers). video.disp\n"
-    "  --fbdev / --no-fbdev  present straight through /dev/fb0 (the mali-fbdev SDL2 of the\n"
-    "                  H700 handhelds; the default is auto: when that SDL2 has a mali driver\n"
-    "                  and fb0 answers). video.fbdev\n"
+    "  --sink S        where frames go: auto (the default: the best this device has) | disp (the\n"
+    "                  display engine's scaler layer, Miyoo A30 class) | fbdev (/dev/fb0, the H700\n"
+    "                  handhelds' mali-fbdev SDL2) | kms (page flips) | dmabuf (Wayland zero-copy) |\n"
+    "                  surface (SDL's window surface) | renderer (SDL_Renderer). One that won't open\n"
+    "                  falls back to the renderer. video.sink. --disp / --fbdev are --sink disp / fbdev\n"
     "  --gpu-present   lay out and scale the picture on the GPU, into the scanout\n"
     "                  buffer (Vulkan dma-buf import; opt-in). video.gpu_present\n"
     "  --no-audio      run without sound\n"
@@ -779,8 +779,8 @@ void on_signal(int) { g_signalled = 1; }
 
 // [video] settings, re-read/re-applied from the pause menu, not just at boot.
 // parse_video() is pure (no SDL); open_displays() does the set_* calls that
-// must precede Display::open. disp/fbdev/dual-window order are boot-only:
-// they force SDL's video driver, fixed before SDL_Init.
+// must precede Display::open. The sink plan and dual-window order are
+// boot-only: they can force SDL's video driver, fixed before SDL_Init.
 struct VideoSetup {
   int    scale = 2;
   bool   fullscreen = false, linear = false, vsync = true, dual_window = false;
@@ -794,7 +794,9 @@ struct VideoSetup {
   ds::sdl::Display::Layout layout;
   std::vector<ds::sdl::Display::Mode> layout_cycle;
   // Boot-only, see above.
-  bool   use_disp = false, use_fbdev = false, gpu_present = false;
+  ds::frontend::Sink panel_sink = ds::frontend::Sink::Count;   // Disp/Fbdev when one owns the panel (frontend/video/select.h)
+  ds::frontend::Sink want_sink = ds::frontend::Sink::Count;    // explicit video.sink among the window sinks
+  bool   gpu_present = false;
   int    upper_display = 0, lower_display = 1;   // dual-window: SDL display per physical panel
 };
 
@@ -886,6 +888,7 @@ bool parse_video(const ds::sdl::Config& cfg, VideoSetup& vs) {
 bool open_displays(const VideoSetup& vs, ds::sdl::Display& display, ds::sdl::Display& display2) {
   display.set_gpu_present(vs.gpu_present); display2.set_gpu_present(vs.gpu_present);
   if (vs.dual_window) {
+    display.set_sinks(ds::frontend::Sink::Count, vs.want_sink); display2.set_sinks(ds::frontend::Sink::Count, vs.want_sink);
     display.set_chunky(vs.chunky != 0, vs.chunky_cell); display2.set_chunky(vs.chunky != 0, vs.chunky_cell);
     display.set_grid_strength(vs.linear ? 0.0 : vs.grid_s); display2.set_grid_strength(vs.linear ? 0.0 : vs.grid_s);
     display.set_integer_scale(vs.int_scale); display2.set_integer_scale(vs.int_scale);
@@ -898,11 +901,10 @@ bool open_displays(const VideoSetup& vs, ds::sdl::Display& display, ds::sdl::Dis
     return true;
   }
   display.set_chunky(vs.chunky != 0, vs.chunky_cell);
-  display.set_disp(vs.use_disp);
+  display.set_sinks(vs.panel_sink, vs.want_sink);
   display.set_integer_scale(vs.int_scale);
   display.set_grid_strength(vs.linear ? 0.0 : vs.grid_s);
   if (!vs.linear) display.set_disp_grid(static_cast<u8>(((256 - vs.grid) * 255) / 256));
-  display.set_fbdev(vs.use_fbdev);
   return display.open("DSperate", vs.scale, vs.fullscreen, vs.linear, vs.vsync, vs.layout);
 }
 
@@ -1072,9 +1074,10 @@ static int run(int argc, char** argv) {
     else if (arg("--chunky-threshold")) cli.set("video.chunky_threshold", argv[++i]);
     else if (arg("--chunky-cell")) cli.set("video.chunky_cell", argv[++i]);
     else if (arg("--seam")) cli.set("video.seam", argv[++i]);
-    else if (flag("--disp")) cli.set("video.disp", "true");
+    else if (arg("--sink")) cli.set("video.sink", argv[++i]);
+    else if (flag("--disp")) cli.set("video.sink", "disp");
     else if (flag("--no-disp")) cli.set("video.disp", "false");
-    else if (flag("--fbdev")) cli.set("video.fbdev", "true");
+    else if (flag("--fbdev")) cli.set("video.sink", "fbdev");
     else if (flag("--no-fbdev")) cli.set("video.fbdev", "false");
     else if (flag("--gpu-present")) cli.set("video.gpu_present", "true");
     else if (flag("--no-gpu-present")) cli.set("video.gpu_present", "false");
@@ -1133,7 +1136,7 @@ static int run(int argc, char** argv) {
     if (!dsi_hle) { dsi_title = rom; rom = nullptr; }
   }
   auto apply_cli = [&] { for (const char* k : {"paths.bios9", "paths.bios7", "paths.firmware", "video.scale", "video.dual_window", "video.layout", "video.screen", "video.pip_alpha", "video.screen_gap", "video.dominant_ratio", "video.dominant_threshold", "video.integer_scale",
-                                              "video.fullscreen", "video.linear", "video.lcd_grid", "video.chunky", "video.chunky_threshold", "video.chunky_cell", "video.seam", "video.disp", "video.fbdev", "video.gpu_present", "video.vsync", "audio.enabled", "audio.volume",
+                                              "video.fullscreen", "video.linear", "video.lcd_grid", "video.chunky", "video.chunky_threshold", "video.chunky_cell", "video.seam", "video.sink", "video.disp", "video.fbdev", "video.gpu_present", "video.vsync", "audio.enabled", "audio.volume",
                                               "audio.mic", "emu.jit", "emu.speed", "emu.limiter", "emu.pacing", "audio.buffer_size", "audio.latency_frames", "emu.frameskip", "emu.frameskip_mode", "emu.frameskip_capture", "video.aa", "emu.autosave_png", "emu.autoload", "cheevos.enabled", "cheevos.token_file", "cheevos.username"}) if (cli.has(k)) cfg.set(k, cli.str(k)); };
   apply_cli();
   const std::string bios9 = cfg.str("paths.bios9"), bios7 = cfg.str("paths.bios7");
@@ -1391,18 +1394,28 @@ static int run(int argc, char** argv) {
       SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
     } else std::fprintf(stderr, "%s: this SDL2 has no headless video driver; its own driver will also open the panel\n", tier);
   };
-  const std::string disp_mode = cfg.str("video.disp");
-  const bool disp_auto = disp_mode.empty() || disp_mode == "auto";
-  bool& use_disp = vs.use_disp;
-  use_disp = disp_mode == "true" || disp_mode == "on";
-  if ((use_disp || disp_auto) && !dual_window) {
-    if (ds::sdl::DispOut::available()) { use_disp = true; go_headless("video.disp"); }
-    else if (use_disp) {
-      std::fprintf(stderr, "video.disp: /dev/disp not usable; using SDL\n");
-      use_disp = false;
-    }
-  } else use_disp = false;
-  if (use_disp && chunky != 0 && chunky != 2) {
+  // Where frames go (frontend/video/select.h). The panel-owning sinks are
+  // decided here, before SDL_Init, since they point SDL at a headless driver.
+  {
+    ds::frontend::BootProbe probe;
+    probe.sink = cfg.str("video.sink");
+    probe.disp = cfg.str("video.disp");
+    probe.fbdev = cfg.str("video.fbdev");
+    probe.dual_window = dual_window;
+    if (const char* vd = std::getenv("SDL_VIDEODRIVER")) probe.sdl_videodriver = vd;
+    for (int i = 0; i < SDL_GetNumVideoDrivers(); ++i) if (!std::strcmp(SDL_GetVideoDriver(i), "mali")) probe.sdl_has_mali = true;
+    probe.display_env = std::getenv("DISPLAY") || std::getenv("WAYLAND_DISPLAY");
+    probe.has_dri = ::access("/dev/dri", F_OK) == 0;
+    probe.disp_ok = !dual_window && ds::sdl::DispOut::available();
+    probe.fb0_ok = !dual_window && ds::sdl::FbdevOut::available();
+    const ds::frontend::BootPlan plan = ds::frontend::plan_boot(probe);
+    for (const std::string& n : plan.notes) std::fprintf(stderr, "%s\n", n.c_str());
+    vs.panel_sink = plan.panel;
+    vs.want_sink = plan.want;
+    if (plan.unset_videodriver) unsetenv("SDL_VIDEODRIVER");
+    if (plan.headless_driver) go_headless(plan.panel == ds::frontend::Sink::Disp ? "video.sink disp" : "video.sink fbdev");
+  }
+  if (vs.panel_sink == ds::frontend::Sink::Disp && chunky != 0 && chunky != 2) {
     std::fprintf(stderr, "chunky %s: the display-engine tier draws chunky cells in the scaler as their mean; using mean\n", cfg.str("video.chunky").c_str());
     chunky = 2;
   }
@@ -1410,41 +1423,6 @@ static int run(int argc, char** argv) {
   // GPU present stage, default on. Display falls back to the scanline scaler
   // without dma-buf import, and GpuPresent::open() declines without Vulkan.
   { const std::string g = cfg.str("video.gpu_present", "true"); vs.gpu_present = g == "true" || g == "on" || g == "1"; }
-
-  // The fbdev tier (display_fbdev.h) owns fb0 the same way. auto takes it
-  // only where SDL2 was built with the mali video driver -- the BaseOS
-  // handhelds -- since any desktop with a console has an fb0 too and its
-  // compositor, not us, should have it. on forces it wherever fb0 answers.
-  const std::string fbdev_mode = cfg.str("video.fbdev");
-  const bool fbdev_auto = fbdev_mode.empty() || fbdev_mode == "auto";
-  bool& use_fbdev = vs.use_fbdev;
-  use_fbdev = fbdev_mode == "true" || fbdev_mode == "on";
-  if (!use_disp && (use_fbdev || fbdev_auto) && !dual_window) {
-    // The signals: the launcher named the mali driver, this SDL2 was built
-    // with one, the launcher named a headless driver outright, or nothing
-    // SDL could draw on exists -- no X or Wayland display, no DRM node --
-    // in which case SDL lands on its offscreen driver by itself (seen on
-    // the RG35XX SP through spruce's launcher: "software renderer,
-    // offscreen driver", a black panel with sound). A box like that with a
-    // writable fb0 is an fbdev box.
-    bool mali = false, headless = false;
-    if (const char* vd = std::getenv("SDL_VIDEODRIVER")) {
-      mali = !std::strcmp(vd, "mali");
-      headless = !std::strcmp(vd, "dummy") || !std::strcmp(vd, "offscreen");
-    } else {
-      for (int i = 0; i < SDL_GetNumVideoDrivers(); ++i) if (!std::strcmp(SDL_GetVideoDriver(i), "mali")) mali = true;
-      headless = !std::getenv("DISPLAY") && !std::getenv("WAYLAND_DISPLAY") && ::access("/dev/dri", F_OK) != 0;
-    }
-    if ((use_fbdev || mali || headless) && ds::sdl::FbdevOut::available()) {
-      use_fbdev = true;
-      // A mali driver named explicitly would put an EGL surface on fb0 under us.
-      if (mali && std::getenv("SDL_VIDEODRIVER")) unsetenv("SDL_VIDEODRIVER");
-      go_headless("video.fbdev");
-    } else if (use_fbdev) {
-      std::fprintf(stderr, "video.fbdev: /dev/fb0 not usable; using SDL\n");
-      use_fbdev = false;
-    } else use_fbdev = false;
-  } else use_fbdev = false;
 
   u32 init = SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER;
   if (audio_on || mic_on) init |= SDL_INIT_AUDIO;
@@ -2025,8 +2003,8 @@ sdl_ready:
   auto reopen_display = [&]() -> bool {
     VideoSetup want;
     if (!parse_video(cfg, want)) return false;
-    want.use_disp = vs.use_disp;
-    want.use_fbdev = vs.use_fbdev;
+    want.panel_sink = vs.panel_sink;
+    want.want_sink = vs.want_sink;
     want.upper_display = vs.upper_display;
     want.lower_display = vs.lower_display;
     want.layout = display.current_layout();

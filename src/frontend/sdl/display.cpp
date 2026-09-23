@@ -133,129 +133,149 @@ bool Display::open(const char* title, int scale, bool fullscreen, bool linear, b
   upper_panel_ = only_screen == 0;
   display_index_ = display_index;
   nviews_ = only_screen_ >= 0 ? 1 : SCREENS;
+  sink_ = Sink::Count;
+  const bool panel = only_screen_ < 0 && (panel_ == Sink::Disp || panel_ == Sink::Fbdev);
   int w = 0, h = 0;
   if (only_screen_ >= 0) { w = static_cast<int>(SCREEN_W) * scale; h = static_cast<int>(SCREEN_H) * scale; }
   else natural_size(layout_, scale, w, h);
-  {
-    int r = rot_wanted_;
-    if (!r) if (const char* e = std::getenv("DS_ROTATE")) r = std::atoi(e);
-    r = ((r % 360) + 360) % 360;
-    if ((r == 90 || r == 270) && !disp_wanted_ && !fbdev_wanted_) std::swap(w, h);
-  }
-  const u32 flags = static_cast<u32>(SDL_WINDOW_RESIZABLE) | (fullscreen ? static_cast<u32>(SDL_WINDOW_FULLSCREEN_DESKTOP) : 0u);
-  win_ = SDL_CreateWindow(title, SDL_WINDOWPOS_CENTERED_DISPLAY(display_index), SDL_WINDOWPOS_CENTERED_DISPLAY(display_index), w, h, flags);
-  if (!win_) { std::fprintf(stderr, "SDL_CreateWindow: %s\n", SDL_GetError()); return false; }
-  fullscreen_ = fullscreen;
-
   int rot = rot_wanted_;
   if (!rot) if (const char* r = std::getenv("DS_ROTATE")) rot = std::atoi(r);
   rot = ((rot % 360) + 360) % 360;
   if (rot != 0 && rot != 90 && rot != 180 && rot != 270) { std::fprintf(stderr, "video: rotation %d not supported; 0\n", rot); rot = 0; }
+  if ((rot == 90 || rot == 270) && !panel) std::swap(w, h);
+  const u32 flags = static_cast<u32>(SDL_WINDOW_RESIZABLE) | (fullscreen ? static_cast<u32>(SDL_WINDOW_FULLSCREEN_DESKTOP) : 0u);
+  win_ = SDL_CreateWindow(title, SDL_WINDOWPOS_CENTERED_DISPLAY(display_index), SDL_WINDOWPOS_CENTERED_DISPLAY(display_index), w, h, flags);
+  if (!win_) { std::fprintf(stderr, "SDL_CreateWindow: %s\n", SDL_GetError()); return false; }
+  fullscreen_ = fullscreen;
   rot_ = 0;
 
-  // Display-engine tier: hardware scales a DS-resolution canvas, so there is
-  // no renderer/scaling here; views are laid out on the canvas and draw()
-  // draws into the layer's source.
-  if (disp_wanted_ && only_screen_ < 0 && DispOut::available()) {
-    auto d = std::make_unique<DispOut>();
-    d->set_grid(disp_grid_);
-    d->set_overlay(true);   // menu/OSD panel pixels: the only place on this chip to get them
-    d->set_nearest(!linear);
-    d->set_integer_scale(static_cast<int>(int_scale_));
-    if (d->open(rot, vsync)) {
-      disp_ = std::move(d);
-      layout();
-      if (chunky_) build_source_scale();
-      std::fprintf(stderr, "video: display-engine scaler (%s), rot %d, layout %s, %s driver, vsync %s%s%s\n",
-                   disp_->nearest() ? "nearest" : "driver filter", rot, mode_name(layout_.mode), SDL_GetCurrentVideoDriver(), vsync ? "on" : "off",
-                   !chunky_ ? "" : disp_->divisor() > 1 ? ", chunky in the scaler" : ", chunky at source",
-                   disp_->grid() ? ", grid layer" : disp_->overlay_available() ? ", overlay layer" : "");
-      return true;
-    }
+  if (panel && panel_ == Sink::Disp && open_disp(linear, vsync, rot)) { sink_ = Sink::Disp; return true; }
+  if (panel && panel_ == Sink::Fbdev) {
+    if (open_fbdev(vsync, rot)) { sink_ = Sink::Fbdev; return true; }
+    std::fprintf(stderr, "video.sink: /dev/fb0 not usable; using SDL\n");
   }
 
-  // fbdev tier: scanline path straight into fb0's buffers, for SDL2 builds
-  // whose only driver is Mali EGL over fbdev (H700 handhelds under BaseOS).
-  if (fbdev_wanted_ && only_screen_ < 0) {
-    auto fo = std::make_unique<FbdevOut>();
-    if (fo->open(win_, vsync)) {
-      out_ = std::move(fo);
-      scaled_ = true;
-      rot_ = rot;
-      layout();
-      build_scale();
-      std::fprintf(stderr, "video: fbdev scanout %dx%d, %s driver, scanline scaling, rot %d, vsync %s\n",
-                   out_->width(), out_->height(), SDL_GetCurrentVideoDriver(), rot_, vsync ? "on" : "off");
-      return true;
-    }
-    std::fprintf(stderr, "video.fbdev: /dev/fb0 not usable; using SDL\n");
-  }
-
-  // Per-scanline scaling renders straight into the presented buffer, so it
-  // can't coexist with an SDL_Renderer and is decided here. Default on
-  // wherever a zero-copy destination exists: Wayland's shm window surface,
-  // or KMSDRM's DrmOut page-flip tier below (even its SDL window-surface
-  // fallback wins, since that's secretly a hidden GLES renderer there; see
-  // display_drm.h). --linear is bilinear here (Gpu::emit_bilinear), the
-  // renderer's own filter on the fallback. DS_SCANLINE_SCALE=0/1 overrides.
   const char* vd = SDL_GetCurrentVideoDriver();
-  const bool wayland = vd && !std::strcmp(vd, "wayland");
-  const bool kms = vd && !std::strcmp(vd, "KMSDRM");
-  const char* sl = std::getenv("DS_SCANLINE_SCALE");
-  scaled_ = sl && *sl ? std::strcmp(sl, "0") != 0
-                      : (wayland || kms);
-  if (scaled_) {
-    rot_ = rot;
-    const char* dmenv = std::getenv("DS_DMABUF");
-    const bool dm_forbidden = dmenv && !std::strcmp(dmenv, "0");
-    const bool dm_required = dmenv && !std::strcmp(dmenv, "1");
-
-    // KMSDRM first, before asking for a window surface: SDL_GetWindowSurface
-    // there *succeeds* by quietly building a GLES renderer, the cost this tier avoids.
-    if (kms && !dm_forbidden) {
-      int ow = 0, oh = 0;
-      SDL_GetWindowSize(win_, &ow, &oh);
-      auto dr = std::make_unique<DrmOut>();
-      if (gpu_wanted_) dr->set_bufs(DrmOut::DEFAULT_BUFS + 1);
-      if (dr->open(win_, ow, oh, display_index_)) {
-        out_ = std::move(dr);
-        layout();
-        build_scale();
-        if (try_gpu_present()) return true;
-        std::fprintf(stderr, "video: kms scanout, %s driver, scanline scaling, rot %d\n", vd, rot_);
-        return true;
-      }
-      if (dm_required) { std::fprintf(stderr, "DS_DMABUF=1 but the kms scanout path failed\n"); return false; }
+  auto env = [](const char* k) { const char* e = std::getenv(k); return std::string(e ? e : ""); };
+  const frontend::WindowPlan plan = frontend::plan_window({want_, vd ? vd : "", env("DS_DMABUF"), env("DS_SCANLINE_SCALE")});
+  for (const Sink s : plan.order) {
+    bool ok = false;
+    switch (s) {
+      case Sink::Kms:      ok = open_kms(rot); break;
+      case Sink::Dmabuf:   ok = open_dmabuf(rot); break;
+      case Sink::Surface:  ok = open_surface(rot); break;
+      case Sink::Renderer: ok = open_renderer(linear, vsync, rot); break;
+      default: break;
     }
-
-    if (!SDL_GetWindowSurface(win_)) {
-      std::fprintf(stderr, "window surface unavailable (%s); using the framebuffer path\n", SDL_GetError());
-      scaled_ = false;
-      rot_ = 0;
-    } else {
-      layout();
-      build_scale();
-      // Same scanline path/targets; pixels land in a CMA dmabuf instead of the shm surface.
-      if (scaled_ && wayland && !dm_forbidden) {
-        int ow = 0, oh = 0;
-        output_size(ow, oh);   // the presented size, whatever the rotation
-        auto dm = std::make_unique<DmabufOut>();
-        if (gpu_wanted_) dm->set_bufs(DmabufOut::DEFAULT_BUFS + 1);
-        if (dm->open(win_, ow, oh, only_screen_ >= 0 ? display_index_ : -1)) out_ = std::move(dm);
-        else if (dm_required) { std::fprintf(stderr, "DS_DMABUF=1 but the dmabuf path failed\n"); return false; }
-      }
-      if (!scaled_) rot_ = 0;
-      if (out_ && try_gpu_present()) return true;
-      std::fprintf(stderr, "video: %s, %s driver, scanline scaling, rot %d\n",
-                   out_ ? "dmabuf" : "window surface", SDL_GetCurrentVideoDriver(), rot_);
-      return true;
+    if (ok) { sink_ = s; return true; }
+    if (plan.required && (s == Sink::Kms || s == Sink::Dmabuf)) {
+      std::fprintf(stderr, "DS_DMABUF=1 but the %s sink failed\n", frontend::sink_name(s));
+      return false;
     }
+    if (s == Sink::Renderer) return false;
   }
-  if (rot) std::fprintf(stderr, "video: rotation %d is not applied on the renderer path\n", rot);
+  return false;
+}
 
-  // SDL_Renderer fallback: reached where no tier above applies (X11,
-  // --linear, DS_SCANLINE_SCALE=0). GPU renderer tried first, software if
-  // it can't be created.
+// Display engine: hardware scales a DS-resolution canvas, so there is no
+// renderer/scaling here; views are laid out on the canvas and draw() draws
+// into the layer's source.
+bool Display::open_disp(bool linear, bool vsync, int rot) {
+  if (!DispOut::available()) return false;
+  auto d = std::make_unique<DispOut>();
+  d->set_grid(disp_grid_);
+  d->set_overlay(true);   // menu/OSD panel pixels: the only place on this chip to get them
+  d->set_nearest(!linear);
+  d->set_integer_scale(static_cast<int>(int_scale_));
+  if (!d->open(rot, vsync)) return false;
+  disp_ = std::move(d);
+  layout();
+  if (chunky_) build_source_scale();
+  std::fprintf(stderr, "video: display-engine scaler (%s), rot %d, layout %s, %s driver, vsync %s%s%s\n",
+               disp_->nearest() ? "nearest" : "driver filter", rot, mode_name(layout_.mode), SDL_GetCurrentVideoDriver(), vsync ? "on" : "off",
+               !chunky_ ? "" : disp_->divisor() > 1 ? ", chunky in the scaler" : ", chunky at source",
+               disp_->grid() ? ", grid layer" : disp_->overlay_available() ? ", overlay layer" : "");
+  return true;
+}
+
+// fbdev: scanline path straight into fb0's buffers, for SDL2 builds whose
+// only driver is Mali EGL over fbdev (H700 handhelds under BaseOS).
+bool Display::open_fbdev(bool vsync, int rot) {
+  auto fo = std::make_unique<FbdevOut>();
+  if (!fo->open(win_, vsync)) return false;
+  out_ = std::move(fo);
+  scaled_ = true;
+  rot_ = rot;
+  layout();
+  build_scale();
+  std::fprintf(stderr, "video: fbdev scanout %dx%d, %s driver, scanline scaling, rot %d, vsync %s\n",
+               out_->width(), out_->height(), SDL_GetCurrentVideoDriver(), rot_, vsync ? "on" : "off");
+  return true;
+}
+
+// KMS page flips. Tried before any window surface is asked for: on KMSDRM
+// SDL_GetWindowSurface *succeeds* by quietly building a GLES renderer.
+bool Display::open_kms(int rot) {
+  scaled_ = true;
+  rot_ = rot;
+  int ow = 0, oh = 0;
+  SDL_GetWindowSize(win_, &ow, &oh);
+  auto dr = std::make_unique<DrmOut>();
+  if (gpu_wanted_) dr->set_bufs(DrmOut::DEFAULT_BUFS + 1);
+  if (!dr->open(win_, ow, oh, display_index_)) { scaled_ = false; rot_ = 0; return false; }
+  out_ = std::move(dr);
+  layout();
+  build_scale();
+  if (try_gpu_present()) return true;
+  std::fprintf(stderr, "video: kms scanout, %s driver, scanline scaling, rot %d\n", SDL_GetCurrentVideoDriver(), rot_);
+  return true;
+}
+
+// The scanline path's pixels in a CMA dma-buf instead of the shm surface.
+// Needs the window surface first (the size it's configured at), and falls
+// back to it if the dma-buf is lost later.
+bool Display::open_dmabuf(int rot) {
+  if (!open_surface_scaling(rot)) return false;
+  int ow = 0, oh = 0;
+  output_size(ow, oh);   // the presented size, whatever the rotation
+  auto dm = std::make_unique<DmabufOut>();
+  if (gpu_wanted_) dm->set_bufs(DmabufOut::DEFAULT_BUFS + 1);
+  if (!dm->open(win_, ow, oh, only_screen_ >= 0 ? display_index_ : -1)) return false;
+  out_ = std::move(dm);
+  if (try_gpu_present()) return true;
+  std::fprintf(stderr, "video: dmabuf, %s driver, scanline scaling, rot %d\n", SDL_GetCurrentVideoDriver(), rot_);
+  return true;
+}
+
+bool Display::open_surface(int rot) {
+  if (!open_surface_scaling(rot)) return false;
+  std::fprintf(stderr, "video: window surface, %s driver, scanline scaling, rot %d\n", SDL_GetCurrentVideoDriver(), rot_);
+  return true;
+}
+
+// Per-scanline scaling into SDL's window surface: the scaling tables built
+// for it, or false (and nothing kept) where it has no usable surface.
+bool Display::open_surface_scaling(int rot) {
+  scaled_ = true;
+  rot_ = rot;
+  if (!SDL_GetWindowSurface(win_)) {
+    std::fprintf(stderr, "window surface unavailable (%s)\n", SDL_GetError());
+    scaled_ = false; rot_ = 0;
+    return false;
+  }
+  layout();
+  build_scale();
+  if (!scaled_) { rot_ = 0; return false; }
+  return true;
+}
+
+// SDL_Renderer: reached where no sink above applies (X11,
+// DS_SCANLINE_SCALE=0, video.sink = renderer). GPU renderer tried first,
+// software if it can't be created.
+bool Display::open_renderer(bool linear, bool vsync, int rot) {
+  scaled_ = false;
+  rot_ = 0;
+  if (rot) std::fprintf(stderr, "video: rotation %d is not applied on the renderer path\n", rot);
   const u32 vflag = vsync ? static_cast<u32>(SDL_RENDERER_PRESENTVSYNC) : 0u;
   ren_ = SDL_CreateRenderer(win_, -1, static_cast<u32>(SDL_RENDERER_ACCELERATED) | vflag);
   if (!ren_) {

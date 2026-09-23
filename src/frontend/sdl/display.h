@@ -5,6 +5,7 @@
 #include "frontend/sdl/video/presenter.h"
 #include "core/gpu/gpu.h"
 #include "frontend/video/layout.h"
+#include "frontend/video/select.h"
 #include "core/types.h"
 #include "display_disp.h"
 #include "display_drm.h"  // complete types for the unique_ptr
@@ -75,9 +76,13 @@ public:
   // cell when N divides both screen dims (else pair path); -1 = auto (smallest N>=4 that does).
   void set_chunky(bool on, int cell = 0) { chunky_ = on; chunky_cell_ = cell; }
   bool chunky() const { return chunky_; }
-  // Present through the display engine's scaler layer (display_disp.h) when
-  // available; DS_ROTATE gives the panel rotation. Set before open().
-  void set_disp(bool on) { disp_wanted_ = on; }
+  // Where frames go (frontend/video/select.h): `panel` is the boot plan's
+  // panel-owning sink (Disp, Fbdev) or Count; `want` an explicit window sink
+  // or Count for auto. open() tries them, then the window plan in order.
+  // Set before open().
+  using Sink = frontend::Sink;
+  void set_sinks(Sink panel, Sink want) { panel_ = panel; want_ = want; }
+  Sink sink() const { return sink_; }   // the one open() settled on
   // LCD grid on the display-engine tier, as its overlay layer (DispOut::set_grid). Set before open().
   void set_disp_grid(u8 alpha) { disp_grid_ = alpha; }
   bool disp() const { return disp_ != nullptr; }
@@ -104,8 +109,6 @@ public:
   // the scanline scaler where the import works. Set before open().
   void set_gpu_present(bool on) { gpu_wanted_ = on; }
   bool gpu_present() const { return gpu_ != nullptr; }
-  // Present straight through /dev/fb0 (display_fbdev.h). Set before open().
-  void set_fbdev(bool on) { fbdev_wanted_ = on; }
   const void* cell_map(int screen) const { return cells_[screen].x.cells ? &cells_[screen] : nullptr; }
   // Locks the panel-sized texture and fills in one target per screen. False
   // if the lock failed, in which case the caller must fall back to draw().
@@ -176,6 +179,14 @@ public:
   static void place(const Layout& l, int w, int h, View out[SCREENS], IntScale snap = IntScale::Off) { frontend::place(l, w, h, out, snap); }
 
 private:
+  // One per sink; true when the window is ready to present through it.
+  bool open_disp(bool linear, bool vsync, int rot);
+  bool open_fbdev(bool vsync, int rot);
+  bool open_kms(int rot);
+  bool open_dmabuf(int rot);
+  bool open_surface(int rot);
+  bool open_surface_scaling(int rot);   // Dmabuf and Surface's shared setup
+  bool open_renderer(bool linear, bool vsync, int rot);
   void layout();
   void build_source_scale();   // display-engine tier w/ chunky: 1:1 run tables and source-side cell maps
   void build_scale();          // pick up the window surface and rebuild the x-map
@@ -209,9 +220,9 @@ private:
   std::vector<u32>  stage_;               // the logical frame under rotation
   u32*              phys_px_ = nullptr;   // the presented buffer this frame, under rotation
   u32               phys_pitch_ = 0;
-  bool              disp_wanted_ = false;
+  Sink              panel_ = Sink::Count, want_ = Sink::Count;
+  Sink              sink_ = Sink::Count;
   u8                disp_grid_ = 0;
-  bool              fbdev_wanted_ = false;
   std::unique_ptr<DispOut> disp_;       // display-engine tier; null otherwise
   bool              chunky_ = false;
   double            grid_strength_ = 0.0;
