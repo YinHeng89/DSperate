@@ -3622,7 +3622,7 @@ sdl_ready:
           if (fb[i] == nds.gpu.framebuffer(i)) { std::memcpy(flash_fb[i].data(), fb[i], flash_fb[i].size() * 4); fb[i] = flash_fb[i].data(); }
           draw_flash(ds_canvas(const_cast<u32*>(fb[i])), flash_alpha);
         }
-        // Known limit until overlays get their own plane: on a 3D line the
+        display.draw(fb);
         if (dual_window) display2.draw(fb);
       }
     }
