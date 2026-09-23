@@ -18,5 +18,6 @@ void DmabufOut::end_frame() {}
 void DmabufOut::on_release(void*, struct wl_buffer*) {}
 bool DmabufOut::alloc_buf(Buf&) { return false; }
 void DmabufOut::drop_buf(Buf&) {}
+bool DmabufOut::dmabuf_plane(int, DmabufPlane&) const { return false; }
 
 } // namespace ds::sdl

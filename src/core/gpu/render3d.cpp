@@ -6,6 +6,9 @@
 #if DSPERATE_VULKAN
 #include "core/gpu/vk/vk_device.h"
 #include "core/gpu/vk/vk_raster.h"
+#else
+// Never made without Vulkan; complete only so Renderer3D's members destroy.
+namespace ds::gpu::vk { class Device {}; class Raster {}; }
 #endif
 
 #include <type_traits>
@@ -3651,10 +3654,19 @@ u32 Renderer3D::gpu_bands() const {
 #endif
 }
 
-void Renderer3D::set_smooth3d(bool on) { smooth3d_ = on; if (vk_raster_) vk_raster_->set_smooth(on); }
+void Renderer3D::set_smooth3d(bool on) {
+  smooth3d_ = on;
+#if DSPERATE_VULKAN
+  if (vk_raster_) vk_raster_->set_smooth(on);
+#endif
+}
 
 bool Renderer3D::gpu_raster_active() const {
+#if DSPERATE_VULKAN
   return vk_raster_ != nullptr && vk_raster_->ready();
+#else
+  return false;
+#endif
 }
 
 // Which frames the GPU raster may take: a whitelist of the simple case (not a
