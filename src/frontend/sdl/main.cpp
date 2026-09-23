@@ -171,8 +171,8 @@ const char* kUsage =
     "  --no-mic        do not open the microphone (M still fakes one)\n"
     "  --no-vsync      present without waiting for the display refresh\n"
     "  --interp        interpreter instead of the recompiler\n"
-    "  --aa [off|accurate|enhanced] / --no-aa  3D edges; video.aa, off by default. accurate: the hardware's blend.\n"
-    "                  resolution (scanline tiers, nearest/grid/seam; 2D untouched). accurate (bare --aa): the hardware's blend\n"
+    "  --aa [off|accurate|enhanced] / --no-aa  3D edges; video.aa, off by default. accurate (bare --aa):\n"
+    "                  the hardware's blend. enhanced: in development, currently the same as accurate\n"
     "  --frameskip N   skip drawing up to N frames in N+1 (0 = off); emu.frameskip. Skipping runs\n"
     "                  in whole display periods, so on a game that drives its screens on\n"
     "                  alternate frames the limit counts pairs (DS_DEBUG_SKIP=1 shows the period)\n"
@@ -278,19 +278,16 @@ std::string save_path(const std::string& rom, const std::string& dir) {
   return dir.empty() ? rom_stem(rom) + ".sav" : dir + "/" + base_name(rom_stem(rom)) + ".sav";
 }
 
-// video.aa: 0 off, 1 smooth (sub-pixel, no hw blend), 2 accurate (hw AA),
-// 3 enhanced (hw AA + edge shaping). Old boolean config reads as accurate/off.
-constexpr const char* kAaNames[4] = {"off", "smooth", "accurate", "enhanced"};
+// video.aa: 0 off, 1 accurate (hw AA), 2 enhanced (for now the same as accurate).
+// Old boolean config reads as accurate/off, the retired smooth as enhanced.
+constexpr const char* kAaNames[3] = {"off", "accurate", "enhanced"};
 int aa_mode(const std::string& v) {
-  if (v == "smooth") return 1;
-  if (v == "enhanced") return 3;
-  if (v == "accurate" || v == "true" || v == "1" || v == "yes" || v == "on") return 2;
+  if (v == "enhanced" || v == "smooth") return 2;
+  if (v == "accurate" || v == "true" || v == "1" || v == "yes" || v == "on") return 1;
   return 0;
 }
 void apply_aa(NDS& nds, int mode) {
-  nds.gpu3d.renderer().set_aa(mode >= 2);
-  nds.gpu.set_subpixel(mode == 1);
-  nds.gpu.set_shape(mode == 3);
+  nds.gpu3d.renderer().set_aa(mode >= 1);
 }
 
 void load_save(NDS& nds, const std::string& path) {

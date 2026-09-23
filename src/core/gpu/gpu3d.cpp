@@ -1171,19 +1171,7 @@ void Gpu3D::set_render_xpos(u16 value, u16 mask) {
 
 void Gpu3D::sync_raster() { renderer_.sync_all(); }
 
-const u32* Gpu3D::split_line(const Renderer3D::FrameRef& f, u32 y) {
-  const u32* raw = f.split_line(y);
-  const u32 xpos = render_xpos_;
-  if (!raw || xpos == 0) return raw;
-  u32* const scrolled = scrolled_split_;   // two u32 per pixel
-  std::memset(scrolled, 0, sizeof scrolled_split_);
-  if (xpos & 0x100) { for (u32 i = 512 - xpos, j = 0; i < 256; ++i, ++j) { scrolled[2 * i] = raw[2 * j]; scrolled[2 * i + 1] = raw[2 * j + 1]; } }
-  else { for (u32 i = 0, j = xpos; j < 256; ++i, ++j) { scrolled[2 * i] = raw[2 * j]; scrolled[2 * i + 1] = raw[2 * j + 1]; } }
-  return scrolled;
-}
-
 const u32* Gpu3D::line(const Renderer3D::FrameRef& f, u32 y) {
-  if (f.shape) renderer_.shape_sync(f);   // edge shaping reads across bands and repaints, once before the first line read
   renderer_.sync_line(f, static_cast<s32>(y));
   const u32* raw = f.line(y);
   const u32 xpos = render_xpos_;

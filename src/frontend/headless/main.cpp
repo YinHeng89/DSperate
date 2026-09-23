@@ -237,7 +237,7 @@ void entry_snap_cb(ds::CpuContext& cpu, ds::u32, void* user) {
 
 int main(int argc, char** argv) {
   ds::mem::fmc::init();   // before any Bus exists: counts page-table churn from reset on
-  bool subpixel = false, shape = false; int scaled_n = 0; const char* scaled_path = nullptr;
+  int scaled_n = 0; const char* scaled_path = nullptr;
   const char *rom = nullptr, *bios9 = nullptr, *bios7 = nullptr, *fw = nullptr, *trace = nullptr, *dump = nullptr, *hash_frames = nullptr, *dump_audio = nullptr, *replay = nullptr, *save = nullptr;
   const char* load_state = nullptr; const char* save_state_path = nullptr; int save_state_at = -1;
   const char* hide_screen = nullptr;
@@ -321,8 +321,6 @@ int main(int argc, char** argv) {
     else if (arg("--max")) ts.max = std::strtoull(argv[++i], nullptr, 0);
     else if (arg("--dump-frames")) dump = argv[++i];
     else if (arg("--hash-frames")) hash_frames = argv[++i];   // FILE: "frame top bottom" per frame, FNV-1a 64 of each screen's 0xAARRGGBB (the video golden hashes)
-    else if (flag("--enhanced") || flag("--shape")) shape = true;            // video.aa = enhanced: edge shaping on top of the hardware picture (Gpu::set_shape); only a scaled dump shows it
-    else if (flag("--subpixel")) subpixel = true;                            // sub-pixel polygon edges (Gpu::set_subpixel), hardware AA off as video.aa = smooth has it; only a scaled dump shows them
     else if (arg("--dump-scaled")) { scaled_n = std::atoi(argv[++i]); scaled_path = argv[++i]; }   // N FILE: both screens through the scanline scaler at Nx, raw BGRA
     else if (arg("--dump-from")) dump_from = std::atoi(argv[++i]);    // first frame to dump
     else if (arg("--dump-count")) dump_count = std::atoi(argv[++i]);  // how many (0 = to the end)
@@ -503,9 +501,7 @@ int main(int argc, char** argv) {
       std::fprintf(stderr, "note: DSi-capable ROM without --bios9i/--bios7i: running as a DS\n");
     }
   }
-  nds.gpu3d.renderer().set_aa(!no_aa && !subpixel);   // the SDL frontend's video.aa = smooth: never with the hardware blend
-  nds.gpu.set_subpixel(subpixel);
-  nds.gpu.set_shape(shape && !subpixel);
+  nds.gpu3d.renderer().set_aa(!no_aa);
   std::vector<ds::u32> scaled_px[2]; std::vector<ds::u16> scaled_xrun; FILE* scaled_out = nullptr;
   if (scaled_n > 0 && scaled_path) {
     const ds::u32 W = ds::SCREEN_W * scaled_n, H = ds::SCREEN_H * scaled_n;

@@ -123,8 +123,6 @@ public:
   Renderer3D::FrameRef frame_ref() const { return renderer_.frame_ref(); }
   u64 last_raster_ns() const { return renderer_.last_band_sum_ns(); }
   const u32* line(const Renderer3D::FrameRef& f, u32 y);
-  // Split map for line y, scrolled the same way (call after line(); null = none).
-  const u32* split_line(const Renderer3D::FrameRef& f, u32 y);
   // Finish async raster; needed before touching texture VRAM (raster workers may still read it).
   void sync_raster();
   void debug_dump(FILE* f) { renderer_.debug_dump(f); }
@@ -213,7 +211,6 @@ private:
   u16 render_xpos_ = 0;
   std::atomic<bool> render_on_{false};
   alignas(16) u32 scrolled_[256] = {};
-  u32 scrolled_split_[512] = {};
 
   // Matrices (20.12, row-major: m[row*4+col]).
   u32 matrix_mode_ = 0;

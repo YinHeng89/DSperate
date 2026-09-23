@@ -64,14 +64,6 @@ public:
   // Anti-aliasing (DISP3DCNT bit 4). Off clears the bit frame-wide: no
   // coverage, pixel-stack push, under-layer depth test, or AA blend.
   void set_aa(bool on) { aa_ = on; }
-  // Sub-pixel edges: also produces a split map (extract_splits) for the scanline scaler.
-  void set_subpixel(bool on) { if (on) for (auto& v : split_) if (v.empty()) v.assign(512 * 192, 0); subpix_ = on; }
-  bool subpixel() const { return subpix_; }
-  // Edge shaping: redraws stair-stepped object boundaries as straight lines
-  // through the stairs' outer corners (shape_frame), over the hardware picture.
-  void set_shape(bool on) { if (on) { for (auto& v : split_) if (v.empty()) v.assign(512 * 192, 0); for (int i = 0; i < 2; ++i) { sh_pure_[i].resize(256 * 192); sh_depth_[i].resize(256 * 192); sh_attr_[i].resize(256 * 192); } sh_hb_.resize(256 * 192); sh_vb_.resize(256 * 192); sh_rep_.resize(256 * 192); } shape_ = on; }
-  bool shape() const { return shape_; }
-  enum : u32 { SPLIT_NONE = 0, SPLIT_LEFT = 1, SPLIT_RIGHT = 2, SPLIT_UP = 3, SPLIT_DOWN = 4, SPLIT_GROW = 1u << 28, SPLIT_MARKED = 1u << 29, SPLIT_SPILL = 1u << 30, SPLIT_WEAK = 1u << 31 };
   bool aa() const { return aa_; }
 private:
   NDS& nds_;
@@ -94,13 +86,6 @@ private:
   // display isn't reading (display_ ^ 1), letting compositing of frame N
   // continue past line 215 of frame N+1.
   std::array<u32, 256 * 192> out_[2]{};
-  std::array<u8, 192> split_any_[2]{};      // per line: has records (extract_splits)
-  std::vector<u32> sh_pure_[2], sh_depth_[2], sh_attr_[2];   // edge shaping: top layer before AA blend (set_shape)
-  std::vector<s8> sh_hb_, sh_vb_; std::vector<u8> sh_rep_;   // shape_frame scratch: tagged boundaries below/right of a pixel, repainted cells
-  u32 sh_seq_[2]{};                                          // bumped when a frame is dispatched into out_[i]
-  std::atomic<u32> sh_built_[2]{};                           // the sh_seq_ whose shape pass has run
-  std::mutex sh_mx_;
-  std::vector<u32> split_[2];               // split map of out_[i], two slots a pixel; allocated by set_subpixel
   u32 display_ = 0;
   std::array<u8, 256 * RING> stencil_{};   // one row per ring line
   // Per ring line: was the previous polygon drawn on it a shadow mask
@@ -134,7 +119,6 @@ public:
   struct Shade {
     u32 blendmode, polyalpha, polyattr;
     bool highlight, textured, wireframe, shadow, polyattr_z;   // polyattr_z: translucent pixels update depth
-    bool subpix;                                                 // edge parts noted for the split map
     u32 dispcnt, alpha_ref;
     const u16* toon;
     // Texture: format, VRAM base, size, wrap/flip, transparent-colour-0 alpha, palette base.
@@ -217,8 +201,6 @@ private:
 
   const Gpu3D* gx_ = nullptr;
   const RenderState* rs_ = nullptr;
-  bool subpix_ = false, subpix_rendered_ = false;
-  bool shape_ = false, shape_rendered_ = false;
   bool game_aa_ = false;                  // AA blend runs (game asked and aa_ allows)
   bool aa_ = true, aa_rendered_ = true;   // aa_rendered_: the setting the kept frame was drawn with
   // rs_->dispcnt with bit 4 cleared when AA is off: kills the whole under
@@ -243,7 +225,6 @@ private:
   static constexpr u32 BATCH_CAP = BATCH_PX + 256 + 16;
   struct SpanBuf {
     s32 x0;
-    s32 e_l0, e_r0;                      // unclipped left/right edge run starts (note_edge_part)
     // +16 slack: stages round span length up to vector width and write whole vectors.
     alignas(16) u32 fac[BATCH_CAP];
     alignas(16) s32 z[BATCH_CAP];
@@ -372,12 +353,8 @@ public:
   // outstanding (rendered inline or kept).
   struct FrameRef {
     const u32* out = nullptr;
-    const u32* split = nullptr;               // null unless the frame was rendered in sub-pixel mode
-    const u8* split_any = nullptr;
-    const u32* split_line(u32 y) const { return split && split_any[y] ? split + y * 512 : nullptr; }   // null: no records on this line
     u64 gen = 0;
     u32 nbins = 0;
-    bool shape = false; u32 shape_idx = 0, shape_seq = 0;   // edge shaping: which buffer, and which dispatch into it (shape_sync)
     std::array<s32, MAX_BINS + 1> bin_y{};
     const u32* line(u32 y) const { return out + y * 256; }
   };
@@ -392,23 +369,6 @@ private:
 
   u32  edge_count_ = 0;
   u32* out_dst_ = nullptr;                              // where final_pass writes
-  u32* split_dst_ = nullptr;
-  struct ShapeDst { u32* pure = nullptr; u32* depth = nullptr; u32* attr = nullptr; } shape_dst_;   // this frame's planes (edge shaping)
-  void save_shape_line(s32 y);
-  void shape_frame(u32 idx);
-public:
-  void shape_sync(const FrameRef& f);   // before the first line of a shaped frame is read: wait for its bands, run the pass once
-private:
-  u8* split_any_dst_ = nullptr;
-  std::array<u8, RING> erow_{};                           // ring rows that had an edge noted since their clear
-  void extract_splits(s32 y);
-  void note_edge_part(const SpanBuf& sb, s32 y, s32 xa, s32 xb, int part, s32 cov, u32 attr_key, const u8* drawn);
-  void note_edge_overlap(const SpanBuf& sb, s32 y, s32 xa, s32 xb, s32 r_cov, u32 attr_key, const u8* drawn);
-  void note_edge_run(const SpanBuf& sb, s32 y, s32 xa, s32 xb, int part, s32 cov, s32 start, u32 attr_key, const u8* drawn, bool second);
-  // What is known of each top-layer pixel's edge (note_edge_part); sub-pixel mode only.
-  std::array<u8, RSIZE> eside_{};
-  std::array<s8, RSIZE> epos_{}, eslope_{};
-  std::array<s32, RSIZE> ez_{};
   const std::vector<const u32*>* texels_in_ = nullptr;  // decoded textures per polygon (render() records them)
   // Latched once by the coordinator after sync_all and handed to every band;
   // workers never read the engine's live list (SWAP can finalise the next
@@ -442,10 +402,7 @@ private:
     std::array<s32, MAX_BINS + 1> bin_y{};
     u32 nbins = 0;
     u32* dst = nullptr;
-    u32* split = nullptr;
-    u8* split_any = nullptr;
-    ShapeDst shape_dst;
-    bool aa = false, subpix = false, shape = false;
+    bool aa = false;
   };
   DispatchCtx ctx_[2];
   struct StealBand { std::unique_ptr<Renderer3D> band; std::atomic<bool> busy{false}; u64 gen = ~u64{0}; };

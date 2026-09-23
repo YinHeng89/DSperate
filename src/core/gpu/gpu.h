@@ -151,25 +151,11 @@ public:
     u32 y_lo = 0, y_hi = 0;
   };
   // Both screens or neither: pass a null `px` to go back to fb_.
-  void set_scale_target(int screen, const ScaleTarget& t) { scale_[screen] = t; if (scale_[screen].y_hi == 0) scale_[screen].y_hi = t.h; update_shape(); }
-  // Edge shaping shows only through the scanline scaler's runs, so it's held
-  // off on a tier that can't patch cells (bilinear, chunky, own scaler, downscale).
-  bool shape_usable() const {
-    for (int s = 0; s < 2; ++s) { const ScaleTarget& t = scale_[s];
-      if (t.px && !t.bilinear && !t.chunky && t.h >= SCREEN_H && t.xrun[SCREEN_W] >= SCREEN_W) return true; }
-    return false;
-  }
+  void set_scale_target(int screen, const ScaleTarget& t) { scale_[screen] = t; if (scale_[screen].y_hi == 0) scale_[screen].y_hi = t.h; }
   // Runs a whole DS-resolution image (e.g. a frontend pause menu) through the
   // scanline scaler with the game's grid/chunky/seam treatment. No-op without a scale target.
   void scale_image(int screen, const u32* src);
   bool scaling() const { return scale_[0].px && scale_[1].px; }
-  // Sub-pixel polygon edges: the 3D raster's split map cuts an edge pixel's
-  // panel cell at the polygon's real boundary. Only nearest/grid/seam scaler
-  // paths show it, only where 3D is the pixel. Every edge drawn (AA fill rule).
-  void set_subpixel(bool on);
-  bool subpixel() const { return subpixel_; }
-  void set_shape(bool on);                 // edge shaping on top of the hardware picture (Renderer3D::shape_frame); not with set_subpixel
-  bool shape() const { return shape_; }
   u16 line() const { return line_; }
 
   Engine2D engine[2];
@@ -235,37 +221,6 @@ private:
   // Scaled row staged here before the target (scanout memory, uncached CMA):
   // duplicating straight out of it would read that memory back.
   alignas(16) u32 row_scratch_[2][SCALED_ROW_MAX];
-  // Sub-pixel edges (emit_splits). A cut whose uncovered part takes the line
-  // below waits in sp_pend_ until that line is composed.
-  struct SplitRec { u8 x, side, unc; s8 slope, src; };   // side: SPLIT_* | 0x80 weak | 0x40 spill | 0x20 edge-marked (unc = position+32) | 0x10 reach from line above; unc 0..32; src: see Renderer3D::extract_splits
-  bool subpixel_ = false;
-  bool shape_ = false;
-  bool shape_live_ = false;                // shape_ and a screen that can show it: what the renderer was told
-  void update_shape();                     // renderer runs the pass only while a screen can show it (shape_usable)
-  bool splits_on() const { return subpixel_ || shape_live_; }   // a split map comes with the 3D lines
-  u8 sp_prev_own_[2][256]{};               // per screen: which pixels of the line before were the 3D layer's, unblended
-  const u32* split3d_ = nullptr;          // split map of line3d_ (null: none this frame)
-  SplitRec sp_pend_[2][4 * SCREEN_W];
-  u32 sp_pend_n_[2] = {0, 0}, sp_pend_line_[2] = {~0u, ~0u};
-  alignas(16) u32 sp_prev_[2][SCREEN_W];  // the previous composed line, for cuts that take the line above
-  u32 sp_prev_line_[2] = {~0u, ~0u};
-  void emit_splits(int screen, u32 line, const u32* dst, const Pixel* composed, bool shown, u64 key);
-  // Carry through display capture: per frame generation, a content-keyed table of split lines.
-  static constexpr u32 kSplitGens = 4;
-  struct SplitGen {
-    struct Slot { u64 key = 0; u32 off = 0; u16 n = 0; };
-    u64 frame = ~u64{0};
-    u32 used = 0;
-    std::array<Slot, 512> slot{};
-    std::array<SplitRec, 16384> recs{};
-  };
-  std::vector<SplitGen> sp_gen_;          // kSplitGens of them once the mode is on (set_subpixel)
-  u64 sp_last_store_ = 0;
-  static bool split_admit(const SplitRec& r, const u32* own, const u32* other, u32 ox, bool horiz);
-  void emit_splits_b(int screen, u32 line, const u32* dst, u64 key);
-  void carry_store(u64 key, const SplitRec* recs, u32 n);
-  u32 carry_find(u64 key, const SplitRec** recs) const;
-  void patch_cell(const ScaleTarget& t, u32 line, const SplitRec& r, u32 nb);
   const u32* line3d_ = nullptr;   // 3D output for the line being drawn (whichever thread draws engine A)
 
   // Lazy-2D state for the frame in progress.
@@ -350,7 +305,7 @@ private:
   // Engine B's scaling, handed to the worker with engine A's lagged lines:
   // the join is only for buffer reuse and frame end. Lines drawn here in lag
   // mode stash their output (output_engine); the worker scales it after engine A's lines.
-  struct StashedLine { u32 line; int screen; u64 key; alignas(16) u32 px[SCREEN_W]; };   // key: see emit_splits
+  struct StashedLine { u32 line; int screen; alignas(16) u32 px[SCREEN_W]; };
   StashedLine bscale_[SCREEN_H];
   u32  bscale_n_ = 0;                   // lines stashed for the job being built / in flight
   bool bscale_defer_ = false;           // output_engine stashes engine B's line instead of scaling it
