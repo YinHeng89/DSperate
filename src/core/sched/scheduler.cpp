@@ -44,6 +44,7 @@ Scheduler::Scheduler(NDS& nds) : nds_(nds), now_(0) {
   debug_slices_ = std::getenv("DS_DEBUG_SLICES") != nullptr;
   idle_survey_ = std::getenv("DS_IDLE_SURVEY") != nullptr;
   if (const char* e = std::getenv("DS_IDLE_SKIP")) set_idle_skip(e);
+  if (const char* e = std::getenv("DS_IDLE_CUT")) idle_cut_ = e[0] != '0';
   reset();
 }
 
@@ -96,6 +97,9 @@ void Scheduler::cut_arm9_at(u64 at) {
   if (running_ != &a9 || at >= slice_end_ || at <= now_) return;
   const s32 nb = budget9_for(static_cast<s64>(at - now_));
   if (nb >= budget9_) return;
+  // An idle-cut probe in progress is abandoned: the held budget back first, so
+  // what the ARM9 has used is counted from the whole slice.
+  if (cut_held_[0]) { a9.hot.cycle_budget += cut_held_[0]; running_start_budget_ += cut_held_[0]; cut_held_[0] = 0; cut_idle_[0] = false; }
   const s32 consumed = budget9_ - a9.hot.cycle_budget;
   budget9_ = nb; running_start_budget_ = nb; slice_end_ = at;
   a9.hot.cycle_budget = nb - consumed;   // <= 0: the ARM9 stops after this instruction, as melonDS's loop does
@@ -118,6 +122,84 @@ void Scheduler::rescan() {
   }
   next_ = best;
   next_id_ = best_id;
+}
+
+// ---- idle cut ----
+// A CPU that ends slices in states it has already been in is re-reading
+// memory and I/O without progress: a poll. Instead of its whole next slice it
+// gets a probe of a few hundred cycles; if that ends in a state already seen
+// too, the rest of the slice counts as run without being emulated. Anything
+// the poll waits on -- a value that lands in a register -- makes the probe end
+// somewhere new and the CPU takes its whole slice, so it notices within one
+// slice. A trade against exact timing: the skipped iterations cost the host
+// nothing, and a store-only loop with frozen registers would be cut too.
+// A running DMA doesn't stop it: the skipped cycles go to the DMA instead
+// (cut_resolve), as a skipped CPU's do in advance_dma_only.
+bool Scheduler::cut_ok(const CpuContext& c) const {
+  return idle_cut_ && !dsi_ && !c.halted && !(c.hot.irq_pending && !(c.hot.cpsr & 0x80));
+}
+namespace {
+u64 reg_hash(const CpuContext& c) {
+  u64 h = 1469598103934665603ull;
+  for (u32 r = 0; r < 15; ++r) h = (h ^ c.hot.regs[r]) * 1099511628211ull;
+  return (h ^ c.hot.cpsr) * 1099511628211ull;
+}
+} // namespace
+// The state is one the CPU ended a recent slice in: same registers, and the
+// same PC or one nearby (a poll of several addresses stops anywhere in its loop).
+bool Scheduler::cut_seen(int i, const CpuContext& c) const {
+  const u32 pc = c.hot.regs[15];
+  const u64 h = reg_hash(c);
+  for (u32 k = 0; k < 8; ++k) if (cut_h_[i][k] == h && cut_pc_[i][k] - pc + 256u < 512u) return true;
+  return false;
+}
+// At a slice end: is the CPU idle (for the next slice's probe), then remember the state.
+void Scheduler::cut_note(int i, const CpuContext& c) {
+  cut_idle_[i] = cut_ok(c) && cut_seen(i, c);
+  cut_h_[i][cut_pos_[i] & 7] = reg_hash(c);
+  cut_pc_[i][cut_pos_[i]++ & 7] = c.hot.regs[15];
+}
+// Slice start: an idle CPU runs a probe, the rest of its budget held back.
+void Scheduler::cut_arm(int i, CpuContext& c, s32 probe) {
+  cut_held_[i] = 0;
+  if (!cut_idle_[i] || !cut_ok(c) || c.hot.cycle_budget <= 2 * probe) return;
+  cut_held_[i] = c.hot.cycle_budget - probe;
+  c.hot.cycle_budget = probe;
+  // The clock inside the slice (now()) counts from the budget the CPU was
+  // handed: the probe's, so it runs from the slice start, not its end.
+  if (running_ == &c) running_start_budget_ -= cut_held_[i];
+  prof::add(prof::C_CUT_PROBES, 1);
+}
+// After the probe: still idle, and the held budget counts as spent (true);
+// or the CPU gets it back to run the rest of its slice (false).
+bool Scheduler::cut_resolve(int i, CpuContext& c) {
+  const s32 held = cut_held_[i];
+  cut_held_[i] = 0;
+  if (c.halted || (cut_ok(c) && cut_seen(i, c))) {
+    if (!c.halted) {
+      prof::add(prof::C_CUT_HITS, 1);
+      prof::add(i == 0 ? prof::C_CYC_CUT_A9 : prof::C_CYC_CUT_A7, static_cast<u64>(held));
+      // A DMA on this CPU still gets the whole slice; what it leaves is idle.
+      if (nds_.dma.any_running(c.which)) {
+        c.hot.cycle_budget += held;
+        if (running_ == &c) running_start_budget_ += held;
+        advance_dma_only(c);
+        if (c.hot.cycle_budget > 0) c.hot.cycle_budget = 0;
+      }
+    }
+    return true;   // a CPU that halted in its probe sleeps out the slice as usual
+  }
+  // Where the probe stopped goes into the ring as well: a loop that spans a
+  // call (a game's wait around a BIOS routine) stops in the other half than
+  // whole slices do, and is recognised there from the second probe on.
+  if (!c.halted) {
+    cut_h_[i][cut_pos_[i] & 7] = reg_hash(c);
+    cut_pc_[i][cut_pos_[i]++ & 7] = c.hot.regs[15];
+  }
+  cut_idle_[i] = false;
+  c.hot.cycle_budget += held;
+  if (running_ == &c) running_start_budget_ += held;
+  return false;
 }
 
 // A CPU counts as idle when halted, or awake but provably going nowhere.
@@ -230,15 +312,29 @@ void Scheduler::count_slice(bool skipped, s64 slice) const {
   else prof::add(prof::C_CYC_NEITHER_HALTED, cyc);
 
   // Spin proxy for the awake CPUs.
-  bool spin[2] = {false, false};
+  bool spin[2] = {false, false}, exact[2] = {false, false}, drift[2] = {false, false};
   const CpuContext* cpus[2] = {&a9, &a7};
   for (int i = 0; i < 2; ++i) {
     if (cpus[i]->halted) continue;
     const u32 pc = cpus[i]->hot.regs[15];
-    for (u32 k = 0; k < 8; ++k) if (spin_ring_[i][k] == pc) { spin[i] = true; break; }
+    u64 h = 1469598103934665603ull;
+    for (u32 r = 0; r < 15; ++r) h = (h ^ cpus[i]->hot.regs[r]) * 1099511628211ull;
+    h = (h ^ cpus[i]->hot.cpsr) * 1099511628211ull;
+    for (u32 k = 0; k < 8; ++k) {
+      if (spin_ring_[i][k] == pc) { spin[i] = true; if (spin_hash_[i][k] == h) exact[i] = true; }
+      else if (spin_hash_[i][k] == h && spin_ring_[i][k] - pc + 256u < 512u) drift[i] = true;
+    }
+    if (exact[i]) drift[i] = false;
+    spin_hash_[i][spin_pos_[i] & 7] = h;
     spin_ring_[i][spin_pos_[i]++ & 7] = pc;
   }
   spin_now_[0] = spin[0]; spin_now_[1] = spin[1];
+  idle_now_[0] = exact[0]; idle_now_[1] = exact[1];
+  drift_now_[0] = drift[0]; drift_now_[1] = drift[1];
+  if (drift[0]) prof::add(prof::C_CYC_A9_IDLE_DRIFT, cyc);
+  if (drift[1]) prof::add(prof::C_CYC_A7_IDLE_DRIFT, cyc);
+  if (exact[0]) prof::add(prof::C_CYC_A9_IDLE_EXACT, cyc);
+  if (exact[1]) prof::add(prof::C_CYC_A7_IDLE_EXACT, cyc);
   // DS_DUMP_CODE=<hex addr>: one-shot dump of 16 guest words, for inspecting
   // a loop body the analyser rejected.
   static const char* dump_env = std::getenv("DS_DUMP_CODE");
@@ -262,7 +358,7 @@ void Scheduler::count_slice(bool skipped, s64 slice) const {
   // loop (a few addresses) from a merely hot inner loop (many).
   static const bool spin_pcs = std::getenv("DS_SPIN_PCS") != nullptr;
   if (spin_pcs) {
-    static std::map<u32, u64> hist[2];
+    static std::map<u32, u64> hist[2], ihist[2];
     static std::map<u32, u32> opc[2];
     static std::map<u32, const char*> why[2];
     spin_opcodes_ = &opc[0];
@@ -272,6 +368,13 @@ void Scheduler::count_slice(bool skipped, s64 slice) const {
       reg = true;
       std::atexit([] {
         for (int i = 0; i < 2; ++i) {
+          std::vector<std::pair<u64, u32>> iv;
+          u64 itot = 0;
+          for (auto& kv : ihist[i]) { iv.push_back({kv.second, kv.first}); itot += kv.second; }
+          std::sort(iv.rbegin(), iv.rend());
+          if (itot) std::fprintf(stderr, "[idle] %s: exact-idle, %zu distinct pcs, %llu cycles\n", i ? "arm7" : "arm9", iv.size(), (unsigned long long)itot);
+          for (size_t k = 0; k < iv.size() && k < 8; ++k)
+            std::fprintf(stderr, "[idle]   %08x  %12llu %5.1f%%\n", iv[k].second, (unsigned long long)iv[k].first, 100.0 * static_cast<double>(iv[k].first) / static_cast<double>(itot));
           std::vector<std::pair<u64, u32>> v;
           u64 tot = 0;
           for (auto& kv : hist[i]) { v.push_back({kv.second, kv.first}); tot += kv.second; }
@@ -290,6 +393,7 @@ void Scheduler::count_slice(bool skipped, s64 slice) const {
     for (int i = 0; i < 2; ++i) if (spin[i]) {
       const u32 pc = cpus[i]->hot.regs[15];
       hist[i][pc] += cyc;
+      if (exact[i]) ihist[i][pc] += cyc;
       const bool th = cpus[i]->thumb();
       const u32 at = pc - (th ? 4 : 8);   // regs[15] runs ahead of the executing instruction
       u32 w = 0;
@@ -391,6 +495,7 @@ void Scheduler::run_cpu(CpuContext& cpu, RunFn run) {
         prof::add_ns(ci == 0 ? prof::CPU9 : prof::CPU7, el);
         prof::add(spin_now_[ci] ? (ci == 0 ? prof::C_NS_A9_SPIN : prof::C_NS_A7_SPIN)
                                 : (ci == 0 ? prof::C_NS_A9_WORK : prof::C_NS_A7_WORK), el);
+        if (idle_now_[ci]) prof::add(ci == 0 ? prof::C_NS_A9_IDLE_EXACT : prof::C_NS_A7_IDLE_EXACT, el); else if (drift_now_[ci]) prof::add(ci == 0 ? prof::C_NS_A9_IDLE_DRIFT : prof::C_NS_A7_IDLE_DRIFT, el);
       }
     }
     if (!cpu.preempt_residual) return;
@@ -450,6 +555,7 @@ begin:
     running_ = &a9; running_start_budget_ = budget9_; running_shift_ = 0; running_rshift_ = dsi_ ? shift9_ + 1 : 0; running_base_ = now_; running_carry_ = static_cast<u64>(arm9_carry_);
     sl_.phase = SL_A9; cpu = &a9; run = nds_.run_arm9;
     if (sl_.skip9) { advance_dma_only(a9); goto a9_done; }
+    cut_arm(0, a9, CUT_PROBE9);
   }
 cpu_begin:   // run_cpu loop head
   {
@@ -484,6 +590,7 @@ run_returned:
       prof::add_ns(ci == 0 ? prof::CPU9 : prof::CPU7, el);
       prof::add(spin_now_[ci] ? (ci == 0 ? prof::C_NS_A9_SPIN : prof::C_NS_A7_SPIN)
                               : (ci == 0 ? prof::C_NS_A9_WORK : prof::C_NS_A7_WORK), el);
+      if (idle_now_[ci]) prof::add(ci == 0 ? prof::C_NS_A9_IDLE_EXACT : prof::C_NS_A7_IDLE_EXACT, el); else if (drift_now_[ci]) prof::add(ci == 0 ? prof::C_NS_A9_IDLE_DRIFT : prof::C_NS_A7_IDLE_DRIFT, el);
     }
     if (cpu->preempt_residual) {
       defer_preempt_cost(*cpu);
@@ -495,6 +602,10 @@ run_returned:
     }
   }
 cpu_done:
+  {
+    const int ci = cpu == &a9 ? 0 : 1;
+    if (cut_held_[ci] && !cut_resolve(ci, *cpu) && cpu->hot.cycle_budget > 0 && !cpu->halted) goto cpu_begin;
+  }
   if (cpu == &a7) goto a7_done;
 a9_done:
   {
@@ -515,6 +626,7 @@ a9_done:
     running_base_ = dsi_ ? static_cast<u64>(static_cast<s64>(now_) + sl_.ran9 - arm7_debt_) : now_;
     sl_.phase = SL_A7; cpu = &a7; run = nds_.run_arm7;
     if (sl_.skip7) { advance_dma_only(a7); goto a7_done; }
+    cut_arm(1, a7, CUT_PROBE7);
     goto cpu_begin;
   }
 a7_done:
@@ -526,6 +638,7 @@ a7_done:
 slice_end:
   {
     running_ = nullptr;
+    if (idle_cut_) { cut_note(0, a9); cut_note(1, a7); }
     now_ += static_cast<u64>(sl_.ran9);
     if (debug_slices_) std::fprintf(stderr, "[slice] now %llu ran9 %lld a9pc %08x b7 %d a7left %d a7pc %08x\n", (unsigned long long)now_, (long long)sl_.ran9, a9.hot.regs[15], sl_.budget7, a7.hot.cycle_budget, a7.hot.regs[15]);
     { prof::Scope sched_scope(prof::SCHED); }   // the walk itself is inside fire_due's per-handler accounting
@@ -593,7 +706,12 @@ u64 Scheduler::run_until_impl(u64 until, bool until_frame) {
     if (a9.boot_stall) take_stall(a9);
     if (a9.irq_offline) { a9.irq_skip_once = !a9.halted; a9.irq_offline = false; }
     running_ = &a9; running_start_budget_ = budget9_; running_shift_ = 0; running_rshift_ = dsi_ ? shift9_ + 1 : 0; running_base_ = now_; running_carry_ = static_cast<u64>(arm9_carry_);
-    if (skip9) advance_dma_only(a9); else run_cpu(a9, nds_.run_arm9);
+    if (skip9) advance_dma_only(a9);
+    else {
+      cut_arm(0, a9, CUT_PROBE9);
+      run_cpu(a9, nds_.run_arm9);
+      if (cut_held_[0] && !cut_resolve(0, a9) && a9.hot.cycle_budget > 0 && !a9.halted) run_cpu(a9, nds_.run_arm9);
+    }
     // A halted CPU consumes exactly the slice; a running one may overshoot,
     // which carries into the next slice.
     const bool full9 = (a9.halted || skip9) && !a9_dma_iter_;
@@ -613,7 +731,12 @@ u64 Scheduler::run_until_impl(u64 until, bool until_frame) {
       if (a7.irq_offline) { a7.irq_skip_once = !a7.halted; a7.irq_offline = false; }
       running_ = &a7; running_start_budget_ = budget7; running_shift_ = 1; running_rshift_ = 0;
       running_base_ = dsi_ ? static_cast<u64>(static_cast<s64>(now_) + ran9 - arm7_debt_) : now_;
-      if (skip7) advance_dma_only(a7); else run_cpu(a7, nds_.run_arm7);
+      if (skip7) advance_dma_only(a7);
+      else {
+        cut_arm(1, a7, CUT_PROBE7);
+        run_cpu(a7, nds_.run_arm7);
+        if (cut_held_[1] && !cut_resolve(1, a7) && a7.hot.cycle_budget > 0 && !a7.halted) run_cpu(a7, nds_.run_arm7);
+      }
       // A BPTWL soft reset halted the ARM7 mid-slice; handled as its run
       // returns, un-halted with a zero budget so the slice counts as run.
       if (nds_.dsi_soft_reset_pending) nds_.dsi_soft_reset();
@@ -621,6 +744,7 @@ u64 Scheduler::run_until_impl(u64 until, bool until_frame) {
       arm7_debt_ -= consumed7 * 2;
     }
     running_ = nullptr;
+    if (idle_cut_) { cut_note(0, a9); cut_note(1, a7); }
 
     now_ += static_cast<u64>(ran9);
     // DS_DEBUG_SLICES=1: one line per slice.

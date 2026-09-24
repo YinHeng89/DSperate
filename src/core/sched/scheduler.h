@@ -80,6 +80,13 @@ public:
     return (running_base_ << (running_rshift_ - 1)) + c + running_carry_;
   }
   bool idle_skip_enabled() const { return idle_skip_ != 0; }
+  // The idle cut (on by default; DS_IDLE_CUT=0 / emu.idle_cut = false for the
+  // exact timing): a CPU that keeps ending slices in a state it has already
+  // been in -- same PC (or nearby, in the same loop) and identical registers --
+  // is only re-reading. It gets a short probe instead of the whole slice; if the
+  // probe ends in a known state too, the rest of the slice counts as run.
+  void set_idle_cut(bool on) { idle_cut_ = on; }
+  bool idle_cut() const { return idle_cut_; }
   void set_idle_skip(const char* mode);   // DS_IDLE_SKIP / emu.idle_skip: "0", "1" or "all"/"2"
 
   // Called when an immediate DMA starts on `cpu`: it leaves its run loop
@@ -155,6 +162,20 @@ private:
   // ARM9 is in a poll loop on GXSTAT with a swap pending; 2 = "all": any
   // proven poll loop.
   u8 idle_skip_ = 1;
+  bool idle_cut_ = false;   // DS_IDLE_CUT=1: parked as a net loss on the device (see the commit); re-measured later
+  // Idle cut state per CPU (ARM9, ARM7): recent slice-end states, whether the
+  // CPU is marked idle, and the budget held back behind this slice's probe.
+  static constexpr s32 CUT_PROBE9 = 256, CUT_PROBE7 = 128;
+  u32 cut_pc_[2][8] = {};
+  u64 cut_h_[2][8] = {};
+  u32 cut_pos_[2] = {};
+  bool cut_idle_[2] = {};
+  s32 cut_held_[2] = {};
+  bool cut_ok(const CpuContext& c) const;
+  bool cut_seen(int i, const CpuContext& c) const;
+  void cut_note(int i, const CpuContext& c);
+  void cut_arm(int i, CpuContext& c, s32 probe);
+  bool cut_resolve(int i, CpuContext& c);
   bool idle_survey_ = false;      // DS_IDLE_SURVEY: count what the dma veto costs, change nothing
   bool idle_analyse(bool& skip9, bool& skip7, bool survey) const;
   void advance_dma_only(CpuContext& cpu);   // a skipped CPU still lets its DMA run
@@ -219,6 +240,8 @@ private:
   mutable u32 idle_pc_ring_[2][8] = {};
   mutable u32 idle_pc_pos_[2] = {};
   mutable u32 spin_ring_[2][8] = {};
+  mutable u64 spin_hash_[2][8] = {};   // register-file hash beside each ring PC (exact idle)
+  mutable bool idle_now_[2] = {}, drift_now_[2] = {};
   mutable u32 spin_pos_[2] = {};
   mutable bool spin_now_[2] = {};
   static inline std::map<u32, u32>* spin_opcodes_ = nullptr;

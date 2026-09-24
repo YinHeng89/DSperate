@@ -27,6 +27,7 @@ R=${DS_RUNNER:-}
 JOBS=${JOBS:-$(nproc)}
 export DS_JIT_STRICT=${DS_JIT_STRICT-1}
 export DS_TIMING=${DS_TIMING-exact}   # the goldens are the exact model; DS_TIMING=fast checks the fast one (its own directory)
+export DS_IDLE_CUT=${DS_IDLE_CUT-0}   # the goldens are the exact timing; the idle cut (on by default) is checked apart
 [ "$DS_JIT_STRICT" = 0 ] && unset DS_JIT_STRICT
 [ -x "$G" ] || { echo "no headless binary at $G"; exit 2; }
 

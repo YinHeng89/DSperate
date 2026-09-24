@@ -127,6 +127,17 @@ enum Counter : u32 { C_POLY_LINES, C_SPAN_PIXELS, C_RESOLVED_PIXELS, C_TEX_FAST,
   // Geometry built for a frame never shown. DROPPED: superseded before its
   // render. SAME: identical to previous, raster skipped. CONSUMED: reached a render.
   C_GX_LIST_DROPPED, C_GX_LIST_SAME, C_GX_LIST_CONSUMED,
+  // Exact idle (a stricter spin test): the CPU ends a slice at a PC it ended
+  // one of the last eight at, with every register (r0-r14, CPSR) unchanged --
+  // it only read. Emulated cycles, and host ns spent emulating them.
+  C_CYC_A9_IDLE_EXACT, C_CYC_A7_IDLE_EXACT, C_NS_A9_IDLE_EXACT, C_NS_A7_IDLE_EXACT,
+  // Drift idle: registers unchanged but the PC is elsewhere in the same loop
+  // (within 256 bytes of a recent slice end) -- a poll of several addresses.
+  // Counted in addition to exact idle, not including it.
+  C_CYC_A9_IDLE_DRIFT, C_CYC_A7_IDLE_DRIFT, C_NS_A9_IDLE_DRIFT, C_NS_A7_IDLE_DRIFT,
+  // The idle cut (Scheduler::cut_*): probes run, probes that found the CPU
+  // still idle, and the slice cycles those let each CPU skip.
+  C_CUT_PROBES, C_CUT_HITS, C_CYC_CUT_A9, C_CYC_CUT_A7,
   C_COUNT };
 // Deduced-size definition in profile.cpp, static_assert'd against C_COUNT;
 // a fixed-size [C_COUNT] array would silently pad a short initialiser with

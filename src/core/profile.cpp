@@ -100,7 +100,12 @@ const char* const count_names[] = {"3d polygon lines", "3d span pixels", "3d res
   "3d resolve groups: every lane opaque and drawing", "3d resolve pixels in every-lane-opaque groups",
   "jit retime invalidations", "jit blocks killed by retimes",
   "bus vram remaps", "bus tcm updates", "bus gba slot retimes", "timing cpu9 range rebuilds",
-  "gx lists dropped unrendered", "gx lists identical to the last", "gx lists that reached a render"};
+  "gx lists dropped unrendered", "gx lists identical to the last", "gx lists that reached a render",
+  "cycles arm9 exact idle (same pc, same regs)", "cycles arm7 exact idle (same pc, same regs)",
+  "host ns arm9 in exact-idle slices", "host ns arm7 in exact-idle slices",
+  "cycles arm9 drift idle (same regs, pc within 256 bytes)", "cycles arm7 drift idle (same regs, pc within 256 bytes)",
+  "host ns arm9 in drift-idle slices", "host ns arm7 in drift-idle slices",
+  "idle cut: probes", "idle cut: probes still idle", "idle cut: arm9 cycles skipped", "idle cut: arm7 cycles skipped"};
 
 static_assert(sizeof(count_names) / sizeof(*count_names) == C_COUNT,
               "count_names must have exactly one entry per Counter enumerator");
