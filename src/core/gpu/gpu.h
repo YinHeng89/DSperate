@@ -226,13 +226,15 @@ private:
   // Lazy-2D state for the frame in progress.
   bool lazy_enabled_ = true;
   bool lazy_frame_ = false;       // this frame may batch
-  // Per engine. With engine_split_ a trapped store takes only the engine its
-  // address reaches out of batched mode; without, both (the old lockstep).
+  // Per engine: a trapped store takes only the engine its address reaches out
+  // of batched mode (a store into one engine's BG/OBJ VRAM cannot change what
+  // the other fetches).
   bool per_line_[2] = {false, false};
   bool per_line_prev_[2] = {false, false};
   u32  render_next_[2] = {SCREEN_H, SCREEN_H};
   bool frame_finished_ = false;   // frame_done() called for both engines
-  bool trap_armed_ = false, trap_lcdc_ = false, trap_a_only_ = false;
+  bool trap_armed_ = false, trap_lcdc_ = false;
+  u32  trap_mask_ = 0;            // windows trapped: bit 0 engine A's, bit 1 engine B's (Bus::set_vram_trap)
   // Engines an address can change: bit 0 A, bit 1 B; LCDC only A (and only when trapped); else both.
   u32 reach_engines(u32 addr) const {
     if ((addr >> 24) != 0x06) return 3;
@@ -245,30 +247,18 @@ private:
   u32  burst_left_[2] = {0, 0};      // display lines left before re-batching
   u32  lazy_bursts_[2] = {0, 0};
   static constexpr u32 LAZY_BURST_LIMIT = 16, LAZY_BURST_LINES = 8;
-  // After LAZY_FUTILE_LIMIT frames in a row where the trap paid for itself
-  // and got nothing, it stops arming; one frame in lazy_probe_period_ re-arms
-  // it to retry. Failing probes double the period up to LAZY_PROBE_MAX,
-  // resetting to LAZY_PROBE_PERIOD on success or a VRAM remap.
-  static constexpr u32 LAZY_FUTILE_LIMIT = 4, LAZY_PROBE_PERIOD = 64, LAZY_PROBE_MAX = 1024;
-  u32  lazy_futile_ = 0;
-  // Per-engine split (DS_2D_SPLIT, on by default; restored from 508b7bc, removed
-  // in ad541a5 when the both-engines futility skip had made it inert): a store
-  // into one engine's BG/OBJ VRAM cannot change what the other fetches. Golden
-  // Sun streams engine B's BG every scanline (HBlank DMA), which took engine A
-  // -- 3D composite and capture -- out of its batch too. With the split an
-  // engine that keeps failing to batch starts its frames per line on its own
-  // (eng_futile_, re-probed every LAZY_PROBE_PERIOD frames), and once engine B
-  // is per line under a batching A the trap narrows to A's windows, so B's
-  // stream stops trapping (what the both-engines skip was added to avoid).
-  bool engine_split_ = true;
+  // Per-engine futility (restored with the split from 508b7bc; the both-engines
+  // skip of 8bdcd13 it replaces never fired once stores were charged per engine,
+  // across 46 titles). An engine that ended LAZY_FUTILE_LIMIT frames in a row
+  // per line starts its frames per line, bar a re-probe every LAZY_PROBE_PERIOD
+  // frames; both futile means the frame does not batch. Golden Sun streams
+  // engine B's BG every scanline (HBlank DMA): B goes per line, engine A --
+  // 3D composite and capture -- keeps its batch. The trap follows (arm_trap):
+  // only the windows of a batching engine, and A's in a lag frame.
+  static constexpr u32 LAZY_FUTILE_LIMIT = 4, LAZY_PROBE_PERIOD = 64;
   u32  eng_futile_[2] = {0, 0};
   u32  eng_probe_in_[2] = {LAZY_PROBE_PERIOD, LAZY_PROBE_PERIOD};
-  void narrow_trap();
-  u32  lazy_probe_period_ = LAZY_PROBE_PERIOD, lazy_probe_in_ = LAZY_PROBE_PERIOD;   // frames until the next probe
-  bool lazy_tried_ = false;
-  // A probe frame gets a smaller budget (LAZY_PROBE_BURSTS) and falls both engines back at once when it runs out.
-  static constexpr u32 LAZY_PROBE_BURSTS = 8;
-  bool lazy_limit_hit_ = false, lazy_probe_ = false;
+  bool lazy_tried_ = false;       // last frame batched (its end state feeds eng_futile_)
   u32  frontier() const { return hblank_done_ ? line_ + 1u : line_; }   // first line a write now can still affect
   void catch_up(u32 mask);             // render the masked engines' lines below the frontier
   void fall_back_per_line(u32 mask);   // catch up and render the rest of the frame per line

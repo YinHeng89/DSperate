@@ -44,7 +44,6 @@ static void ev_fifo(NDS& nds, u32 x)   { nds.gpu.on_display_fifo(x); }
 Gpu::Gpu(NDS& nds) : engine{Engine2D(nds, 0), Engine2D(nds, 1)}, nds_(nds) {
   read_knobs();
   split_ = thread_layout_on() || std::getenv("DS_2D_BWORKER");
-  if (const char* e = std::getenv("DS_2D_SPLIT")) engine_split_ = std::atoi(e) != 0;   // per-engine lazy 2D (gpu.h)
   worker_.start(&Gpu::worker_job, this, split_ ? ThreadRole::EngineA : ThreadRole::Line, split_ ? "2d-engine-a" : "line-worker");
   if (split_) worker_b_.start(&Gpu::worker_b_job, this, ThreadRole::Line, "2d-engine-b");
 }
@@ -174,8 +173,8 @@ void Gpu::vram_store_trap(Cpu cpu, u32 addr) {
     if (reach_engines(addr) & (b_deferred_ ? 3u : 1u)) { prof::add(prof::C_2D_A_JOIN_STORES, 1); join_worker(JoinSite::Trap); }
     return;
   }
-  // Engines this store is charged to: the one its address reaches (split), or both.
-  const u32 mask = engine_split_ ? reach_engines(addr) : 3u;
+  // Charged to the engine its address reaches (both for anything unattributed).
+  const u32 mask = reach_engines(addr);
   // Already per line everywhere it reaches: nothing to do but the lag-mode join below.
   if ((per_line_[0] || !(mask & 1)) && (per_line_[1] || !(mask & 2))) {
     // Lag mode: the store may land on a line engine B is still drawing.
@@ -189,7 +188,7 @@ void Gpu::vram_store_trap(Cpu cpu, u32 addr) {
     if (over && lag_frame_) {
       if (!b_joined) join_worker(JoinSite::Trap);
       lag_frame_ = false;
-      if (per_line_[0] && per_line_[1]) disarm_trap();
+      arm_trap();   // the trap now guards only a batching engine's windows, if any
       prof::add(prof::C_2D_LAG_DROPPED, 1);
     }
     return;
@@ -204,19 +203,16 @@ void Gpu::vram_store_trap(Cpu cpu, u32 addr) {
   }
   // The budget is per engine: one engine streaming tiles must not spend the other's.
   u32 burst_mask = 0;
-  const u32 limit = lazy_probe_ ? LAZY_PROBE_BURSTS : LAZY_BURST_LIMIT;
   for (int e = 0; e < 2; ++e)
-    if ((mask & (1u << e)) && !per_line_[e] && ++lazy_bursts_[e] < limit) burst_mask |= 1u << e;
+    if ((mask & (1u << e)) && !per_line_[e] && ++lazy_bursts_[e] < LAZY_BURST_LIMIT) burst_mask |= 1u << e;
   if (burst_mask) {
     catch_up(burst_mask);
     for (int e = 0; e < 2; ++e)
       if (burst_mask & (1u << e)) { per_line_[e] = true; burst_[e] = true; burst_left_[e] = LAZY_BURST_LINES; }
-    // As in fall_back_per_line: a lag frame's in-flight line still needs the trap.
-    if (!lag_frame_ && per_line_[0] && per_line_[1]) disarm_trap();
+    arm_trap();   // a bursting engine's windows need no trap until its burst ends
     return;
   }
-  lazy_limit_hit_ = true;
-  fall_back_per_line(lazy_probe_ ? 3u : mask);   // a probe frame gives up on both
+  fall_back_per_line(mask);
 }
 
 // `moved_2d`: engines whose read views this remap actually moves. CENSUS
@@ -239,8 +235,6 @@ bool Gpu::vram_remap_begin(u32 moved_2d) {
               (render_next_[1] < f && render_next_[1] < SCREEN_H)))
       prof::add(prof::C_VRAM_REMAP_PENDING, 1);
   }
-  lazy_probe_period_ = LAZY_PROBE_PERIOD;   // remap = scene change: probe soon
-  if (lazy_probe_in_ > LAZY_PROBE_PERIOD) lazy_probe_in_ = LAZY_PROBE_PERIOD;
   catch_up(3);
   join_worker(JoinSite::Remap);
   engine[0].vram_remapped(); engine[1].vram_remapped();
@@ -251,23 +245,27 @@ bool Gpu::vram_remap_begin(u32 moved_2d) {
 void Gpu::vram_remap_end(bool trapped) { if (trapped) arm_trap(); }
 
 void Gpu::arm_trap() {
-  // LCDC banks trapped when engine A displays one, or a capture writes one.
-  const bool lcdc = ((engine[0].dispcnt() >> 16) & 3) == 2 || capture_on_;
-  // Armed for the whole VRAM window: arming only the batching engine's
-  // windows costs more in page-table toggling than it saves. Lag frames that
-  // aren't batching only need A's windows guarded (B may stream via per-scanline
-  // HDMA), and so does a batching A over a per-line B (engine split).
-  const bool a_only = (lag_frame_ && !lazy_frame_) || (engine_split_ && lazy_frame_ && per_line_[1] && !per_line_[0]);
-  // Re-armed at a burst's end: clear the old ranges first if they change, or
-  // pages the new arming leaves out would stay trapped with nothing to lift them.
-  if (trap_armed_ && (lcdc != trap_lcdc_ || a_only != trap_a_only_)) nds_.bus.set_vram_trap(false, trap_lcdc_, trap_a_only_);
-  trap_lcdc_ = lcdc; trap_a_only_ = a_only;
-  nds_.bus.set_vram_trap(true, trap_lcdc_, trap_a_only_);
+  // Windows that need it: a batching engine's (its stores must render the lines
+  // before them first), and engine A's in a lag frame (its per-line line is in
+  // flight). A per-line engine renders each line at its own HBlank.
+  u32 m = lag_frame_ ? 1u : 0u;
+  if (lazy_frame_) { if (!per_line_[0]) m |= 1; if (!per_line_[1]) m |= 2; }
+  if (!m) { disarm_trap(); return; }
+  // LCDC banks trapped when engine A displays one, or a capture writes one (A's reach).
+  const bool lcdc = (m & 1) && (((engine[0].dispcnt() >> 16) & 3) == 2 || capture_on_);
+  if (trap_armed_) {
+    if (m == trap_mask_ && lcdc == trap_lcdc_) return;
+    // Clear the old ranges first, or pages the new arming leaves out stay trapped.
+    nds_.bus.set_vram_trap(false, trap_lcdc_, trap_mask_);
+    prof::add(prof::C_2D_TRAP_NARROWED, 1);
+  }
+  trap_lcdc_ = lcdc; trap_mask_ = m;
+  nds_.bus.set_vram_trap(true, trap_lcdc_, trap_mask_);
   trap_armed_ = true;
 }
 void Gpu::disarm_trap() {
   if (!trap_armed_) return;
-  nds_.bus.set_vram_trap(false, trap_lcdc_, trap_a_only_);
+  nds_.bus.set_vram_trap(false, trap_lcdc_, trap_mask_);
   trap_armed_ = false;
 }
 
@@ -286,19 +284,7 @@ void Gpu::catch_up(u32 mask) {
 void Gpu::fall_back_per_line(u32 mask) {
   catch_up(mask);
   for (int e = 0; e < 2; ++e) if (mask & (1u << e)) { per_line_[e] = true; burst_[e] = false; }
-  // Trap now guards the in-flight line, not the batch.
-  if (!lag_frame_ && per_line_[0] && per_line_[1]) disarm_trap();
-  else narrow_trap();
-}
-
-// Engine B per line under a batching engine A: only A's windows need the trap
-// (B's lines render at their own HBlank), so B's stores stop trapping.
-void Gpu::narrow_trap() {
-  if (!engine_split_ || !trap_armed_ || trap_a_only_ || !per_line_[1] || per_line_[0]) return;
-  nds_.bus.set_vram_trap(false, trap_lcdc_, false);
-  trap_a_only_ = true;
-  nds_.bus.set_vram_trap(true, trap_lcdc_, true);
-  prof::add(prof::C_2D_TRAP_NARROWED, 1);
+  arm_trap();   // guards what still batches (and a lag frame's in-flight line); lifted when nothing does
 }
 
 // ---- timing -----------------------------------------------------------------
@@ -492,44 +478,24 @@ void Gpu::begin_frame() {
   render_next_[0] = render_next_[1] = 0;
   per_line_prev_[0] = per_line_[0]; per_line_prev_[1] = per_line_[1];
   per_line_[0] = per_line_[1] = false; frame_finished_ = false;
-  // Was last frame's trap worth arming? Both per-line at the end means no batch
-  // survived. With the split one engine running out of bursts leaves the other's.
-  if (lazy_tried_) {
-    const bool wasted = (per_line_prev_[0] && per_line_prev_[1]) || (lazy_limit_hit_ && !engine_split_);
-    // Per engine: this one ended per line while the other kept its batch.
-    if (engine_split_)
-      for (int e = 0; e < 2; ++e) {
-        if (per_line_prev_[e] && !per_line_prev_[1 - e]) ++eng_futile_[e];
-        else if (!per_line_prev_[e]) eng_futile_[e] = 0;
-      }
-    if (wasted) {
-      ++lazy_futile_;
-      if (lazy_probe_ && lazy_probe_period_ < LAZY_PROBE_MAX) lazy_probe_period_ *= 2;
-    } else { lazy_futile_ = 0; lazy_probe_period_ = LAZY_PROBE_PERIOD; }
-  }
-  lazy_limit_hit_ = false;
-  const bool skipping = lazy_futile_ >= LAZY_FUTILE_LIMIT;
-  lazy_probe_ = false;
-  if (skipping && --lazy_probe_in_ == 0) { lazy_probe_ = true; lazy_probe_in_ = lazy_probe_period_; if (g_dbg_skip) std::fprintf(stderr, "[lazy] probe at frame %llu period %u futile %u\n", (unsigned long long)nds_.frame_count, lazy_probe_period_, lazy_futile_); }
-  else if (!skipping) lazy_probe_in_ = lazy_probe_period_;
-  const bool futile = skipping && !lazy_probe_;
-  lazy_frame_ = lazy_enabled_ && !g_no_lazy && !run_fifo_ && !futile;
-  lazy_tried_ = lazy_frame_;
-  if (futile) prof::add(prof::C_2D_LAZY_SKIPPED, 1);
+  // Per-engine futility: an engine that keeps ending its frames per line starts
+  // them per line (bar a re-probe); the other engine keeps its batch.
+  if (lazy_tried_)
+    for (int e = 0; e < 2; ++e) eng_futile_[e] = per_line_prev_[e] ? eng_futile_[e] + 1 : 0;
+  lazy_frame_ = lazy_enabled_ && !g_no_lazy && !run_fifo_;
   lazy_bursts_[0] = lazy_bursts_[1] = 0; burst_[0] = burst_[1] = false; burst_left_[0] = burst_left_[1] = 0;
-  // An engine that keeps ending per line under the other's batch starts per
-  // line, bar a re-probe every LAZY_PROBE_PERIOD frames; the batching engine is unaffected.
-  if (engine_split_ && lazy_frame_ && !lazy_probe_)
+  if (lazy_frame_)
     for (int e = 0; e < 2; ++e) {
       if (eng_futile_[e] < LAZY_FUTILE_LIMIT) { eng_probe_in_[e] = LAZY_PROBE_PERIOD; continue; }
-      if (--eng_probe_in_[e] == 0) { eng_probe_in_[e] = LAZY_PROBE_PERIOD; continue; }
+      if (--eng_probe_in_[e] == 0) { eng_probe_in_[e] = LAZY_PROBE_PERIOD; continue; }   // re-probe: try batching
       per_line_[e] = true;
       prof::add(e ? prof::C_2D_ENGINE_FUTILE_B : prof::C_2D_ENGINE_FUTILE_A, 1);
     }
-  if (per_line_[0] && per_line_[1]) { lazy_frame_ = false; lazy_tried_ = false; }
+  if (per_line_[0] && per_line_[1]) lazy_frame_ = false;   // both futile: nothing batches, nothing to trap for
+  lazy_tried_ = lazy_frame_ || (lazy_enabled_ && !g_no_lazy && !run_fifo_);
   lag_frame_ = !run_fifo_ && !g_no_lag;
   lag_trap_hits_ = 0; lag_trap_stores_ = 0;
-  if (lazy_frame_ || lag_frame_) arm_trap();
+  arm_trap();
   if (lazy_frame_) prof::add(prof::C_2D_LAZY_FRAMES, 1);
   if (lag_frame_ && !lazy_frame_) prof::add(prof::C_2D_LAG_FRAMES, 1);
   if (!lazy_frame_) per_line_[0] = per_line_[1] = true;
@@ -656,7 +622,7 @@ void Gpu::render_ranges(u32 af, u32 al, u32 bf, u32 bl) {
     prof::add(prof::C_RR_DEFER_A, 1);
     hand(true, false);
     a_handed = true; a_deferred_ = true;
-    if (split_ && b_has && bl == SCREEN_H - 1 && b_len >= 24 && trap_armed_ && !trap_a_only_) {
+    if (split_ && b_has && bl == SCREEN_H - 1 && b_len >= 24 && trap_armed_ && (trap_mask_ & 2)) {
       // Engine B's batch to its own worker, deferred to the same join: only a
       // batch run to the last line (everything journaled meanwhile is past the
       // frame) with the trap over the whole VRAM window (a lag frame's guards
@@ -697,8 +663,8 @@ void Gpu::render_ranges(u32 af, u32 al, u32 bf, u32 bl) {
   // A's deferred batch stays in flight until line 0; a lagged run until the
   // next line. The last display line always joins.
   if (!a_deferred_) {
-    // A B line left in flight needs B's windows trapped: not under a narrowed (A-only) trap.
-    if ((a_handed || b_handed || scale_inflight_) && lag_frame_ && last < SCREEN_H - 1 && !(b_handed && trap_a_only_ && lazy_frame_)) prof::add(prof::C_2D_LAG_LINES, 1);
+    // A B line left in flight needs B's windows trapped.
+    if ((a_handed || b_handed || scale_inflight_) && lag_frame_ && last < SCREEN_H - 1 && !(b_handed && !(trap_armed_ && (trap_mask_ & 2)))) prof::add(prof::C_2D_LAG_LINES, 1);
     else join_worker(JoinSite::RangesPost);
   }
   if (a_has) render_next_[0] = al + 1;

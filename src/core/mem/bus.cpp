@@ -622,15 +622,15 @@ void Bus::io_write(Cpu cpu, u32 addr, u32 width, u32 v) {
   }
 }
 
-void Bus::set_vram_trap(bool on, bool lcdc, bool a_only) {
+void Bus::set_vram_trap(bool on, bool lcdc, u32 windows) {
   PageTable& pt9 = nds_.cpu(Cpu::ARM9).page_table;
   // Only over mapped pages (~330 of the 8K in the engine windows).
   auto range = [&](u32 addr, u32 size) {
     const u32 first = (addr - 0x06000000) >> PAGE_SHIFT;
     pt9.set_write_trap_bits(addr >> PAGE_SHIFT, size >> PAGE_SHIFT, vram_mapped9_ + first / 64, on);
   };
-  if (a_only) { range(0x06000000, 0x00200000); range(0x06400000, 0x00200000); }   // BG-A, OBJ-A
-  else range(0x06000000, 0x00800000);         // all four engine windows
+  if (windows & 1) { range(0x06000000, 0x00200000); range(0x06400000, 0x00200000); }   // BG-A, OBJ-A
+  if (windows & 2) { range(0x06200000, 0x00200000); range(0x06600000, 0x00200000); }   // BG-B, OBJ-B
   if (lcdc) range(0x06800000, 0x00800000);    // LCDC and its 1 MB mirrors
 }
 

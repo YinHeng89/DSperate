@@ -61,7 +61,8 @@ public:
   // Lazy 2D: trap ARM9 stores to the engines' VRAM windows (and, with
   // `lcdc`, the LCDC window) so the first store in a frame flushes the
   // deferred render first. `a_only`: engine A only (lag mode).
-  void set_vram_trap(bool on, bool lcdc, bool a_only = false);
+  // `windows`: bit 0 engine A's BG/OBJ windows, bit 1 engine B's.
+  void set_vram_trap(bool on, bool lcdc, u32 windows = 3);
   // Read trap on one LCDC bank, all mirrors: ARM9 loads/DMA reads take the
   // slow path while a display capture writing the bank is still in flight
   // (Gpu::join_worker). Saved/restored; a VRAMCNT remap lifts it first.

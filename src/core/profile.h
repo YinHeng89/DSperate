@@ -68,7 +68,7 @@ enum Counter : u32 { C_POLY_LINES, C_SPAN_PIXELS, C_RESOLVED_PIXELS, C_TEX_FAST,
   C_SLPX0, C_SLPX1, C_SLPX2, C_SLPX3, C_SLPX4, C_SLPX5, C_SLPX6,
   C_W_PALETTE, C_W_OAM,   // stores into palette/OAM space
   // Lazy 2D: frames starting batched, and VRAM-trap hits (each drops a frame to per-line rendering).
-  C_2D_LAZY_FRAMES, C_2D_LAZY_SKIPPED, C_2D_ENGINE_FUTILE_A, C_2D_ENGINE_FUTILE_B, C_2D_TRAP_NARROWED, C_2D_TRAP_HITS,
+  C_2D_LAZY_FRAMES, C_2D_ENGINE_FUTILE_A, C_2D_ENGINE_FUTILE_B, C_2D_TRAP_NARROWED, C_2D_TRAP_HITS,
   C_2D_LAG_FRAMES, C_2D_LAG_STORES, C_2D_LAG_STORE_JOINS, C_2D_LAG_DROPPED, C_2D_LAG_LINES, C_2D_A_JOIN_STORES, C_2D_A_JOIN_READS,
   C_W2D_JOIN_CALLS,   // 2D worker join by call site; see Gpu::JoinSite
   // VRAMCNT remaps: whether they move a view a 2D engine reads. STILL = no
