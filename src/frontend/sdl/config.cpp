@@ -337,7 +337,8 @@ R"(# DSperate settings. Command-line flags override this file. Two files next
 # timing = fast                 # CPU cycle model: fast (the default: a constant cost per memory access
                                 # and per jump; much cheaper to emulate, and games cannot tell in
                                 # practice) | exact (melonDS's per-access model: memory wait states,
-                                # fetch/data overlap, the ARM7's main-RAM rules). Read at launch
+                                # fetch/data overlap, the ARM7's main-RAM rules; also the cartridge
+                                # bus clock per ROM word, which fast skips). Read at launch
 # idle_skip = 1                 # skip a CPU busy-wait: 0 = never | 1 = only the GXSTAT swap poll |
                                 # all = every proven poll loop
 # autosave = false              # on quit, save a state to the hidden "auto" slot

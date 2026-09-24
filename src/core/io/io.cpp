@@ -9,6 +9,7 @@
 #include "core/nds.h"
 #include "core/dma/dma.h"
 #include "core/dma/ndma.h"
+#include "core/cpu/timing_mode.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -756,7 +757,12 @@ void Io::cart_write_romctrl(u32 value) {
 // slice must end at every word to interleave correctly with the ARM7.
 bool Io::cart_dma_armed() const { return nds_.dsi || nds_.dma.cart_armed(); }
 
+// Fast timing: a word is ready as soon as the FIFO has room. A CPU copy loop
+// then finds DRQ on every poll instead of spinning on ROMCTRL between words,
+// and a cart DMA's words chain within one scheduler pass instead of an event
+// (and a split CPU slice) every 40 cycles. The command delay stays.
 u32 Io::cart_word_delay() const {
+  if (g_fast_timing) return 0;
   const u32 xfer = (cart.romctrl & (1u << 27)) ? 8 : 5;
   u32 delay = 4;
   if (!(cart.transfer_pos & 0x1FF)) delay += (cart.romctrl >> 16) & 0x3F;
