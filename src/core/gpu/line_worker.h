@@ -13,6 +13,7 @@
 
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <condition_variable>
 #include <mutex>
 #include <thread>
@@ -102,7 +103,8 @@ private:
     place_current_thread(role_);
     u32 last = 0;
     for (;;) {
-      static constexpr int kSpin = 20000;   // spin budget before parking (~line gap)
+      // Spin budget before parking (~line gap). DS_LINE_SPIN overrides.
+      static const int kSpin = std::getenv("DS_LINE_SPIN") ? std::atoi(std::getenv("DS_LINE_SPIN")) : 20000;
       int spins = kSpin;
       bool slept = false;
       u32 r = req_.load(std::memory_order_acquire);

@@ -17,6 +17,7 @@
 
 #if defined(__linux__)
 #include <dirent.h>
+#include <pthread.h>
 #include <sched.h>
 #include <sys/prctl.h>
 #include <sys/syscall.h>
@@ -207,11 +208,41 @@ void set_thread_layout(bool on) {
 }
 bool thread_layout_on() { return g_layout.load(std::memory_order_relaxed) || std::getenv("DS_PIN"); }
 
+#if defined(__linux__)
+namespace {
+std::atomic<int> g_worker_policy{-1}, g_worker_prio{0};   // -1: not latched
+}
+#endif
+
+void latch_worker_sched() {
+#if defined(__linux__)
+  sched_param sp{};
+  const int pol = sched_getscheduler(0);
+  if (pol < 0 || sched_getparam(0, &sp) != 0) return;
+  g_worker_prio.store(sp.sched_priority, std::memory_order_relaxed);
+  g_worker_policy.store(pol, std::memory_order_relaxed);
+#endif
+}
+
 void place_current_thread(ThreadRole role, u32 index) {
 #if defined(__linux__)
   const long tid = current_tid();
   { std::lock_guard<std::mutex> lk(g_placed_m); g_placed.push_back(tid); }
   if (const u64 m = role_mask(role, index)) set_tid_affinity(tid, m);
+  const int pol = g_worker_policy.load(std::memory_order_relaxed);
+  if (pol == SCHED_RR || pol == SCHED_FIFO) {
+    static const bool emu_other = std::getenv("DS_EMU_OTHER") != nullptr;
+    sched_param sp{};
+    int want = pol;
+    sp.sched_priority = g_worker_prio.load(std::memory_order_relaxed);
+    if (role == ThreadRole::Emu && emu_other) { want = SCHED_OTHER; sp.sched_priority = 0; }
+    // Through pthread, not sched_setscheduler: glibc caches what
+    // pthread_setschedparam last set, and pthread_getschedparam (the pacer's
+    // spin saves and restores the policy with it) answers from that cache.
+    if (role != ThreadRole::Aux)
+      if (const int e = pthread_setschedparam(pthread_self(), want, &sp))
+        std::fprintf(stderr, "thread layout: scheduling policy %d/%d for role %d not set: %s\n", want, sp.sched_priority, static_cast<int>(role), std::strerror(e));
+  }
 #else
   (void)role; (void)index;
 #endif

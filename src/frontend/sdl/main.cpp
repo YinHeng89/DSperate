@@ -1199,6 +1199,7 @@ static int run(int argc, char** argv) {
         VLOG("realtime scheduling (%s %d) not permitted: %s\n", rt.c_str(), prio, std::strerror(errno));
       else { VLOG("realtime scheduling: %s %d\n", rt.c_str(), prio); }
     }
+    ds::latch_worker_sched();   // what the video workers run at, whichever thread starts them
   }
   // CPU timing model (core/cpu/timing_mode.h), fixed before anything runs or
   // the recompiler emits its stubs. DS_TIMING wins.
@@ -1803,7 +1804,7 @@ sdl_ready:
     const double period_us = sysctl_num("/proc/sys/kernel/sched_rt_period_us");
     int policy = 0; sched_param sp{};
     const bool rt = pthread_getschedparam(pthread_self(), &policy, &sp) == 0 && (policy == SCHED_RR || policy == SCHED_FIFO);
-    if (!rt) VLOG("rt relief: not needed, this thread is not real-time\n");
+    if (!rt || std::getenv("DS_EMU_OTHER")) VLOG("rt relief: not needed, this thread is not real-time\n");
     else if (runtime_us < 0 || period_us <= 0) VLOG("rt relief: not needed, the real-time class is uncapped\n");
     else if (runtime_us >= period_us) VLOG("rt relief: not needed, the cap is not a cap (%.0f of %.0f us)\n", runtime_us, period_us);
     else {

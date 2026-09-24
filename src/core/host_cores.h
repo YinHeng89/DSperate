@@ -28,6 +28,15 @@ void name_current_thread(const char* name);
 enum class ThreadRole { Emu, Band, Line, EngineA, Aux };
 void set_thread_layout(bool on);
 bool thread_layout_on();
+// Latches the calling thread's scheduling policy as the one the video
+// workers run at (call once the frontend has set it, before any worker
+// starts). place_current_thread then applies it per role, so a worker's
+// policy does not depend on which thread happened to create it.
+// DS_EMU_OTHER=1 makes the emulation thread a normal task and keeps the
+// workers real-time. On ROCKNIX that costs ~1.3 ms a frame (ST): RR is what
+// keeps PipeWire's SCHED_FIFO data loops and the input-poll kworker (1 kHz)
+// off the emulation core.
+void latch_worker_sched();
 // Places the calling thread (`index`: the band number).
 void place_current_thread(ThreadRole role, u32 index = 0);
 // Moves every thread of the process not placed through place_current_thread
