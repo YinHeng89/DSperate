@@ -731,6 +731,10 @@ void Io::cart_write_romctrl(u32 value) {
   const u32 xfer = (cart.romctrl & (1u << 27)) ? 8 : 5;
   u32 cmddelay = 8 + (cart.romctrl & 0x1FFF);
   if (bytes) cmddelay += (cart.romctrl >> 16) & 0x3F;
+  // Fast timing: the command's 8 clocks only, no gap1/gap2 latency. Games
+  // poll ROMCTRL through it: a DS_IO_CENSUS of eight titles found ROMCTRL
+  // reads outnumbering ROM data words about 7:1, nearly all this wait.
+  if (g_fast_timing) cmddelay = 8;
   cart.event_armed = false;
   if (cart.romctrl & (1u << 30)) {            // write direction: not supported; end after the command
     nds_.sched.schedule(EventId::Cart, nds_.sched.now() + 2 * xfer * cmddelay, cart_ev, 0);
@@ -757,10 +761,11 @@ void Io::cart_write_romctrl(u32 value) {
 // slice must end at every word to interleave correctly with the ARM7.
 bool Io::cart_dma_armed() const { return nds_.dsi || nds_.dma.cart_armed(); }
 
-// Fast timing: a word is ready as soon as the FIFO has room. A CPU copy loop
-// then finds DRQ on every poll instead of spinning on ROMCTRL between words,
-// and a cart DMA's words chain within one scheduler pass instead of an event
-// (and a split CPU slice) every 40 cycles. The command delay stays.
+// Fast timing: a word is ready as soon as the FIFO has room, and the command
+// delay is cut to the command itself (cart_write_romctrl). A CPU copy loop
+// finds DRQ on every poll instead of spinning on ROMCTRL, and a cart DMA's
+// words chain within one scheduler pass instead of an event (and a split CPU
+// slice) every 40 cycles.
 u32 Io::cart_word_delay() const {
   if (g_fast_timing) return 0;
   const u32 xfer = (cart.romctrl & (1u << 27)) ? 8 : 5;
