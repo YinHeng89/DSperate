@@ -13,10 +13,12 @@
 #pragma once
 #include "core/cpu/cpu.h"
 #include "core/cpu/cpu_mem.h"
+#include "core/cpu/timing_mode.h"
 
 #include <algorithm>
 
 namespace ds {
+
 
 // ARM9 numC at the moment of charging: the odd halfword of a Thumb pair is
 // already in the prefetch buffer.
@@ -36,8 +38,15 @@ inline void charge_CI(CpuContext& cpu, u32 internal) {
 
 inline u32 max3(s32 a, s32 b, s32 c) { return static_cast<u32>(std::max(a, std::max(b, c))); }
 
+// Fast model: numC (the ARM7's non-sequential one) plus the data cost, no overlap.
+inline void charge_fast_CD(CpuContext& cpu) {
+  const u32 numC = cpu.which == Cpu::ARM9 ? num_c9(cpu) : cpu.timing7[cpu.code_cycles][cpu.thumb() ? 0 : 2];
+  cpu.hot.cycle_budget -= static_cast<s32>(numC + cpu.data_cycles);
+}
+
 // Loads (the ARM9 skips the internal cycle; the ARM7 pays it unless main RAM absorbs it).
 inline void charge_CDI(CpuContext& cpu) {
+  if (g_fast_timing) { charge_fast_CD(cpu); return; }
   const s32 numD = static_cast<s32>(cpu.data_cycles);
   if (cpu.which == Cpu::ARM9) {
     const s32 numC = static_cast<s32>(num_c9(cpu));
@@ -60,6 +69,7 @@ inline void charge_CDI(CpuContext& cpu) {
 // A load that just jumped (LDM pc, POP pc). melonDS charges with R[15] at
 // target+2 in Thumb where jump() leaves target+4, so `& 2` here is inverted.
 inline void charge_CDI_after_jump(CpuContext& cpu) {
+  if (g_fast_timing) { cpu.hot.cycle_budget -= static_cast<s32>(cpu.data_cycles); return; }   // the constant refill stands for numC
   if (cpu.which == Cpu::ARM9) {
     const s32 numC = (cpu.thumb() && !(cpu.hot.regs[15] & 2)) ? 0 : static_cast<s32>(cpu.code_cycles);
     const s32 numD = static_cast<s32>(cpu.data_cycles);
@@ -71,6 +81,7 @@ inline void charge_CDI_after_jump(CpuContext& cpu) {
 
 // Stores.
 inline void charge_CD(CpuContext& cpu) {
+  if (g_fast_timing) { charge_fast_CD(cpu); return; }
   const s32 numD = static_cast<s32>(cpu.data_cycles);
   if (cpu.which == Cpu::ARM9) {
     const s32 numC = static_cast<s32>(num_c9(cpu));
@@ -114,8 +125,9 @@ inline u32 refill_cycles(const CpuContext& cpu, u32 addr, bool thumb, u32* code_
       c = fetch_cost9(cpu, addr, true) + last;
     }
     if (code_after) *code_after = last;
-    return c;
+    return g_fast_timing ? g_fast.r9 : c;
   }
+  if (g_fast_timing) return g_fast.r7;
   const u8* t = cpu.timing7[addr >> 15];
   return thumb ? (t[0] + t[1]) : (t[2] + t[3]);
 }

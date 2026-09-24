@@ -9,7 +9,8 @@
 #
 # Modes: "aa" (video.aa = accurate, the default) and "noaa" (--no-aa), each
 # with the JIT and with --interp when the binary has a JIT. Hashes are FNV-1a
-# 64 of each screen's 0xAARRGGBB (headless --hash-frames).
+# 64 of each screen's 0xAARRGGBB (headless --hash-frames). The CPU timing model
+# is DS_TIMING (default exact here); DS_TIMING=fast needs a golden directory of its own.
 # HEADLESS=path overrides the binary (default build/host); DS_RUNNER=qemu-aarch64-static
 # runs a cross-built one. JOBS=N sets the parallelism (default nproc).
 # The JIT runs with DS_JIT_STRICT=1 (per-instruction budget checks: the mode in
@@ -25,6 +26,7 @@ G=${HEADLESS:-$HERE/build/host/src/frontend/headless/dsperate-headless}
 R=${DS_RUNNER:-}
 JOBS=${JOBS:-$(nproc)}
 export DS_JIT_STRICT=${DS_JIT_STRICT-1}
+export DS_TIMING=${DS_TIMING-exact}   # the goldens are the exact model; DS_TIMING=fast checks the fast one (its own directory)
 [ "$DS_JIT_STRICT" = 0 ] && unset DS_JIT_STRICT
 [ -x "$G" ] || { echo "no headless binary at $G"; exit 2; }
 

@@ -6,6 +6,7 @@
 // file (config.h) with the command line on top; hotkeys cover what a
 // handheld needs (volume, layout, screenshots, save states), and the pause
 // key opens a blitted menu over the held frame (menu.h).
+#include "core/cpu/timing_mode.h"
 #include "core/nds.h"
 #include "core/host_cores.h"
 #include "core/cart/zip.h"
@@ -171,6 +172,8 @@ const char* kUsage =
     "  --no-mic        do not open the microphone (M still fakes one)\n"
     "  --no-vsync      present without waiting for the display refresh\n"
     "  --interp        interpreter instead of the recompiler\n"
+    "  --timing M      CPU cycle model: fast (default: constant memory and jump costs, much cheaper)\n"
+    "                  | exact (melonDS's per-access model); emu.timing\n"
     "  --aa [off|accurate|enhanced] / --no-aa  3D edges; video.aa, off by default. accurate (bare --aa):\n"
     "                  the hardware's blend. enhanced: in development, currently the same as accurate\n"
     "  --frameskip N   skip drawing up to N frames in N+1 (0 = off); emu.frameskip. Skipping runs\n"
@@ -1086,6 +1089,7 @@ static int run(int argc, char** argv) {
     else if (flag("--no-mic")) cli.set("audio.mic", "false");
     else if (flag("--no-vsync")) cli.set("video.vsync", "false");
     else if (flag("--interp")) cli.set("emu.jit", "false");
+    else if (arg("--timing")) cli.set("emu.timing", argv[++i]);
     else if (arg("--frameskip")) cli.set("emu.frameskip", argv[++i]);
     else if (arg("--frameskip-mode")) cli.set("emu.frameskip_mode", argv[++i]);
     else if (flag("--frameskip-capture")) cli.set("emu.frameskip_capture", "true");
@@ -1134,7 +1138,7 @@ static int run(int argc, char** argv) {
   }
   auto apply_cli = [&] { for (const char* k : {"paths.bios9", "paths.bios7", "paths.firmware", "video.scale", "video.dual_window", "video.layout", "video.screen", "video.pip_alpha", "video.screen_gap", "video.dominant_ratio", "video.dominant_threshold", "video.integer_scale",
                                               "video.fullscreen", "video.linear", "video.lcd_grid", "video.chunky", "video.chunky_threshold", "video.chunky_cell", "video.seam", "video.sink", "video.disp", "video.fbdev", "video.gpu_present", "video.vsync", "audio.enabled", "audio.volume",
-                                              "audio.mic", "emu.jit", "emu.speed", "emu.limiter", "emu.pacing", "audio.buffer_size", "audio.latency_frames", "emu.frameskip", "emu.frameskip_mode", "emu.frameskip_capture", "video.aa", "emu.autosave_png", "emu.autoload", "cheevos.enabled", "cheevos.token_file", "cheevos.username"}) if (cli.has(k)) cfg.set(k, cli.str(k)); };
+                                              "audio.mic", "emu.jit", "emu.timing", "emu.speed", "emu.limiter", "emu.pacing", "audio.buffer_size", "audio.latency_frames", "emu.frameskip", "emu.frameskip_mode", "emu.frameskip_capture", "video.aa", "emu.autosave_png", "emu.autoload", "cheevos.enabled", "cheevos.token_file", "cheevos.username"}) if (cli.has(k)) cfg.set(k, cli.str(k)); };
   apply_cli();
   const std::string bios9 = cfg.str("paths.bios9"), bios7 = cfg.str("paths.bios7");
   const std::string dsi_fw = cfg.str("paths.dsi_firmware");
@@ -1184,6 +1188,10 @@ static int run(int argc, char** argv) {
       else { VLOG("realtime scheduling: %s %d\n", rt.c_str(), prio); }
     }
   }
+  // CPU timing model (core/cpu/timing_mode.h), fixed before anything runs or
+  // the recompiler emits its stubs. DS_TIMING wins.
+  if (cfg.has("emu.timing") && !std::getenv("DS_TIMING")) ds::g_fast_timing = cfg.str("emu.timing") != "exact";
+  VLOG("cpu timing: %s\n", ds::g_fast_timing ? "fast" : "exact");
   if (cfg.num("emu.host_cores", 0) > 0) ds::set_host_cores(static_cast<ds::u32>(cfg.num("emu.host_cores", 0)));   // DS_HOST_CORES still wins
   VLOG("host: %u cores\n", ds::host_cores());
 

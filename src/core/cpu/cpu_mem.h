@@ -3,6 +3,7 @@
 
 #pragma once
 #include "core/cpu/cpu.h"
+#include "core/cpu/timing_mode.h"
 #include "core/mem/bus.h"
 #include "core/mem/fastmem_census.h"
 #include "core/nds.h"
@@ -22,7 +23,8 @@ extern void (*g_census_access)(bool a9, u32 addr, bool seq);
 inline void data_cost(CpuContext& cpu, u32 addr, int width, bool seq, bool store) {
   if (prof::census && g_census_access) g_census_access(cpu.which == Cpu::ARM9, addr, seq);
   u32 c;
-  if (cpu.which == Cpu::ARM9) {
+  if (g_fast_timing) c = cpu.fast_d;
+  else if (cpu.which == Cpu::ARM9) {
     const u8* t = cpu.timing9[addr >> 12] + (store ? 4 : 0);   // TCM windows are baked into the table
     c = seq ? t[3] : t[width ? 2 : 1];
   } else {

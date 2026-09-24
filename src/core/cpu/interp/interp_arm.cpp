@@ -235,6 +235,7 @@ void undefined(CpuContext& cpu) { cpu.raise_exception(CpuContext::Exception::Und
 } // namespace
 
 void exec_arm(CpuContext& cpu, u32 instr) {
+  if (g_fast_timing) cpu.fast_d = static_cast<u8>(fast_data(cpu, instr, false));
   const u32 cond = instr >> 28;
   if (cond == 0xF) {
     // Unconditional space: BLX imm (v5), PLD.

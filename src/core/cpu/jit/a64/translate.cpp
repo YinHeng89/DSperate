@@ -17,6 +17,7 @@
 #include "core/cpu/jit/block_shape.h"
 #include "core/cpu/arm_decode.h"
 #include "core/cpu/cpu_cycles.h"
+#include "core/cpu/timing_mode.h"
 #include "core/nds.h"
 
 #include <algorithm>
@@ -357,6 +358,7 @@ private:
   Block& blk_;
   const u32 key_;
   const bool thumb_, a9_;
+  u32 cur_raw_ = 0;          // the guest instruction being translated (fast timing's data cost)
   std::vector<Instr>& instrs_;
   u32 pc_ = 0;
   u32 live_ = F_ALL;
@@ -865,12 +867,15 @@ private:
   // load to r15 passes false and polls in its branch instead.
   void emit_single(Mem m, u32 wdata, u32 dst, bool wb, u32 wb_reg, bool cdi, int const_nd = -1, bool cold_poll = true) {
     const bool word = is_word(m);
-    const bool const_cost = const_nd >= 0;
+    // Fast timing: numC + a constant, charged where the exact model charges
+    // (after the access), one instruction, no table load or combine.
+    const bool ftime = g_fast_timing;
+    const bool const_cost = const_nd >= 0 && !ftime;
     if (const_cost) add_pending(const_charge(static_cast<u32>(const_nd)));
     flush_pending();
-    const int slot7 = const_cost ? -1 : cost7_slot(cdi, word);
+    const int slot7 = (const_cost || ftime) ? -1 : cost7_slot(cdi, word);
     auto cost = [&] {
-      if (const_cost) return;
+      if (const_cost || ftime) return;
       if (slot7 < 0) { emit_data_cost(SCRATCH1, SCRATCH6, word, false, !is_load(m)); return; }
       e().lsr_imm(SCRATCH6, SCRATCH1, 15);
       e().add_reg(SCRATCH6, R_TIM, SCRATCH6, LSL, 5, true);
@@ -879,6 +884,7 @@ private:
     };
     auto charge = [&] {
       if (wb) e().mov(host_reg(wb_reg), SCRATCH7);
+      if (ftime) { e().sub_imm(R_BUDGET, R_BUDGET, numC_internal() + fast_data(cpu_, cur_raw_, thumb_)); return; }
       if (const_cost) return;
       if (slot7 < 0) { emit_charge_data(SCRATCH6, SCRATCH1, cdi); return; }
       flush_pending();
@@ -992,6 +998,7 @@ private:
     // Cost after the transfers, as the interpreter and the single-access slow path
     // charge it: an I/O access sees the time before this instruction's data cycles
     // (DIVCNT polled after an STM to the divider). Per word, since words span pages.
+    if (g_fast_timing) { e().sub_imm(R_BUDGET, R_BUDGET, numC_internal() + n * fast_data(cpu_, cur_raw_, thumb_)); return; }
     e().sub_imm(SCRATCH1, SCRATCH1, n * 4, true);
     for (u32 k = 0; k < n; ++k) {
       if (k == 0) emit_data_cost(SCRATCH1, SCRATCH6, true, false, !load);
@@ -1069,12 +1076,28 @@ private:
       }
       if (writeback) e().mov(host_reg(rn), SCRATCH7);
     }
+    const bool ftime = g_fast_timing;
+    if (ftime && load && pc_in_list) {
+      // Fast timing: the data cost now, the constant refill in the branch
+      // (charge_CDI_after_jump's fast form charges the data alone).
+      e().sub_imm(R_BUDGET, R_BUDGET, n * fast_data(cpu_, cur_raw_, thumb_));
+      emit_branch_indirect(SCRATCH0, interwork_pc);
+      cold_begin(fail);
+      const size_t fb = cold_.size();
+      emit_fallback(instr, true);
+      cold_end();
+      fm_walk(fb);
+      ended_ = true;
+      return;
+    }
     // N + (n - 1) S
-    emit_data_cost(SCRATCH1, SCRATCH6, true, false, !load);
-    if (n > 1) {
-      emit_data_cost(SCRATCH1, SCRATCH5, true, true, !load);
-      e().mov_imm(SCRATCH4, n - 1);
-      e().madd(SCRATCH6, SCRATCH5, SCRATCH4, SCRATCH6);
+    if (!ftime) {
+      emit_data_cost(SCRATCH1, SCRATCH6, true, false, !load);
+      if (n > 1) {
+        emit_data_cost(SCRATCH1, SCRATCH5, true, true, !load);
+        e().mov_imm(SCRATCH4, n - 1);
+        e().madd(SCRATCH6, SCRATCH5, SCRATCH4, SCRATCH6);
+      }
     }
     if (load && pc_in_list) {
       // CDI charged by the stub after the jump: w1 = numD, w2 = data address.
@@ -1089,7 +1112,8 @@ private:
       ended_ = true;
       return;
     }
-    emit_charge_data(SCRATCH6, SCRATCH1, load);
+    if (ftime) e().sub_imm(R_BUDGET, R_BUDGET, numC_internal() + n * fast_data(cpu_, cur_raw_, thumb_));
+    else emit_charge_data(SCRATCH6, SCRATCH1, load);
     const size_t join = hot_.size();
     cold_begin(fail);
     const size_t fb = cold_.size();
@@ -2006,6 +2030,7 @@ bool Translator::run() {
     live_ = in.live_out;
     if (rt().trace) { flush_pending(); emit_trace(in.raw); }
     if (rt().cyclog) { flush_pending(); emit_call2(reinterpret_cast<const void*>(&jit_h_cyclog), in.raw, make_key(in.addr, thumb_)); }
+    cur_raw_ = in.raw;
     if (thumb_) translate_thumb(static_cast<u16>(in.raw)); else translate_arm(in.raw);
     rt().stats.instrs_translated++;
     ++dinstrs_;

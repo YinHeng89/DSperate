@@ -4,6 +4,7 @@
 // Headless frontend: boots the BIOS/firmware (and optionally a ROM), runs N
 // frames, optionally tracing instructions or dumping frames/audio.
 #include "core/nds.h"
+#include "core/cpu/timing_mode.h"
 #include "core/pc_sampler.h"
 #include "core/mem/fastmem_census.h"
 #include "core/host_cores.h"
@@ -332,6 +333,8 @@ int main(int argc, char** argv) {
     else if (arg("--cheat")) enable_cheats.push_back(argv[++i]);   // enable one by name, or by "#N" from --list-cheats
     else if (!std::strcmp(argv[i], "--direct")) direct = true;
     else if (!std::strcmp(argv[i], "--interp")) jit = false;
+    else if (arg("--timing")) { const char* m = argv[++i]; if (!std::getenv("DS_TIMING")) ds::g_fast_timing = std::strcmp(m, "exact") != 0; }   // CPU cycle model (timing_mode.h): fast (default) | exact; DS_TIMING wins
+
     else if (flag("--rtc-host")) rtc_host = true;                            // INEXACT by construction: runs stop being reproducible
     else if (arg("--firmware-override")) fw_override = argv[++i];            // load it, and write back what the firmware changed
     else if (flag("--no-aa")) no_aa = true;                                  // 3D anti-aliasing off (Renderer3D::set_aa); inexact, for measurement

@@ -4,6 +4,7 @@
 // Host-agnostic recompiler runtime: arena, block cache, linking, park-and-revive,
 // SMC tracking by host page. Host code emission is in backend::.
 #include "core/cpu/jit/jit_internal.h"
+#include "core/cpu/timing_mode.h"
 #include "core/mem/fastmem_census.h"
 #include "core/mem/fastmem.h"
 #include "core/profile.h"
@@ -637,6 +638,13 @@ static void install_fault_handler() {
 
 bool attach(NDS& nds, bool arm9, bool arm7) {
   Runtime& r = g_rt;
+  // The stubs bake in the timing model (refill); a change between attaches
+  // (tests run both) drops every block and emits them again.
+  if (r.arena && r.stubs_fast != g_fast_timing) {
+    reset_arena();
+    backend::emit_stubs(r);
+    r.stubs_fast = g_fast_timing;
+  }
   if (!r.arena) {
     void* p = mmap(nullptr, ARENA_BYTES, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (p == MAP_FAILED) { std::fprintf(stderr, "jit: cannot map code arena\n"); return false; }
@@ -647,6 +655,7 @@ bool attach(NDS& nds, bool arm9, bool arm7) {
       for (u32 i = 0; i < LUT_SIZE; ++i) r.cpus[c].lut[i] = LUT_EMPTY_KEY;
     }
     backend::emit_stubs(r);
+    r.stubs_fast = g_fast_timing;
     perf_map_stubs(r);
     r.strict = std::getenv("DS_JIT_STRICT") != nullptr;
     r.debug = std::getenv("DS_JIT_DEBUG") != nullptr;

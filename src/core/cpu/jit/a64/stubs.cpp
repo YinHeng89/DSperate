@@ -4,6 +4,7 @@
 // AArch64 stubs and runtime code patches. Stubs are entered by `bl`; literal args
 // follow the bl and are read/skipped via x30. x17 and x30 are free temps in stubs.
 #include "core/cpu/jit/jit_internal.h"
+#include "core/cpu/timing_mode.h"
 #include "core/cpu/jit/a64/convention.h"
 #include "core/cpu/jit/a64/emit.h"
 #include "core/mem/timing.h"
@@ -407,7 +408,8 @@ void emit_stubs(Runtime& rt) {
       e.bfi(1, 0, 5, 1);
       e.str_w(1, R_CTX, OFF_CPSR);
       e.and_imm(2, 0, ~1u);
-      if (c == 0) {
+      if (g_fast_timing) e.movz(3, c == 0 ? g_fast.r9 : g_fast.r7);   // fast timing: a constant refill
+      else if (c == 0) {
         // ARM9 refill: ARM cost(a,B)+cost(a+4,S); Thumb a&2 ? cost(a-2,B)+cost(a+2,S) : cost(a,B).
         // Byte from Timing's refill9 table: page of first = a - 2*odd; index by second =
         // a + 4 - 2*T: 3 if dropped (T && !odd), 2 if page start, 1 if line start, else 0.

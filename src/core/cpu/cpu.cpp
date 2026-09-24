@@ -5,9 +5,28 @@
 #include "core/state/state.h"
 #include "core/cpu/cpu_cycles.h"
 
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 namespace ds {
+
+// Fast unless DS_TIMING=exact; exact by default where the recompiler is the
+// ARMv7 one, which implements only the exact model.
+// DS_FAST="d9s,d9,d7,r9,r7" overrides the fast model's constants (tuning only).
+FastTiming g_fast = [] {
+  FastTiming f;
+  if (const char* e = std::getenv("DS_FAST")) std::sscanf(e, "%u,%u,%u,%u,%u", &f.d9s, &f.d9, &f.d7, &f.r9, &f.r7);
+  return f;
+}();
+bool g_fast_timing = [] {
+  if (const char* e = std::getenv("DS_TIMING")) return std::strcmp(e, "exact") != 0;
+#if DSPERATE_JIT && !defined(__aarch64__)
+  return false;
+#else
+  return true;
+#endif
+}();
 
 namespace {
 // Bank index for each mode: {USR/SYS, FIQ, IRQ, SVC, ABT, UND}.

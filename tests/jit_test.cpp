@@ -5,6 +5,7 @@
 // and memory must agree afterwards. The first disagreement prints the
 // sequence, which names the broken instruction.
 #include "core/nds.h"
+#include "core/cpu/timing_mode.h"
 #include "core/cpu/interp/interp.h"
 #include "core/cpu/jit/jit.h"
 #include "check.h"
@@ -625,11 +626,17 @@ int main(int argc, char** argv) {
     fuzz(set >= 2 ? Cpu::ARM7 : Cpu::ARM9, set & 1, trials, seed);
     return 0;
   }
-  directed();
-  fuzz(Cpu::ARM9, false, trials, 1000);
-  fuzz(Cpu::ARM9, true, trials, 2000);
-  fuzz(Cpu::ARM7, false, trials, 3000);
-  fuzz(Cpu::ARM7, true, trials, 4000);
+  // Both timing models (timing_mode.h): the interpreter and the recompiler
+  // must agree under each; the runtime re-emits its stubs between the two.
+  for (const bool fast : {false, true}) {
+    ds::g_fast_timing = fast;
+    std::printf("jit: %s timing\n", fast ? "fast" : "exact");
+    directed();
+    fuzz(Cpu::ARM9, false, trials, 1000);
+    fuzz(Cpu::ARM9, true, trials, 2000);
+    fuzz(Cpu::ARM7, false, trials, 3000);
+    fuzz(Cpu::ARM7, true, trials, 4000);
+  }
   const jit::Stats& s = jit::stats();
   std::printf("jit: %llu blocks, %llu inline instrs, %llu fallbacks\n",
               (unsigned long long)s.blocks_translated, (unsigned long long)s.instrs_translated, (unsigned long long)s.instrs_fallback);

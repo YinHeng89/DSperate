@@ -68,7 +68,7 @@ struct CpuContext {
   u32 code_cycles;         // ARM9: cost of the most recent prefetch. ARM7: code-region table index.
   u32 data_cycles;         // accumulated data-access cost of the current instruction
   u32 code_region, data_region;   // high byte of the address (ARM7 main-RAM overlap rules)
-  u8  _pad1;
+  u8  fast_d;              // fast timing: the current instruction's data cost per access (timing_mode.h)
   bool branch_fetch;       // ARM9: the next prefetch is the first after a branch
 
   // Cycles owed before executing anything: reset/direct-boot pipeline fills,

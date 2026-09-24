@@ -136,6 +136,29 @@ mode the budget is also tested after every instruction, so the two engines
 interleave identically and frame dumps must be byte-equal; normally it is
 tested once per block.
 
+**Fast timing** (`emu.timing = fast`, the default; `core/cpu/timing_mode.h`).
+The exact model above costs several instructions per memory access (the
+timing-table load and the CD/CDI combine; on the ARM7 the main-RAM rule is
+~12) and ~20 per indirect branch (the refill lookup). The fast model charges
+every data access a constant and every jump a constant refill, loads and
+stores pay `numC + data` with no overlap, so an access costs one `sub` and the
+refill one `movz`. numC stays exact: it is resolved at translation time anyway.
+The interpreter implements the same model (`cpu_cycles.h`), so strict mode
+still makes the two engines byte-equal; `test_jit` runs every trial under both
+models, and the stubs are re-emitted when the model changes between attaches.
+The ARM9's data constant depends on the base register, known at translation:
+SP-based accesses (the stack, in DTCM) cost 0, all others 5; the ARM7's cost
+2; refills 4 / 2 (`DS_FAST=d9s,d9,d7,r9,r7` overrides them). The interpreter
+derives the same split from the opcode (`fast_sp_based`). One constant cannot
+fit: exact overlaps a DTCM access with the fetch, so stack-heavy frame logic
+(ST, NSMB) pays nothing for data, while main-RAM-bound idle work (PW2's) pays
+~5. A flat 4 pushed ST's and NSMB's frame logic past VBlank and halved their 3D
+rate while audio kept pace (the host time it "saved" was the work the game no
+longer did); a flat 2 fixed that but made PW2 iterate ~40% more per frame.
+Check a change against 3D swap counts under exact (`DS_PROFILE`,
+"gx swap_buffers"), not only host time: ST sits at its deadline even under
+exact, and (1, 5) already drops it from 2255 swaps to 2053.
+
 **Flags.** A backward liveness pass per block records which of N, Z, C, V are
 live after each instruction. Logical ops then use a bare `tst` when C/V are
 dead; when they are not, a shared stub merges (`bl merge_keep_cv` /

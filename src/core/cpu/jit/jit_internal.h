@@ -138,6 +138,7 @@ struct Runtime {
   size_t cap = 0;
   size_t pos = 0;
   size_t stubs_end = 0;        // arena below this is permanent
+  bool   stubs_fast = false;   // the timing model the stubs were emitted for (g_fast_timing)
   bool   need_reset = false;   // reset at the next safe point
 
   void (*enter)(CpuContext*, const void*) = nullptr;

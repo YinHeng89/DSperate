@@ -15,6 +15,7 @@ inline bool is_arm9(const CpuContext& cpu) { return cpu.which == Cpu::ARM9; }
 }
 
 void exec_thumb(CpuContext& cpu, u16 instr) {
+  if (g_fast_timing) cpu.fast_d = static_cast<u8>(fast_data(cpu, instr, true));
   const TOp op = arm::decode_thumb(instr);
   switch (op) {
   case TOp::ShiftImm: {
