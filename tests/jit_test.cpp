@@ -480,6 +480,15 @@ void directed() {
     {Cpu::ARM9, false, {0xE28FF000, 0xE2800064, 0xE2800001}, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
     {Cpu::ARM9, false, {0xE1A0F001, 0xE2800001}, {0, HALT_STUB, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
     {Cpu::ARM7, false, {0xE1A0F001, 0xE2800001}, {0, HALT_STUB, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
+    // Exit flag liveness: cmp r1, r1 (C=1); tst r0, r0 (C kept); bne -> a
+    // successor that reads C first (bcs), taken and not taken, and one whose
+    // successors overwrite C first (adds), where the merge is dropped.
+    {Cpu::ARM9, true, {0x4289, 0x4200, 0xD100, 0x3001, 0xD200, 0x3064, 0x3001}, {5, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
+    {Cpu::ARM9, true, {0x4289, 0x4200, 0xD100, 0x3001, 0xD200, 0x3064, 0x3001}, {0, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
+    {Cpu::ARM7, true, {0x4289, 0x4200, 0xD100, 0x3001, 0xD200, 0x3064, 0x3001}, {5, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
+    {Cpu::ARM9, true, {0x4289, 0x4200, 0xD100, 0x3001, 0x3002, 0x3064, 0x3001}, {5, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
+    // ARM: the same through a conditional B, the successor reading C (addcs).
+    {Cpu::ARM9, false, {0xE1510001, 0xE3100000, 0x1A000000, 0xE2900001, 0x22800064, 0xE2800001}, {5, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
     // Thumb: movs then ldr [r6 + r0] far away.
     {Cpu::ARM9, true, {0x2001, 0x5871}, {0, 0x12345678, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
     {Cpu::ARM7, true, {0x2001, 0x5871}, {0, 0x12345678, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},

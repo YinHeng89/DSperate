@@ -279,8 +279,9 @@ static bool guest_bytes_match(JitCpu& jc, const Block* b) {
 static void register_block(JitCpu& jc, Block* b) {
   Runtime& r = g_rt;
   const u32 pc = key_pc(b->key);
-  const u8* p0 = jc.ctx->page_table.read_ptr(pc);
-  const u8* p1 = jc.ctx->page_table.read_ptr(pc + b->guest_len - 1);
+  const bool span = b->span_hi != 0;
+  const u8* p0 = jc.ctx->page_table.read_ptr(span ? b->span_lo : pc);
+  const u8* p1 = jc.ctx->page_table.read_ptr(span ? b->span_hi : pc + b->guest_len - 1);
   b->npages = 0;
   b->host_lo = p0; b->host_hi = p1;
   if (p0) b->host_pages[b->npages++] = host_page_of(p0);
@@ -304,7 +305,7 @@ static Block* revive(JitCpu& jc, u32 key) {
   const u64 stamp = jc.nds->bus.timing().stamp;
   for (size_t k = v.size(); k-- > 0;) {
     Block* b = v[k];
-    if (b->stamp != stamp || b->guest_len != b->guest_copy_len || !guest_bytes_match(jc, b)) continue;
+    if (b->stamp != stamp || b->span_hi || b->guest_len != b->guest_copy_len || !guest_bytes_match(jc, b)) continue;
     v.erase(v.begin() + static_cast<std::ptrdiff_t>(k));
     if (v.empty()) jc.parked.erase(it);
     std::memcpy(b->entry, b->entry_words, backend::ENTRY_PATCH);

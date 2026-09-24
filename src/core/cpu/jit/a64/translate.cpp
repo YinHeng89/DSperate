@@ -458,6 +458,52 @@ private:
     return true;
   }
 
+  // ---- exit flag liveness ----------------------------------------------------------------
+  // Flags a successor may read before writing them, from its first
+  // instructions up to its own block end. Blocks end live in every flag
+  // otherwise, so a Thumb `tst` before a branch must keep C and V (a stub call
+  // on every such exit) though the target overwrites them first. Only static
+  // successors; the bytes read widen [lo, hi], which the block then watches
+  // for writes (capped at one page so it spans at most two).
+  u32 successor_flag_live(u32 a, u32& lo, u32& hi) {
+    constexpr u32 SCAN = 8;
+    u32 undecided = F_ALL, live = 0, nlo = std::min(lo, a), nhi = hi;
+    for (u32 k = 0; k < SCAN && undecided; ++k, a += step()) {
+      if (!cpu_.page_table.read_ptr(a)) return F_ALL;
+      nlo = std::min(nlo, a); nhi = std::max(nhi, a + step() - 1);
+      if (nhi - nlo >= mem::PAGE_SIZE) return F_ALL;
+      const u32 raw = fetch(a);
+      const FlagUse u = thumb_ ? thumb_flag_use(static_cast<u16>(raw), a9_) : arm_flag_use(raw, a9_);
+      live |= u.reads & undecided;
+      undecided &= ~(u.reads | u.writes);
+      if (thumb_ ? shape::thumb_ends_block(static_cast<u16>(raw)) : shape::arm_ends_block(raw, a9_)) break;
+    }
+    lo = nlo; hi = nhi;
+    return live | undecided;
+  }
+  // `next`: the address after the block's last instruction.
+  u32 exit_flag_live(u32 next, u32& lo, u32& hi) {
+    const Instr& last = instrs_.back();
+    const bool ends = thumb_ ? shape::thumb_ends_block(static_cast<u16>(last.raw)) : shape::arm_ends_block(last.raw, a9_);
+    if (!ends) return successor_flag_live(next, lo, hi);
+    u32 target = 0;
+    bool cond = false;
+    if (thumb_) {
+      const u16 t = static_cast<u16>(last.raw);
+      const TOp op = arm::decode_thumb(t);
+      if (op == TOp::BCond) { target = last.addr + 4 + static_cast<u32>(static_cast<s32>(static_cast<s8>(t & 0xFF)) * 2); cond = true; }
+      else if (op == TOp::B) target = last.addr + 4 + static_cast<u32>((static_cast<s32>(static_cast<u32>(t) << 21) >> 21) * 2);
+      else return F_ALL;
+    } else {
+      if ((last.raw >> 28) == 0xF || arm::decode_arm(last.raw) != AOp::B) return F_ALL;
+      target = last.addr + 8 + static_cast<u32>(static_cast<s32>(last.raw << 8) >> 6);
+      cond = (last.raw >> 28) != 0xE;
+    }
+    u32 live = successor_flag_live(target, lo, hi);
+    if (cond && live != F_ALL) live |= successor_flag_live(next, lo, hi);
+    return cond && live == F_ALL ? F_ALL : live;
+  }
+
   // ---- decoding ------------------------------------------------------------------------
   u32 fetch(u32 addr) {
     if (u8* p = cpu_.page_table.read_ptr(addr)) {
@@ -2012,8 +2058,9 @@ bool Translator::run() {
     if (!cpu_.page_table.read_ptr(addr)) break;
   }
 
-  // Backward flag liveness.
-  u32 live = F_ALL;
+  // Backward flag liveness, from what the static successors need at the exit.
+  u32 span_lo = start, span_hi = addr - 1;
+  u32 live = exit_flag_live(addr, span_lo, span_hi);
   for (size_t i = instrs_.size(); i-- > 0;) {
     instrs_[i].live_out = live;
     const FlagUse u = thumb_ ? thumb_flag_use(static_cast<u16>(instrs_[i].raw), a9_) : arm_flag_use(instrs_[i].raw, a9_);
@@ -2088,6 +2135,7 @@ bool Translator::run() {
     }
   }
   blk_.guest_len = end_addr - start;
+  if (span_lo != start || span_hi != addr - 1) { blk_.span_lo = span_lo; blk_.span_hi = span_hi; }
   if (!ended_) emit_branch_static(end_addr, thumb_, false);
   return finish();
 }
