@@ -371,7 +371,7 @@ void Gpu3D::drain_all() {
   const u32* const q = par_log_.get();
   u32 pi = 0;
   // DS_PROFILE: which commands the lists are made of (gx_cmd_census).
-  static u64* const hist = prof::enabled ? gx_cmd_census() : nullptr;
+  static u64* const hist = prof::heavy ? gx_cmd_census() : nullptr;
   if (hist) for (u32 i = 0; i < cmd_n_; ++i) ++hist[c[i]];
   for (u32 i = 0; i < cmd_n_; ++i) {
     const u8 k = c[i];

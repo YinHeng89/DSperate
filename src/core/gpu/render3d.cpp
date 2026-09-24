@@ -283,7 +283,7 @@ struct Renderer3D::Pool {
   // reference). Bin bits gate a display line; this gates the frame boundary.
   u64 wait_idle() {
     if (remaining_.load(std::memory_order_acquire) == 0 && thieves_.load(std::memory_order_acquire) == 0) return 0;
-    const auto t0 = std::chrono::steady_clock::now();
+    const u64 t0 = prof::now_ns();
     const u64 h0 = handoff::enabled ? handoff::now_ns() : 0;
     {
       std::unique_lock<std::mutex> lk(m_);
@@ -294,7 +294,7 @@ struct Renderer3D::Pool {
       handoff::stats().wait[handoff::Band].add(t1 - h0);
       if (done > h0 && done <= t1) handoff::stats().back[handoff::Band].add(t1 - done);
     }
-    return static_cast<u64>((std::chrono::steady_clock::now() - t0).count());
+    return prof::now_ns() - t0;
   }
   // A thief's claim: only if `gen` is still the dispatch in flight, atomically
   // with that check (dispatch resets the cursor under the lock), and counted
@@ -1413,7 +1413,7 @@ template <int mode, bool textured, bool aa, bool opq>
   // The profiling flag is read once per span, not once per eight-pixel
   // group: prof::add tests the global inside the innermost loop otherwise
   // (two loads and a branch per group, as stage_line already hoists).
-  const bool pe = prof::enabled;
+  const bool pe = prof::heavy;
   u32 resolved_px = 0;
   const u32 polyattr = sh.polyattr;
   const uint32x4_t lane = {0, 1, 2, 3};
@@ -1873,7 +1873,7 @@ void Renderer3D::stage_line(Edge& e, s32 y, const LineSpan& ls) {
   // One load of the profiling flag for the whole line: the kernels between
   // the checks are opaque to the compiler, so every test would otherwise
   // re-read it.
-  const bool pe = prof::enabled;
+  const bool pe = prof::heavy;
   const int mode = sh.mode;
   if (pe) { prof::add(prof::C_POLY_LINES, 1); prof::add(prof::C_SPAN_PIXELS, xb > xa ? static_cast<u64>(xb - xa) : 0); }
   if (pe) {
@@ -2540,8 +2540,8 @@ void Renderer3D::render(const Gpu3D& gx) {
   sync_all();
   // From here to band dispatch (identical-frame check, texcache validation,
   // resolve) is R3D_PREP; band dispatch accounts separately.
-  const auto t_prep0 = prof::enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-  struct PrepEnd { std::chrono::steady_clock::time_point t0; bool* done; ~PrepEnd() { if (prof::enabled && !*done) { prof::add_ns(prof::R3D_PREP, static_cast<u64>((std::chrono::steady_clock::now() - t0).count())); *done = true; } } };
+  const u64 t_prep0 = prof::enabled ? prof::now_ns() : 0;
+  struct PrepEnd { u64 t0; bool* done; ~PrepEnd() { if (prof::enabled && !*done) { prof::add_timed(prof::R3D_PREP, prof::now_ns() - t0); *done = true; } } };
   bool prep_done = false;
   PrepEnd prep_end{t_prep0, &prep_done};
   gx_ = &gx;
@@ -2593,7 +2593,7 @@ void Renderer3D::render(const Gpu3D& gx) {
     }
   }
   texels_in_ = &poly_texels_;
-  if (prof::enabled && !prep_done) { prof::add_ns(prof::R3D_PREP, static_cast<u64>((std::chrono::steady_clock::now() - t_prep0).count())); prep_done = true; }
+  if (prof::enabled && !prep_done) { prof::add_timed(prof::R3D_PREP, prof::now_ns() - t_prep0); prep_done = true; }
 
   u32 nb = band_count(live);
   // Gpu lag mode: the compositor thread contends for the fourth core, so drop
@@ -2648,7 +2648,7 @@ void Renderer3D::render(const Gpu3D& gx) {
   // job_fn_ is a member since the job outlives this call. Workers claim bins
   // until exhausted (not one band each), so an uneven split costs nothing.
   job_fn_ = [this, &gxr, dst](u32 w) {
-    const auto t0 = std::chrono::steady_clock::now();
+    const u64 t0 = prof::now_ns();
     Renderer3D* r = this;
     if (w != 0) { r = bands_[w - 1].get(); r->prepare_worker(gxr, list_polys_, list_count_, &poly_texels_, &rs_frame_); }
     else build_edges();   // this instance's render state is already latched
@@ -2660,7 +2660,7 @@ void Renderer3D::render(const Gpu3D& gx) {
       pool_->mark_done(b);
     }
     // Per worker, own slot, no synchronisation; read next frame after sync_all.
-    if (w < 8) band_ns_[w] = static_cast<u64>((std::chrono::steady_clock::now() - t0).count());
+    if (w < 8) band_ns_[w] = prof::now_ns() - t0;
   };
   pending_bands_ = nbins_;
   // Set once: engine A's deferred lines (a 2D worker) read it through
@@ -2936,9 +2936,9 @@ void Renderer3D::render_band(s32 y0, s32 y1, u32* dst) {
   // stage per line per band, which is a measurable share of what it measures.
   const bool timing = prof::enabled;
   u64 spans_ns = 0, final_ns = 0;
-  auto now = [] { return std::chrono::steady_clock::now(); };
-  auto t = timing ? now() : std::chrono::steady_clock::time_point{};
-  auto lap = [&](u64& into) { if (!timing) return; const auto n = now(); into += static_cast<u64>((n - t).count()); t = n; };
+  auto now = [] { return prof::now_ns(); };
+  u64 t = timing ? now() : 0;
+  auto lap = [&](u64& into) { if (!timing) return; const u64 n = now(); into += n - t; t = n; };
 
   // Rasterise a chunk at a time, then run the final pass over every line the
   // chunk completed. A line's final pass reads its two neighbours, so it lags

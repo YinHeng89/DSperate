@@ -29,7 +29,12 @@ enum Stage : u32 {
   R3D_STEAL,    // "of which": bins the caller drew instead of waiting for a worker
   COUNT
 };
-extern bool enabled;
+// DS_PROFILE=1: the stage probes (Scope) and the frame series -- cheap
+// enough to read frame times through (each probe's cost is taken off).
+// DS_PROFILE=2 (`heavy`): the counters and censuses too -- per DMA unit,
+// per span, per slice register hashing -- which cost real frame time.
+extern bool enabled, heavy;
+void set_level(const char* env);   // the DS_PROFILE value, or null
 // Per-access censuses (palette/OAM store counts, DS_CENSUS, DS_IO_CENSUS,
 // DS_FASTMEM_CENSUS, code-page store counts) need -DDSPERATE_CENSUS=1; compiled out by default.
 #ifndef DSPERATE_CENSUS
@@ -147,17 +152,43 @@ extern const char* const count_names[];
 struct Accum {
   u64 ns[COUNT] = {};
   u64 count[C_COUNT] = {};
+  u64 probes[COUNT] = {};   // Scope probes per stage, for removing their own cost (probe_ns)
   u32 tid = 0;          // registration order: 0 is the emulation thread, 1.. the band workers
 };
+
+// The probe clock: the ARM generic counter read directly (cntvct_el0, one
+// instruction) where there is one, since clock_gettime through the vDSO is
+// what made DS_PROFILE cost 4-6 ms a frame on the A55. Nanoseconds either way.
+#if defined(__aarch64__)
+namespace detail { extern u64 cnt_mul; }   // ns per tick, 32.32
+inline u64 now_ns() {
+  u64 t;
+  asm volatile("mrs %0, cntvct_el0" : "=r"(t));
+  return static_cast<u64>((static_cast<unsigned __int128>(t) * detail::cnt_mul) >> 32);
+}
+#else
+inline u64 now_ns() { return static_cast<u64>(std::chrono::steady_clock::now().time_since_epoch().count()); }
+#endif
+// What one Scope probe costs on this host (its two clock reads and the
+// bookkeeping), measured once when profiling starts; every stage, the frame
+// series and the frontend's frame times have probes x probe_ns taken off.
+extern double probe_ns;
+// Take the emulation thread's probe cost per frame off the frontend's frame
+// samples (tail-aligned to the frame series, as frame_breakdown is). Call
+// before frame_report / frame_breakdown.
+void deduct_probe_overhead(std::vector<double>& frame_ms, std::vector<double>* work_ms);
 namespace detail {
 extern thread_local Accum* acc;
 Accum* make_acc();                                  // registers a new one (once per thread)
 inline Accum* get() { Accum* a = acc; return a ? a : make_acc(); }
 }
 
-inline void add(Counter c, u64 n) { if (enabled) detail::get()->count[c] += n; }
-inline u64 count(Counter c) { return enabled ? detail::get()->count[c] : 0; }
+inline void add(Counter c, u64 n) { if (heavy) detail::get()->count[c] += n; }
+inline u64 count(Counter c) { return heavy ? detail::get()->count[c] : 0; }
 inline void add_ns(Stage s, u64 n) { if (enabled) detail::get()->ns[s] += n; }
+// A manual pair of now_ns() reads around `s`: counted as a probe, so its
+// own cost comes off like a Scope's.
+inline void add_timed(Stage s, u64 n) { if (enabled) { Accum* a = detail::get(); a->ns[s] += n; ++a->probes[s]; } }
 void report();
 
 // frame_mark() snapshots stage accumulators at a frame boundary (call where
@@ -169,9 +200,9 @@ void frame_breakdown(const std::vector<double>& frame_ms);
 // A stack object; `on` lets a caller skip timing some invocations without
 // heap-allocating the scope conditionally.
 struct Scope {
-  Stage s; bool on; std::chrono::steady_clock::time_point t0;
-  explicit Scope(Stage st, bool want = true) : s(st), on(want && enabled) { if (on) t0 = std::chrono::steady_clock::now(); }
-  ~Scope() { if (on) add_ns(s, static_cast<u64>((std::chrono::steady_clock::now() - t0).count())); }
+  Stage s; bool on; u64 t0;
+  explicit Scope(Stage st, bool want = true) : s(st), on(want && enabled) { if (on) t0 = now_ns(); }
+  ~Scope() { if (on) { Accum* a = detail::get(); a->ns[s] += now_ns() - t0; ++a->probes[s]; } }
 };
 
 } // namespace ds::prof

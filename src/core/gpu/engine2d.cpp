@@ -154,7 +154,7 @@ void Engine2D::render_line(u32 line) {
   if (cur_.forced_blank) { out_.fill(0xFF3F3F3F); return; }
 
   for (auto& p : bg_) p.any = false;
-  if (prof::enabled) {
+  if (prof::heavy) {
     prof::add(prof::C_2D_LINES, 1);
     if ((cur_.layer_enable & 0x10) && num_sprites_) prof::add(prof::C_2D_OBJ_LINES, 1);
     if (cur_.dispcnt & 0xE000) prof::add(prof::C_2D_WINDOW_LINES, 1);
@@ -181,7 +181,7 @@ void Engine2D::render_line(u32 line) {
   }
 
   // 2. Window plane, 3. sprite X mosaic, 4. priority select, 5. colour effects.
-  if (prof::enabled) {
+  if (prof::heavy) {
     u32 layers = 0; int only = -1;
     for (int n = 0; n < 4; ++n) if (bg_[n].any) { ++layers; only = n; }
     bool objpx = false;

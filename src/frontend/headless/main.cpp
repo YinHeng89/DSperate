@@ -593,7 +593,7 @@ int main(int argc, char** argv) {
 #else
   (void)jit;
 #endif
-  ds::prof::enabled = std::getenv("DS_PROFILE") != nullptr;
+  ds::prof::set_level(std::getenv("DS_PROFILE"));
   std::fprintf(stderr, "host: %u cores\n", ds::host_cores());
   if (const char* w = std::getenv("DS_WATCH")) nds.bus.enable_watch(static_cast<ds::u32>(std::strtoul(w, nullptr, 16)));
   if (trace) {
@@ -897,6 +897,7 @@ int main(int argc, char** argv) {
   }
   if (ds::mem::fmc::on()) ds::mem::fmc::report(frame_ms.size());
   nds.bus.fastmem_report();
+  ds::prof::deduct_probe_overhead(frame_ms, nullptr);
   ds::frame_report(frame_ms);
   ds::prof::frame_breakdown(frame_ms);
   if (nds.dsi_nand.valid())

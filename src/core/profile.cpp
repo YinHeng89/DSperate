@@ -14,7 +14,11 @@
 
 namespace ds::prof {
 
-bool enabled = false;
+bool enabled = false, heavy = false;
+void set_level(const char* env) {
+  enabled = env != nullptr;
+  heavy = enabled && std::atoi(env) >= 2;
+}
 bool async_window = false;
 bool census_same_list = false;
 
@@ -110,6 +114,37 @@ const char* const count_names[] = {"3d polygon lines", "3d span pixels", "3d res
 static_assert(sizeof(count_names) / sizeof(*count_names) == C_COUNT,
               "count_names must have exactly one entry per Counter enumerator");
 
+#if defined(__aarch64__)
+namespace detail {
+u64 cnt_mul = [] {
+  u64 f;
+  asm volatile("mrs %0, cntfrq_el0" : "=r"(f));
+  return f ? static_cast<u64>((static_cast<unsigned __int128>(1000000000ull) << 32) / f) : 0;
+}();
+}
+#endif
+double probe_ns = 0.0;
+
+namespace {
+// The cost of one probe, measured on a scratch accumulator so the stages
+// stay clean. The clock governor decides what a probe costs: measured once
+// at startup it varied 70-110 ns on the RK3566 with where the clock stood,
+// so it is re-measured every few hundred frames and the minimum kept -- the
+// cost at full clock, which is what the loaded emulation core runs at.
+void calibrate_probe(u32 n) {
+  Accum scratch;
+  Accum* const saved = detail::acc;
+  detail::acc = &scratch;
+  for (u32 i = 0; i < n / 10; ++i) { Scope s(CPU9); }   // warm
+  const u64 t0 = now_ns();
+  for (u32 i = 0; i < n; ++i) { Scope s(CPU9); }
+  const u64 t1 = now_ns();
+  detail::acc = saved;
+  const double v = static_cast<double>(t1 - t0) / n;
+  if (probe_ns == 0.0 || v < probe_ns) probe_ns = v;
+}
+}
+
 namespace detail {
 thread_local Accum* acc = nullptr;
 
@@ -122,7 +157,14 @@ Accum* make_acc() {
   Accum* a = new Accum();
   { std::lock_guard<std::mutex> lk(accs_mutex()); a->tid = static_cast<u32>(accs().size()); accs().push_back(a); }
   acc = a;
+  static std::once_flag once;
+  if (enabled) std::call_once(once, [] { calibrate_probe(200000); });
   return a;
+}
+// A stage's time less what its own probes cost.
+inline u64 net_ns(const Accum& a, u32 i) {
+  const u64 cost = static_cast<u64>(static_cast<double>(a.probes[i]) * probe_ns);
+  return a.ns[i] > cost ? a.ns[i] - cost : 0;
 }
 } // namespace detail
 
@@ -132,27 +174,30 @@ Accum* make_acc() {
 namespace {
 // cyc/slices distinguish a STALLED frame (lost time outside emulation) from
 // a CATCH-UP one (ran several frames' worth of cycles).
-struct FrameNs { u64 ns[COUNT]; u64 workers; u64 cyc; u64 slices; };
+struct FrameNs { u64 ns[COUNT]; u64 workers; u64 cyc; u64 slices; u64 probe_emu; };   // probe_emu: the emulation thread's probe cost this frame, ns
 std::vector<FrameNs> frame_series;
 u64 frame_last_ns[COUNT];
-u64 frame_last_workers;
+u64 frame_last_workers, frame_last_probes;
 u64 frame_last_cyc, frame_last_slices;
 } // namespace
 
 void frame_mark() {
   if (!enabled) return;
-  u64 now[COUNT] = {}; u64 workers = 0;
+  { static u32 frames = 0; if (++frames % 256 == 0) calibrate_probe(5000); }   // ~0.4 ms, once every 256 frames
+  u64 now[COUNT] = {}; u64 workers = 0, probes = 0;
   {
     std::lock_guard<std::mutex> lk(detail::accs_mutex());
     for (const Accum* a : detail::accs()) {
-      if (a->tid == 0) for (u32 i = 0; i < COUNT; ++i) now[i] = a->ns[i];
-      else             for (u32 i = 0; i < COUNT; ++i) workers += a->ns[i];
+      if (a->tid == 0) for (u32 i = 0; i < COUNT; ++i) { now[i] = detail::net_ns(*a, i); probes += a->probes[i]; }
+      else             for (u32 i = 0; i < COUNT; ++i) workers += detail::net_ns(*a, i);
     }
   }
   FrameNs d{};
-  for (u32 i = 0; i < COUNT; ++i) { d.ns[i] = now[i] - frame_last_ns[i]; frame_last_ns[i] = now[i]; }
-  d.workers = workers - frame_last_workers;
+  for (u32 i = 0; i < COUNT; ++i) { d.ns[i] = now[i] > frame_last_ns[i] ? now[i] - frame_last_ns[i] : 0; frame_last_ns[i] = now[i]; }
+  d.workers = workers > frame_last_workers ? workers - frame_last_workers : 0;
   frame_last_workers = workers;
+  d.probe_emu = static_cast<u64>(static_cast<double>(probes - frame_last_probes) * probe_ns);
+  frame_last_probes = probes;
   {
     u64 cyc = 0, slices = 0;
     std::lock_guard<std::mutex> lk(detail::accs_mutex());
@@ -161,6 +206,16 @@ void frame_mark() {
     d.slices = slices - frame_last_slices; frame_last_slices = slices;
   }
   frame_series.push_back(d);
+}
+
+void deduct_probe_overhead(std::vector<double>& frame_ms, std::vector<double>* work_ms) {
+  if (!enabled || frame_series.size() < frame_ms.size()) return;
+  const size_t off = frame_series.size() - frame_ms.size();
+  for (size_t i = 0; i < frame_ms.size(); ++i) {
+    const double p = static_cast<double>(frame_series[off + i].probe_emu) / 1e6;
+    frame_ms[i] = std::max(0.0, frame_ms[i] - p);
+    if (work_ms && i < work_ms->size()) (*work_ms)[i] = std::max(0.0, (*work_ms)[i] - p);
+  }
 }
 
 void frame_breakdown(const std::vector<double>& frame_ms) {
@@ -301,9 +356,15 @@ void report() {
   {
     std::lock_guard<std::mutex> lk(detail::accs_mutex());
     for (const Accum* a : detail::accs()) {
-      for (u32 i = 0; i < COUNT; ++i) t.ns[i] += a->ns[i];
+      for (u32 i = 0; i < COUNT; ++i) { t.ns[i] += detail::net_ns(*a, i); t.probes[i] += a->probes[i]; }
       for (u32 i = 0; i < C_COUNT; ++i) t.count[i] += a->count[i];
     }
+  }
+  {
+    u64 probes = 0;
+    for (u32 i = 0; i < COUNT; ++i) probes += t.probes[i];
+    std::fprintf(stderr, "[profile] probe cost %.0f ns each, %llu probes: %.1f ms removed from the stages below (and from frame ms, per frame)\n",
+                 probe_ns, static_cast<unsigned long long>(probes), static_cast<double>(probes) * probe_ns / 1e6);
   }
   const u64* ns = t.ns;
   const u64* count = t.count;
@@ -338,9 +399,9 @@ void report() {
           std::fprintf(stderr, "[profile]     %-24s %12llu\n", count_names[i], (unsigned long long)a->count[i]);
     }
   }
-  std::fprintf(stderr, "[profile] %-14s %9s %6s\n", "stage", "ms", "%");
+  std::fprintf(stderr, "[profile] %-14s %9s %6s %12s\n", "stage", "ms", "%", "probes");
   for (u32 i = 0; i < COUNT; ++i)
-    if (ns[i]) std::fprintf(stderr, "[profile] %-14s %9.1f %5.1f%%\n", names[i], ns[i] / 1e6, 100.0 * ns[i] / total);
+    if (ns[i] || t.probes[i]) std::fprintf(stderr, "[profile] %-14s %9.1f %5.1f%% %12llu\n", names[i], ns[i] / 1e6, 100.0 * ns[i] / total, static_cast<unsigned long long>(t.probes[i]));
   std::fprintf(stderr, "[profile] %-14s %9.1f  (excludes the \"of which\" rows)\n", "sum", total / 1e6);
 }
 

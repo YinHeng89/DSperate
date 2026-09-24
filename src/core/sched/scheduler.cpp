@@ -295,6 +295,11 @@ bool Scheduler::both_idle() const {
 void Scheduler::count_slice(bool skipped, s64 slice) const {
   const CpuContext& a9 = nds_.cpu(Cpu::ARM9);
   const CpuContext& a7 = nds_.cpu(Cpu::ARM7);
+  if (!prof::heavy) {   // light profiling: only what the frame series annotates
+    prof::Accum* a = prof::detail::get();
+    a->count[prof::C_SLICES] += 1; a->count[prof::C_CYC_TOTAL] += static_cast<u64>(slice);
+    return;
+  }
   prof::add(prof::C_SLICES, 1);
   if (a9.halted) prof::add(prof::C_SLICES_A9_HALTED, 1);
   if (a7.halted) prof::add(prof::C_SLICES_A7_HALTED, 1);
@@ -434,10 +439,10 @@ void Scheduler::fire_due() {
         else if (!prof::enabled) fn_[i](nds_, param_[i]);   // may schedule: next_ is kept current by schedule()
         else {
           // Per event id as well as in the EVENTS stage (destructor prints it).
-          const auto t0 = std::chrono::steady_clock::now();
+          const u64 t0 = prof::now_ns();
           fn_[i](nds_, param_[i]);
-          const u64 el = static_cast<u64>((std::chrono::steady_clock::now() - t0).count());
-          prof::add_ns(prof::EVENTS, el);
+          const u64 el = prof::now_ns() - t0;
+          prof::add_timed(prof::EVENTS, el);
           ev_ns_[i] += el; ++ev_n_[i];
         }
         m = armed_ & ~((bit << 1) - 1);
@@ -486,13 +491,13 @@ void Scheduler::run_cpu(CpuContext& cpu, RunFn run) {
       if (cpu.irq_offline) { cpu.irq_skip_once = !cpu.halted; cpu.irq_offline = false; }
     }
     {
-      std::chrono::steady_clock::time_point t0;
-      if (prof::enabled) t0 = std::chrono::steady_clock::now();   // a vDSO call per slice otherwise
+      u64 t0 = 0;
+      if (prof::enabled) t0 = prof::now_ns();
       run(cpu);
       if (prof::enabled) {
         const int ci = which == Cpu::ARM9 ? 0 : 1;
-        const u64 el = static_cast<u64>((std::chrono::steady_clock::now() - t0).count());
-        prof::add_ns(ci == 0 ? prof::CPU9 : prof::CPU7, el);
+        const u64 el = prof::now_ns() - t0;
+        prof::add_timed(ci == 0 ? prof::CPU9 : prof::CPU7, el);
         prof::add(spin_now_[ci] ? (ci == 0 ? prof::C_NS_A9_SPIN : prof::C_NS_A7_SPIN)
                                 : (ci == 0 ? prof::C_NS_A9_WORK : prof::C_NS_A7_WORK), el);
         if (idle_now_[ci]) prof::add(ci == 0 ? prof::C_NS_A9_IDLE_EXACT : prof::C_NS_A7_IDLE_EXACT, el); else if (drift_now_[ci]) prof::add(ci == 0 ? prof::C_NS_A9_IDLE_DRIFT : prof::C_NS_A7_IDLE_DRIFT, el);
@@ -567,7 +572,7 @@ cpu_begin:   // run_cpu loop head
       if (cpu->hot.cycle_budget <= 0 || nds_.dma.any_running(cpu->which)) goto cpu_done;
       if (cpu->irq_offline) { cpu->irq_skip_once = !cpu->halted; cpu->irq_offline = false; }   // see run_cpu
     }
-    if (prof::enabled) sl_.t0 = std::chrono::steady_clock::now();
+    if (prof::enabled) sl_.t0 = prof::now_ns();
     if (!cpu->jit) { run(*cpu); goto run_returned; }
     // jit::run up to the first entry (check_irq also retires irq_skip_once)
     if (cpu->hot.irq_pending || cpu->irq_skip_once) cpu->check_irq();
@@ -586,8 +591,8 @@ run_returned:
   {
     if (prof::enabled) {
       const int ci = cpu->which == Cpu::ARM9 ? 0 : 1;
-      const u64 el = static_cast<u64>((std::chrono::steady_clock::now() - sl_.t0).count());
-      prof::add_ns(ci == 0 ? prof::CPU9 : prof::CPU7, el);
+      const u64 el = prof::now_ns() - sl_.t0;
+      prof::add_timed(ci == 0 ? prof::CPU9 : prof::CPU7, el);
       prof::add(spin_now_[ci] ? (ci == 0 ? prof::C_NS_A9_SPIN : prof::C_NS_A7_SPIN)
                               : (ci == 0 ? prof::C_NS_A9_WORK : prof::C_NS_A7_WORK), el);
       if (idle_now_[ci]) prof::add(ci == 0 ? prof::C_NS_A9_IDLE_EXACT : prof::C_NS_A7_IDLE_EXACT, el); else if (drift_now_[ci]) prof::add(ci == 0 ? prof::C_NS_A9_IDLE_DRIFT : prof::C_NS_A7_IDLE_DRIFT, el);

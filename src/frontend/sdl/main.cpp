@@ -1399,7 +1399,7 @@ static int run(int argc, char** argv) {
   using Menu = ds::sdl::Menu;
   Disp::Layout& layout = vs.layout;
   std::vector<Disp::Mode>& layout_cycle = vs.layout_cycle;
-  ds::prof::enabled = std::getenv("DS_PROFILE") != nullptr;
+  ds::prof::set_level(std::getenv("DS_PROFILE"));
   std::signal(SIGINT, on_signal);
   std::signal(SIGTERM, on_signal);
 
@@ -3913,7 +3913,9 @@ sdl_ready:
          relief_frames, static_cast<unsigned long long>(frames), relief_us);
   }
   if (std::getenv("DS_FRAME_STATS") || ds::prof::enabled) {
-    // Emulation work only; excluded costs named on their own line.
+    // Emulation work only; excluded costs named on their own line. Under
+    // DS_PROFILE the probes' own cost comes off first.
+    ds::prof::deduct_probe_overhead(frame_ms, &work_ms);
     ds::frame_report(frame_ms);
     // Same statistics over emulation + present: what a missed display
     // frame actually is. Only worth reading with --no-vsync (with vsync

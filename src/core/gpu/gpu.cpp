@@ -306,11 +306,11 @@ void Gpu::on_hblank() {
     }
     // Draws account for themselves; subtracted from this hook's time. The
     // worker join in render_ranges has no scope of its own, so it's added back rather than subtracted.
-    const auto t_draw0 = prof::enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const u64 t_draw0 = prof::enabled ? prof::now_ns() : 0;
     const u64 join0 = prof::enabled ? join_wait_ns_ : 0;
     render_ranges(f[0], l[0], f[1], l[1]);
     if (prof::enabled)
-      prof::add_ns(prof::GPU_LINE, static_cast<u64>(-(std::chrono::steady_clock::now() - t_draw0).count()) + (join_wait_ns_ - join0));
+      prof::add_timed(prof::GPU_LINE, (t_draw0 - prof::now_ns()) + (join_wait_ns_ - join0));   // wraps: a subtraction from the hook's own scope
     // End of a burst window: the lines after this one batch again, trapped.
     for (int e = 0; e < 2; ++e)
       if (burst_[e] && --burst_left_[e] == 0 && line_ < SCREEN_H - 1) {
@@ -326,9 +326,9 @@ void Gpu::on_hblank() {
       // 3D flushed at VBlank rasterises now, ahead of the next frame's display
       // lines, so frameskip is decided here for begin_frame to latch.
       skip_next_ = skip_req_ && skippable();
-      const auto t_r0 = prof::enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+      const u64 t_r0 = prof::enabled ? prof::now_ns() : 0;
       if (!skip_next_) nds_.gpu3d.render_frame(); else nds_.gpu3d.note_raster_skipped();
-      if (prof::enabled) prof::add_ns(prof::GPU_LINE, static_cast<u64>(-(std::chrono::steady_clock::now() - t_r0).count()));
+      if (prof::enabled) prof::add_timed(prof::GPU_LINE, t_r0 - prof::now_ns());   // wraps, as above
       if (probe_enabled_) async_probe_start();
     } else if (line_ == 262) {
       engine[0].latch(Engine2D::L_SPRITES, 0, false); engine[1].latch(Engine2D::L_SPRITES, 0, false);
@@ -545,8 +545,8 @@ void Gpu::join_worker(JoinSite site) {
   if (b_deferred_) worker_b_.wait();
   const bool dbg = g_dbg_join;
   if (dbg) std::fprintf(stderr, "[join] frame %llu line %u hblank %d a %u..%u b %u..%u deferred %d\n", (unsigned long long)nds_.frame_count, line_, hblank_done_ ? 1 : 0, job_first_[0], job_last_[0], job_first_[1], job_last_[1], a_deferred_ ? 1 : 0);
-  { const auto t0 = std::chrono::steady_clock::now(); worker_.wait();
-    const u64 dt = static_cast<u64>((std::chrono::steady_clock::now() - t0).count());
+  { const u64 t0 = prof::now_ns(); worker_.wait();
+    const u64 dt = prof::now_ns() - t0;
     join_wait_ns_ += dt; prof::add_ns(prof::W2D_JOIN, dt);
     if (prof::enabled) {
       prof::add(prof::C_W2D_JOIN_CALLS, 1);

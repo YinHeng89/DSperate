@@ -145,7 +145,7 @@ private:
     s64 slice = 0, ran9 = 0;
     s32 budget7 = 0;
     bool skip9 = false, skip7 = false;   // proven idle loop: do not execute this slice
-    std::chrono::steady_clock::time_point t0;
+    u64 t0 = 0;   // prof::now_ns() at the CPU run's start
   } sl_;
   u64 run_until_native(u64 until, bool until_frame);
   u64 run_until_impl(u64 until, bool until_frame);

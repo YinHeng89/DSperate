@@ -89,7 +89,7 @@ void Dma::start(Channel& c) {
     c.rem_count = c.cnt & mask;
     if (!c.rem_count) c.rem_count = mask + 1;
   }
-  if (prof::enabled) {
+  if (prof::heavy) {
     prof::add(prof::C_DMA_STARTS, 1);
     prof::add(c.cpu == Cpu::ARM9 && c.start_mode <= MODE9_GXFIFO
                 ? static_cast<prof::Counter>(prof::C_DMA_M_IMM + c.start_mode) : prof::C_DMA_M_ARM7, 1);
@@ -322,7 +322,7 @@ u32 Dma::run_channel_impl(Channel& c, u32 budget) {
         // Lazy-2D write trap: take it once for the run rather than per word.
         // A page still trapped afterwards falls to the per-word path.
         if (ps && !pd && a9 && (c.cur_dst >> 24) == 0x06) {
-          prof::add(prof::C_DMA_VRAM_TRAP, 1); if (prof::enabled) prof::add(dma_zone(c.cur_dst, true), 1);
+          prof::add(prof::C_DMA_VRAM_TRAP, 1); if (prof::heavy) prof::add(dma_zone(c.cur_dst, true), 1);
           nds_.gpu.vram_store_trap(Cpu::ARM9, c.cur_dst);
           pd = nds_.cpu(c.cpu).page_table.write_ptr(c.cur_dst, &code);
           // A lag-mode trap stays armed once satisfied: write the run through it.
@@ -360,7 +360,7 @@ u32 Dma::run_channel_impl(Channel& c, u32 budget) {
               c.cur_src += 4 * lo; c.cur_dst += 4 * lo;
               c.iter_count -= lo; c.rem_count -= lo;
               prof::add(prof::C_DMA_RUN_W, lo);
-              if (prof::enabled) prof::add(dma_zone(zdst, false), z0 - c.iter_count);
+              if (prof::heavy) prof::add(dma_zone(zdst, false), z0 - c.iter_count);
               continue;
             }
           }
@@ -372,12 +372,12 @@ u32 Dma::run_channel_impl(Channel& c, u32 budget) {
             cost = rc.next(c); if (a9) cost <<= shift9_; used += cost;
             ps += 4; pd += 4;
           }
-          if (prof::enabled) prof::add(dma_zone(zdst, false), z0 - c.iter_count);
+          if (prof::heavy) prof::add(dma_zone(zdst, false), z0 - c.iter_count);
           continue;
         }
         no_run_below = (c.cur_dst | (mem::PAGE_SIZE - 1)) + 1;
       }
-      prof::add(prof::C_DMA_SLOW_W, 1); if (prof::enabled) prof::add(dma_zone(c.cur_dst, false), 1);
+      prof::add(prof::C_DMA_SLOW_W, 1); if (prof::heavy) prof::add(dma_zone(c.cur_dst, false), 1);
       bus.dma_write32(c.cpu, c.cur_dst, bus.dma_read32(c.cpu, c.cur_src));
     }
     else {
@@ -387,7 +387,7 @@ u32 Dma::run_channel_impl(Channel& c, u32 budget) {
         bool code = false;
         u8* pd = ps ? nds_.cpu(c.cpu).page_table.write_ptr(c.cur_dst, &code) : nullptr;
         if (ps && !pd && a9 && (c.cur_dst >> 24) == 0x06) {
-          prof::add(prof::C_DMA_VRAM_TRAP, 1); if (prof::enabled) prof::add(dma_zone(c.cur_dst, true), 1);
+          prof::add(prof::C_DMA_VRAM_TRAP, 1); if (prof::heavy) prof::add(dma_zone(c.cur_dst, true), 1);
           nds_.gpu.vram_store_trap(Cpu::ARM9, c.cur_dst);
           pd = nds_.cpu(c.cpu).page_table.write_ptr(c.cur_dst, &code);
           // A lag-mode trap stays armed once satisfied: write the run through it.
@@ -423,7 +423,7 @@ u32 Dma::run_channel_impl(Channel& c, u32 budget) {
               c.cur_src += 2 * lo; c.cur_dst += 2 * lo;
               c.iter_count -= lo; c.rem_count -= lo;
               prof::add(prof::C_DMA_RUN_H, lo);
-              if (prof::enabled) prof::add(dma_zone(zdst, false), z0 - c.iter_count);
+              if (prof::heavy) prof::add(dma_zone(zdst, false), z0 - c.iter_count);
               continue;
             }
           }
@@ -435,12 +435,12 @@ u32 Dma::run_channel_impl(Channel& c, u32 budget) {
             cost = rc.next(c); if (a9) cost <<= shift9_; used += cost;
             ps += 2; pd += 2;
           }
-          if (prof::enabled) prof::add(dma_zone(zdst, false), z0 - c.iter_count);
+          if (prof::heavy) prof::add(dma_zone(zdst, false), z0 - c.iter_count);
           continue;
         }
         no_run_below = (c.cur_dst | (mem::PAGE_SIZE - 1)) + 1;
       }
-      prof::add(prof::C_DMA_SLOW_H, 1); if (prof::enabled) prof::add(dma_zone(c.cur_dst, false), 1);
+      prof::add(prof::C_DMA_SLOW_H, 1); if (prof::heavy) prof::add(dma_zone(c.cur_dst, false), 1);
       bus.dma_write16(c.cpu, c.cur_dst, bus.dma_read16(c.cpu, c.cur_src));
     }
     const u32 step = word ? 4 : 2;
