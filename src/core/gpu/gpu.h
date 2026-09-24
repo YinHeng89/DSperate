@@ -286,6 +286,15 @@ private:
   // The two engines share no mutable state, so a line sees exactly the state
   // the sequential order would.
   LineWorker worker_;
+  // Split mode (with the thread layout, or DS_2D_SPLIT=1): engine B's batch in
+  // a frame whose engine A batch is deferred goes to its own worker (paired
+  // with a 3D band on its core) instead of this thread, deferred to the same
+  // join. Its frame end (frame_done) moves to that join too.
+  LineWorker worker_b_;
+  bool split_ = false;
+  bool b_deferred_ = false;             // engine B's batch is in flight on worker_b_ past line 191
+  u32  bjob_first_ = 1, bjob_last_ = 0;
+  static void worker_b_job(void* self);
 public:
   // DS_WATCHDOG: where the display pipeline stands when a frame stalls.
   void debug_dump(FILE* f);

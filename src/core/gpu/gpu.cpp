@@ -43,7 +43,9 @@ static void ev_fifo(NDS& nds, u32 x)   { nds.gpu.on_display_fifo(x); }
 
 Gpu::Gpu(NDS& nds) : engine{Engine2D(nds, 0), Engine2D(nds, 1)}, nds_(nds) {
   read_knobs();
-  worker_.start(&Gpu::worker_job, this);
+  split_ = thread_layout_on() || std::getenv("DS_2D_SPLIT");
+  worker_.start(&Gpu::worker_job, this, split_ ? ThreadRole::EngineA : ThreadRole::Line, split_ ? "2d-engine-a" : "line-worker");
+  if (split_) worker_b_.start(&Gpu::worker_b_job, this, ThreadRole::Line, "2d-engine-b");
 }
 
 void Gpu::reset() {
@@ -166,9 +168,9 @@ void Gpu::vram_store_trap(Cpu cpu, u32 addr) {
   if (!trap_armed_ || cpu != Cpu::ARM9) return;
   if (addr >= 0x06800000 && !trap_lcdc_) return;
   // A's deferred batch: a store reaching what it reads joins it, finishing
-  // the frame and lifting the trap. B's windows cannot trigger this.
+  // the frame and lifting the trap. B's windows only when B is deferred too.
   if (a_deferred_) {
-    if (reach_engines(addr) & 1) { prof::add(prof::C_2D_A_JOIN_STORES, 1); join_worker(JoinSite::Trap); }
+    if (reach_engines(addr) & (b_deferred_ ? 3u : 1u)) { prof::add(prof::C_2D_A_JOIN_STORES, 1); join_worker(JoinSite::Trap); }
     return;
   }
   // A store is charged to both engines, so both per-line means the whole frame is.
@@ -325,9 +327,9 @@ void Gpu::on_hblank() {
       if (probe_enabled_) async_probe_start();
     } else if (line_ == 262) {
       engine[0].latch(Engine2D::L_SPRITES, 0, false); engine[1].latch(Engine2D::L_SPRITES, 0, false);
-      // Engine A's skip flag resets at the join while its lines are in flight (finish_a).
+      // An engine's skip flag resets at the join while its lines are in flight (finish_a, join_worker).
       if (!inflight_[0]) skipped_[0] = false;
-      skipped_[1] = false;
+      if (!inflight_[1]) skipped_[1] = false;
     }
     engine[0].latch(Engine2D::L_POSTDRAW, line_, frame_reset);
     engine[1].latch(Engine2D::L_POSTDRAW, line_, frame_reset);
@@ -531,8 +533,14 @@ void Gpu::worker_job(void* self) {
   }
 }
 
+void Gpu::worker_b_job(void* self) {
+  Gpu& g = *static_cast<Gpu*>(self);
+  for (u32 l = g.bjob_first_; l <= g.bjob_last_; ++l) g.step_engine(1, l);
+}
+
 void Gpu::join_worker(JoinSite site) {
   if (!inflight_[0] && !inflight_[1] && !scale_inflight_) return;
+  if (b_deferred_) worker_b_.wait();
   const bool dbg = g_dbg_join;
   if (dbg) std::fprintf(stderr, "[join] frame %llu line %u hblank %d a %u..%u b %u..%u deferred %d\n", (unsigned long long)nds_.frame_count, line_, hblank_done_ ? 1 : 0, job_first_[0], job_last_[0], job_first_[1], job_last_[1], a_deferred_ ? 1 : 0);
   { const auto t0 = std::chrono::steady_clock::now(); worker_.wait();
@@ -547,6 +555,12 @@ void Gpu::join_worker(JoinSite site) {
       prof::add(kBySite[static_cast<int>(site)], dt);
     } }
   inflight_[0] = inflight_[1] = false; scale_inflight_ = false; bscale_n_ = 0;
+  if (b_deferred_) {   // as finish_a: writes the guest made meanwhile were journaled past the frame
+    b_deferred_ = false;
+    if (line_ == 0 || (line_ == 262 && hblank_done_)) skipped_[1] = false;
+    engine[1].apply_pending();
+    if (frame_finished_) engine[1].frame_done();
+  }
   if (a_deferred_) { a_deferred_ = false; finish_a(); }
 }
 
@@ -563,6 +577,7 @@ void Gpu::debug_dump(FILE* f) {
   std::fprintf(f, "  gpu: line %u hblank_done %d render_next %u/%u lazy %d per_line %d/%d trap %d job a %u..%u b %u..%u inflight %d/%d deferred %d read_trap %d lag %d frame_ready %d\n", line_, hblank_done_ ? 1 : 0, render_next_[0], render_next_[1],
                lazy_frame_ ? 1 : 0, per_line_[0] ? 1 : 0, per_line_[1] ? 1 : 0, trap_armed_ ? 1 : 0, job_first_[0], job_last_[0], job_first_[1], job_last_[1], inflight_[0] ? 1 : 0, inflight_[1] ? 1 : 0, a_deferred_ ? 1 : 0, read_trap_bank_, lag_frame_ ? 1 : 0, nds_.frame_ready ? 1 : 0);
   worker_.debug_dump(f);
+  if (split_) worker_b_.debug_dump(f);
   nds_.gpu3d.debug_dump(f);
 }
 
@@ -605,6 +620,15 @@ void Gpu::render_ranges(u32 af, u32 al, u32 bf, u32 bl) {
     prof::add(prof::C_RR_DEFER_A, 1);
     hand(true, false);
     a_handed = true; a_deferred_ = true;
+    if (split_ && b_has && bl == SCREEN_H - 1 && b_len >= 24 && trap_armed_ && !trap_a_only_) {
+      // Engine B's batch to its own worker, deferred to the same join: only a
+      // batch run to the last line (everything journaled meanwhile is past the
+      // frame) with the trap over the whole VRAM window (a lag frame's guards
+      // only engine A's).
+      bjob_first_ = bf; bjob_last_ = bl;
+      worker_b_.dispatch();
+      inflight_[1] = true; b_deferred_ = true; b_handed = true;
+    }
   } else if (lag_frame_ && (a_has || (b_has && scaling()))) {
     // Lag: A's lines stay in flight until next HBlank unless this is the
     // last one. B is drawn here (its window streams per-line, joining lag on
@@ -644,7 +668,7 @@ void Gpu::render_ranges(u32 af, u32 al, u32 bf, u32 bl) {
   if (b_has) render_next_[1] = bl + 1;
   if (!frame_finished_ && render_next_[0] >= SCREEN_H && render_next_[1] >= SCREEN_H) {
     frame_finished_ = true;
-    if (a_deferred_) engine[1].frame_done();   // engine A's end (and traps) happen at the join in finish_a
+    if (a_deferred_) { if (!b_deferred_) engine[1].frame_done(); }   // the deferred engines end (and lift traps) at the join
     else {
       join_worker(JoinSite::RangesPost);
       if (read_trap_bank_ >= 0) { nds_.bus.set_lcdc_read_trap(read_trap_bank_, false); read_trap_bank_ = -1; }

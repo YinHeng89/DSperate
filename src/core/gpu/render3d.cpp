@@ -2637,7 +2637,9 @@ void Renderer3D::render(const Gpu3D& gx) {
     if (w < 8) band_ns_[w] = static_cast<u64>((std::chrono::steady_clock::now() - t0).count());
   };
   pending_bands_ = nbins_;
-  owner_ = std::this_thread::get_id();
+  // Set once: engine A's deferred lines (a 2D worker) read it through
+  // steal_bins while this runs at line 215, and it never changes.
+  if (owner_ == std::thread::id{}) owner_ = std::this_thread::get_id();
   {
     // Next generation's slot; sync_all above guarantees no thief two back is still reading it.
     DispatchCtx& c = ctx_[(gen_ + 1) & 1];
