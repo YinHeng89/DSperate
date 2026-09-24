@@ -43,10 +43,17 @@ public:
   static bool parse_corner(const std::string& s, Corner& c) { return frontend::parse_corner(s, c); }
   static void natural_size(const Layout& l, double scale, int& w, int& h) { frontend::natural_size(l, scale, w, h); }
 
+  ~Display() { sync(); }
   bool open(const char* title, int scale, bool fullscreen, bool linear, bool vsync, const Layout& layout, int only_screen = -1, int display_index = 0);
   void close();
 
   void draw(const u32* const fb[SCREENS]);
+  // The frame loop's present: each GPU-presenting window of `ds` takes the
+  // frame on the present thread (present_thread.h) and this returns once the
+  // frame is copied out, so `fb` may change straight after. The others draw
+  // here, as draw() does. Every other call on a window waits for its present
+  // first, so none of them sees one half done.
+  static void draw_async(Display* const ds[], int n, const u32* const fb[SCREENS]);
 
   // Per-scanline scaling: the core scales each line into place as it's
   // produced, straight into the window surface or a scanout tier's buffer
@@ -122,7 +129,7 @@ public:
   // if the lock failed, in which case the caller must fall back to draw().
   bool begin_frame(Target out[SCREENS]);
   void end_frame();   // unlock and present
-  void on_resize() { layout(); build_scale(); margins_dirty_ = true; }
+  void on_resize() { sync(); layout(); build_scale(); margins_dirty_ = true; }
   // Dual-window: which DS screen this window shows. The window stays on its
   // panel (and keeps that panel's hinge-side alignment); only the screen moves.
   void set_only_screen(int screen) { if (only_screen_ < 0 || screen == only_screen_) return; only_screen_ = screen; on_resize(); }
@@ -169,7 +176,7 @@ public:
   void present();
   // After a present with no frame following (the pause menu): make sure the
   // scanout tier has put it on its way. See ScanoutOut::flush.
-  void flush() { if (gpu_) gpu_->flush(); else if (out_) out_->flush(); }
+  void flush() { sync(); if (gpu_) gpu_->flush(); else if (out_) out_->flush(); }
 
   // Where the frontend drew on the canvas this frame, so a scanout tier's
   // other buffers get it cleaned up too before reuse (an overlay isn't
@@ -242,7 +249,13 @@ private:
   bool              gpu_wanted_ = false;
   std::unique_ptr<FramePresenter> gpu_; // a GPU presenter (on top of out_ for the import one); null: software
   bool try_gpu_present();               // after out_ opened: import its buffers, switch draw() over
+  // One frame for gpu_, taken on this thread (the window's size, the views,
+  // the overlay's rect) so it can be presented on another.
+  struct GpuFrame { FramePresenter* p = nullptr; FramePresenter::View v[SCREENS]; int n = 0; FramePresenter::Params params; };
+  bool prepare_gpu(GpuFrame& f);        // false: nothing to present (the presenter was lost)
   void draw_gpu(const u32* const fb[SCREENS]);
+  mutable u64       job_ = 0;             // present thread ticket of this window's last frame; 0 once waited for
+  void sync() const;                    // wait for it
   SDL_Surface*      surf_ = nullptr;    // window surface; owned by SDL
   bool              margins_dirty_ = true;
   u32               out_clean_ = 0;       // scanout buffers (by index) whose letterbox is cleared

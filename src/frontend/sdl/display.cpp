@@ -2,6 +2,7 @@
 #include "frontend/sdl/gpu_present.h"
 #include "display.h"
 #include "display_wl.h"
+#include "present_thread.h"
 
 #include <algorithm>
 #include <cmath>
@@ -128,6 +129,7 @@ double Display::dominant_ratio() const {
 }
 
 bool Display::open(const char* title, int scale, bool fullscreen, bool linear, bool vsync, const Layout& layout_mode, int only_screen, int display_index) {
+  sync();
   layout_ = layout_mode;
   only_screen_ = only_screen;
   upper_panel_ = only_screen == 0;
@@ -308,6 +310,7 @@ bool Display::open_renderer(bool linear, bool vsync, int rot) {
 }
 
 void Display::close() {
+  sync();
   if (disp_) { disp_->close(); disp_.reset(); }
   gpu_.reset();   // flushes what it has in flight
   if (out_) { out_->close(); out_.reset(); }
@@ -346,6 +349,7 @@ bool Display::try_gpu_present() {
 }
 
 bool Display::settle_step(const u32* const blank[SCREENS]) {
+  sync();
   if (!out_ || !fullscreen_) return true;
   // Target: the output's size. Unknown -> nothing to wait for.
   SDL_DisplayMode m{};
@@ -368,6 +372,7 @@ bool Display::settle_step(const u32* const blank[SCREENS]) {
 }
 
 bool Display::drop_gpu_present(const char* why) {
+  sync();
   if (!gpu_) return false;
   std::fprintf(stderr, "video: GPU present %s; scanline scaling from here\n", why);
   gpu_.reset();
@@ -378,7 +383,13 @@ bool Display::drop_gpu_present(const char* why) {
   return true;
 }
 
-void Display::draw_gpu(const u32* const fb[SCREENS]) {
+void Display::sync() const {
+  if (!job_) return;
+  PresentThread::get().wait(job_);
+  job_ = 0;
+}
+
+bool Display::prepare_gpu(GpuFrame& f) {
   int w = 0, h = 0;
   SDL_GetWindowSize(win_, &w, &h);
   switch (gpu_->fit(win_, w, h)) {
@@ -386,22 +397,67 @@ void Display::draw_gpu(const u32* const fb[SCREENS]) {
       // The sink may be closed now; begin_frame() reopens it or falls back
       // to the window surface.
       drop_gpu_present("lost on resize");
-      return;   // this frame is dropped; the next takes begin_frame()
+      return false;   // this frame is dropped; the next takes begin_frame()
     case FramePresenter::Fit::Changed: layout(); break;
     case FramePresenter::Fit::Same: break;
   }
-  FramePresenter::Params p;
+  FramePresenter::Params& p = f.params;
   out_size(p.lw, p.lh);
-  FramePresenter::View v[SCREENS];
-  for (int i = 0; i < nviews_; ++i) v[i] = FramePresenter::View{views_[i].screen, views_[i].rect, views_[i].shown, !views_[i].direct, grid_on(views_[i].screen)};
+  for (int i = 0; i < nviews_; ++i) f.v[i] = FramePresenter::View{views_[i].screen, views_[i].rect, views_[i].shown, !views_[i].direct, grid_on(views_[i].screen)};
+  f.n = nviews_;
   p.rot = rot_; p.inset_alpha = inset_alpha_;
   p.drawn = frontend::Rect{canvas_drawn_.x, canvas_drawn_.y, canvas_drawn_.w, canvas_drawn_.h};
   p.grid = grid_strength_ > 0.0 ? static_cast<u32>(std::lround((1.0 - grid_strength_) * 256.0)) : 256u;
-  gpu_->present(fb, v, nviews_, p);
   canvas_drawn_ = SDL_Rect{0, 0, 0, 0};
+  f.p = gpu_.get();
+  return true;
+}
+
+void Display::draw_gpu(const u32* const fb[SCREENS]) {
+  GpuFrame f;
+  if (prepare_gpu(f)) f.p->present(fb, f.v, f.n, f.params);
+}
+
+void Display::draw_async(Display* const ds[], int n, const u32* const fb[SCREENS]) {
+  // One copy of the frame for every window: the core writes the next frame
+  // into fb while the present thread reads this one. Reused once the job
+  // that read it is done.
+  static std::vector<u32> stage[SCREENS];
+  static u64 stage_job = 0;
+  // A frame reaches the sink at the next present, when its fence has long
+  // signalled: on the Mali-G52 a present's compute takes ~5 ms from submit
+  // to fence, so retiring it straight away holds the job that long per
+  // window. DS_PRESENT_RETIRE=1 does so anyway (a frame less latency).
+  static const bool retire = std::getenv("DS_PRESENT_RETIRE") != nullptr;
+  GpuFrame frames[2];
+  Display* owners[2] = {};
+  int nf = 0;
+  for (int i = 0; i < n && i < 2; ++i) {
+    Display& d = *ds[i];
+    d.sync();
+    if (!d.gpu_) { d.draw(fb); continue; }
+    if (d.prepare_gpu(frames[nf])) owners[nf++] = &d;
+  }
+  if (!nf) return;
+  PresentThread& pt = PresentThread::get();
+  pt.wait(stage_job);
+  for (int s = 0; s < SCREENS; ++s) {
+    stage[s].resize(static_cast<size_t>(SCREEN_W) * SCREEN_H);
+    std::memcpy(stage[s].data(), fb[s], stage[s].size() * sizeof(u32));
+  }
+  stage_job = pt.post([frames, nf] {
+    const u32* const sfb[SCREENS] = {stage[0].data(), stage[1].data()};
+    for (int k = 0; k < nf; ++k) {
+      const GpuFrame& f = frames[k];
+      f.p->present(sfb, f.v, f.n, f.params);
+      if (retire) f.p->retire();
+    }
+  });
+  for (int k = 0; k < nf; ++k) owners[k]->job_ = stage_job;
 }
 
 void Display::draw(const u32* const fb[SCREENS]) {
+  sync();
   if (gpu_) { draw_gpu(fb); return; }
   if (disp_) {
     if (disp_->overlay_available()) { disp_->overlay_changed(canvas_taken_); canvas_taken_ = false; }
@@ -429,11 +485,13 @@ void Display::draw(const u32* const fb[SCREENS]) {
 }
 
 void Display::set_page(bool on) {
+  sync();
   page_ = on;
   if (disp_) disp_->set_divisor(on ? 1 : disp_divisor_);
 }
 
 void Display::toggle_fullscreen() {
+  sync();
   if (disp_) return;   // the panel is the window
   fullscreen_ = !fullscreen_;
   SDL_SetWindowFullscreen(win_, fullscreen_ ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
@@ -443,6 +501,7 @@ void Display::toggle_fullscreen() {
 }
 
 void Display::set_layout(const Layout& l) {
+  sync();
   if (only_screen_ >= 0) return;
   if (disp_) { layout_ = l; layout(); if (chunky_) build_source_scale(); return; }
   const Mode was = layout_.mode;
@@ -808,7 +867,8 @@ void Display::blit_insets() {
 }
 
 bool Display::begin_frame(Target out[SCREENS]) {
-  if (!scaled_) return false;
+  if (!scaled_) return false;   // GPU present or the renderer: nothing here touches the present thread's side
+  sync();
   if (disp_) {
     for (int i = 0; i < SCREENS; ++i)
       out[i] = Target{src_side_[i].data(), SCREEN_W, SCREEN_H, xrun_[i].data(), seam_w_[i].data(), nullptr, nullptr, false, xrun_plain_[i].data()};
@@ -888,6 +948,7 @@ void Display::take_frame(u32* px, u32 stride, int w, int h, int idx, Target out[
 // Insets go down before anything the frontend draws, so an overlay can't be
 // buried by the PiP inset.
 void Display::finish_views() {
+  sync();
   if (disp_) return;
   blit_insets();
 }
@@ -901,6 +962,7 @@ bool Display::canvas_capable() const {
 }
 
 bool Display::canvas(CanvasView& out) const {
+  sync();
   if (gpu_) {
     int lw = 0, lh = 0;
     if (!out_size(lw, lh)) return false;
@@ -924,6 +986,7 @@ bool Display::canvas(CanvasView& out) const {
 }
 
 void Display::present() {
+  sync();
   if (disp_) {
     const u32* fb[SCREENS];
     for (int i = 0; i < SCREENS; ++i) fb[i] = src_side_[i].data();
@@ -942,6 +1005,7 @@ void Display::present() {
 }
 
 void Display::end_frame() {
+  sync();
   finish_views();
   present();
 }

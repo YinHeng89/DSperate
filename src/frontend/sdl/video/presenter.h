@@ -43,6 +43,10 @@ public:
   virtual u32* overlay(int lw, int lh) = 0;
   // Everything presented is on its way to the panel (a present with no frame following).
   virtual void flush() = 0;
+  // The frame just presented goes to the sink now, once the GPU is done with
+  // it, rather than at the start of the next present(). Unlike flush(), it
+  // does not wait for the sink to put it on the panel.
+  virtual void retire() {}
 
 protected:
   std::string name_;

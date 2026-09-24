@@ -42,6 +42,7 @@
 #include "menu.h"
 #include "cpu_gov.h"
 #include "pacer.h"
+#include "present_thread.h"
 
 #include <dirent.h>
 #include <algorithm>
@@ -3669,19 +3670,28 @@ sdl_ready:
           if (fb[i] == nds.gpu.framebuffer(i)) { std::memcpy(flash_fb[i].data(), fb[i], flash_fb[i].size() * 4); fb[i] = flash_fb[i].data(); }
           draw_flash(ds_canvas(const_cast<u32*>(fb[i])), flash_alpha);
         }
-        // Pinned (thread layout), the emulation thread presents as a normal task:
-        // the kernel work a present queues on this core (a per-CPU kworker)
-        // cannot run under an RT thread that has the core to itself, so it
-        // piled up until the per-CPU RT cap (950 ms/s, no runtime sharing on
-        // ROCKNIX's kernel) idled the thread -- a 20-33 ms stall about once a
-        // second on the heavy titles (ST, GS:DD). DS_PRESENT_RT=1 keeps RT.
-        static const bool present_nort = ds::thread_layout_on() && !std::getenv("DS_PRESENT_RT");
-        int rt_pol = 0; sched_param rt_sp{};
-        const bool drop_rt = present_nort && pthread_getschedparam(pthread_self(), &rt_pol, &rt_sp) == 0 && (rt_pol == SCHED_RR || rt_pol == SCHED_FIFO);
-        if (drop_rt) { sched_param z{}; sched_setscheduler(0, SCHED_OTHER, &z); }
-        display.draw(fb);
-        if (dual_window) display2.draw(fb);
-        if (drop_rt) sched_setscheduler(0, rt_pol, &rt_sp);
+        // A GPU present goes to the present thread on the aux core
+        // (present_thread.h); DS_PRESENT_SYNC=1 keeps it here.
+        static const bool present_sync = std::getenv("DS_PRESENT_SYNC") != nullptr;
+        if (!present_sync && display.gpu_present() && (!dual_window || display2.gpu_present())) {
+          ds::sdl::Display* const ds_[2] = {&display, &display2};
+          ds::sdl::Display::draw_async(ds_, dual_window ? 2 : 1, fb);
+        } else {
+          // Pinned (thread layout), the emulation thread presents here as a
+          // normal task: the kernel work a present queues on this core (a
+          // per-CPU kworker) cannot run under an RT thread that has the core
+          // to itself, so it piled up until the per-CPU RT cap (950 ms/s, no
+          // runtime sharing on ROCKNIX's kernel) idled the thread -- a 20-33 ms
+          // stall about once a second on the heavy titles (ST, GS:DD).
+          // DS_PRESENT_RT=1 keeps RT.
+          static const bool present_nort = ds::thread_layout_on() && !std::getenv("DS_PRESENT_RT");
+          int rt_pol = 0; sched_param rt_sp{};
+          const bool drop_rt = present_nort && pthread_getschedparam(pthread_self(), &rt_pol, &rt_sp) == 0 && (rt_pol == SCHED_RR || rt_pol == SCHED_FIFO);
+          if (drop_rt) { sched_param z{}; sched_setscheduler(0, SCHED_OTHER, &z); }
+          display.draw(fb);
+          if (dual_window) display2.draw(fb);
+          if (drop_rt) sched_setscheduler(0, rt_pol, &rt_sp);
+        }
       }
     }
     // Unlimited limiter outruns the speakers like fast forward: sheds audio the same way.
@@ -3912,6 +3922,11 @@ sdl_ready:
       std::fprintf(stderr, "  (emulation only; excluded: present %.1f ms, pacing %.1f ms total over %zu frames)\n",
                    static_cast<double>(draw_ticks_total) * ticks_to_ms,
                    static_cast<double>(pace_ticks) * ticks_to_ms, frame_ms.size());
+    if (const auto ps = ds::sdl::PresentThread::get().stats(); ps.jobs)
+      std::fprintf(stderr, "present thread: %llu frames, %.3f ms mean, %.3f ms max; the emulation thread waited on it %llu times, %.1f ms total, %llu over 0.5 ms\n",
+                   static_cast<unsigned long long>(ps.jobs), static_cast<double>(ps.job_ns) / 1e6 / static_cast<double>(ps.jobs),
+                   static_cast<double>(ps.job_max_ns) / 1e6, static_cast<unsigned long long>(ps.waits),
+                   static_cast<double>(ps.wait_ns) / 1e6, static_cast<unsigned long long>(ps.long_waits));
   }
   log.close();
   ds::prof::report();

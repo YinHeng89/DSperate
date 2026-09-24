@@ -35,6 +35,7 @@ public:
   }
   u32* overlay(int lw, int lh) override { return gpu_->overlay(lw, lh); }
   void flush() override { gpu_->flush(sink_); sink_.flush(); }
+  void retire() override { gpu_->flush(sink_); }
 
 private:
   ScanoutOut& sink_;
