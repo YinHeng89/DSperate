@@ -226,7 +226,8 @@ private:
   // Lazy-2D state for the frame in progress.
   bool lazy_enabled_ = true;
   bool lazy_frame_ = false;       // this frame may batch
-  // Per engine, kept in lockstep: a trapped store takes BOTH engines out of batched mode.
+  // Per engine. With engine_split_ a trapped store takes only the engine its
+  // address reaches out of batched mode; without, both (the old lockstep).
   bool per_line_[2] = {false, false};
   bool per_line_prev_[2] = {false, false};
   u32  render_next_[2] = {SCREEN_H, SCREEN_H};
@@ -250,6 +251,19 @@ private:
   // resetting to LAZY_PROBE_PERIOD on success or a VRAM remap.
   static constexpr u32 LAZY_FUTILE_LIMIT = 4, LAZY_PROBE_PERIOD = 64, LAZY_PROBE_MAX = 1024;
   u32  lazy_futile_ = 0;
+  // Per-engine split (DS_2D_SPLIT, on by default; restored from 508b7bc, removed
+  // in ad541a5 when the both-engines futility skip had made it inert): a store
+  // into one engine's BG/OBJ VRAM cannot change what the other fetches. Golden
+  // Sun streams engine B's BG every scanline (HBlank DMA), which took engine A
+  // -- 3D composite and capture -- out of its batch too. With the split an
+  // engine that keeps failing to batch starts its frames per line on its own
+  // (eng_futile_, re-probed every LAZY_PROBE_PERIOD frames), and once engine B
+  // is per line under a batching A the trap narrows to A's windows, so B's
+  // stream stops trapping (what the both-engines skip was added to avoid).
+  bool engine_split_ = true;
+  u32  eng_futile_[2] = {0, 0};
+  u32  eng_probe_in_[2] = {LAZY_PROBE_PERIOD, LAZY_PROBE_PERIOD};
+  void narrow_trap();
   u32  lazy_probe_period_ = LAZY_PROBE_PERIOD, lazy_probe_in_ = LAZY_PROBE_PERIOD;   // frames until the next probe
   bool lazy_tried_ = false;
   // A probe frame gets a smaller budget (LAZY_PROBE_BURSTS) and falls both engines back at once when it runs out.
@@ -286,7 +300,7 @@ private:
   // The two engines share no mutable state, so a line sees exactly the state
   // the sequential order would.
   LineWorker worker_;
-  // Split mode (with the thread layout, or DS_2D_SPLIT=1): engine B's batch in
+  // Split mode (with the thread layout, or DS_2D_BWORKER=1): engine B's batch in
   // a frame whose engine A batch is deferred goes to its own worker (paired
   // with a 3D band on its core) instead of this thread, deferred to the same
   // join. Its frame end (frame_done) moves to that join too.

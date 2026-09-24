@@ -68,7 +68,7 @@ const char* const count_names[] = {"3d polygon lines", "3d span pixels", "3d res
   "3d spans len 1-4", "3d spans len 5-8", "3d spans len 9-16", "3d spans len 17-32", "3d spans len 33-64", "3d spans len 65-128", "3d spans len 129-256",
   "3d span pixels in len 1-4", "3d span pixels in len 5-8", "3d span pixels in len 9-16", "3d span pixels in len 17-32", "3d span pixels in len 33-64", "3d span pixels in len 65-128", "3d span pixels in len 129-256",
   "stores into palette space", "stores into oam space",
-  "2d lazy frames", "2d lazy frames skipped (futile)", "2d vram trap hits", "2d lag frames", "2d lag: trapped stores", "2d lag: stores that joined a line", "2d lag: frames that hit the trap limit", "2d lag: lines left in flight", "2d engine A batch: stores that joined it", "2d engine A batch: capture-bank reads that joined it",
+  "2d lazy frames", "2d lazy frames skipped (futile)", "2d frames engine A starts per line (futile)", "2d frames engine B starts per line (futile)", "2d trap narrowed to engine A", "2d vram trap hits", "2d lag frames", "2d lag: trapped stores", "2d lag: stores that joined a line", "2d lag: frames that hit the trap limit", "2d lag: lines left in flight", "2d engine A batch: stores that joined it", "2d engine A batch: capture-bank reads that joined it",
   "2d join calls", "render_ranges calls", "rr: engine A deferred", "rr: lag hand-off", "rr: engine B handed", "rr: nothing handed",
   "rr: worker parked at the decision", "rr: worker awake at the decision",
   "rr: short run handed ONLY because awake", "rr: short run inline ONLY because parked",
