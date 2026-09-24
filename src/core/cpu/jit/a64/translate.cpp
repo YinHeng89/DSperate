@@ -12,6 +12,7 @@
 //   x2,x3 page-table entry / host base
 //   w4-w7 temporaries; w7 = writeback value (preserved by the slow path)
 #include "core/cpu/jit/jit_internal.h"
+#include "core/cpu/wait_loop.h"
 #include "core/cpu/jit/a64/convention.h"
 #include "core/cpu/jit/a64/emit.h"
 #include "core/cpu/jit/block_shape.h"
@@ -2112,6 +2113,14 @@ bool Translator::run() {
     call_stub(jc_.fallback);
     e().word(BIOS_SHA1_MARKER);
     e().word(make_key(start - 4, false));
+  }
+  // ARM7 BIOS WaitByLoop head: skip the iterations the budget covers, then
+  // the loop below runs the rest.
+  if (!a9_ && cpu::wait_loop_hook_wanted(cpu_, start, thumb_)) {
+    flush_pending();
+    call_stub(jc_.fallback);
+    e().word(WAIT_LOOP_MARKER);
+    e().word(make_key(start - 2, true));
   }
 
   u32 end_addr = addr;

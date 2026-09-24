@@ -23,6 +23,7 @@ struct Stats {
   u64 slow_accesses = 0;       // loads/stores that left the inline page-table path
   u64 blocks_revived = 0;      // killed blocks whose guest bytes matched again
   u64 bios_sha1_blocks = 0;    // DSi BIOS SHA-1 blocks run natively
+  u64 wait_loop_runs = 0;      // ARM7 BIOS WaitByLoop heads fast-forwarded
 };
 
 // Safe to call once per NDS; `trace` mirrors NDS::trace at attach time

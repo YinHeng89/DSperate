@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // DSperate - Nintendo DS emulator. Copyright (C) 2026 DSperate contributors.
 #include "core/cpu/interp/interp.h"
+#include "core/cpu/wait_loop.h"
 #include "core/cpu/interp/interp_internal.h"
 #include "core/cpu/cpu_cycles.h"
 #include "core/nds.h"
@@ -184,6 +185,8 @@ void run(CpuContext& cpu) {
     cpu.jumped = false;
     if (debug_cycles) std::fprintf(stderr, "[cyc%d] %08x %d\n", a9 ? 9 : 7, cpu.hot.regs[15], cpu.hot.cycle_budget);
     if (cpu.thumb()) {
+      // The ARM7 BIOS WaitByLoop head: skip the iterations the budget covers.
+      if (!a9 && cpu.hot.regs[15] == cpu::g_wait_loop_r15_7 && cpu::wait_loop_run(cpu)) continue;
       const u32 pc = cpu.hot.regs[15] - 4;
       const u16 instr = fetch16(cpu, pc);
       if (census::on()) census::thumb_instr(a9, instr);

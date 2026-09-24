@@ -238,6 +238,8 @@ u32         jit_h_fallback(CpuContext* cpu, u32 instr, u32 key);   // returns cp
 constexpr u32 BIOS_SHA1_MARKER = 0xE7F5A1F0;
 bool bios_sha1_hook_wanted(CpuContext& cpu, u32 pc, bool thumb);
 bool bios_sha1_run(CpuContext& cpu);
+// ARM7 BIOS WaitByLoop head (cpu/wait_loop.h): the same shape of hook.
+constexpr u32 WAIT_LOOP_MARKER = 0xE7F5A1F1;
 const void* jit_h_lookup(CpuContext* cpu, u32 key);
 const void* jit_h_link(CpuContext* cpu, u32 key, u8* patch_site);
 void        jit_h_trace(CpuContext* cpu, u32 instr, u32 key);

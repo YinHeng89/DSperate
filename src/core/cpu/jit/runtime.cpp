@@ -4,6 +4,7 @@
 // Host-agnostic recompiler runtime: arena, block cache, linking, park-and-revive,
 // SMC tracking by host page. Host code emission is in backend::.
 #include "core/cpu/jit/jit_internal.h"
+#include "core/cpu/wait_loop.h"
 #include "core/cpu/timing_mode.h"
 #include "core/mem/fastmem_census.h"
 #include "core/mem/fastmem.h"
@@ -451,6 +452,11 @@ void invalidate_cpu(JitCpu& jc) {
 
 extern "C" u32 jit_h_fallback(CpuContext* cpu, u32 instr, u32 key) {
   if (instr == BIOS_SHA1_MARKER) return bios_sha1_run(*cpu) ? 1 : 0;   // key is LOOP-4, so a poll resumes at LOOP
+  if (instr == WAIT_LOOP_MARKER) {   // key is LOOP-2: a poll resumes at LOOP, and the block's own loop runs what is left
+    cpu->hot.regs[15] = key_r15(key) + 2;
+    if (cpu::wait_loop_run(*cpu)) g_rt.stats.wait_loop_runs++;
+    return 0;
+  }
   cpu->hot.regs[15] = key_r15(key);
   cpu->data_cycles = 0;
   cpu->jumped = false;
@@ -758,6 +764,8 @@ void report(std::FILE* out) {
     std::fprintf(out, "[jit] fastmem: %llu site faults (rewritten to the walk), %zu guest sites on the walk, %zu registered sites\n",
                  static_cast<unsigned long long>(g_rt.fm_faults), g_rt.fm_slow.size() + g_rt.fm_ring_n, g_rt.fm_rels.size());
   if (s.bios_sha1_blocks) std::fprintf(out, "[jit] DSi BIOS SHA-1 blocks run natively: %llu\n", (unsigned long long)s.bios_sha1_blocks);
+  if (const cpu::WaitLoopStats& w = cpu::wait_loop_stats(); w.runs)
+    std::fprintf(out, "[jit] ARM7 WaitByLoop fast-forwarded %llu times: %llu iterations, %llu ARM7 cycles\n", (unsigned long long)w.runs, (unsigned long long)w.iterations, (unsigned long long)w.cycles);
   std::fprintf(out, "[jit] code %llu KB (hot %llu KB): %.1f bytes per guest instruction, %.1f hot\n", (unsigned long long)(s.code_bytes >> 10), (unsigned long long)(s.hot_bytes >> 10),
                s.instrs_translated ? static_cast<double>(s.code_bytes) / static_cast<double>(s.instrs_translated) : 0.0,
                s.instrs_translated ? static_cast<double>(s.hot_bytes) / static_cast<double>(s.instrs_translated) : 0.0);
