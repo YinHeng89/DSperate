@@ -81,7 +81,9 @@ bool arm_needs_fallback(u32 instr, bool a9) {
     const u32 opcode = (instr >> 21) & 0xF;
     const bool test = opcode >= 8 && opcode <= 0xB;
     if (rd == 15 && !test && (shape::dp_exc_return(instr) || exc_return_reg(instr))) return false;
-    return rd == 15 && !test;
+    // Other writes to pc: S=0 (jump tables, `add pc, pc, rX, lsl #2`) inline as
+    // an indirect branch; S=1 restores CPSR and stays interpreted.
+    return rd == 15 && !test && ((instr & (1u << 20)) || op == AOp::DpRegShift);
   }
   case AOp::Mrs: case AOp::B: case AOp::Bl: case AOp::Bx: case AOp::Pld:
     return false;
@@ -1194,7 +1196,7 @@ void Translator::arm_data_processing(u32 instr, AOp op) {
   const u32 rd = (instr >> 12) & 0xF, rn = (instr >> 16) & 0xF;
   const bool test = opcode >= 8 && opcode <= 0xB;
   const bool logical = opcode <= 1 || opcode == 8 || opcode == 9 || opcode >= 0xC;
-  if (rd == 15 && !test) {
+  if (rd == 15 && !test && !dp_csel_) {   // dp_csel_: a jump table's target, into w6 (translate_arm)
     if (shape::dp_exc_return(instr)) { emit_exc_return(instr, opcode, rn); return; }
     if (exc_return_reg(instr)) { e().mov(SCRATCH1, host_reg(instr & 0xF)); emit_exc_return_tail(); return; }
     emit_fallback(instr, true); return;
@@ -1614,7 +1616,9 @@ void Translator::translate_arm(u32 instr) {
   const bool conditional = cond != 0xE;
   // csel form: result in x6, committed by the select; cost charged unconditionally.
   const bool csel_form = conditional && use_csel_op(op, instr);
-  const bool precharged = conditional && !csel_form && arm_simple_cost(op);
+  // A pc write ends the block: its not-taken path charges numC in the epilogue.
+  const bool dp_pc = (op == AOp::DpImm || op == AOp::DpImmShift) && ((instr >> 12) & 0xF) == 15;
+  const bool precharged = conditional && !csel_form && !dp_pc && arm_simple_cost(op);
   if (conditional && !csel_form) {
     if (precharged) { const u32 c = numC(pc_); add_pending(c); flush_pending(); charged_ahead_ = c; }
     else flush_pending();
@@ -1624,6 +1628,15 @@ void Translator::translate_arm(u32 instr) {
 
   switch (op) {
   case AOp::DpImm: case AOp::DpImmShift: case AOp::DpRegShift:
+    if (dp_pc && !(instr & (1u << 20)) && (((instr >> 21) & 0xF) < 8 || ((instr >> 21) & 0xF) > 0xB)) {
+      // Jump table: the result into w6, then the refill as any ARMv5 data-processing
+      // write to pc (no interworking; the stub aligns the target).
+      dp_csel_ = true;
+      arm_data_processing(instr, op);
+      dp_csel_ = false;
+      emit_branch_indirect(SCRATCH6, false);
+      break;
+    }
     arm_data_processing(instr, op);
     break;
   case AOp::Mrs: {
