@@ -340,6 +340,28 @@ void Gpu3D::set_powcnt(u16 value) {
 
 // Replay everything queued. Called at VBlank, on a read, and when the log
 // nears full. No time passes, so read() can report busy bits clear unconditionally.
+u64* gx_cmd_census() {
+  static u64 hist[256];
+  static bool reg = false;
+  if (!reg) {
+    reg = true;
+    std::atexit([] {
+      u64 tot = 0;
+      for (u64 v : hist) tot += v;
+      if (!tot) return;
+      std::fprintf(stderr, "[gx] command census: %llu commands\n", (unsigned long long)tot);
+      for (int pass = 0; pass < 12; ++pass) {   // the twelve most frequent, descending
+        int best = -1;
+        for (int k = 0; k < 256; ++k) if (hist[k] && (best < 0 || hist[k] > hist[best])) best = k;
+        if (best < 0) break;
+        std::fprintf(stderr, "[gx]   %02x %12llu %5.1f%%\n", best, (unsigned long long)hist[best], 100.0 * static_cast<double>(hist[best]) / static_cast<double>(tot));
+        hist[best] = 0;
+      }
+    });
+  }
+  return hist;
+}
+
 void Gpu3D::drain_all() {
   if (!geometry_on_) return;
   if (!cmd_n_) return;
@@ -348,6 +370,9 @@ void Gpu3D::drain_all() {
   const u8* const c = cmd_log_.get();
   const u32* const q = par_log_.get();
   u32 pi = 0;
+  // DS_PROFILE: which commands the lists are made of (gx_cmd_census).
+  static u64* const hist = prof::enabled ? gx_cmd_census() : nullptr;
+  if (hist) for (u32 i = 0; i < cmd_n_; ++i) ++hist[c[i]];
   for (u32 i = 0; i < cmd_n_; ++i) {
     const u8 k = c[i];
     exec_single(k, q + pi);
