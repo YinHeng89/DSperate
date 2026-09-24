@@ -3669,8 +3669,19 @@ sdl_ready:
           if (fb[i] == nds.gpu.framebuffer(i)) { std::memcpy(flash_fb[i].data(), fb[i], flash_fb[i].size() * 4); fb[i] = flash_fb[i].data(); }
           draw_flash(ds_canvas(const_cast<u32*>(fb[i])), flash_alpha);
         }
+        // Pinned (thread layout), the emulation thread presents as a normal task:
+        // the kernel work a present queues on this core (a per-CPU kworker)
+        // cannot run under an RT thread that has the core to itself, so it
+        // piled up until the per-CPU RT cap (950 ms/s, no runtime sharing on
+        // ROCKNIX's kernel) idled the thread -- a 20-33 ms stall about once a
+        // second on the heavy titles (ST, GS:DD). DS_PRESENT_RT=1 keeps RT.
+        static const bool present_nort = ds::thread_layout_on() && !std::getenv("DS_PRESENT_RT");
+        int rt_pol = 0; sched_param rt_sp{};
+        const bool drop_rt = present_nort && pthread_getschedparam(pthread_self(), &rt_pol, &rt_sp) == 0 && (rt_pol == SCHED_RR || rt_pol == SCHED_FIFO);
+        if (drop_rt) { sched_param z{}; sched_setscheduler(0, SCHED_OTHER, &z); }
         display.draw(fb);
         if (dual_window) display2.draw(fb);
+        if (drop_rt) sched_setscheduler(0, rt_pol, &rt_sp);
       }
     }
     // Unlimited limiter outruns the speakers like fast forward: sheds audio the same way.
