@@ -114,7 +114,8 @@ u32 gen_arm(Rng& r) {
       const u32 l = r.coin(50), p = r.coin(50), u = r.coin(50);
       return (cond << 28) | (4u << 25) | (p << 24) | (u << 23) | (l << 20) | (9u << 16) | list;
     }
-    case 8: {   // CLZ / MRS
+    case 8: {   // CLZ / MRS / SWP(B) [r9]
+      if (r.coin(30)) return (cond << 28) | 0x01000090 | (r.coin(40) << 22) | (9u << 16) | (reg_nw() << 12) | reg_nw();
       if (r.coin(50)) return (cond << 28) | 0x016F0F10 | (reg_nw() << 12) | reg_nw();
       return (cond << 28) | 0x010F0000 | (reg_nw() << 12);
     }
@@ -454,6 +455,18 @@ void directed() {
     {Cpu::ARM9, true, {0x448F, 0x46C0, 0x4801, 0x4700, 0x46C0, 0x46C0, static_cast<u32>(HALT_STUB & 0xFFFF), static_cast<u32>(HALT_STUB >> 16)}, {0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
     {Cpu::ARM9, true, {0xB404, 0xBD00}, {0, 0, HALT_STUB, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
     {Cpu::ARM9, true, {0xE800}, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, HALT_STUB}},
+    // SWP / SWPB [r9]: rd != rm, rd == rm (the in-place swap), rd == rn
+    // (the base register takes the loaded word), conditional taken / not
+    // taken, and through a register far from the buffer (the slow path).
+    {Cpu::ARM9, false, {0xE5892000, 0xE1090091, 0xE2800001}, {0, 0x11111111, 0x22222222, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
+    {Cpu::ARM7, false, {0xE5892000, 0xE1090091, 0xE2800001}, {0, 0x11111111, 0x22222222, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
+    {Cpu::ARM9, false, {0xE5892000, 0xE1091091, 0xE2800001}, {0, 0x11111111, 0x22222222, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
+    {Cpu::ARM9, false, {0xE5892000, 0xE1491091, 0xE5990000}, {0, 0x111111AB, 0x22222222, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
+    {Cpu::ARM7, false, {0xE5892000, 0xE1491091, 0xE5990000}, {0, 0x111111AB, 0x22222222, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
+    {Cpu::ARM9, false, {0xE1A03009, 0xE1033091, 0xE5990000}, {0, 0x11111111, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
+    {Cpu::ARM9, false, {0xE1500000, 0x01090091, 0x11092091, 0xE2800001}, {0, 0x11111111, 0x22222222, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
+    {Cpu::ARM9, false, {0xE1030091, 0xE2800001}, {0, 0x11111111, 0, 0x04000208, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
+    {Cpu::ARM7, false, {0xE1030091, 0xE2800001}, {0, 0x11111111, 0, 0x04000208, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
     // Thumb: movs then ldr [r6 + r0] far away.
     {Cpu::ARM9, true, {0x2001, 0x5871}, {0, 0x12345678, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
     {Cpu::ARM7, true, {0x2001, 0x5871}, {0, 0x12345678, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},

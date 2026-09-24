@@ -113,6 +113,8 @@ bool arm_needs_fallback(u32 instr, bool a9) {
   }
   case AOp::Ldm: case AOp::Stm:
     return ((instr & (1u << 22)) && !ldm_user_inline(instr)) || (instr & 0xFFFF) == 0 || rn == 15;
+  case AOp::Swp: case AOp::Swpb:   // fast timing only: exact's two-access CDI combine stays interpreted
+    return !g_fast_timing || rd == 15 || rn == 15 || (instr & 0xF) == 15;
   default:
     return true;
   }
@@ -359,6 +361,7 @@ private:
   const u32 key_;
   const bool thumb_, a9_;
   u32 cur_raw_ = 0;          // the guest instruction being translated (fast timing's data cost)
+  int charge_as_ = -1;       // fast timing: emit_single charges this instead of numC + data (>= 0)
   std::vector<Instr>& instrs_;
   u32 pc_ = 0;
   u32 live_ = F_ALL;
@@ -884,7 +887,11 @@ private:
     };
     auto charge = [&] {
       if (wb) e().mov(host_reg(wb_reg), SCRATCH7);
-      if (ftime) { e().sub_imm(R_BUDGET, R_BUDGET, numC_internal() + fast_data(cpu_, cur_raw_, thumb_)); return; }
+      if (ftime) {
+        const u32 c = charge_as_ >= 0 ? static_cast<u32>(charge_as_) : numC_internal() + fast_data(cpu_, cur_raw_, thumb_);
+        if (c) e().sub_imm(R_BUDGET, R_BUDGET, c);
+        return;
+      }
       if (const_cost) return;
       if (slot7 < 0) { emit_charge_data(SCRATCH6, SCRATCH1, cdi); return; }
       flush_pending();
@@ -965,6 +972,7 @@ private:
   }
 
   void emit_exc_return(u32 instr, u32 opcode, u32 rn);
+  void arm_swp(u32 instr, bool byte);
   void emit_exc_return_tail();
   void arm_mrc(u32 instr);
   void arm_smlal_xy(u32 instr);
@@ -1428,6 +1436,30 @@ void Translator::arm_ldr_str_h(u32 instr, AOp op) {
   }
 }
 
+// SWP/SWPB (fast timing): load into w7, write rd, then store. The slow stubs
+// preserve x1 (the address) and x7, and only the store's slow path polls, so a
+// poll that leaves at the next instruction finds rd written and nothing left to
+// do. The instruction charges once, numC + two accesses, as the interpreter's
+// charge_CDI after both.
+void Translator::arm_swp(u32 instr, bool byte) {
+  const u32 rn = (instr >> 16) & 0xF, rd = (instr >> 12) & 0xF, rm = instr & 0xF;
+  e().mov(SCRATCH1, host_reg(rn));
+  charge_as_ = 0;
+  emit_single(byte ? Mem::Ld8 : Mem::Ld32, 0, SCRATCH7, false, 0, true, -1, false);
+  u32 data = host_reg(rm);
+  if (rd == rm) {   // swap w7 and rm in place: rm takes the loaded word, w7 the old rm to store
+    e().eor_reg(host_reg(rm), host_reg(rm), SCRATCH7);
+    e().eor_reg(SCRATCH7, SCRATCH7, host_reg(rm));
+    e().eor_reg(host_reg(rm), host_reg(rm), SCRATCH7);
+    data = SCRATCH7;
+  } else {
+    e().mov(host_reg(rd), SCRATCH7);
+  }
+  charge_as_ = static_cast<int>(numC_internal() + 2 * fast_data(cpu_, cur_raw_, thumb_));
+  emit_single(byte ? Mem::St8 : Mem::St32, data, 0, false, 0, false);
+  charge_as_ = -1;
+}
+
 void Translator::arm_ldm_stm(u32 instr, bool load) {
   const bool p = instr & (1u << 24), u = instr & (1u << 23), w = instr & (1u << 21);
   const u32 rn = (instr >> 16) & 0xF;
@@ -1648,6 +1680,7 @@ void Translator::translate_arm(u32 instr) {
   case AOp::LdrStrHImm: case AOp::LdrStrHReg: arm_ldr_str_h(instr, op); break;
   case AOp::Ldm: arm_ldm_stm(instr, true); break;
   case AOp::Stm: arm_ldm_stm(instr, false); break;
+  case AOp::Swp: case AOp::Swpb: arm_swp(instr, op == AOp::Swpb); break;
   default: break;
   }
 
