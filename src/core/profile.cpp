@@ -167,8 +167,10 @@ void frame_breakdown(const std::vector<double>& frame_ms) {
   std::vector<size_t> order(n);
   for (size_t i = 0; i < n; ++i) order[i] = i;
   std::sort(order.begin(), order.end(), [&](size_t a, size_t b) { return frame_ms[a] < frame_ms[b]; });
-  // p99: slowest 1%. typical: middle fifth, keeping boot transients and spikes out of the baseline.
-  const size_t n99 = std::max<size_t>(1, n / 100);
+  // Tail: the slowest (100 - DS_PROFILE_TAIL)% (default 99: the slowest 1%).
+  // typical: middle fifth, keeping boot transients and spikes out of the baseline.
+  static const int tail_pct = [] { const char* e = std::getenv("DS_PROFILE_TAIL"); const int v = e ? std::atoi(e) : 99; return v >= 50 && v <= 99 ? v : 99; }();
+  const size_t n99 = std::max<size_t>(1, n * static_cast<size_t>(100 - tail_pct) / 100);
   const std::vector<size_t> tail(order.end() - static_cast<long>(n99), order.end());
   const std::vector<size_t> mid(order.begin() + static_cast<long>(n * 2 / 5),
                                 order.begin() + static_cast<long>(n * 3 / 5));
@@ -192,9 +194,9 @@ void frame_breakdown(const std::vector<double>& frame_ms) {
   // between this and the middle column is what the heavy frame adds.
   const std::vector<size_t> low(order.begin(), order.begin() + static_cast<long>(n / 5));
   const Group m = mean(mid), t = mean(tail), l = mean(low);
-  std::fprintf(stderr, "[frames] stage breakdown, mean of fastest fifth (%zu frames), typical (middle 20%%, %zu frames) and p99 tail (%zu frames), sorted by what the tail adds:\n",
-               low.size(), mid.size(), tail.size());
-  std::fprintf(stderr, "[frames] %-16s %9s %9s %9s %9s\n", "stage", "fast ms", "typ ms", "p99 ms", "delta");
+  std::fprintf(stderr, "[frames] stage breakdown, mean of fastest fifth (%zu frames), typical (middle 20%%, %zu frames) and p%d tail (%zu frames), sorted by what the tail adds:\n",
+               low.size(), mid.size(), tail_pct, tail.size());
+  std::fprintf(stderr, "[frames] %-16s %9s %9s %6s%d ms %9s\n", "stage", "fast ms", "typ ms", "p", tail_pct, "delta");
   std::vector<u32> rows(COUNT);
   for (u32 s = 0; s < COUNT; ++s) rows[s] = s;
   std::sort(rows.begin(), rows.end(), [&](u32 a, u32 b) { return t.stage[a] - m.stage[a] > t.stage[b] - m.stage[b]; });

@@ -3719,9 +3719,20 @@ sdl_ready:
     if (static_cast<long>(frames) >= stats_from) {
       frame_ms.push_back(static_cast<double>(t1 - t0) * ticks_to_ms);
       work_ms.push_back(static_cast<double>(t2 - t0) * ticks_to_ms);
-      // DS_FRAME_SERIES=<path>: "emu work" ms per frame in run order.
+      // DS_FRAME_SERIES=<path>: "emu work start end" per frame in run order:
+      // ms, then the emu slice's CLOCK_MONOTONIC bounds in ns, so a
+      // `perf record --clockid monotonic` can be cut to chosen frames.
       static FILE* series = [] { const char* p = std::getenv("DS_FRAME_SERIES"); return p ? std::fopen(p, "w") : nullptr; }();
-      if (series) std::fprintf(series, "%.3f %.3f\n", frame_ms.back(), work_ms.back());
+      if (series) {
+        timespec ts{};
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        const double tick_ns = ticks_to_ms * 1e6;
+        const Uint64 tc = SDL_GetPerformanceCounter();   // taken with ts: maps the counter onto CLOCK_MONOTONIC
+        const long long now = static_cast<long long>(ts.tv_sec) * 1000000000LL + ts.tv_nsec;
+        const long long emu_end = now - static_cast<long long>(static_cast<double>(tc - t1) * tick_ns);
+        const long long start = emu_end - static_cast<long long>(static_cast<double>(t1 - t0) * tick_ns);
+        std::fprintf(series, "%.3f %.3f %lld %lld\n", frame_ms.back(), work_ms.back(), start, emu_end);
+      }
       // DS_HITCH_PNG=<ms>: write what is ON SCREEN for any frame whose work
       // exceeds that, named <index>-<ms>. Capped at DS_HITCH_MAX (default 12).
       static const double hitch_ms = [] { const char* p = std::getenv("DS_HITCH_PNG"); return p ? std::atof(p) : 0.0; }();
