@@ -12,9 +12,15 @@
 #include <cstring>
 #include <string>
 
+#include <mutex>
+#include <vector>
+
 #if defined(__linux__)
+#include <dirent.h>
 #include <sched.h>
 #include <sys/prctl.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 #endif
 
 namespace ds {
@@ -106,6 +112,126 @@ void name_current_thread(const char* name) {
   prctl(PR_SET_NAME, name, 0, 0, 0);
 #else
   (void)name;
+#endif
+}
+
+// ---- thread layout -----------------------------------------------------------------------------
+namespace {
+std::atomic<bool> g_layout{false};
+std::mutex g_placed_m;
+std::vector<long> g_placed;   // tids placed by role
+
+#if defined(__linux__)
+long current_tid() { return static_cast<long>(syscall(SYS_gettid)); }
+
+// The four cores the layout uses, in role order {aux, engine A pair, engine
+// B pair, emu}: the startup set's first four, lowest first (CPU0 takes the
+// interrupts on the RK3566, so it is aux). 0 cores: layout unavailable.
+u32 layout_cores(u32 out[4]) {
+  const u64 m = startup_affinity();
+  u32 n = 0;
+  for (u32 c = 0; c < MAX_CPUS && n < 4; ++c) if (m & (u64{1} << c)) out[n++] = c;
+  return n;
+}
+
+u64 role_mask_default(ThreadRole role, u32 index) {
+  u32 c[4];
+  if (layout_cores(c) < 4) return 0;
+  switch (role) {
+    case ThreadRole::Emu:     return u64{1} << c[3];
+    case ThreadRole::EngineA: return u64{1} << c[1];
+    case ThreadRole::Line:    return u64{1} << c[2];
+    case ThreadRole::Band:    return u64{1} << (index == 0 ? c[1] : index == 1 ? c[2] : c[0]);
+    case ThreadRole::Aux:     return u64{1} << c[0];
+  }
+  return 0;
+}
+
+// DS_PIN="emu=3,band0=1,band1=2,line=2,enginea=1,aux=0": a role's CPU list
+// ("0-1" for a range). "band" names every band. 0 if the role is not named.
+u64 role_mask_env(const char* key) {
+  const char* e = std::getenv("DS_PIN");
+  if (!e) return 0;
+  const size_t kl = std::strlen(key);
+  for (const char* p = e; *p;) {
+    const char* end = std::strchr(p, ',');
+    const char* eq = std::strchr(p, '=');
+    if (!eq || (end && eq > end)) break;
+    if (static_cast<size_t>(eq - p) == kl && !std::strncmp(p, key, kl)) {
+      u64 m = 0;
+      const char* q = eq + 1;
+      while (*q && *q != ',') {
+        char* x; const long a = std::strtol(q, &x, 10); long b = a;
+        if (x == q) break;
+        if (*x == '-') b = std::strtol(x + 1, &x, 10);
+        for (long c = a; c <= b && c < static_cast<long>(MAX_CPUS); ++c) if (c >= 0) m |= u64{1} << c;
+        q = x;
+      }
+      return m;
+    }
+    if (!end) break;
+    p = end + 1;
+  }
+  return 0;
+}
+
+u64 role_mask(ThreadRole role, u32 index) {
+  char key[16];
+  switch (role) {
+    case ThreadRole::Emu:     std::snprintf(key, sizeof key, "emu"); break;
+    case ThreadRole::EngineA: std::snprintf(key, sizeof key, "enginea"); break;
+    case ThreadRole::Line:    std::snprintf(key, sizeof key, "line"); break;
+    case ThreadRole::Band:    std::snprintf(key, sizeof key, "band%u", index); break;
+    case ThreadRole::Aux:     std::snprintf(key, sizeof key, "aux"); break;
+  }
+  if (const u64 m = role_mask_env(key)) return m;
+  if (role == ThreadRole::Band) if (const u64 m = role_mask_env("band")) return m;
+  if (std::getenv("DS_PIN")) return 0;   // an explicit layout names what it pins
+  return g_layout.load(std::memory_order_relaxed) ? role_mask_default(role, index) : 0;
+}
+
+bool set_tid_affinity(long tid, u64 m) {
+  cpu_set_t set; CPU_ZERO(&set);
+  for (u32 c = 0; c < MAX_CPUS; ++c) if (m & (u64{1} << c)) CPU_SET(c, &set);
+  return sched_setaffinity(static_cast<pid_t>(tid), sizeof set, &set) == 0;
+}
+#endif
+} // namespace
+
+void set_thread_layout(bool on) {
+#if defined(__linux__)
+  startup_affinity();   // latch the unpinned set before anything is pinned
+  host_cores();
+#endif
+  g_layout.store(on, std::memory_order_relaxed);
+}
+bool thread_layout_on() { return g_layout.load(std::memory_order_relaxed) || std::getenv("DS_PIN"); }
+
+void place_current_thread(ThreadRole role, u32 index) {
+#if defined(__linux__)
+  const long tid = current_tid();
+  { std::lock_guard<std::mutex> lk(g_placed_m); g_placed.push_back(tid); }
+  if (const u64 m = role_mask(role, index)) set_tid_affinity(tid, m);
+#else
+  (void)role; (void)index;
+#endif
+}
+
+void place_foreign_threads() {
+#if defined(__linux__)
+  const u64 m = role_mask(ThreadRole::Aux, 0);
+  if (!m) return;
+  DIR* d = opendir("/proc/self/task");
+  if (!d) return;
+  std::vector<long> placed;
+  { std::lock_guard<std::mutex> lk(g_placed_m); placed = g_placed; }
+  while (dirent* e = readdir(d)) {
+    if (e->d_name[0] < '0' || e->d_name[0] > '9') continue;
+    const long tid = std::atol(e->d_name);
+    if (std::find(placed.begin(), placed.end(), tid) != placed.end()) continue;
+    set_tid_affinity(tid, m);
+  }
+  closedir(d);
 #endif
 }
 

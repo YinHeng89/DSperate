@@ -17,4 +17,22 @@ void set_host_cores(u32 n);
 // Calling thread's name (15 chars max on Linux), for profilers/debuggers.
 void name_current_thread(const char* name);
 
+// Thread layout (emu.thread_layout): with four or more usable cores, each
+// thread role gets a core of its own or a shared pair, the DraStic shape:
+//   core A (the one taking the device interrupts, CPU0 on the RK3566): aux --
+//          audio, SDL, input, driver threads, anything we did not start
+//   core B: 2D engine A + 3D band 0      core C: 2D engine B + 3D band 1
+//   core D: emulation (CPU cores, JIT, scheduler; steals raster bins)
+// Bands past 1 share the aux core. Off, or fewer cores: threads migrate
+// freely. DS_PIN="emu=3,band0=1,line=2,aux=0,..." overrides per role.
+enum class ThreadRole { Emu, Band, Line, EngineA, Aux };
+void set_thread_layout(bool on);
+bool thread_layout_on();
+// Places the calling thread (`index`: the band number).
+void place_current_thread(ThreadRole role, u32 index = 0);
+// Moves every thread of the process not placed through place_current_thread
+// (audio, driver pools, ...) to the aux core. Call after the libraries that
+// start threads are up; again later catches lazily started ones.
+void place_foreign_threads();
+
 } // namespace ds

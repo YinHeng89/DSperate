@@ -1204,6 +1204,13 @@ static int run(int argc, char** argv) {
   VLOG("cpu timing: %s\n", ds::g_fast_timing ? "fast" : "exact");
   if (cfg.num("emu.host_cores", 0) > 0) ds::set_host_cores(static_cast<ds::u32>(cfg.num("emu.host_cores", 0)));   // DS_HOST_CORES still wins
   VLOG("host: %u cores\n", ds::host_cores());
+  // Thread layout (host_cores.h): before any worker starts, so each places itself.
+  {
+    const std::string tl = cfg.str("emu.thread_layout", "auto");
+    const bool on = (tl == "on" || tl == "auto") && !std::getenv("DS_NO_THREAD_LAYOUT");
+    ds::set_thread_layout(on);
+    VLOG("thread layout: %s\n", on ? "pinned" : "free");
+  }
 
   NDS nds;
   if (cfg.has("emu.idle_skip") && !std::getenv("DS_IDLE_SKIP")) nds.sched.set_idle_skip(cfg.str("emu.idle_skip").c_str());   // DS_IDLE_SKIP wins
@@ -3160,7 +3167,13 @@ sdl_ready:
         break;
       }
   };
+  // The emulation thread takes its core; the audio, SDL and driver threads
+  // started so far go to the aux core, and once more after the first frames
+  // for the ones started lazily.
+  ds::place_current_thread(ds::ThreadRole::Emu);
+  ds::place_foreign_threads();
   while (!input.quit() && !g_signalled && (frame_limit == 0 || frames < static_cast<u64>(frame_limit))) {
+    if (frames == 120) ds::place_foreign_threads();
     SDL_Event e;
     input.set_menu_open(menu.open());
     while (SDL_PollEvent(&e)) input.handle(e, display, dual_window ? &display2 : nullptr);

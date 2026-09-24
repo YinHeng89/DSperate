@@ -333,6 +333,9 @@ R"(# DSperate settings. Command-line flags override this file. Two files next
                                 # costs a core's idle power. auto = busy only where such a
                                 # governor is in charge. No system setting is changed either way
 # host_cores = 0                # cores the emulator's threads size themselves for; 0 = detect
+# thread_layout = auto          # auto (on with 4+ cores) | off: pin each thread role to a core --
+                                # emulation on its own, the 2D engines each paired with a 3D band,
+                                # audio/SDL/driver threads on the interrupt core (DS_PIN overrides)
 # jit = true                    # false = interpreter (much slower; for comparison)
 # timing = fast                 # CPU cycle model: fast (the default: a constant cost per memory access
                                 # and per jump; much cheaper to emulate, and games cannot tell in

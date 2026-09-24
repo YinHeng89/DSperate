@@ -26,9 +26,10 @@ public:
   LineWorker& operator=(const LineWorker&) = delete;
 
   // `fn`/`arg` is the job; it runs on the worker for every dispatch().
-  void start(void (*fn)(void*), void* arg) {
+  // `role`/`name`: the thread's placement (host_cores.h) and name.
+  void start(void (*fn)(void*), void* arg, ThreadRole role = ThreadRole::Line, const char* name = "line-worker") {
     if (thread_.joinable()) return;
-    fn_ = fn; arg_ = arg;
+    fn_ = fn; arg_ = arg; role_ = role; name_ = name;
     quit_.store(false, std::memory_order_relaxed);
     req_.store(0, std::memory_order_relaxed);
     ack_.store(0, std::memory_order_relaxed);
@@ -87,7 +88,8 @@ private:
   }
 
   void loop() {
-    name_current_thread("line-worker");
+    name_current_thread(name_);
+    place_current_thread(role_);
     u32 last = 0;
     for (;;) {
       static constexpr int kSpin = 20000;   // spin budget before parking (~line gap)
@@ -117,6 +119,8 @@ private:
   }
 
   std::thread thread_;
+  ThreadRole role_ = ThreadRole::Line;
+  const char* name_ = "line-worker";
   void (*fn_)(void*) = nullptr;
   void* arg_ = nullptr;
   std::atomic<u32> req_{0}, ack_{0};

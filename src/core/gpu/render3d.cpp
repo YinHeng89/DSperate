@@ -301,6 +301,7 @@ private:
     char name[16];
     std::snprintf(name, sizeof name, "r3d-band%u", index);
     name_current_thread(name);
+    place_current_thread(ThreadRole::Band, index);
     u64 seen = 0;
     for (;;) {
       std::unique_lock<std::mutex> lk(m_);
