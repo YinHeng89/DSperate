@@ -29,13 +29,13 @@ bool census_env(const char* var) {
 }
 
 // "Of which" stages nest inside another scope; excluded from the sum. See profile.h.
-inline bool of_which(Stage s) { return s == JIT_TX || s == GX_RUN || s == W2D_JOIN || s == R3D_STEAL; }
+inline bool of_which(Stage s) { return s == JIT_TX || s == JIT_TX_GEN || s == JIT_TX_INSTALL || s == JIT_TX_ICACHE || s == JIT_TX_DECODE || s == JIT_TX_LIVE || s == JIT_TX_EMIT || s == JIT_TX_FINISH || s == GX_RUN || s == W2D_JOIN || s == R3D_STEAL; }
 
 const char* const names[COUNT] = {
   "cpu arm9", "cpu arm7", "dma", "gx geometry (of which)",
   "2d bg draw", "2d obj draw", "2d window", "2d select", "2d effects", "output", "capture",
   "3d clear", "3d spans", "3d final pass", "3d band wait", "spu",
-  "jit translate",
+  "jit translate", "jit tx codegen", "jit tx install", "jit tx icache", "jit tx decode", "jit tx liveness", "jit tx emit", "jit tx finish",
   "2d worker join (of which)",
   "sched slice loop", "events (timers, dma, fifo; not spu)", "gpu line hooks", "line-0 worker join", "begin_frame", "gx vblank (sort, join)",
   "2d journal/latches", "3d line wait", "3d prep (texcache)", "3d bins stolen (of which)",

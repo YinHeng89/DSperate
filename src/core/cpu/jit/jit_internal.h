@@ -79,8 +79,9 @@ struct Block {
   const u8* host_hi;
   // Guest bytes this translation depends on beyond its own, inclusive (0, 0:
   // none): successor code read by the exit flag liveness. Writes there
-  // invalidate the block, and it is never revived.
+  // invalidate the block; span_hash (of the whole range) is what revives it.
   u32  span_lo, span_hi;
+  u64  span_hash;
   u8   owner;        // index into Runtime::cpus
   bool dead;
   bool pooled;       // in Runtime::block_pool (freed by arena reset), not heap

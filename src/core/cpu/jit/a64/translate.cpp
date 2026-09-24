@@ -2050,6 +2050,8 @@ bool Translator::run() {
   if (!a9_) { t7_ = cpu_.timing7[start >> 15]; code_region7_ = start >> 24; }
 
   u32 addr = start;
+  u64 t_ph = prof::enabled ? prof::now_ns() : 0;
+  auto phase = [&](prof::Stage s) { if (prof::enabled) { const u64 n = prof::now_ns(); prof::add_timed(s, n - t_ph); t_ph = n; } };
   for (u32 i = 0; i < MAX_INSTRS; ++i) {
     const u32 raw = fetch(addr);
     instrs_.push_back({addr, raw, F_ALL});
@@ -2059,6 +2061,7 @@ bool Translator::run() {
     if (!cpu_.page_table.read_ptr(addr)) break;
   }
 
+  phase(prof::JIT_TX_DECODE);
   // Backward flag liveness, from what the static successors need at the exit.
   u32 span_lo = start, span_hi = addr - 1;
   u32 live = exit_flag_live(addr, span_lo, span_hi);
@@ -2068,6 +2071,7 @@ bool Translator::run() {
     live = u.reads | (live & ~u.writes);
   }
 
+  phase(prof::JIT_TX_LIVE);
   // DS_JIT_CENSUS static facts, stored in the density slot.
   const bool census = rt().census;
   u16 c_live_in = 0, c_written = 0;
@@ -2146,7 +2150,10 @@ bool Translator::run() {
   blk_.guest_len = end_addr - start;
   if (span_lo != start || span_hi != addr - 1) { blk_.span_lo = span_lo; blk_.span_hi = span_hi; }
   if (!ended_) emit_branch_static(end_addr, thumb_, false);
-  return finish();
+  phase(prof::JIT_TX_EMIT);
+  const bool ok = finish();
+  phase(prof::JIT_TX_FINISH);
+  return ok;
 }
 
 } // namespace

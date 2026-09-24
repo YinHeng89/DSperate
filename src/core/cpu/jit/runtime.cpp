@@ -53,6 +53,8 @@ static std::map<u32, u64> victims_by_page;
 static std::map<u32, u64> retrans;             // guest pc -> translations
 static std::map<u64, u64> trans_by_frame;
 static std::map<u64, u64> retrans_by_frame;
+static std::map<u64, u64> store_sites;         // (victim pc << 32 | store guest addr) -> kills
+static u64 revive_none = 0, revive_stamp = 0, revive_span = 0, revive_len = 0, revive_bytes = 0, revive_ok = 0;   // why a revive did not happen
 static u64 inval = 0, killed = 0, trans = 0, frames_seen = 0, range_miss = 0, resets = 0;
 static u64 retime_calls = 0, retime_killed = 0;
 // Lead time: page's last invalidation -> retranslation, in ARM9 cycles.
@@ -82,6 +84,10 @@ static void report() {
   top(writers, "writers (pc of the store / DMA start)", 15, pk);
   top(victims_by_page, "invalidated guest pages (2 KB)", 15, pa);
   top(retrans, "retranslated block pcs", 20, pa);
+  auto ps = [](u64 n, u64 k) { std::fprintf(stderr, "   %10llu  block %08x <- store at %08x\n", (unsigned long long)n, static_cast<u32>(k >> 32), static_cast<u32>(k)); };
+  top(store_sites, "store address per victim block", 12, ps);
+  std::fprintf(stderr, "[churn] revive: ok %llu, no parked %llu, stamp %llu, span %llu, len %llu, bytes differ %llu\n", (unsigned long long)revive_ok,
+               (unsigned long long)revive_none, (unsigned long long)revive_stamp, (unsigned long long)revive_span, (unsigned long long)revive_len, (unsigned long long)revive_bytes);
   auto pf = [](u64 n, u64 f) { std::fprintf(stderr, "   %10llu  frame %llu (%llu re)\n",
       (unsigned long long)n, (unsigned long long)f, (unsigned long long)retrans_by_frame[f]); };
   top(trans_by_frame, "translation frames", 20, pf);
@@ -271,6 +277,18 @@ static void copy_guest_bytes(JitCpu& jc, u32 pc, u8* dst, u32 len) {
     done += room;
   }
 }
+// FNV-1a over the block's watched range, page by page (unmapped bytes as zero).
+static u64 span_hash(JitCpu& jc, const Block* b) {
+  u64 h = 1469598103934665603ull;
+  u32 a = b->span_lo;
+  while (a <= b->span_hi) {
+    const u32 room = std::min<u32>(b->span_hi - a + 1, mem::PAGE_SIZE - (a & (mem::PAGE_SIZE - 1)));
+    const u8* p = jc.ctx->page_table.read_ptr(a);
+    for (u32 i = 0; i < room; ++i) h = (h ^ (p ? p[i] : 0)) * 1099511628211ull;
+    a += room;
+  }
+  return h;
+}
 static bool guest_bytes_match(JitCpu& jc, const Block* b) {
   u8 cur[GUEST_COPY_MAX];
   copy_guest_bytes(jc, key_pc(b->key), cur, b->guest_copy_len);
@@ -301,12 +319,20 @@ static void register_block(JitCpu& jc, Block* b) {
 // Revive a parked translation whose guest bytes match again; same timing stamp only.
 static Block* revive(JitCpu& jc, u32 key) {
   auto it = jc.parked.find(key);
-  if (it == jc.parked.end()) return nullptr;
+  if (it == jc.parked.end()) { if (churn::on()) churn::revive_none++; return nullptr; }
   std::vector<Block*>& v = it->second;
   const u64 stamp = jc.nds->bus.timing().stamp;
   for (size_t k = v.size(); k-- > 0;) {
     Block* b = v[k];
-    if (b->stamp != stamp || b->span_hi || b->guest_len != b->guest_copy_len || !guest_bytes_match(jc, b)) continue;
+    // A spanned block is checked by its range hash (the successor's bytes it
+    // read decide the flags it keeps at the exit); others by their own bytes.
+    const bool same = b->stamp == stamp && (b->span_hi ? span_hash(jc, b) == b->span_hash
+                                                        : (b->guest_len == b->guest_copy_len && guest_bytes_match(jc, b)));
+    if (churn::on()) {
+      if (b->stamp != stamp) churn::revive_stamp++; else if (!b->span_hi && b->guest_len != b->guest_copy_len) churn::revive_len++;
+      else if (!same) churn::revive_bytes++; else churn::revive_ok++;
+    }
+    if (!same) continue;
     v.erase(v.begin() + static_cast<std::ptrdiff_t>(k));
     if (v.empty()) jc.parked.erase(it);
     std::memcpy(b->entry, b->entry_words, backend::ENTRY_PATCH);
@@ -331,6 +357,7 @@ static void install(JitCpu& jc, Block* b) {
   b->stamp = jc.nds->bus.timing().stamp;
   b->guest_copy_len = std::min<u32>(b->guest_len, GUEST_COPY_MAX);
   copy_guest_bytes(jc, key_pc(b->key), b->guest_copy, b->guest_copy_len);
+  if (b->span_hi) b->span_hash = span_hash(jc, b);
   register_block(jc, b);
   jc.all_blocks.push_back(b);
   r.blocks_live++;
@@ -374,7 +401,10 @@ Block* translate(JitCpu& jc, u32 key) {
   b->pooled = true;
   u32 size = 0;
   r.fm_new.clear();
-  if (!backend::translate_block(jc, key, r.arena + r.pos, BLOCK_MARGIN, *b, size)) { r.block_pool.pop_back(); r.fm_new.clear(); return nullptr; }
+  {
+    DS_PROF(JIT_TX_GEN);
+    if (!backend::translate_block(jc, key, r.arena + r.pos, BLOCK_MARGIN, *b, size)) { r.block_pool.pop_back(); r.fm_new.clear(); return nullptr; }
+  }
   b->entry = r.arena + r.pos;
   b->size = size;
   if (!r.fm_new.empty()) {
@@ -383,8 +413,8 @@ Block* translate(JitCpu& jc, u32 key) {
     r.fm_new.clear();
   }
   r.pos += (b->size + 15) & ~size_t{15};
-  sync_icache(b->entry, b->size);
-  install(jc, b);
+  { DS_PROF(JIT_TX_ICACHE); sync_icache(b->entry, b->size); }
+  { DS_PROF(JIT_TX_INSTALL); install(jc, b); }
   return b;
 }
 
@@ -409,6 +439,7 @@ void invalidate_host_range(const u8* host_page, const u8* lo, const u8* hi) {
   }
   if (victims.empty()) { churn::range_miss++; return; }
   if (list.empty()) { g_rt.code_pages.erase(it); set_code_tag(host_page, false); }
+  if (churn::on()) for (Block* b : victims) churn::store_sites[(static_cast<u64>(key_pc(b->key)) << 32) | ((key_pc(b->key) & ~(mem::PAGE_SIZE - 1)) + slo)]++;
   invalidate_blocks(host_page, std::move(victims));
 }
 

@@ -15,6 +15,8 @@ enum Stage : u32 {
   BG_DRAW, OBJ_DRAW, WINDOW, SELECT, EFFECTS, OUTPUT, CAPTURE,
   R3D_CLEAR, R3D_SPANS, R3D_FINAL, R3D_WAIT, SPU,
   JIT_TX,    // "of which": nests inside CPU9/CPU7, never add to wall time
+  JIT_TX_GEN, JIT_TX_INSTALL, JIT_TX_ICACHE,   // "of which" of JIT_TX: codegen, bookkeeping, the icache sync
+  JIT_TX_DECODE, JIT_TX_LIVE, JIT_TX_EMIT, JIT_TX_FINISH,   // "of which" of JIT_TX_GEN
   W2D_JOIN,  // "of which": nests inside DMA/GPU_LINE/JOURNAL/JOIN0
   // Untimed bucket: leaf scopes that don't nest, so they add against wall time.
   SCHED,        // slice loop bookkeeping: deadline, idle test, budgets
