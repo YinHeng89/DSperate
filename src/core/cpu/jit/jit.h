@@ -24,6 +24,7 @@ struct Stats {
   u64 blocks_revived = 0;      // killed blocks whose guest bytes matched again
   u64 bios_sha1_blocks = 0;    // DSi BIOS SHA-1 blocks run natively
   u64 wait_loop_runs = 0;      // ARM7 BIOS WaitByLoop heads fast-forwarded
+  u64 slices_interpreted = 0;  // slices the interpreter ran for cold code (DS_JIT_WARM)
 };
 
 // Safe to call once per NDS; `trace` mirrors NDS::trace at attach time

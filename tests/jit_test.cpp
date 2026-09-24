@@ -4,6 +4,7 @@
 // one per engine, from identical state; the registers, flags, consumed cycles
 // and memory must agree afterwards. The first disagreement prints the
 // sequence, which names the broken instruction.
+#include <cstdlib>
 #include "core/nds.h"
 #include "core/cpu/timing_mode.h"
 #include "core/cpu/interp/interp.h"
@@ -650,6 +651,7 @@ void fuzz(Cpu which, bool thumb, u32 trials, u32 seed0) {
 } // namespace
 
 int main(int argc, char** argv) {
+  setenv("DS_JIT_WARM", "1", 1);   // the trials must run translated code, not the cold-code interpreter path
   const u32 trials = argc > 1 ? static_cast<u32>(std::atoi(argv[1])) : 400;
   // test_jit <count> <seed> [set]: run <count> trials from <seed> in one set,
   // and nothing else. <count> 1 is the single-trial form; a larger count

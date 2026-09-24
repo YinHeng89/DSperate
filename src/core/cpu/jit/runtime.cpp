@@ -507,8 +507,30 @@ extern "C" u32 jit_h_fallback(CpuContext* cpu, u32 instr, u32 key) {
   return cpu->jumped ? 1 : 0;
 }
 
+// DS_JIT_WARM=N: lookups of a key before it is translated; 1 (the default)
+// translates on first sight. Counted on the C side (every cold execution
+// reaches it: the native paths exit for cold code), so at 2 a key's first
+// execution is interpreted and its second translated. Opt-in: at 2 it took
+// GS:DD's load bursts down but cost ST 0.2 ms a frame, since the interpreter
+// takes the whole rest of the slice, hot code after the cold block included.
+// Interpreting just the cold block would need a one-block interpreter entry.
+static u32 warm_threshold() { static const u32 v = std::getenv("DS_JIT_WARM") ? static_cast<u32>(std::atoi(std::getenv("DS_JIT_WARM"))) : 1; return v; }
+static bool is_cold(JitCpu& jc, u32 key) {
+  if (warm_threshold() <= 1) return false;
+  if (jc.blocks.count(key)) return false;
+  return static_cast<u32>(jc.warm[(key >> 1) & (LUT_SIZE - 1)]) + 1 < warm_threshold();
+}
+static bool cold_after_count(JitCpu& jc, u32 key) {
+  if (warm_threshold() <= 1) return false;
+  if (jc.blocks.count(key)) return false;
+  u8& n = jc.warm[(key >> 1) & (LUT_SIZE - 1)];
+  if (n < 255) ++n;
+  return n < warm_threshold();
+}
+
 extern "C" const void* jit_h_lookup(CpuContext* cpu, u32 key) {
   JitCpu& jc = *static_cast<JitCpu*>(cpu->jit);
+  if (is_cold(jc, key)) { cpu->hot.regs[15] = key_r15(key); return g_rt.exit_r15; }   // the C side interprets it
   const u8* native = find_native(jc, key);
   if (g_rt.debug) std::fprintf(stderr, "[jit] lookup %08x -> %p (budget %d)\n", key, static_cast<const void*>(native), cpu->hot.cycle_budget);
   if (native) return native;
@@ -518,6 +540,7 @@ extern "C" const void* jit_h_lookup(CpuContext* cpu, u32 key) {
 
 extern "C" const void* jit_h_link(CpuContext* cpu, u32 key, u8* patch_site) {
   JitCpu& jc = *static_cast<JitCpu*>(cpu->jit);
+  if (is_cold(jc, key)) { cpu->hot.regs[15] = key_r15(key); return g_rt.exit_r15; }   // unpatched: linked once the target is warm
   const u8* native = find_native(jc, key);
   if (g_rt.debug) std::fprintf(stderr, "[jit] link %08x -> %p at %p (budget %d)\n", key, static_cast<const void*>(native), static_cast<void*>(patch_site), cpu->hot.cycle_budget);
   if (!native) { cpu->hot.regs[15] = key_r15(key); return g_rt.flush_exit; }
@@ -795,6 +818,7 @@ void report(std::FILE* out) {
     std::fprintf(out, "[jit] fastmem: %llu site faults (rewritten to the walk), %zu guest sites on the walk, %zu registered sites\n",
                  static_cast<unsigned long long>(g_rt.fm_faults), g_rt.fm_slow.size() + g_rt.fm_ring_n, g_rt.fm_rels.size());
   if (s.bios_sha1_blocks) std::fprintf(out, "[jit] DSi BIOS SHA-1 blocks run natively: %llu\n", (unsigned long long)s.bios_sha1_blocks);
+  if (s.slices_interpreted) std::fprintf(out, "[jit] cold code: %llu slices interpreted (DS_JIT_WARM)\n", (unsigned long long)s.slices_interpreted);
   if (const cpu::WaitLoopStats& w = cpu::wait_loop_stats(); w.runs)
     std::fprintf(out, "[jit] ARM7 WaitByLoop fast-forwarded %llu times: %llu iterations, %llu ARM7 cycles\n", (unsigned long long)w.runs, (unsigned long long)w.iterations, (unsigned long long)w.cycles);
   std::fprintf(out, "[jit] code %llu KB (hot %llu KB): %.1f bytes per guest instruction, %.1f hot\n", (unsigned long long)(s.code_bytes >> 10), (unsigned long long)(s.hot_bytes >> 10),
@@ -884,6 +908,13 @@ const void* lookup(CpuContext& cpu) {
     const bool thumb = cpu.thumb();
     const u32 key = make_key(cpu.hot.regs[15] - (thumb ? 4 : 8), thumb);
     const u64 lut = jc.lut[(key >> 1) & (LUT_SIZE - 1)];
+    if (static_cast<u32>(lut) != key && cold_after_count(jc, key)) {
+      // Cold: the interpreter takes the rest of the slice, and translated
+      // code is entered only to leave (the state is already in ctx).
+      interp::run(cpu);
+      r.stats.slices_interpreted++;
+      return r.exit_r15;
+    }
     const u8* native = static_cast<u32>(lut) == key ? r.arena + (lut >> 32) : find_native(jc, key);
     if (!native) { reset_arena(); continue; }
     cpu.hot.alerts = 0;

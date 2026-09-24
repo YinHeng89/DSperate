@@ -130,6 +130,11 @@ struct JitCpu {
   std::unordered_map<u32, Block*> blocks;
   std::vector<Block*> all_blocks;
   std::unordered_map<u32, std::vector<Block*>> parked;   // killed translations, newest last
+  // Cold-code threshold (DS_JIT_WARM, opt-in): lookups per key (direct-mapped,
+  // the LUT's hash) before a block is translated; below it the slice is
+  // interpreted. Translating a block costs ~12 us on the A55, and a load's
+  // 1000-block burst was 7 ms in one frame.
+  u8 warm[LUT_SIZE] = {};
   u8*   dispatch = nullptr;                  // w0 = key
   u8*   link = nullptr;                      // `bl link; .word key`: patches the bl into `b block`
   u8*   fallback = nullptr;                  // `bl fallback; .word instr; .word key`: interpret one instr, poll, dispatch
