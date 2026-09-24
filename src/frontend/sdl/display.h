@@ -64,6 +64,14 @@ public:
   struct Target { u32* px; u32 pitch; u32 h; const u16* xrun; const u8* seam_w; const u16* lin_sx; const u8* lin_wx; bool grid; const u16* xrun_plain; u32 y_lo = 0, y_hi = 0; };
 
   bool scaling() const { return scaled_; }
+  // Leave GPU present for scanline scaling (dual-window: when the other window
+  // could not keep it, both must scale). False if this window was not presenting.
+  bool drop_gpu_present(const char* why);
+  // Fullscreen scanout: commit one blank frame and follow a resize. True once
+  // the compositor's configure has arrived (or there is nothing to wait for).
+  // Called before the ROM loads, so the buffers reach their final size while
+  // the CMA pool is not yet full of the ROM's page cache.
+  bool settle_step(const u32* const blank[SCREENS]);
   // Panel rotation on the scanline tiers (0/90/180/270, same DS_ROTATE the
   // display-engine tier reads). Drawing works in the logical (unrotated)
   // frame into a staging buffer; present() rotates that into the presented
@@ -210,6 +218,7 @@ private:
   IntScale      int_scale_ = IntScale::Off;
   int           display_index_ = 0;
   bool          fullscreen_ = false;
+  int           open_w_ = 0, open_h_ = 0;   // window size when the scanout sink opened (settle_step)
   Layout        layout_;
   u8            inset_alpha_ = 255;
 

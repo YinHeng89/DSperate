@@ -250,7 +250,8 @@ bool DmabufOut::open(SDL_Window* win, int w, int h, int output_index) {
 void DmabufOut::close() {
   // Only per-instance objects die here; globals live for the connection.
   for (Buf& b : bufs_) drop_buf(b);
-  dpy_ = nullptr; surf_ = nullptr; q_ = nullptr; cur_ = -1; dead_ = false;
+  // Size 0: a sink whose reopen failed must not look usable at its new size.
+  dpy_ = nullptr; surf_ = nullptr; q_ = nullptr; cur_ = -1; dead_ = false; w_ = h_ = 0;
 }
 
 bool DmabufOut::dmabuf_plane(int buf, DmabufPlane& out) const {
@@ -261,7 +262,7 @@ bool DmabufOut::dmabuf_plane(int buf, DmabufPlane& out) const {
 }
 
 u32* DmabufOut::begin_frame() {
-  if (dead_) return nullptr;
+  if (dead_ || !dpy_) return nullptr;
   for (;;) {
     wl_display_dispatch_queue_pending(dpy_, q_);
     for (int i = 0; i < nbufs_; ++i)

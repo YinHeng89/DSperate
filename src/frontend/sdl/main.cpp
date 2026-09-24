@@ -883,6 +883,16 @@ bool parse_video(const ds::sdl::Config& cfg, VideoSetup& vs) {
   return true;
 }
 
+// Dual-window: both windows present the same way (the frame loop hands the
+// scaled targets to both or draws both). One that could not get or keep GPU
+// present, e.g. a dmabuf allocation failing on a CMA pool full of page cache,
+// takes the other down to scanline scaling with it. False if still mixed.
+bool sync_dual_modes(ds::sdl::Display& a, ds::sdl::Display& b) {
+  if (a.scaling() == b.scaling()) return true;
+  (a.scaling() ? b : a).drop_gpu_present("dropped to match the other window");
+  return a.scaling() == b.scaling();
+}
+
 // Split from parse_video so a settings change can close the windows and
 // come back through here with new values.
 bool open_displays(const VideoSetup& vs, ds::sdl::Display& display, ds::sdl::Display& display2) {
@@ -894,7 +904,7 @@ bool open_displays(const VideoSetup& vs, ds::sdl::Display& display, ds::sdl::Dis
     display.set_integer_scale(vs.int_scale); display2.set_integer_scale(vs.int_scale);
     if (!display.open("DSperate", vs.scale, vs.fullscreen, vs.linear, vs.vsync, vs.layout, 0, vs.upper_display) ||
         !display2.open("DSperate (Bottom)", vs.scale, vs.fullscreen, vs.linear, vs.vsync, vs.layout, 1, vs.lower_display)) return false;
-    if (display.scaling() != display2.scaling()) { std::fprintf(stderr, "dual-window: mixed display modes\n"); return false; }
+    if (!sync_dual_modes(display, display2)) { std::fprintf(stderr, "dual-window: mixed display modes\n"); return false; }
     // MAIN SCREEN picks the DS screen on the upper panel.
     display.set_only_screen(vs.layout.primary);
     display2.set_only_screen(1 - vs.layout.primary);
@@ -1473,6 +1483,19 @@ sdl_ready:
     }
   }
   if (!open_displays(vs, display, display2)) { SDL_Quit(); return 1; }
+  // Let fullscreen windows take their final size before the ROM loads (see
+  // Display::settle_step); bounded, in case no configure comes.
+  {
+    static const std::vector<u32> blank(ds::SCREEN_W * ds::SCREEN_H, 0xFF000000u);
+    const u32* const bfb[2] = {blank.data(), blank.data()};
+    const Uint32 until = SDL_GetTicks() + 1000;
+    for (;;) {
+      bool done = display.settle_step(bfb);
+      if (dual_window) { done = display2.settle_step(bfb) && done; sync_dual_modes(display, display2); }
+      if (done || SDL_TICKS_PASSED(SDL_GetTicks(), until)) break;
+      SDL_Delay(8);
+    }
+  }
   // Single-screen layout shows one screen (core skips the other's engine);
   // every other layout, and dual-window, shows both.
   auto apply_visibility = [&] {
@@ -1590,6 +1613,7 @@ sdl_ready:
       const bool on_canvas = display.canvas_capable();
       if (!on_canvas) ds::sdl::draw_notice(ds_canvas(menu_fb[menu_screen].data()), title.c_str(), line2, line3);
       ds::sdl::Display::Target target[2] = {};
+      if (dual_window) sync_dual_modes(display, display2);
       bool scaled = display.begin_frame(target);
       if (dual_window) scaled = display2.begin_frame(target) && scaled;
       if (scaled) {
@@ -3260,6 +3284,7 @@ sdl_ready:
         const bool on_canvas = display.canvas_capable();
         if (!on_canvas) menu.draw(ds_canvas(menu_fb[menu_screen].data()));
         ds::sdl::Display::Target target[2] = {};
+        if (dual_window) sync_dual_modes(display, display2);
         bool scaled = display.begin_frame(target);
         if (dual_window) scaled = display2.begin_frame(target) && scaled;
         if (scaled) {
@@ -3421,6 +3446,7 @@ sdl_ready:
     if (present && !pause_pending && !shot_pending) {
       // Scanout tiers block here until a buffer is free (DS_FPS "wait").
       const Uint64 tw = SDL_GetPerformanceCounter();
+      if (dual_window) sync_dual_modes(display, display2);
       scaled = display.begin_frame(target);
       if (dual_window) scaled = display2.begin_frame(target) && scaled;
       wait_ticks += SDL_GetPerformanceCounter() - tw;

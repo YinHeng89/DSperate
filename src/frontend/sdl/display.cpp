@@ -242,6 +242,7 @@ bool Display::open_dmabuf(int rot) {
   if (gpu_wanted_) dm->set_bufs(DmabufOut::DEFAULT_BUFS + 1);
   if (!dm->open(win_, ow, oh, only_screen_ >= 0 ? display_index_ : -1)) return false;
   out_ = std::move(dm);
+  SDL_GetWindowSize(win_, &open_w_, &open_h_);
   if (try_gpu_present()) return true;
   std::fprintf(stderr, "video: dmabuf, %s driver, scanline scaling, rot %d\n", SDL_GetCurrentVideoDriver(), rot_);
   return true;
@@ -344,17 +345,47 @@ bool Display::try_gpu_present() {
   return true;
 }
 
+bool Display::settle_step(const u32* const blank[SCREENS]) {
+  if (!out_ || !fullscreen_) return true;
+  // Target: the output's size. Unknown -> nothing to wait for.
+  SDL_DisplayMode m{};
+  const int di = only_screen_ >= 0 ? display_index_ : SDL_GetWindowDisplayIndex(win_);
+  if (di < 0 || SDL_GetDesktopDisplayMode(di, &m) != 0 || m.w <= 0 || m.h <= 0) return true;
+  SDL_PumpEvents();
+  int w = 0, h = 0;
+  SDL_GetWindowSize(win_, &w, &h);
+  // Commit a frame: the surface maps on its first buffer, and the compositor
+  // sends the fullscreen configure after that. Drawing at the new size is
+  // what makes the buffers follow it.
+  if (gpu_) draw_gpu(blank);
+  else {
+    Target t[SCREENS] = {};
+    if (begin_frame(t)) present();
+  }
+  const bool done = (w == m.w && h == m.h) || (w == m.h && h == m.w);   // a rotated output reports either way
+  if (done && verbose() && (w != open_w_ || h != open_h_)) std::fprintf(stderr, "video: settled at %dx%d (opened %dx%d) at %u ms\n", w, h, open_w_, open_h_, SDL_GetTicks());
+  return done;
+}
+
+bool Display::drop_gpu_present(const char* why) {
+  if (!gpu_) return false;
+  std::fprintf(stderr, "video: GPU present %s; scanline scaling from here\n", why);
+  gpu_.reset();
+  scaled_ = true;
+  margins_dirty_ = true;
+  layout();
+  build_scale();
+  return true;
+}
+
 void Display::draw_gpu(const u32* const fb[SCREENS]) {
   int w = 0, h = 0;
   SDL_GetWindowSize(win_, &w, &h);
   switch (gpu_->fit(win_, w, h)) {
     case FramePresenter::Fit::Lost:
-      std::fprintf(stderr, "video: GPU present lost on resize; scanline scaling from here\n");
-      gpu_.reset();
-      scaled_ = true;
-      margins_dirty_ = true;
-      layout();
-      build_scale();
+      // The sink may be closed now; begin_frame() reopens it or falls back
+      // to the window surface.
+      drop_gpu_present("lost on resize");
       return;   // this frame is dropped; the next takes begin_frame()
     case FramePresenter::Fit::Changed: layout(); break;
     case FramePresenter::Fit::Same: break;

@@ -240,6 +240,11 @@ std::vector<Source> candidates() {
 } // namespace
 
 int alloc(size_t len, const std::function<bool(int fd)>& usable, const char* tag) {
+  // DS_DMABUF_FAIL_AFTER=N: every allocation after the first N fails (tests the
+  // fallbacks for a CMA pool that page cache or another client has used up).
+  static const long fail_after = [] { const char* e = std::getenv("DS_DMABUF_FAIL_AFTER"); return e ? std::atol(e) : -1L; }();
+  static long allocs = 0;
+  if (fail_after >= 0 && allocs++ >= fail_after) { errno = ENOMEM; std::fprintf(stderr, "%s: alloc: %s (DS_DMABUF_FAIL_AFTER)\n", tag, std::strerror(errno)); return -1; }
   if (g_have_pinned) {
     const int fd = alloc_from(g_pinned, len);
     if (fd < 0) { std::fprintf(stderr, "%s: %s: alloc: %s\n", tag, g_chosen.c_str(), std::strerror(errno)); return -1; }
