@@ -2613,7 +2613,7 @@ void Renderer3D::render(const Gpu3D& gx) {
   // Never replaced once big enough: the compositor may still be waiting on it
   // for the previous frame's bands (sync_line). Sized for 3 by default (the
   // usual max); unused workers are never woken (Pool::dispatch).
-  if (!pool_ || pool_->workers() < nb) pool_ = std::make_unique<Pool>(nb > 3 ? nb : 3);
+  if (!pool_ || pool_->workers() < nb) pool_ = std::make_unique<Pool>(thread_layout_on() || nb > 3 ? nb : 3);
 
   last_nb_ = nb;
   nbins_ = bin_count(nb);
@@ -2812,8 +2812,11 @@ bool Renderer3D::steal_bins(u64 gen, u32 upto) {
 // about raster cost (a skybox or a full-screen quad is a full frame of spans).
 u32 Renderer3D::band_count(u32 polygons) {
   if (polygons < 2) return 0;
-  // Three on three+ cores, two on two; a single core draws inline.
+  // Three on three+ cores, two on two; a single core draws inline. The thread
+  // layout pins two, one beside each 2D engine; the emulation thread steals
+  // bins as it reaches them (the fourth core is the aux one).
   const u32 cores = host_cores();
+  if (thread_layout_on() && cores >= 4) return 2;
   return cores >= 3 ? 3 : cores >= 2 ? 2 : 0;
 }
 
