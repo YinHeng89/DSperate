@@ -530,6 +530,27 @@ void directed() {
     // mode guard included).
     {Cpu::ARM9, false, {0xE321F0D2, 0xE1500000, 0x08D07FFF, 0xE321F0DF}, {BUF_BASE, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
     {Cpu::ARM9, false, {0xE321F0D2, 0xE1500000, 0x18D07FFF, 0xE321F0DF}, {BUF_BASE, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
+    // Loads to pc, inline: a literal (ldr pc, [pc, #-4] with the target as the
+    // next word), a post-indexed pop from the stack (push r1 first), and the
+    // conditional pop the IRQ handlers end with, taken and not taken.
+    {Cpu::ARM9, false, {0xE51FF004, HALT_STUB}, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
+    {Cpu::ARM7, false, {0xE51FF004, HALT_STUB}, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
+    {Cpu::ARM9, false, {0xE52D1004, 0xE49DF004}, {0, HALT_STUB, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
+    {Cpu::ARM7, false, {0xE52D1004, 0xE49DF004}, {0, HALT_STUB, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
+    {Cpu::ARM9, false, {0xE52D1004, 0xE3500000, 0x049DF004, 0xE2800001}, {0, HALT_STUB, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
+    {Cpu::ARM9, false, {0xE52D1004, 0xE3500000, 0x049DF004, 0xE2800001}, {1, HALT_STUB, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
+    {Cpu::ARM7, false, {0xE52D1004, 0xE3500000, 0x049DF004, 0xE2800001}, {0, HALT_STUB, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
+    // SWI: the harness vector is itself `ldr pc, [pc, #k]`.
+    {Cpu::ARM9, false, {0xEF000000}, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
+    {Cpu::ARM7, false, {0xEF000000}, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
+    // MRC p15 reads (ARM9): DTCM region, control, main ID, then an ALU op.
+    {Cpu::ARM9, false, {0xEE190F11, 0xEE111F10, 0xEE102F10, 0xE2800001}, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
+    // MOVS pc, lr (register form) from SVC: SPSR = SYS, lr = the halt stub.
+    {Cpu::ARM9, false, {0xE321F0D3, 0xE16FF001, 0xE1A0E002, 0xE1B0F00E}, {0, 0x1F, HALT_STUB, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
+    {Cpu::ARM7, false, {0xE321F0D3, 0xE16FF001, 0xE1A0E002, 0xE1B0F00E}, {0, 0x1F, HALT_STUB, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
+    // SMLALBB / SMLALTT r4 (lo), r5 (hi), r1, r2: a carry out of the low word, and a negative product.
+    {Cpu::ARM9, false, {0xE1454281, 0xE2800001}, {0, 0x7FFF8000u, 0x00028001u, 0, 0xFFFFFFF0u, 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
+    {Cpu::ARM9, false, {0xE14542E1, 0xE2800001}, {0, 0x7FFF8000u, 0x80018001u, 0, 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
   };
   u32 n = 0;
   for (const Directed& d : cases) {

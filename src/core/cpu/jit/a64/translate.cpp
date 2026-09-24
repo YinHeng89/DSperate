@@ -61,6 +61,15 @@ using shape::ldm_user_inline;
 using shape::mcr_is_nop;
 using shape::msr_inline;
 
+// MOVS pc, rm (LSL #0): the register form of the exception return
+// (`movs pc, lr` ends the BIOS SWI handlers), inlined as dp_exc_return is.
+// Local to this backend: block shape does not depend on it.
+bool exc_return_reg(u32 instr) {
+  if ((instr >> 28) != 0xE || arm::decode_arm(instr) != AOp::DpImmShift) return false;
+  if (!(instr & (1u << 20)) || ((instr >> 12) & 0xF) != 15 || ((instr >> 21) & 0xF) != 0xD) return false;
+  return (instr & 0xFF0) == 0 && (instr & 0xF) != 15;
+}
+
 bool arm_needs_fallback(u32 instr, bool a9) {
   const u32 cond = instr >> 28;
   if (cond == 0xF) return !(((instr >> 25) & 7) == 5 && a9) && ((instr >> 24) & 0xF7) != 0x55;   // BLX imm (ARM9) and PLD inline
@@ -70,7 +79,7 @@ bool arm_needs_fallback(u32 instr, bool a9) {
   case AOp::DpImm: case AOp::DpImmShift: case AOp::DpRegShift: {
     const u32 opcode = (instr >> 21) & 0xF;
     const bool test = opcode >= 8 && opcode <= 0xB;
-    if (rd == 15 && !test && shape::dp_exc_return(instr)) return false;
+    if (rd == 15 && !test && (shape::dp_exc_return(instr) || exc_return_reg(instr))) return false;
     return rd == 15 && !test;
   }
   case AOp::Mrs: case AOp::B: case AOp::Bl: case AOp::Bx: case AOp::Pld:
@@ -87,9 +96,14 @@ bool arm_needs_fallback(u32 instr, bool a9) {
   case AOp::SmlaXY: case AOp::SmulXY: case AOp::SmlawY: case AOp::SmulwY:
     return !a9 || rn == 15 || ((instr >> 8) & 0xF) == 15 || (instr & 0xF) == 15 ||
            ((op == AOp::SmlaXY || op == AOp::SmlawY) && rd == 15);
+  case AOp::SmlalXY:   // RdHi bits 19:16, RdLo 15:12; RdHi == RdLo stays interpreted
+    return !a9 || rn == 15 || rd == 15 || rn == rd || ((instr >> 8) & 0xF) == 15 || (instr & 0xF) == 15;
+  case AOp::Mrc:       // ARM9 CP15 reads: a constant or a context field (cp15_read)
+    return !a9 || ((instr >> 8) & 0xF) != 15 || rd == 15;
   case AOp::LdrStrImm: case AOp::LdrStrReg: {
     const bool l = instr & (1u << 20), p = instr & (1u << 24), w = instr & (1u << 21);
-    return (l && rd == 15) || (rn == 15 && (!p || w)) || (op == AOp::LdrStrReg && (instr & 0xF) == 15);
+    const bool b = instr & (1u << 22);
+    return (l && rd == 15 && b) || (rn == 15 && (!p || w)) || (op == AOp::LdrStrReg && (instr & 0xF) == 15);
   }
   case AOp::LdrStrHImm: case AOp::LdrStrHReg: {
     const bool l = instr & (1u << 20), p = instr & (1u << 24), w = instr & (1u << 21);
@@ -148,7 +162,7 @@ FlagUse arm_flag_use(u32 instr, bool a9) {
   case AOp::B: case AOp::Bl: case AOp::Bx: case AOp::BlxReg: case AOp::Clz: case AOp::Pld:
   case AOp::LdrStrImm: case AOp::LdrStrReg: case AOp::LdrStrHImm: case AOp::LdrStrHReg:
   case AOp::Ldm: case AOp::Stm:
-  case AOp::SmlaXY: case AOp::SmulXY: case AOp::SmlawY: case AOp::SmulwY:
+  case AOp::SmlaXY: case AOp::SmulXY: case AOp::SmlawY: case AOp::SmulwY: case AOp::SmlalXY: case AOp::Mrc:
     break;
   case AOp::Mrs: u.reads = F_ALL; break;
   case AOp::Mcr: break;
@@ -847,7 +861,9 @@ private:
   }
   // One access at w1. const_nd >= 0: translate-time data cost, charged before
   // the access (nothing observes the budget in between).
-  void emit_single(Mem m, u32 wdata, u32 dst, bool wb, u32 wb_reg, bool cdi, int const_nd = -1) {
+  // `cold_poll`: the slow path polls and may leave at the next instruction; a
+  // load to r15 passes false and polls in its branch instead.
+  void emit_single(Mem m, u32 wdata, u32 dst, bool wb, u32 wb_reg, bool cdi, int const_nd = -1, bool cold_poll = true) {
     const bool word = is_word(m);
     const bool const_cost = const_nd >= 0;
     if (const_cost) add_pending(const_charge(static_cast<u32>(const_nd)));
@@ -935,12 +951,17 @@ private:
     if (is_load(m)) emit_load_post(m, dst);
     cost();
     charge();
-    call_stub(rt().poll);
-    e().word(make_key(pc_ + step(), thumb_));
+    if (cold_poll) {
+      call_stub(rt().poll);
+      e().word(make_key(pc_ + step(), thumb_));
+    }
     cold_end_jump(join);
   }
 
   void emit_exc_return(u32 instr, u32 opcode, u32 rn);
+  void emit_exc_return_tail();
+  void arm_mrc(u32 instr);
+  void arm_smlal_xy(u32 instr);
   // USR/SYS slot for r`i`, or 0 if the host register is already the user's.
   static u32 user_bank_off(u32 i) { return i == 13 ? OFF_BANK_R13 : i == 14 ? OFF_BANK_R14 : 0; }
 
@@ -1117,6 +1138,12 @@ void Translator::emit_exc_return(u32 instr, u32 opcode, u32 rn) {
   if (opcode == 0xD) e().mov_imm(SCRATCH1, imm);
   else if (opcode == 0x2) e().sub_imm_any(SCRATCH1, host_reg(rn), imm, SCRATCH2);
   else e().add_imm_any(SCRATCH1, host_reg(rn), imm, SCRATCH2);
+  emit_exc_return_tail();
+}
+
+// Target in w1: restore CPSR from SPSR (call_pure carries r8-r12, reloads host
+// flags from the restored CPSR; r13/r14 spilled by hand), then branch.
+void Translator::emit_exc_return_tail() {
   add_pending(numC(pc_));
   flush_pending();
   e().str_w(host_reg(13), R_CTX, off_reg(13));
@@ -1137,6 +1164,7 @@ void Translator::arm_data_processing(u32 instr, AOp op) {
   const bool logical = opcode <= 1 || opcode == 8 || opcode == 9 || opcode >= 0xC;
   if (rd == 15 && !test) {
     if (shape::dp_exc_return(instr)) { emit_exc_return(instr, opcode, rn); return; }
+    if (exc_return_reg(instr)) { e().mov(SCRATCH1, host_reg(instr & 0xF)); emit_exc_return_tail(); return; }
     emit_fallback(instr, true); return;
   }
   if (op == AOp::DpRegShift) add_pending(numC_internal() + 1);
@@ -1282,6 +1310,45 @@ void Translator::arm_dsp_multiply(u32 instr, AOp op) {
   e().mov(host_reg(rd), SCRATCH2);   // last: rd may alias rm/rs/rn
 }
 
+// MRC p15 (ARM9, rd != pc): cp15_read's values, charge_CI(3). Ends the block
+// as before (block_shape); the block links on to the next instruction.
+void Translator::arm_mrc(u32 instr) {
+  const u32 crn = (instr >> 16) & 0xF, rd = (instr >> 12) & 0xF, crm = instr & 0xF, opc2 = (instr >> 5) & 7;
+  add_pending(numC_internal() + 3);
+  const u32 hr = host_reg(rd);
+  auto field = [&](size_t off) { e().ldr_w(hr, R_CTX, static_cast<u32>(off)); };
+  switch ((crn << 8) | (crm << 4) | opc2) {
+  case 0x000: e().mov_imm(hr, 0x41059461); break;   // main ID
+  case 0x001: e().mov_imm(hr, 0x0F0D2112); break;   // cache type
+  case 0x002: e().mov_imm(hr, 0x00140180); break;   // TCM size
+  case 0x100: field(offsetof(CpuContext, cp15_control)); break;
+  case 0x200: field(offsetof(CpuContext, pu_data_cacheable)); break;
+  case 0x201: field(offsetof(CpuContext, pu_code_cacheable)); break;
+  case 0x300: field(offsetof(CpuContext, pu_data_bufferable)); break;
+  case 0x502: field(offsetof(CpuContext, pu_data_perm)); break;
+  case 0x503: field(offsetof(CpuContext, pu_code_perm)); break;
+  case 0x600: case 0x610: case 0x620: case 0x630: case 0x640: case 0x650: case 0x660: case 0x670:
+  case 0x601: case 0x611: case 0x621: case 0x631: case 0x641: case 0x651: case 0x661: case 0x671:
+    field(offsetof(CpuContext, pu_region) + crm * sizeof(u32)); break;
+  case 0x910: field(offsetof(CpuContext, cp15_dtcm)); break;
+  case 0x911: field(offsetof(CpuContext, cp15_itcm)); break;
+  default: e().mov_imm(hr, 0); break;
+  }
+}
+
+// SMLAL<x><y> (ARM9): RdHi:RdLo += half(Rm) * half(Rs), charge_CI(1).
+void Translator::arm_smlal_xy(u32 instr) {
+  const u32 rdhi = (instr >> 16) & 0xF, rdlo = (instr >> 12) & 0xF, rs = (instr >> 8) & 0xF, rm = instr & 0xF;
+  add_pending(numC_internal() + 1);
+  e().sbfx(SCRATCH1, host_reg(rs), (instr & (1u << 6)) ? 16 : 0, 16);
+  e().sbfx(SCRATCH0, host_reg(rm), (instr & (1u << 5)) ? 16 : 0, 16);
+  e().mov(SCRATCH2, host_reg(rdlo));
+  e().bfi(SCRATCH2, host_reg(rdhi), 32, 32, true);
+  e().smaddl(SCRATCH2, SCRATCH0, SCRATCH1, SCRATCH2);
+  e().mov(host_reg(rdlo), SCRATCH2);
+  e().lsr_imm(host_reg(rdhi), SCRATCH2, 32, true);
+}
+
 void Translator::arm_ldr_str(u32 instr, AOp op) {
   const bool l = instr & (1u << 20), b = instr & (1u << 22);
   const bool p = instr & (1u << 24), u = instr & (1u << 23), w = instr & (1u << 21);
@@ -1300,6 +1367,14 @@ void Translator::arm_ldr_str(u32 instr, AOp op) {
       const u32 addr = u ? pc_ + 8 + (instr & 0xFFF) : pc_ + 8 - (instr & 0xFFF);
       note_dep(addr, mem::Timing::RETIME_DATA);
       const_nd = cpu_.timing9[addr >> 12][2];
+    }
+    if (rd == 15) {
+      // Load to pc: the data cost as any load (charge_CDI before the jump), then
+      // an indirect branch that charges the refill and takes a pending IRQ as the
+      // interpreter's next instruction would. ARMv5 interworks on bit 0.
+      emit_single(Mem::Ld32, 0, SCRATCH0, false, 0, true, const_nd, false);
+      emit_branch_indirect(SCRATCH0, a9_, false, true);
+      return;
     }
     emit_single(b ? Mem::Ld8 : Mem::Ld32, 0, host_reg(rd), false, 0, true, const_nd);
   } else {
@@ -1536,6 +1611,8 @@ void Translator::translate_arm(u32 instr) {
   }
   case AOp::Pld: add_pending(numC(pc_)); break;
   case AOp::Mcr: add_pending(numC(pc_) + 2); break;      // ignored cache op: charge_CI(2)
+  case AOp::Mrc: arm_mrc(instr); break;
+  case AOp::SmlalXY: arm_smlal_xy(instr); break;
   case AOp::MsrReg: case AOp::MsrImm: arm_msr(instr, op); break;
   case AOp::SmlaXY: case AOp::SmulXY: case AOp::SmlawY: case AOp::SmulwY:
     arm_dsp_multiply(instr, op);
