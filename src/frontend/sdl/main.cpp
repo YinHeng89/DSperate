@@ -8,6 +8,7 @@
 // key opens a blitted menu over the held frame (menu.h).
 #include "core/cpu/timing_mode.h"
 #include "core/nds.h"
+#include "core/handoff_stats.h"
 #include "core/host_cores.h"
 #include "core/cart/zip.h"
 #include "core/cart/zip_cache.h"
@@ -3927,6 +3928,7 @@ sdl_ready:
                    static_cast<unsigned long long>(ps.jobs), static_cast<double>(ps.job_ns) / 1e6 / static_cast<double>(ps.jobs),
                    static_cast<double>(ps.job_max_ns) / 1e6, static_cast<unsigned long long>(ps.waits),
                    static_cast<double>(ps.wait_ns) / 1e6, static_cast<unsigned long long>(ps.long_waits));
+    ds::handoff::report(stderr);
   }
   log.close();
   ds::prof::report();

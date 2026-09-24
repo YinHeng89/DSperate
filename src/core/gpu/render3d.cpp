@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // DSperate - Nintendo DS emulator. Copyright (C) 2026 DSperate contributors.
 #include "core/gpu/render3d.h"
+#include "core/handoff_stats.h"
 #include "core/div64.h"
 #include "core/state/state.h"
 
@@ -233,6 +234,7 @@ struct Renderer3D::Pool {
       // next_bin_ reset must precede the generation bump, or a worker waking
       // on the new generation could see the old exhausted counter.
       next_bin_.store(0, std::memory_order_relaxed);
+      if (handoff::enabled) disp_ns_ = handoff::now_ns();
       gen = generation_.fetch_add(1, std::memory_order_acq_rel) + 1;
     }
     for (u32 i = 0; i < jobs; ++i) start_[i].notify_one();
@@ -245,6 +247,7 @@ struct Renderer3D::Pool {
   u32 bins() const { return nbins_; }
 
   void mark_done(u32 bin) {
+    if (handoff::enabled) bin_done_ns_[bin].store(handoff::now_ns(), std::memory_order_relaxed);
     { std::lock_guard<std::mutex> lk(m_); done_bits_.fetch_or(u64{1} << bin, std::memory_order_release); }
     done_.notify_all();
   }
@@ -258,10 +261,20 @@ struct Renderer3D::Pool {
     if (!mask) return;
     if (generation_.load(std::memory_order_acquire) != gen) return;
     if ((done_bits_.load(std::memory_order_acquire) & mask) == mask) return;
-    std::unique_lock<std::mutex> lk(m_);
-    done_.wait(lk, [this, gen, mask] {
-      return generation_.load(std::memory_order_relaxed) != gen || (done_bits_.load(std::memory_order_relaxed) & mask) == mask;
-    });
+    const u64 t0 = handoff::enabled ? handoff::now_ns() : 0;
+    {
+      std::unique_lock<std::mutex> lk(m_);
+      done_.wait(lk, [this, gen, mask] {
+        return generation_.load(std::memory_order_relaxed) != gen || (done_bits_.load(std::memory_order_relaxed) & mask) == mask;
+      });
+    }
+    if (handoff::enabled) {
+      const u64 t1 = handoff::now_ns();
+      handoff::stats().wait[handoff::Band].add(t1 - t0);
+      u64 done = 0;
+      for (u64 m = mask; m; m &= m - 1) done = std::max(done, bin_done_ns_[__builtin_ctzll(m)].load(std::memory_order_relaxed));
+      if (done > t0 && done <= t1) handoff::stats().back[handoff::Band].add(t1 - done);
+    }
   }
 
   // Every worker has returned from the job, not merely finished its bins:
@@ -271,9 +284,15 @@ struct Renderer3D::Pool {
   u64 wait_idle() {
     if (remaining_.load(std::memory_order_acquire) == 0 && thieves_.load(std::memory_order_acquire) == 0) return 0;
     const auto t0 = std::chrono::steady_clock::now();
+    const u64 h0 = handoff::enabled ? handoff::now_ns() : 0;
     {
       std::unique_lock<std::mutex> lk(m_);
       done_.wait(lk, [this] { return remaining_.load(std::memory_order_relaxed) == 0 && thieves_.load(std::memory_order_relaxed) == 0; });
+    }
+    if (handoff::enabled) {
+      const u64 t1 = handoff::now_ns(), done = idle_ns_.load(std::memory_order_relaxed);
+      handoff::stats().wait[handoff::Band].add(t1 - h0);
+      if (done > h0 && done <= t1) handoff::stats().back[handoff::Band].add(t1 - done);
     }
     return static_cast<u64>((std::chrono::steady_clock::now() - t0).count());
   }
@@ -288,6 +307,7 @@ struct Renderer3D::Pool {
     return b;
   }
   void thief_done(u32 bin) {
+    if (handoff::enabled) { const u64 t = handoff::now_ns(); bin_done_ns_[bin].store(t, std::memory_order_relaxed); idle_ns_.store(t, std::memory_order_relaxed); }
     { std::lock_guard<std::mutex> lk(m_); done_bits_.fetch_or(u64{1} << bin, std::memory_order_release); thieves_.fetch_sub(1, std::memory_order_acq_rel); }
     done_.notify_all();
   }
@@ -311,8 +331,10 @@ private:
       if (stop_) return;
       seen = generation_.load(std::memory_order_relaxed);
       const std::function<void(u32)>* fn = job_;
+      if (handoff::enabled) handoff::stats().wake_parked[handoff::Band].add(handoff::now_ns() - disp_ns_);
       lk.unlock();
       if (fn) (*fn)(index);
+      if (handoff::enabled) idle_ns_.store(handoff::now_ns(), std::memory_order_relaxed);
       lk.lock();
       remaining_.fetch_sub(1, std::memory_order_release);
       done_.notify_all();
@@ -333,6 +355,10 @@ public:
   std::atomic<u64> done_bits_{0};
   std::atomic<u32> next_bin_{0};
   std::atomic<u32> thieves_{0};      // bins claimed by waiting threads and not yet done
+  // DS_HANDOFF_STATS: last dispatch (under m_), each bin's and the last job's end.
+  u64 disp_ns_ = 0;
+  std::atomic<u64> bin_done_ns_[64]{};
+  std::atomic<u64> idle_ns_{0};
   std::atomic<u32> remaining_{0};
   u32 jobs_ = 0, nbins_ = 0;
   bool stop_ = false;

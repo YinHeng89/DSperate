@@ -7,6 +7,7 @@ add_library(dsperate_core STATIC
   bios/freebios_data.cpp
   bios/firmware_gen.cpp
   profile.cpp
+  handoff_stats.cpp
   host_cores.cpp
   pc_sampler.cpp
   mem/page_table.cpp
