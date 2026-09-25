@@ -85,7 +85,7 @@ const char* const count_names[] = {"3d polygon lines", "3d span pixels", "3d res
   "3d polygon-chunk entries",
   "3d spans empty (no pixels)", "3d spans fully occluded by depth", "3d spans that draw",
   "gx reg reads", "gx reads of GXSTAT", "gx GXSTAT reads while busy (bit27)",
-  "3d drawn spans: plain", "3d drawn pixels: plain", "3d drawn spans: toon/highlight", "3d drawn pixels: toon/highlight", "3d drawn spans: shadow (scalar)", "3d drawn pixels: shadow (scalar)", "3d drawn spans: wireframe (scalar)", "3d drawn pixels: wireframe (scalar)",
+  "3d drawn spans: plain", "3d drawn pixels: plain", "3d drawn spans: toon/highlight", "3d drawn pixels: toon/highlight", "3d drawn spans: shadow", "3d drawn pixels: shadow", "3d drawn spans: wireframe (scalar)", "3d drawn pixels: wireframe (scalar)",
   "2d compares: bg ext palette (512B)", "2d compares: obj ext palette (512B)",
   "2d compares that differed: bg ext palette", "2d compares that differed: obj ext palette",
   "dma transfers started", "dma dispatch loop entries (a run or one unit)",

@@ -1071,7 +1071,7 @@ void Renderer3D::setup_shade(Shade& sh, const Polygon& p) {
   if (cached && texels_in_) sh.texels = setup_poly_ < texels_in_->size() ? (*texels_in_)[setup_poly_] : nullptr;
 #if DSPERATE_NEON
   sh.gather4 = select_gather4(sh);
-  sh.vec = !sh.shadow && !sh.wireframe;   // toon / highlight (blendmode 2) are vector stages in flush_batch
+  sh.vec = !sh.wireframe;   // toon / highlight (blendmode 2) are vector stages in flush_batch; shadows via their pre-pass
 #else
   sh.gather4 = nullptr;
   sh.vec = false;
@@ -1484,12 +1484,18 @@ template <int mode, bool textured, bool aa, bool opq>
   const uint8x8_t pa1 = vdup_n_u8(static_cast<u8>((polyattr >> 8) & 0xE0));
   const uint8x8_t pa2 = vdup_n_u8(static_cast<u8>((polyattr >> 24) | 0x40));
   const uint8x8_t pa2id = vand_u8(pa2, vdup_n_u8(0x7F));
+  const uint8x8_t pa3id = vdup_n_u8(static_cast<u8>((polyattr >> 24) & 0x3F)), v40_8 = vdup_n_u8(0x40);
   const uint8x8_t v7f8 = vdup_n_u8(0x7F), v0f8 = vdup_n_u8(0x0F), v1f8 = vdup_n_u8(0x1F), v3f8 = vdup_n_u8(0x3F);
   const uint8x8_t one8 = vdup_n_u8(1), v32_8 = vdup_n_u8(32), zero8 = vdup_n_u8(0);
   auto plot8 = [&](u32 base, const uint32x4_t* m, const uint8x8x4_t& src, const int32x4_t* z) __attribute__((always_inline)) {
     const uint8x8x4_t da = vld4_u8(ab + base * 4), dc = vld4_u8(cb + base * 4);
     uint8x8_t m8 = vmovn_u16(vcombine_u16(vmovn_u32(m[0]), vmovn_u32(m[1])));
-    m8 = vbic_u8(m8, vceq_u8(vand_u8(da.val[2], v7f8), pa2id));   // equal translucent ids don't blend
+    if (sh.shadow) {
+      // Shadows skip pixels of their own polygon id, translucent (byte 2 id) or opaque (byte 3 id).
+      const uint8x8_t same_t = vceq_u8(vand_u8(da.val[2], v7f8), pa2id);
+      const uint8x8_t same_o = vceq_u8(vand_u8(da.val[3], v3f8), pa3id);
+      m8 = vbic_u8(m8, vbsl_u8(vtst_u8(da.val[2], v40_8), same_t, same_o));
+    } else m8 = vbic_u8(m8, vceq_u8(vand_u8(da.val[2], v7f8), pa2id));   // equal translucent ids don't blend
     const uint8x8_t sa = src.val[3], dsta = dc.val[3];
     uint8x8_t r = src.val[0], g = src.val[1], b = src.val[2];
     if (blend_on) {
@@ -1580,7 +1586,10 @@ template <int mode, bool textured, bool aa, bool opq>
           // bit 0 per lane: opaque, bit 1: translucent, bit 2: translucent with a pixel underneath;
           // bits 3 and 4: the same opaque / translucent, landing on the pixel underneath.
           // The under layer is dead without AA (dispcnt_), so bit 2 is off there.
-          if constexpr (aa) mb[k] = vandq_u32(mt1[k], vtstq_u32(dstattr[k], vdupq_n_u32(0xF)));
+          if constexpr (aa) {
+            mb[k] = vandq_u32(mt1[k], vtstq_u32(dstattr[k], vdupq_n_u32(0xF)));
+            if (sh.shadow) mb[k] = vandq_u32(mb[k], vtstq_u32(pv[k], vdupq_n_u32(4)));   // no shadow under anti-aliased edges (stencil bit 1)
+          }
           kv[k] = vorrq_u32(vorrq_u32(vandq_u32(mo1[k], vdupq_n_u32(1)), vandq_u32(mt1[k], vdupq_n_u32(2))), vandq_u32(mb[k], vdupq_n_u32(4)));
           if constexpr (two) kv[k] = vorrq_u32(kv[k], vorrq_u32(vandq_u32(mo2[k], vdupq_n_u32(8)), vandq_u32(mt2[k], vdupq_n_u32(16))));
         }
@@ -1653,7 +1662,8 @@ template <int mode, bool textured, bool aa, bool opq>
           ok = vbslq_u32(back, vcleq_s32(z[k], dz), vcltq_s32(z[k], dz));
         } else if constexpr (mode == 2) ok = vcleq_u32(vreinterpretq_u32_s32(vaddq_s32(vsubq_s32(dz, z[k]), vdupq_n_s32(0x200))), vdupq_n_u32(0x400));
         else ok = vcleq_u32(vreinterpretq_u32_s32(vaddq_s32(vsubq_s32(dz, z[k]), vdupq_n_s32(0xFF))), vdupq_n_u32(0x1FE));
-        m2[k] = vandq_u32(vtstq_u32(pv[k], vdupq_n_u32(2)), ok);
+        m2[k] = vtstq_u32(pv[k], vdupq_n_u32(2));
+        if (!sh.shadow) m2[k] = vandq_u32(m2[k], ok);   // shadows: the pre-pass tested it, partly with the top's attributes
       }
       group(std::true_type{}, m2);
     } else {
@@ -1943,15 +1953,19 @@ void Renderer3D::stage_line(Edge& e, s32 y, const LineSpan& ls) {
 #else
     span_stage(sb, ls.xstart, ls.xend, xa, xb, ls.wl, ls.wr, ls.zl, ls.zr, p.wbuffer, nullptr, nullptr, false, off);
 #endif
+    const u32 row = row_of(y) + 1 + xa;
+    const u32 under_off = (sh.dispcnt & (1u << 4)) ? RSIZE : 0;
+    u32 r;
     if (sh.shadow) {
-      // Shadow polygons test against whichever pixel their stencil names; no pre-pass.
-      std::memset(sb.pass + off, 1, static_cast<size_t>(xb - xa)); cb = xb;
+      // Shadow polygons test against whichever pixel their stencil names. The
+      // stencil row is stable from here to the flush: masks flush the batch
+      // before drawing, and the ring holds a whole chunk.
+      const u8* stencil = &stencil_[256 * static_cast<u32>((y + 1) & (RING - 1)) + static_cast<u32>(xa)];
+      r = kern::active::depth_candidates_shadow(mode, sb.z + off, &depth_[row], &attr_[row], stencil, static_cast<u32>(xb - xa), sb.pass + off, under_off);
     } else {
-      const u32 row = row_of(y) + 1 + xa;
-      const u32 r = kern::active::depth_candidates(mode, sb.z + off, &depth_[row], &attr_[row],
-                                                   static_cast<u32>(xb - xa), sb.pass + off, (sh.dispcnt & (1u << 4)) ? RSIZE : 0);
-      if (r) { ca = xa + static_cast<s32>(r >> 16); cb = xa + static_cast<s32>(r & 0xFFFF); }
+      r = kern::active::depth_candidates(mode, sb.z + off, &depth_[row], &attr_[row], static_cast<u32>(xb - xa), sb.pass + off, under_off);
     }
+    if (r) { ca = xa + static_cast<s32>(r >> 16); cb = xa + static_cast<s32>(r & 0xFFFF); }
   }
   if (pe) prof::add(cb > ca ? prof::C_SPAN_DRAWN : (xb > xa ? prof::C_SPAN_OCCLUDED : prof::C_SPAN_EMPTY), 1);
   if (cb <= ca) return;

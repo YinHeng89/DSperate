@@ -543,4 +543,30 @@ u32 depth_candidates(int mode, const s32* z, const u32* dstz, const u32* dstattr
   return first < n ? (first << 16) | (last + 1) : 0;
 }
 
+u32 depth_candidates_shadow(int mode, const s32* z, const u32* dstz, const u32* dstattr, const u8* stencil, u32 n, u8* pass, u32 under_off) {
+  u32 first = n, last = 0;
+  auto test = [mode](s32 zi, u32 dz, u32 da) {
+    const s32 d = static_cast<s32>(dz);
+    switch (mode) {
+    case 0: return zi < d;
+    case 1: return (da & 0x00400010) == 0x00000010 ? zi <= d : zi < d;
+    case 2: return static_cast<u32>((d - zi) + 0x200) <= 0x400;
+    default: return static_cast<u32>((d - zi) + 0xFF) <= 0x1FE;
+    }
+  };
+  for (u32 i = 0; i < n; ++i) {
+    const u8 st = stencil[i];
+    u8 v = 0;
+    if (st & 1) {
+      if (test(z[i], dstz[i], dstattr[i])) v = (st & 2) ? 5 : 1;
+      else if ((st & 2) && under_off && (dstattr[i] & 0xF) && test(z[i], dstz[i + under_off], dstattr[i + under_off])) v = 2;
+    } else if (st & 2) {
+      if (under_off && test(z[i], dstz[i + under_off], dstattr[i])) v = 2;
+    }
+    pass[i] = v;
+    if (v) { if (i < first) first = i; last = i; }
+  }
+  return first < n ? (first << 16) | (last + 1) : 0;
+}
+
 } // namespace ds::gpu::kern::ref

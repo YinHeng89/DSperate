@@ -560,6 +560,13 @@ static void test_depth_candidates() {
     if (ra != rb) { std::fprintf(stderr, "FAIL depth_candidates range %08x vs %08x (iteration %u)\n", ra, rb, it); ++failures; }
     CHECK_SAME("depth pass", pa, pb, n);
     if (!under) for (u32 i = 0; i < n; ++i) if (pa[i] & 2) { std::fprintf(stderr, "FAIL depth_candidates names the under layer without AA (iteration %u)\n", it); ++failures; break; }
+    // Shadow variant: a random stencil, both layers.
+    alignas(16) u8 st[264];
+    for (u32 i = 0; i < 264; ++i) st[i] = static_cast<u8>(rng() & 3);
+    std::memset(pa, 0xAA, sizeof pa); std::memset(pb, 0xAA, sizeof pb);
+    const u32 sa = kern::ref::depth_candidates_shadow(mode, z, dz, da, st, n, pa, uo), sb = N::depth_candidates_shadow(mode, z, dz, da, st, n, pb, uo);
+    if (sa != sb) { std::fprintf(stderr, "FAIL depth_candidates_shadow range %08x vs %08x (iteration %u)\n", sa, sb, it); ++failures; }
+    CHECK_SAME("shadow depth pass", pa, pb, n);
   }
 }
 

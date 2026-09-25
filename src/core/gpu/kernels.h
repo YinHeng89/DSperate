@@ -133,7 +133,14 @@ inline Pixel resolve_one(const Pixel* tab, u16 c) {
      pixel carries edge flags and the same test passes against the pixel underneath (dstz/dstattr +          \
      under_off; only when under_off is non-zero), else 0. Returns (first<<16)|(last+1) of non-zero entries,   \
      0 if none. n may round up to a multiple of 4. */                                                         \
-  u32  NS##depth_candidates(int mode, const s32* z, const u32* dstz, const u32* dstattr, u32 n, u8* pass, u32 under_off);
+  u32  NS##depth_candidates(int mode, const s32* z, const u32* dstz, const u32* dstattr, u32 n, u8* pass, u32 under_off); \
+  /* The same for a shadow polygon, steered by the stencil the shadow mask left: bit 0 names the top pixel,   \
+     bit 1 the one underneath. pass[i] = 1 (| 4 when bit 1 is set: the top plot may also reach the layer     \
+     under) where bit 0 is set and z passes the top; 2 where the pixel underneath takes it instead: bit 0     \
+     unset (tested with the TOP pixel's attributes, as the hardware does), or bit 0 set, the top failed, bit  \
+     1 set and the top carries edge flags (tested with its own attributes). The under layer only exists       \
+     with under_off. */                                                                                       \
+  u32  NS##depth_candidates_shadow(int mode, const s32* z, const u32* dstz, const u32* dstattr, const u8* stencil, u32 n, u8* pass, u32 under_off);
 
 namespace ref { DS_KERNEL_LIST() }
 #if DSPERATE_NEON
