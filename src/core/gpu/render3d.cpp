@@ -1686,8 +1686,9 @@ template <int mode, bool textured, int aa, bool opq>
             uint32x4_t pm = mo1[k], at = attr[k];
             if constexpr (aa == 2) {
               // Enhanced: an edge over the same edge of its surface doesn't
-              // push it under; the larger coverage stands (see resolve_span).
-              if (attr_base & 0x3) {
+              // push it under; the larger coverage stands (see resolve_span,
+              // which leaves shadow polygons out of it).
+              if ((attr_base & 0x3) && !sh.shadow) {
                 const uint32x4_t same = vandq_u32(mo1[k], same_edge_v(dstattr[k], dstcol, dstz, z[k]));
                 pm = vbicq_u32(mo1[k], same);
                 at = vbslq_u32(same, with_cov(attr[k], vmaxq_u32(cov_of(dstattr[k]), cov_of(attr[k]))), attr[k]);
@@ -2467,6 +2468,98 @@ void Renderer3D::final_pass_debug(s32 y) {
 
 // The scalar passes: the specification the NEON final_pass is checked against
 // (selftest_final_pass), and the whole of final_pass on non-NEON builds.
+// Enhanced AA (video.aa = enhanced, no layer underneath): each edge pixel
+// blends with the neighbour on its outside, which stands in for the pixel
+// the hardware keeps underneath. The partner is that neighbour's colour as
+// the raster left it, before this frame's final pass touched it (fog, edge
+// marking and blends of already finished lines would otherwise leak in:
+// a band's first line saw its overlap line unfogged, a line of unfogged
+// pixels at every band boundary in fog), fogged by its own depth when fog
+// is on and its fog bit is set, as the hardware fogs the pixel underneath.
+// The axis is attr bit 13 (see precompute_lines); across it, the neighbour
+// whose polygon id differs from this pixel's, or the farther one when both
+// match; none when its translucent state differs (a haze quad's boundary).
+// One scalar body for both final passes, so NEON and portable agree.
+void Renderer3D::save_raw_row(s32 y) {
+  std::memcpy(raw_rows_[y & 3], &color_[row_of(y)], W * sizeof(u32));
+  raw_prev_ok_ = raw_line_ == y - 1;
+  raw_line_ = y;
+}
+void Renderer3D::enhanced_aa_line(s32 y) {
+  const u32 rb = row_of(y), row = rb + 1;
+  const u32 ub = row_of(y - 1), db = row_of(y + 1);
+  const u32* raw_y = raw_rows_[y & 3];
+  // The line above: saved by its own pass on this instance, else still raw
+  // in the ring (a band's overlap line); the line below is raw in the ring.
+  const u32* raw_up = raw_prev_ok_ ? raw_rows_[(y - 1) & 3] : &color_[ub];
+  const u32* raw_dn = &color_[db];
+  const bool fog = dispcnt_ & (1 << 7), fogcolor = !(dispcnt_ & (1 << 6));
+  u32 fr = 0, fg = 0, fb = 0, fa = 0;
+  if (fog) { rgb15_to_666(static_cast<u16>(rs_->fog_color), fr, fg, fb); fa = (rs_->fog_color >> 16) & 0x1F; }
+  auto partner = [&](u32 n, const u32* raw, u32 base) -> u32 {
+    u32 c = raw[n - base];
+    if (!fog || !(attr_[n] & (1 << 15))) return c;
+    const u32 d = fog_density(n);
+    u32 r = c & 0x3F, g = (c >> 8) & 0x3F, b = (c >> 16) & 0x3F, a = (c >> 24) & 0x1F;
+    if (fogcolor) { r = ((fr * d) + (r * (128 - d))) >> 7; g = ((fg * d) + (g * (128 - d))) >> 7; b = ((fb * d) + (b * (128 - d))) >> 7; }
+    a = ((fa * d) + (a * (128 - d))) >> 7;
+    return r | (g << 8) | (b << 16) | (a << 24);
+  };
+  // The pixel underneath is behind this one, so only a neighbour that is
+  // not nearer can stand in for it: of another polygon id, not nearer; of
+  // the same id (GS:DD draws whole landscapes as id 0), clearly farther than
+  // this surface. None -> no blend, rather than pulling a nearer polygon's
+  // colour into the pixel. Two -> the nearer of them (the hardware keeps the
+  // nearest thing behind), an id change first.
+  auto outside = [&](u32 attr, u32 z, u32 a, u32 b) -> u32 {
+    auto candidate = [&](u32 n) -> int {   // 0: no, 1: same id but clearly behind, 2: another id, not nearer
+      const u32 nz = depth_[n];
+      if ((attr_[n] >> 24) != (attr >> 24)) return nz >= z ? 2 : 0;
+      return nz > z && !same_surface(static_cast<s32>(z), static_cast<s32>(nz)) ? 1 : 0;
+    };
+    const int ca = candidate(a), cb = candidate(b);
+    u32 n;
+    if (ca != cb) n = ca > cb ? a : b;
+    else if (!ca) return 0;
+    else n = depth_[a] <= depth_[b] ? a : b;
+    return ((attr_[n] ^ attr) & (1u << 22)) ? 0 : n;
+  };
+  for (int x = 0; x < 256; ++x) {
+    if (!(x & 7)) {   // skip eight pixels without edge flags at once
+      u64 f0, f1; std::memcpy(&f0, &attr_[row + x], 8); std::memcpy(&f1, &attr_[row + x + 2], 8);
+      u64 f2, f3; std::memcpy(&f2, &attr_[row + x + 4], 8); std::memcpy(&f3, &attr_[row + x + 6], 8);
+      if (!((f0 | f1 | f2 | f3) & 0x0000000F0000000Full)) { x += 7; continue; }
+    }
+    const u32 addr = row + x;
+    const u32 attr = attr_[addr];
+    if (!(attr & 0xF)) continue;
+    u32 cov = (attr >> 8) & 0x1F;
+    if (cov == 0x1F) continue;
+    u32 bot;
+    if (attr & 0x2000) {
+      const u32 n = outside(attr, depth_[addr], ub + 1 + x, db + 1 + x);
+      if (!n) continue;
+      bot = n == ub + 1 + x ? partner(n, raw_up, ub) : partner(n, raw_dn, db);
+    } else {
+      const u32 n = outside(attr, depth_[addr], addr - 1, addr + 1);
+      if (!n) continue;
+      bot = partner(n, raw_y, rb);
+    }
+    if (cov == 0) { color_[addr] = bot; continue; }
+    const u32 top = color_[addr];
+    u32 tr = top & 0x3F, tg = (top >> 8) & 0x3F, tb = (top >> 16) & 0x3F, ta = (top >> 24) & 0x1F;
+    const u32 br = bot & 0x3F, bg = (bot >> 8) & 0x3F, bb = (bot >> 16) & 0x3F, ba = (bot >> 24) & 0x1F;
+    ++cov;
+    if (ba > 0) {
+      tr = ((tr * cov) + (br * (32 - cov))) >> 5;
+      tg = ((tg * cov) + (bg * (32 - cov))) >> 5;
+      tb = ((tb * cov) + (bb * (32 - cov))) >> 5;
+    }
+    ta = ((ta * cov) + (ba * (32 - cov))) >> 5;
+    color_[addr] = tr | (tg << 8) | (tb << 16) | (ta << 24);
+  }
+}
+
 void Renderer3D::final_pass_ref(s32 y) {
   const u32 dispcnt = dispcnt_;
   // Edge marking and anti-aliasing act on polygon pixels (edge flags); fog
@@ -2477,6 +2570,7 @@ void Renderer3D::final_pass_ref(s32 y) {
     const bool clear_fog = (rs_->dispcnt & (1 << 14)) || (rs_->clear_attr1 & 0x8000);
     work = (dispcnt & (1 << 7)) && clear_fog;
   }
+  if (game_aa_ && !under_layer_) save_raw_row(y);   // enhanced AA: the line before this pass touches it
   if (!work) { std::memcpy(&out_dst_[y * 256], &color_[row_of(y) + 1], 256 * sizeof(u32)); return; }
   if (dispcnt & (1 << 5)) {
     // Edge marking on the topmost pixels, against the four neighbours.
@@ -2523,45 +2617,28 @@ void Renderer3D::final_pass_ref(s32 y) {
     }
   }
   if (game_aa_) {
-    // Anti-aliasing: blend edge pixels with the pixel underneath by coverage.
-    // Enhanced keeps no layer underneath and blends with the neighbour on the
-    // edge's outside instead: across the run's axis (attr bit 13, see
-    // precompute_lines), the neighbour that is not this polygon, or the
-    // farther one when both are. On a silhouette that is the surface the DS
-    // would have had underneath.
-    const u32 up = row_of(y - 1) + 1, dn = row_of(y + 1) + 1;
-    // Neighbours along the row come from a copy taken before any blend, so
-    // the result does not depend on the order pixels are visited in (the
-    // vector kernel reads the same copy).
-    u32 pre[W];
-    if (!under_layer_) std::memcpy(pre, &color_[row_of(y)], sizeof pre);
-    auto outside = [&](u32 attr, u32 a, u32 b) -> u32 {
-      const bool same_a = (attr_[a] >> 24) == (attr >> 24), same_b = (attr_[b] >> 24) == (attr >> 24);
-      if (same_a != same_b) return same_a ? b : a;
-      return depth_[a] >= depth_[b] ? a : b;
-    };
-    for (int x = 0; x < 256; ++x) {
-      const u32 addr = row_of(y) + 1 + x;
-      const u32 attr = attr_[addr];
-      if (!(attr & 0xF)) continue;
-      u32 cov = (attr >> 8) & 0x1F;
-      if (cov == 0x1F) continue;
-      u32 bot;
-      if (under_layer_) bot = color_[addr + RSIZE];
-      else if (attr & 0x2000) bot = color_[outside(attr, up + x, dn + x)];
-      else { const u32 n = outside(attr, addr - 1, addr + 1); bot = pre[n - row_of(y)]; }
-      if (cov == 0) { color_[addr] = bot; continue; }
-      const u32 top = color_[addr];
-      u32 tr = top & 0x3F, tg = (top >> 8) & 0x3F, tb = (top >> 16) & 0x3F, ta = (top >> 24) & 0x1F;
-      const u32 br = bot & 0x3F, bg = (bot >> 8) & 0x3F, bb = (bot >> 16) & 0x3F, ba = (bot >> 24) & 0x1F;
-      ++cov;
-      if (ba > 0) {
-        tr = ((tr * cov) + (br * (32 - cov))) >> 5;
-        tg = ((tg * cov) + (bg * (32 - cov))) >> 5;
-        tb = ((tb * cov) + (bb * (32 - cov))) >> 5;
+    if (!under_layer_) enhanced_aa_line(y);
+    else {
+      // Anti-aliasing: blend edge pixels with the pixel underneath by coverage.
+      for (int x = 0; x < 256; ++x) {
+        const u32 addr = row_of(y) + 1 + x;
+        const u32 attr = attr_[addr];
+        if (!(attr & 0xF)) continue;
+        u32 cov = (attr >> 8) & 0x1F;
+        if (cov == 0x1F) continue;
+        if (cov == 0) { color_[addr] = color_[addr + RSIZE]; continue; }
+        const u32 top = color_[addr], bot = color_[addr + RSIZE];
+        u32 tr = top & 0x3F, tg = (top >> 8) & 0x3F, tb = (top >> 16) & 0x3F, ta = (top >> 24) & 0x1F;
+        const u32 br = bot & 0x3F, bg = (bot >> 8) & 0x3F, bb = (bot >> 16) & 0x3F, ba = (bot >> 24) & 0x1F;
+        ++cov;
+        if (ba > 0) {
+          tr = ((tr * cov) + (br * (32 - cov))) >> 5;
+          tg = ((tg * cov) + (bg * (32 - cov))) >> 5;
+          tb = ((tb * cov) + (bb * (32 - cov))) >> 5;
+        }
+        ta = ((ta * cov) + (ba * (32 - cov))) >> 5;
+        color_[addr] = tr | (tg << 8) | (tb << 16) | (ta << 24);
       }
-      ta = ((ta * cov) + (ba * (32 - cov))) >> 5;
-      color_[addr] = tr | (tg << 8) | (tb << 16) | (ta << 24);
     }
   }
   std::memcpy(&out_dst_[y * 256], &color_[row_of(y) + 1], 256 * sizeof(u32));
@@ -2579,6 +2656,7 @@ void Renderer3D::final_pass(s32 y) {
     const bool clear_fog = (rs_->dispcnt & (1 << 14)) || (rs_->clear_attr1 & 0x8000);
     work = (dispcnt & (1 << 7)) && clear_fog;
   }
+  if (game_aa_ && !under_layer_) save_raw_row(y);   // enhanced AA: the line before this pass touches it
   if (!work) { std::memcpy(&out_dst_[y * 256], &color_[row_of(y) + 1], 256 * sizeof(u32)); return; }
   // Three passes as 16-pixel byte-plane kernels (ld4/st4), matching the
   // scalar loops below bit for bit.
@@ -2698,7 +2776,8 @@ void Renderer3D::final_pass(s32 y) {
       if (compat::maxv_u8(ufog)) apply16(under, ufog);
     }
   }
-  if (game_aa_) {
+  if (game_aa_ && !under_layer_) enhanced_aa_line(y);   // enhanced: scalar, shared with final_pass_ref
+  else if (game_aa_) {
     // Anti-aliasing: blend edge pixels with the pixel underneath by coverage.
     // Coverage 31 keeps the top pixel, 0 takes the one underneath whole;
     // otherwise (cov + 1) / 32 of the top over the rest of the bottom, the
@@ -2709,43 +2788,13 @@ void Renderer3D::final_pass(s32 y) {
       const uint16x8_t hi = vmlal_u8(vmull_u8(vget_high_u8(t), vget_high_u8(c1)), vget_high_u8(b), vget_high_u8(c2));
       return vcombine_u8(vshrn_n_u16(lo, 5), vshrn_n_u16(hi, 5));
     };
-    const u32 up = row_of(y - 1) + 1, dn = row_of(y + 1) + 1;
-    // Row neighbours from a pre-blend copy (see final_pass_ref).
-    alignas(16) u32 pre[W];
-    if (!under_layer_) std::memcpy(pre, &color_[row_of(y)], sizeof pre);
-    const u8* const pb = reinterpret_cast<const u8*>(pre);
     for (u32 x = 0; x < 256; x += 16) {
       const u32 addr = base + x;
       const uint8x16x4_t at = vld4q_u8(ab + addr * 4);
       const uint8x16_t cov = vandq_u8(at.val[1], a5);
       const uint8x16_t m = vbicq_u8(vtstq_u8(at.val[0], vdupq_n_u8(0xF)), vceqq_u8(cov, v31));
       if (compat::maxv_u8(m) == 0) continue;
-      const uint8x16x4_t top = vld4q_u8(cb + addr * 4);
-      uint8x16x4_t bot;
-      if (under_layer_) bot = vld4q_u8(cb + (addr + RSIZE) * 4);
-      else {
-        // Enhanced: the neighbour on the edge's outside, per lane. The axis
-        // is attr bit 13 (byte 1 bit 5); across it, the neighbour whose
-        // polygon id differs from this pixel's, or the farther one when both
-        // match (see final_pass_ref).
-        const uint8x16_t vert = vtstq_u8(at.val[1], vdupq_n_u8(0x20));
-        const u32 a0 = addr - 1, b0 = addr + 1, a1 = up + x, b1 = dn + x;
-        auto ge_depth = [&](u32 a, u32 b) -> uint8x16_t {   // depth[a] >= depth[b] as a byte mask
-          uint16x4_t m16[4];
-          for (u32 k = 0; k < 4; ++k) m16[k] = vmovn_u32(vcgeq_u32(vld1q_u32(&depth_[a + k * 4]), vld1q_u32(&depth_[b + k * 4])));
-          return vcombine_u8(vmovn_u16(vcombine_u16(m16[0], m16[1])), vmovn_u16(vcombine_u16(m16[2], m16[3])));
-        };
-        auto pick = [&](u32 a, u32 b) -> uint8x16_t {   // lanes taking a (else b)
-          const uint8x16_t id = at.val[3];
-          const uint8x16_t same_a = vceqq_u8(vld4q_u8(ab + a * 4).val[3], id), same_b = vceqq_u8(vld4q_u8(ab + b * 4).val[3], id);
-          const uint8x16_t differ = veorq_u8(same_a, same_b);
-          return vbslq_u8(differ, same_b, ge_depth(a, b));   // one matches: take the other; else the farther
-        };
-        const uint8x16_t take_l = pick(a0, b0), take_u = pick(a1, b1);
-        const uint8x16x4_t l = vld4q_u8(pb + x * 4), r = vld4q_u8(pb + (x + 2) * 4);   // pre[1 + x - 1], pre[1 + x + 1]
-        const uint8x16x4_t u = vld4q_u8(cb + a1 * 4), d = vld4q_u8(cb + b1 * 4);
-        for (u32 k = 0; k < 4; ++k) bot.val[k] = vbslq_u8(vert, vbslq_u8(take_u, u.val[k], d.val[k]), vbslq_u8(take_l, l.val[k], r.val[k]));
-      }
+      const uint8x16x4_t top = vld4q_u8(cb + addr * 4), bot = vld4q_u8(cb + (addr + RSIZE) * 4);
       const uint8x16_t c1 = vaddq_u8(cov, vdupq_n_u8(1)), c2 = vsubq_u8(v32, c1);
       const uint8x16_t ta = vandq_u8(top.val[3], a5), ba = vandq_u8(bot.val[3], a5);
       const uint8x16_t under = vtstq_u8(ba, ba), whole = vceqq_u8(cov, v0);
@@ -3256,6 +3305,7 @@ void Renderer3D::seed_active(s32 y) {
 // the border row stands in at the top and bottom of the screen).
 void Renderer3D::render_band(s32 y0, s32 y1, u32* dst) {
   out_dst_ = dst;
+  raw_line_ = -100;   // enhanced AA: no raw row of this frame saved yet (the marker must not carry over from the last frame's lines)
   const s32 first = y0 > 0 ? y0 - 1 : 0;
   const s32 last = y1 + 1 < 192 ? y1 + 1 : 192;
   // Bins overlap by the line or two final_pass needs either side of a

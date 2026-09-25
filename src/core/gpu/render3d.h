@@ -426,6 +426,12 @@ private:
   u32  fog_density(u32 addr) const;
   void final_pass(s32 y);
   void final_pass_ref(s32 y);
+  // Enhanced AA: the line's blend with outside neighbours (both final passes), and the raw-row copies it reads.
+  void enhanced_aa_line(s32 y);
+  void save_raw_row(s32 y);
+  u32 raw_rows_[4][W]{};
+  s32 raw_line_ = -100;
+  bool raw_prev_ok_ = false;
   void final_pass_debug(s32 y);   // DS_AA_DEBUG: the final pass with each 3D edge pixel painted by what the AA does with it
 public:
   // final_pass against final_pass_ref on random buffers; 0 when identical.
