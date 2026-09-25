@@ -1961,14 +1961,21 @@ void Renderer3D::precompute_lines(Edge& e, s32 y0, s32 y1) {
     // an X-major edge crosses the row at a shallow angle, so the uncovered
     // part of the pixel is above or below; a Y-major run's is left or right.
     // Which side is decided in the final pass from the neighbours themselves.
-    auto dir_of = [](const auto& s) -> u32 { return s.xmajor ? 0x2000u : 0u; };
+    // Bit 14: the outside is the up/left neighbour. A Y-major run's outside
+    // is beside it (left run: left); an X-major run's is above when the
+    // polygon lies below the edge (a left edge stepping left as y grows, a
+    // right edge stepping right), else below.
+    auto dir_of = [](const auto& s, bool left) -> u32 {
+      if (!s.xmajor) return left ? 0x4000u : 0u;
+      return 0x2000u | ((s.negative == left) ? 0x4000u : 0u);
+    };
     u32 l_dir = 0, r_dir = 0;
     if (xstart > xend) {
       // Swapped edges: hardware walks them backwards, breaking X-major edge lengths/AA in a specific way.
       astart = 1;
       e.right.edge_params<true>(aa, &l_len, &l_cov);
       e.left.edge_params<true>(aa, &r_len, &r_cov);
-      if (aa_ == 2) { l_dir = dir_of(e.right); r_dir = dir_of(e.left); }
+      if (aa_ == 2) { l_dir = dir_of(e.right, true); r_dir = dir_of(e.left, false); }
       std::swap(xstart, xend); std::swap(wl, wr); std::swap(zl, zr);
       if (always_fill) { l_fill = r_fill = true; }
       else {
@@ -1978,7 +1985,7 @@ void Renderer3D::precompute_lines(Edge& e, s32 y0, s32 y1) {
     } else {
       e.left.edge_params<false>(aa, &l_len, &l_cov);
       e.right.edge_params<false>(aa, &r_len, &r_cov);
-      if (aa_ == 2) { l_dir = dir_of(e.left); r_dir = dir_of(e.right); }
+      if (aa_ == 2) { l_dir = dir_of(e.left, true); r_dir = dir_of(e.right, false); }
       // Fill rules: left edge fills when slope<=1, right when >1/vertical; negative
       // X-major edge's bottom pixel fills next to a flat bottom; overlapping edges fill.
       if (always_fill) { l_fill = r_fill = true; }
@@ -2049,7 +2056,14 @@ void Renderer3D::precompute_lines(Edge& e, s32 y0, s32 y1) {
     // an X-major edge crosses the row at a shallow angle, so the uncovered
     // part of the pixel is above or below; a Y-major run's is left or right.
     // Which side is decided in the final pass from the neighbours themselves.
-    auto dir_of = [](const auto& s) -> u32 { return s.xmajor ? 0x2000u : 0u; };
+    // Bit 14: the outside is the up/left neighbour. A Y-major run's outside
+    // is beside it (left run: left); an X-major run's is above when the
+    // polygon lies below the edge (a left edge stepping left as y grows, a
+    // right edge stepping right), else below.
+    auto dir_of = [](const auto& s, bool left) -> u32 {
+      if (!s.xmajor) return left ? 0x4000u : 0u;
+      return 0x2000u | ((s.negative == left) ? 0x4000u : 0u);
+    };
     u32 l_dir = 0, r_dir = 0;
     if (xstart > xend) {
       vlcur = e.vcr; vlnext = e.vnr;
@@ -2057,7 +2071,7 @@ void Renderer3D::precompute_lines(Edge& e, s32 y0, s32 y1) {
       istart = &e.right.interp; iend = &e.left.interp;
       e.right.edge_params<true>(aa, &l_len, &l_cov);
       e.left.edge_params<true>(aa, &r_len, &r_cov);
-      if (aa_ == 2) { l_dir = dir_of(e.right); r_dir = dir_of(e.left); }
+      if (aa_ == 2) { l_dir = dir_of(e.right, true); r_dir = dir_of(e.left, false); }
       std::swap(xstart, xend); std::swap(wl, wr); std::swap(zl, zr);
       if (always_fill) { l_fill = r_fill = true; }
       else {
@@ -2070,7 +2084,7 @@ void Renderer3D::precompute_lines(Edge& e, s32 y0, s32 y1) {
       istart = &e.left.interp; iend = &e.right.interp;
       e.left.edge_params<false>(aa, &l_len, &l_cov);
       e.right.edge_params<false>(aa, &r_len, &r_cov);
-      if (aa_ == 2) { l_dir = dir_of(e.left); r_dir = dir_of(e.right); }
+      if (aa_ == 2) { l_dir = dir_of(e.left, true); r_dir = dir_of(e.right, false); }
       if (always_fill) { l_fill = r_fill = true; }
       else {
         l_fill = e.nx_l || (bottom_fill && e.lxm) ||
@@ -2812,7 +2826,10 @@ void Renderer3D::save_raw_row(s32 y) {
 // larger (a diagonal would otherwise flip axis from pixel to pixel).
 void Renderer3D::stamp_intersections(s32 y) {
   const u32 row = row_of(y) + 1, up = row_of(y - 1) + 1, dn = row_of(y + 1) + 1;
-  auto opaque_plain = [&](u32 n) { const u32 a = attr_[n]; return (color_[n] >> 24) != 0 && !(a & (1u << 22)) && !(a & 0xF); };
+  // A pixel under a translucent layer still holds the opaque surface's depth
+  // (or the layer's, when it wrote depth: then its own outline is found),
+  // so the translucency state does not exclude it.
+  auto opaque_plain = [&](u32 n) { const u32 a = attr_[n]; return (color_[n] >> 24) != 0 && !(a & 0xF); };
   // Crossing from P's centre toward N's in 1/32 (-1: same surface), with
   // P's slope from L beyond it and N's from R beyond it (0 = none).
   auto crossing = [&](u32 P, u32 N, u32 L, u32 R) -> int {
@@ -2902,26 +2919,34 @@ void Renderer3D::enhanced_aa_line(s32 y) {
     a = ((fa * d) + (a * (128 - d))) >> 7;
     return r | (g << 8) | (b << 16) | (a << 24);
   };
-  // The pixel underneath is behind this one, so only a neighbour that is
-  // not nearer can stand in for it: of another polygon id, not nearer; of
-  // the same id (GS:DD draws whole landscapes as id 0), clearly farther than
-  // this surface. None -> no blend, rather than pulling a nearer polygon's
-  // colour into the pixel. Two -> the nearer of them (the hardware keeps the
-  // nearest thing behind), an id change first.
+  // The outside of the edge is the side the rasteriser recorded (attr bit
+  // 14: up/left, else down/right; bits 5-6 when stamp_intersections fixed
+  // it). That neighbour stands in for what lies behind the edge unless it
+  // is another polygon nearer than this one (an occluder: its own edge
+  // handles that pixel). The 1x blend also wants both pixels in the same
+  // translucency state, or a haze layer's edge would pull an unhazed colour
+  // in; the panel cut copies final colours and needs no such guard.
   auto outside = [&](u32 attr, u32 z, u32 a, u32 b) -> u32 {
-    if (attr & 0x20) return (attr & 0x40) ? a : b;   // side fixed by stamp_intersections
-    auto candidate = [&](u32 n) -> int {   // 0: no, 1: same id but clearly behind, 2: another id, not nearer
-      const u32 nz = depth_[n];
-      if ((attr_[n] >> 24) != (attr >> 24)) return nz >= z ? 2 : 0;
-      return nz > z && !same_surface(static_cast<s32>(z), static_cast<s32>(nz)) ? 1 : 0;
-    };
-    const int ca = candidate(a), cb = candidate(b);
     u32 n;
-    if (ca != cb) n = ca > cb ? a : b;
-    else if (!ca) return 0;
-    else n = depth_[a] <= depth_[b] ? a : b;
-    return ((attr_[n] ^ attr) & (1u << 22)) ? 0 : n;
+    if (attr & 0x20) n = (attr & 0x40) ? a : b;
+    else n = (attr & 0x4000) ? a : b;
+    if ((attr_[n] >> 24) != (attr >> 24) && depth_[n] < z) return 0;
+    if (!eb && ((attr_[n] ^ attr) & (1u << 22))) return 0;
+    return n;
   };
+  // DS_EDGE_TRACE=x,y: one pixel's attribute, coverage, depth and its four
+  // neighbours, and what this pass decides for it, every frame.
+  static int trx = -2, try_ = -2;
+  if (trx == -2) { trx = try_ = -1; if (const char* t = std::getenv("DS_EDGE_TRACE")) std::sscanf(t, "%d,%d", &trx, &try_); }
+  if (y == try_ && trx >= 0 && trx < 256) {
+    const u32 a = row + trx;
+    auto px = [&](const char* tag, u32 n) { std::fprintf(stderr, "  %s id %3u z %08x attr %08x flags %x cov %2u tr %d fog %d\n", tag, attr_[n] >> 24, depth_[n], attr_[n], attr_[n] & 0xF, (attr_[n] >> 8) & 0x1F, (attr_[n] >> 22) & 1, (attr_[n] >> 15) & 1); };
+    std::fprintf(stderr, "edge-trace frame %llu (%d,%d) line_touched %d\n", (unsigned long long)nds_.frame_count, trx, try_, (int)line_touched_[y]);
+    px("self ", a); px("left ", a - 1); px("right", a + 1); px("up   ", ub + 1 + trx); px("down ", db + 1 + trx);
+    const u32 attr = attr_[a], cov = (attr >> 8) & 0x1F;
+    const char* why = !(attr & 0xF) ? "no edge flags" : cov == 0x1F ? "full coverage" : !outside(attr, depth_[a], (attr & 0x2000) ? ub + 1 + trx : a - 1, (attr & 0x2000) ? db + 1 + trx : a + 1) ? "no partner" : "edge";
+    std::fprintf(stderr, "  -> %s (axis %s, side %s, forced %d)\n", why, (attr & 0x2000) ? "vertical" : "horizontal", (attr & 0x4000) ? "up/left" : "down/right", (attr >> 5) & 3);
+  }
   for (int x = 0; x < 256; ++x) {
     if (!(x & 7)) {   // skip eight pixels without edge flags at once
       u64 f0, f1; std::memcpy(&f0, &attr_[row + x], 8); std::memcpy(&f1, &attr_[row + x + 2], 8);
