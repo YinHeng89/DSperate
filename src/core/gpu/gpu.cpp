@@ -58,7 +58,8 @@ void Gpu::reset() {
   master_bright_g_[0] = master_bright_g_[1] = 0;
   capcnt_ = 0; capture_on_ = false;
   fifo_.fill(0); fifo_rd_ = fifo_wr_ = 0; fifo_line_.fill(0); run_fifo_ = false;
-  for (auto& fb : fb_) fb.fill(0);
+  for (auto& set : fb_store_) for (auto& fb : set) fb.fill(0);
+  fb_cur_ = 0;
   engine[0].reset(); engine[1].reset();
   set_powcnt(nds_.io.powcnt1);
   nds_.io.set_vcount(0);
@@ -556,6 +557,8 @@ void Gpu::begin_frame() {
   }
   // Frameskip: what line 215 assumed, re-checked now the capture bit is known.
   skip_frame_ = skip_next_ && skippable();
+  // Exporting edge planes: the frame buffers alternate per drawn frame (see fb_store_).
+  if (edge_export_ && !skip_frame_) fb_cur_ ^= 1;
   if (g_dbg_skip)
     std::fprintf(stderr, "[skip] frame %llu req %d raster %d capture %d/%u fifo %d period %u -> %s\n",
                  static_cast<unsigned long long>(nds_.frame_count), skip_req_ ? 1 : 0, skip_next_ ? 1 : 0,
@@ -807,8 +810,9 @@ void Gpu::step_engine(int e, u32 line) {
 void Gpu::set_edge_export(bool on) {
   edge_export_ = on;
   nds_.gpu3d.renderer().set_edge_export(on);
-  if (!on) { edge_fb_[0].fill(0); edge_fb_[1].fill(0); edge_vram_.clear(); edge_vram_.shrink_to_fit(); for (int s = 0; s < 2; ++s) { prev_fb_[s].clear(); prev_edge_[s].clear(); } }
-  else { edge_vram_.assign(4 * 65536, 0); for (int s = 0; s < 2; ++s) { prev_fb_[s].assign(SCREEN_W * SCREEN_H, 0xFFFFFFFFu); prev_edge_[s].assign(SCREEN_W * SCREEN_H, 0); } }
+  for (int k = 0; k < 2; ++k) { edge_store_[k][0].fill(0); edge_store_[k][1].fill(0); }
+  if (!on) { edge_vram_.clear(); edge_vram_.shrink_to_fit(); }
+  else { edge_vram_.assign(4 * 65536, 0); fb_store_[fb_cur_ ^ 1][0].fill(0xFFFFFFFFu); fb_store_[fb_cur_ ^ 1][1].fill(0xFFFFFFFFu); }
   engine[0].set_edge_vram(on ? edge_vram_.data() : nullptr);
   engine[1].set_edge_vram(on ? edge_vram_.data() : nullptr);
 }
@@ -818,7 +822,7 @@ void Gpu::output_engine(int e, u32 line) {
   const Engine2D& en = engine[e];
   const int screen = en.screen();
   const bool scaled = scaling();
-  u32* dst = scaled ? line_out_[e].data() : fb_[screen].data() + line * SCREEN_W;
+  u32* dst = scaled ? line_out_[e].data() : fb_store_[fb_cur_][screen].data() + line * SCREEN_W;
   if (screens_on_) {
     if (e == 0) {
       const u32 mode = (en.dispcnt() >> 16) & 3;
@@ -831,7 +835,7 @@ void Gpu::output_engine(int e, u32 line) {
     }
   } else { for (u32 i = 0; i < 256; ++i) dst[i] = 0xFF000000; }
   if (edge_export_ && !scaled) {
-    u8* const edst = edge_fb_[screen].data() + line * SCREEN_W;
+    u8* const edst = edge_store_[fb_cur_][screen].data() + line * SCREEN_W;
     const u32 dmode = e == 0 ? (en.dispcnt() >> 16) & 3 : ((en.dispcnt() >> 16) & 1);
     if (screens_on_ && dmode == 1) en.edge_mask(edst);
     else if (screens_on_ && e == 0 && dmode == 2) {   // VRAM display: the captured image's edge bytes
@@ -840,13 +844,10 @@ void Gpu::output_engine(int e, u32 line) {
       else std::memset(edst, 0, SCREEN_W);
     } else std::memset(edst, 0, SCREEN_W);
     if (!scaled) {
-      // Same line as last frame and nothing new known about it: keep last frame's edge bytes.
-      u32* const pfb = prev_fb_[screen].data() + line * SCREEN_W;
-      u8* const ped = prev_edge_[screen].data() + line * SCREEN_W;
+      // Same line as last frame (the other set) and nothing new known about it: keep its edge bytes.
       u64 any = 0; for (u32 i = 0; i < SCREEN_W; i += 8) { u64 w; std::memcpy(&w, edst + i, 8); any |= w; }
-      if (!any && std::memcmp(dst, pfb, SCREEN_W * sizeof(u32)) == 0) std::memcpy(edst, ped, SCREEN_W);
-      std::memcpy(pfb, dst, SCREEN_W * sizeof(u32));
-      std::memcpy(ped, edst, SCREEN_W);
+      if (!any && std::memcmp(dst, fb_store_[fb_cur_ ^ 1][screen].data() + line * SCREEN_W, SCREEN_W * sizeof(u32)) == 0)
+        std::memcpy(edst, edge_store_[fb_cur_ ^ 1][screen].data() + line * SCREEN_W, SCREEN_W);
     }
   }
   if (scaled) {
@@ -1308,7 +1309,7 @@ void Gpu::prepare_load() {
 template <class S> void Gpu::sync_state(S& s) {
   s.begin("GPU ");
   s.fields(line_, hblank_done_, frame_begun_, screens_on_, master_bright_g_, capcnt_, capture_on_, fifo_, fifo_rd_, fifo_wr_, fifo_line_, run_fifo_);
-  s.fields(fb_);   // what the display shows until the next frame (and the thumbnail)
+  s.fields(fb_store_[fb_cur_]);   // what the display shows until the next frame (and the thumbnail)
   s.end();
   engine[0].sync_state(s);
   engine[1].sync_state(s);

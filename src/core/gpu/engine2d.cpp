@@ -9,6 +9,9 @@
 #include "core/gpu/kernels.h"
 #include "core/nds.h"
 #include "core/profile.h"
+#if DSPERATE_NEON
+#include <arm_neon.h>
+#endif
 
 #include <cstdio>
 #include <cstdlib>
@@ -1011,6 +1014,26 @@ void Engine2D::edge_mask(u8* out) const {
   if (obj_edge_any_) src[T_OBJ_STD] = src[T_OBJ_EXT] = src[T_OBJ_DIRECT] = obj_edge_;
   if (top_mode_ == TOP_NONE || !cur_.enabled) { std::memset(out, 0, 256); return; }
   if (top_mode_ == TOP_ALL) { if (top_all_bg_ >= 0 && src[top_all_bg_]) std::memcpy(out, src[top_all_bg_], 256); else std::memset(out, 0, 256); return; }
+  // One source layer (the common case: the 3D layer, or one bitmap): a
+  // sixteen-lane select on the top ids. Several: the plain loop.
+  int nsrc = 0, only = -1;
+  for (int t = 0; t < T_COUNT; ++t) if (src[t]) { ++nsrc; only = t; }
+  if (!nsrc) { std::memset(out, 0, 256); return; }
+  if (nsrc == 1 || (nsrc == 3 && src[T_OBJ_STD] && src[T_OBJ_EXT] && src[T_OBJ_DIRECT])) {
+    const u8* s = nsrc == 1 ? src[only] : obj_edge_;
+    const u8 lo = nsrc == 1 ? static_cast<u8>(only) : static_cast<u8>(T_OBJ_STD), hi = nsrc == 1 ? static_cast<u8>(only) : static_cast<u8>(T_OBJ_DIRECT);
+#if DSPERATE_NEON
+    const uint8x16_t vlo = vdupq_n_u8(lo), vhi = vdupq_n_u8(hi);
+    for (u32 x = 0; x < 256; x += 16) {
+      const uint8x16_t t = vld1q_u8(top_tid_.data() + x);
+      const uint8x16_t m = vandq_u8(vcgeq_u8(t, vlo), vcleq_u8(t, vhi));
+      vst1q_u8(out + x, vandq_u8(vld1q_u8(s + x), m));
+    }
+#else
+    for (u32 x = 0; x < 256; ++x) { const u8 t = top_tid_[x]; out[x] = (t >= lo && t <= hi) ? s[x] : 0; }
+#endif
+    return;
+  }
   for (u32 x = 0; x < 256; ++x) { const u8 t = top_tid_[x]; out[x] = t < T_COUNT && src[t] ? src[t][x] : 0; }
 }
 

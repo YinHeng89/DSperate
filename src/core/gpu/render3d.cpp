@@ -2313,7 +2313,15 @@ void Renderer3D::cutout_coverage(const Shade& sh, SpanBuf& sb, const SpanJob* jo
       for (s32 x = job.ca; x < job.cb; ++x) { const s32 i = static_cast<s32>(job.off) + (x - job.ca); if (sb.gath[i / 16]) texture_sample(sh, sb.sc[i], sb.tc[i], &sb.talp[i]); }
     }
   }
-  s16 ss[16], tt[16]; u32 aa[16];
+  // Texel alpha for arrays of texcoords: the batch gather where there is
+  // one (NEON), the scalar sampler otherwise; the two agree on every texel.
+  // Arrays carry 16 entries of slack past `cnt`.
+  auto sample_n = [&](const s16* s, const s16* t, u32 cnt, u32* alpha) {
+#if DSPERATE_NEON
+    if (const GatherNFn g = reinterpret_cast<GatherNFn>(sh.gather4)) { alignas(16) u32 col[BATCH_CAP + 16]; g(sh, s, t, (cnt + 3) & ~3u, col, alpha); return; }
+#endif
+    for (u32 k = 0; k < cnt; ++k) texture_sample(sh, s[k], t[k], &alpha[k]);
+  };
   // Texels were gathered for the live sixteen-pixel groups only (live_runs);
   // a transparent neighbour is a gathered lane with zero alpha.
   auto gathered = [&](s32 i) { return sb.gath[i / 16] != 0; };
@@ -2321,38 +2329,162 @@ void Renderer3D::cutout_coverage(const Shade& sh, SpanBuf& sb, const SpanJob* jo
   // Nothing here reads another line: what a batch holds of a polygon's other
   // lines depends on where the band's lines start, and the result must not.
   const s32 dsx = sh.dsdx, dtx = sh.dtdx, dsy = sh.dsdy, dty = sh.dtdy;
-  for (u32 j = 0; j < n; ++j) {
-    const SpanJob& job = jobs[j];
-    for (s32 x = job.ca; x < job.cb; ++x) {
-      const s32 i = static_cast<s32>(job.off) + (x - job.ca);
-      if (!sb.pass[i] || !sb.talp[i]) continue;   // not drawn, or a transparent texel itself
-      const s32 il = x > job.ca ? i - 1 : -1, ir = x + 1 < job.cb ? i + 1 : -1;
-      // A transparent texel beside this one: along the span from the gathered
-      // neighbours, above or below from the texture itself.
-      bool cut = transparent(il) || transparent(ir);
-      if (!cut) {
-        u32 a_up, a_dn;
-        texture_sample(sh, static_cast<s16>(sb.sc[i] - dsy), static_cast<s16>(sb.tc[i] - dty), &a_up);
-        texture_sample(sh, static_cast<s16>(sb.sc[i] + dsy), static_cast<s16>(sb.tc[i] + dty), &a_dn);
-        cut = !a_up || !a_dn;
+  // DS_CUT_TRACE=x,y: the cut-out decision at one pixel (NEON against scalar checks).
+  static int trx = -2, try_ = -2;
+  if (trx == -2) { trx = try_ = -1; if (const char* t = std::getenv("DS_CUT_TRACE")) std::sscanf(t, "%d,%d", &trx, &try_); }
+
+  // A batch whose gathered texels are all opaque is a polygon of a cut-out
+  // format whose texture has no hole where it is drawn (most terrain): no
+  // cut edge to find, and the vertical samples below would be the cost of a
+  // second texel gather for nothing. A hole crossing the batch only between
+  // its lines is missed, which leaves that edge as the hardware draws it.
+  // Only the spans' own lanes of gathered groups carry a valid alpha on
+  // every build (the vector gather reads whole groups, the scalar sampler
+  // only the spans), so only those decide.
+  //
+  // Pass 1: every drawn opaque texel. A transparent texel beside it along
+  // the span (the gathered neighbours) makes it a candidate at once; the
+  // rest are tested above and below by two texture samples each, in bulk.
+  // A neighbouring line's texcoord often lands in the pixel's own texel
+  // (textures magnified past 1:1, and the ds/dy of a screen-aligned quad):
+  // that texel is the opaque one already known, so only the samples whose
+  // texel differs are taken (the texel is s >> 4, t >> 4 of the 16-bit
+  // coordinate, before the wrap).
+  alignas(16) s16 sv[2][BATCH_CAP + 16], tv[2][BATCH_CAP + 16];
+  alignas(16) u32 av[2][BATCH_CAP + 16];
+  s16 vidx[2][BATCH_CAP], cand[BATCH_CAP], candx[BATCH_CAP], candy[BATCH_CAP];
+  u8 mark[BATCH_CAP];
+  u32 nv[2] = {0, 0}, nc = 0;
+  std::memset(mark, 0, total);
+  auto step = [&](s16 v, s32 dv) { return static_cast<s16>(v + dv); };
+  bool scalar = trx >= 0;
+#if DSPERATE_NEON
+  if (!scalar) {
+    // Sixteen lanes at a time: tz = transparent texel, tr = tz in a gathered
+    // group (a valid transparent neighbour). tr has a zeroed lane on either
+    // side of the batch so the neighbour loads never leave it.
+    alignas(16) u8 tz[BATCH_CAP + 16], trbuf[16 + BATCH_CAP + 16];
+    u8* const tr = trbuf + 16;
+    std::memset(trbuf, 0, 16); std::memset(tr + total, 0, 16);
+    const uint32x4_t zero = vdupq_n_u32(0);
+    for (u32 i = 0; i < total; i += 16) {
+      const uint16x8_t lo = vcombine_u16(vmovn_u32(vceqq_u32(vld1q_u32(sb.talp + i), zero)), vmovn_u32(vceqq_u32(vld1q_u32(sb.talp + i + 4), zero)));
+      const uint16x8_t hi = vcombine_u16(vmovn_u32(vceqq_u32(vld1q_u32(sb.talp + i + 8), zero)), vmovn_u32(vceqq_u32(vld1q_u32(sb.talp + i + 12), zero)));
+      const uint8x16_t z = vcombine_u8(vmovn_u16(lo), vmovn_u16(hi));
+      vst1q_u8(tz + i, z);
+      vst1q_u8(tr + i, vandq_u8(z, vdupq_n_u8(sb.gath[i / 16] ? 0xFF : 0)));
+    }
+    static const u8 kIdx[16] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
+    static const u8 kBit[16] = {1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128};
+    const uint8x16_t idx = vld1q_u8(kIdx), bit = vld1q_u8(kBit);
+    auto bits = [&](uint8x16_t m) -> u32 {
+      const uint64x2_t w = vpaddlq_u32(vpaddlq_u16(vpaddlq_u8(vandq_u8(m, bit))));
+      return static_cast<u32>(vgetq_lane_u64(w, 0)) | (static_cast<u32>(vgetq_lane_u64(w, 1)) << 8);
+    };
+    bool hole = false;
+    for (u32 j = 0; j < n && !hole; ++j) {
+      const SpanJob& job = jobs[j];
+      const u32 len = static_cast<u32>(job.cb - job.ca);
+      uint8x16_t acc = vdupq_n_u8(0);
+      for (u32 k = 0; k < len; k += 16) {
+        uint8x16_t t = vld1q_u8(tr + job.off + k);
+        if (len - k < 16) t = vandq_u8(t, vcltq_u8(idx, vdupq_n_u8(static_cast<u8>(len - k))));
+        acc = vorrq_u8(acc, t);
       }
-      // DS_CUT_TRACE=x,y: the cut-out decision at one pixel (NEON against scalar checks).
-      static int trx = -2, try_ = -2;
-      if (trx == -2) { trx = try_ = -1; if (const char* t = std::getenv("DS_CUT_TRACE")) std::sscanf(t, "%d,%d", &trx, &try_); }
-      const bool tr = x == trx && job.y == try_;
-      if (tr) std::fprintf(stderr, "cut-trace frame %llu (%d,%d) vec %d pass %u talp %u il %d(%u,g%d) ir %d(%u,g%d) cut %d dsx %d dtx %d dsy %d dty %d s %d t %d fmt %u\n", (unsigned long long)nds_.frame_count, x, job.y, (int)sh.vec, sb.pass[i], sb.talp[i], il, il >= 0 ? sb.talp[il] : 0, il >= 0 ? (int)gathered(il) : -1, ir, ir >= 0 ? sb.talp[ir] : 0, ir >= 0 ? (int)gathered(ir) : -1, (int)cut, dsx, dtx, dsy, dty, sb.sc[i], sb.tc[i], sh.fmt);
-      if (!cut) continue;
+      hole = compat::maxv_u8(acc) != 0;
+    }
+    if (!hole) return;
+    const int16x8_t vdsy = vdupq_n_s16(static_cast<s16>(dsy)), vdty = vdupq_n_s16(static_cast<s16>(dty));
+    for (u32 j = 0; j < n; ++j) {
+      const SpanJob& job = jobs[j];
+      const u32 len = static_cast<u32>(job.cb - job.ca);
+      for (u32 k = 0; k < len; k += 16) {
+        const u32 i = job.off + k;
+        const uint8x16_t inspan = len - k < 16 ? vcltq_u8(idx, vdupq_n_u8(static_cast<u8>(len - k))) : vdupq_n_u8(0xFF);
+        uint8x16_t drawn = vandq_u8(vbicq_u8(vmvnq_u8(vceqq_u8(vld1q_u8(sb.pass + i), vdupq_n_u8(0))), vld1q_u8(tz + i)), inspan);
+        if (compat::maxv_u8(drawn) == 0) continue;
+        uint8x16_t left = vld1q_u8(tr + i - 1), right = vld1q_u8(tr + i + 1);
+        if (k == 0) left = vandq_u8(left, vmvnq_u8(vceqq_u8(idx, vdupq_n_u8(0))));               // no neighbour before ca
+        if (len - k <= 16) right = vandq_u8(right, vcltq_u8(idx, vdupq_n_u8(static_cast<u8>(len - k - 1))));   // none past cb
+        const uint8x16_t horiz = vandq_u8(drawn, vorrq_u8(left, right));
+        for (u32 m = bits(horiz); m; m &= m - 1) {
+          const u32 l = static_cast<u32>(__builtin_ctz(m));
+          cand[nc] = static_cast<s16>(i + l); candx[nc] = -1; candy[nc] = -1; ++nc;
+        }
+        const uint8x16_t rest = vbicq_u8(drawn, horiz);
+        if (compat::maxv_u8(rest) == 0) continue;
+        const int16x8_t s0a = vld1q_s16(sb.sc + i), s0b = vld1q_s16(sb.sc + i + 8), t0a = vld1q_s16(sb.tc + i), t0b = vld1q_s16(sb.tc + i + 8);
+        for (int d = 0; d < 2; ++d) {
+          const int16x8_t s1a = d ? vaddq_s16(s0a, vdsy) : vsubq_s16(s0a, vdsy), s1b = d ? vaddq_s16(s0b, vdsy) : vsubq_s16(s0b, vdsy);
+          const int16x8_t t1a = d ? vaddq_s16(t0a, vdty) : vsubq_s16(t0a, vdty), t1b = d ? vaddq_s16(t0b, vdty) : vsubq_s16(t0b, vdty);
+          const uint16x8_t samea = vandq_u16(vceqq_s16(vshrq_n_s16(s1a, 4), vshrq_n_s16(s0a, 4)), vceqq_s16(vshrq_n_s16(t1a, 4), vshrq_n_s16(t0a, 4)));
+          const uint16x8_t sameb = vandq_u16(vceqq_s16(vshrq_n_s16(s1b, 4), vshrq_n_s16(s0b, 4)), vceqq_s16(vshrq_n_s16(t1b, 4), vshrq_n_s16(t0b, 4)));
+          const uint8x16_t need = vbicq_u8(rest, vcombine_u8(vmovn_u16(samea), vmovn_u16(sameb)));
+          for (u32 m = bits(need); m; m &= m - 1) {
+            const u32 l = static_cast<u32>(__builtin_ctz(m)), q = i + l;
+            sv[d][nv[d]] = step(sb.sc[q], d ? dsy : -dsy); tv[d][nv[d]] = step(sb.tc[q], d ? dty : -dty); vidx[d][nv[d]] = static_cast<s16>(q); ++nv[d];
+          }
+        }
+      }
+    }
+  } else
+#endif
+  {
+    bool hole = false;
+    for (u32 j = 0; j < n && !hole; ++j) {
+      const SpanJob& job = jobs[j];
+      for (s32 x = job.ca; x < job.cb; ++x) { const s32 i = static_cast<s32>(job.off) + (x - job.ca); if (gathered(i) && !sb.talp[i]) { hole = true; break; } }
+    }
+    if (!hole) return;
+    for (u32 j = 0; j < n; ++j) {
+      const SpanJob& job = jobs[j];
+      for (s32 x = job.ca; x < job.cb; ++x) {
+        const s32 i = static_cast<s32>(job.off) + (x - job.ca);
+        if (!sb.pass[i] || !sb.talp[i]) continue;   // not drawn, or a transparent texel itself
+        const s32 il = x > job.ca ? i - 1 : -1, ir = x + 1 < job.cb ? i + 1 : -1;
+        if (transparent(il) || transparent(ir)) { cand[nc] = static_cast<s16>(i); candx[nc] = static_cast<s16>(x); candy[nc] = static_cast<s16>(job.y); ++nc; continue; }
+        const s16 s0 = sb.sc[i], t0 = sb.tc[i];
+        for (int d = 0; d < 2; ++d) {
+          const s16 s1 = step(s0, d ? dsy : -dsy), t1 = step(t0, d ? dty : -dty);
+          if ((s1 >> 4) == (s0 >> 4) && (t1 >> 4) == (t0 >> 4)) continue;
+          sv[d][nv[d]] = s1; tv[d][nv[d]] = t1; vidx[d][nv[d]] = static_cast<s16>(i); ++nv[d];
+        }
+        if (x == trx && job.y == try_) std::fprintf(stderr, "cut-trace frame %llu (%d,%d) vec %d pass %u talp %u il %d(%u,g%d) ir %d(%u,g%d) dsx %d dtx %d dsy %d dty %d s %d t %d fmt %u\n", (unsigned long long)nds_.frame_count, x, job.y, (int)sh.vec, sb.pass[i], sb.talp[i], il, il >= 0 ? sb.talp[il] : 0, il >= 0 ? (int)gathered(il) : -1, ir, ir >= 0 ? sb.talp[ir] : 0, ir >= 0 ? (int)gathered(ir) : -1, dsx, dtx, dsy, dty, sb.sc[i], sb.tc[i], sh.fmt);
+      }
+    }
+  }
+  (void)scalar;
+  for (int d = 0; d < 2; ++d) {
+    if (!nv[d]) continue;
+    sample_n(sv[d], tv[d], nv[d], av[d]);
+    for (u32 k = 0; k < nv[d]; ++k)
+      if (!av[d][k] && !mark[vidx[d][k]]) { mark[vidx[d][k]] = 1; cand[nc] = vidx[d][k]; candx[nc] = -1; candy[nc] = -1; ++nc; }
+  }
+  if (!nc) return;
+
+  // Pass 2: the candidates' 4x4 grids, sampled in chunks.
+  constexpr u32 kChunk = 32;   // candidates per gather: 512 samples
+  alignas(16) s16 ss[kChunk * 16 + 16], tt[kChunk * 16 + 16];
+  alignas(16) u32 aa[kChunk * 16 + 16];
+  for (u32 c0 = 0; c0 < nc; c0 += kChunk) {
+    const u32 cn = std::min(kChunk, nc - c0);
+    for (u32 c = 0; c < cn; ++c) {
+      const s32 i = cand[c0 + c];
       for (int v = 0; v < 4; ++v)
         for (int u = 0; u < 4; ++u) {
           const s32 fu = 2 * u - 3, fv = 2 * v - 3;   // (u + 0.5) / 4 - 0.5 in eighths
-          ss[v * 4 + u] = static_cast<s16>(sb.sc[i] + (dsx * fu + dsy * fv) / 8);
-          tt[v * 4 + u] = static_cast<s16>(sb.tc[i] + (dtx * fu + dty * fv) / 8);
+          ss[c * 16 + v * 4 + u] = static_cast<s16>(sb.sc[i] + (dsx * fu + dsy * fv) / 8);
+          tt[c * 16 + v * 4 + u] = static_cast<s16>(sb.tc[i] + (dtx * fu + dty * fv) / 8);
         }
-      for (int k = 0; k < 16; ++k) texture_sample(sh, ss[k], tt[k], &aa[k]);   // the scalar sampler: sixteen lookups per cut pixel only
+    }
+    sample_n(ss, tt, cn * 16, aa);
+    for (u32 c = 0; c < cn; ++c) {
+      const s32 i = cand[c0 + c];
+      const u32* a = aa + c * 16;
       int col[4] = {0, 0, 0, 0}, row[4] = {0, 0, 0, 0}, covered = 0;
       for (int v = 0; v < 4; ++v)
         for (int u = 0; u < 4; ++u)
-          if (aa[v * 4 + u]) { ++covered; ++col[u]; ++row[v]; }
+          if (a[v * 4 + u]) { ++covered; ++col[u]; ++row[v]; }
       if (covered >= 16) continue;
       const int ax = (col[0] + col[1]) - (col[2] + col[3]), ay = (row[0] + row[1]) - (row[2] + row[3]);
       // Near a diagonal the two halves tie and the axis would flip from
@@ -2362,7 +2494,7 @@ void Renderer3D::cutout_coverage(const Shade& sh, SpanBuf& sb, const SpanJob* jo
       const bool neg = vertical ? ay < 0 : ax < 0;   // the less covered half is the outside
       const u32 cov = covered ? static_cast<u32>(covered * 2 - 1) : 0u;
       sb.ccov[i] = static_cast<u8>(cov | (vertical ? 0x20 : 0) | (neg ? 0x40 : 0));
-      if (tr) std::fprintf(stderr, "cut-trace   covered %d ccov %02x\n", covered, sb.ccov[i]);
+      if (trx >= 0 && candx[c0 + c] == trx && candy[c0 + c] == try_) std::fprintf(stderr, "cut-trace   covered %d ccov %02x\n", covered, sb.ccov[i]);
     }
   }
 }
@@ -2693,7 +2825,35 @@ void Renderer3D::stamp_intersections(s32 y) {
     if (den != 0) { t32 = ((zn - zp - dzB) * 32) / den; if (t32 < 0 || t32 > 32) t32 = 16; }
     return static_cast<int>(t32);
   };
+  // Prefilter: a pixel needs the work below only if a horizontal or vertical
+  // neighbour is on another surface. Sixteen pixels a step (NEON) or a plain
+  // loop; the same test as same_surface().
+  alignas(16) u8 flag[256 + 16] = {};
+  {
+    auto differ = [](u32 za, u32 zb) { const u32 d = za > zb ? za - zb : zb - za; return d > ((za < zb ? za : zb) >> 6) + 0x200; };
+#if DSPERATE_NEON
+    const uint32x4_t v200 = vdupq_n_u32(0x200);
+    for (int x = 0; x < 256; x += 4) {
+      const uint32x4_t zp = vld1q_u32(&depth_[row + x]);
+      auto test = [&](const u32* q) -> uint32x4_t {
+        const uint32x4_t zq = vld1q_u32(q);
+        const uint32x4_t d = vabdq_u32(zp, zq), tol = vaddq_u32(vshrq_n_u32(vminq_u32(zp, zq), 6), v200);
+        return vcgtq_u32(d, tol);
+      };
+      uint32x4_t f = vorrq_u32(vorrq_u32(test(&depth_[row + x + 1]), test(&depth_[row + x - 1])), vorrq_u32(test(&depth_[dn + x]), test(&depth_[up + x])));
+      const uint16x4_t f16 = vmovn_u32(f);
+      vst1_lane_u32(reinterpret_cast<u32*>(flag + x), vreinterpret_u32_u8(vmovn_u16(vcombine_u16(f16, f16))), 0);
+    }
+#else
+    for (int x = 0; x < 256; ++x) {
+      const u32 zp = depth_[row + x];
+      flag[x] = differ(zp, depth_[row + x + 1]) || differ(zp, depth_[row + x - 1]) || differ(zp, depth_[dn + x]) || differ(zp, depth_[up + x]);
+    }
+#endif
+    (void)differ;
+  }
   for (int x = 0; x < 256; ++x) {
+    if (!flag[x]) continue;
     const u32 P = row + x;
     if (!opaque_plain(P)) continue;
     // Candidate pairs: right, left (horizontal), down, up (vertical). Only a
