@@ -776,6 +776,24 @@ namespace {
 }
 } // namespace
 
+// Live 16-pixel groups of the pass plane over [0, n): fn(k, len) once per
+// maximal run of groups holding any candidate. The per-pixel stages only feed
+// the resolve, which never reads a pixel whose pass byte is zero, and every
+// kernel here computes each pixel from its own position, so the dead groups
+// (occluded pixels inside the candidate range: about a third of GS:DD's
+// texel work) can be left unstaged. Reads up to 15 bytes past n (buffer slack).
+template <typename Fn>
+[[gnu::always_inline]] inline void live_runs(const u8* pass, u32 n, Fn&& fn) {
+  auto dead = [pass](u32 k) { u64 a, b; std::memcpy(&a, pass + k, 8); std::memcpy(&b, pass + k + 8, 8); return (a | b) == 0; };
+  u32 k = 0;
+  while (k < n) {
+    if (dead(k)) { k += 16; continue; }
+    const u32 start = k;
+    for (k += 16; k < n && !dead(k); k += 16) {}
+    fn(start, std::min(k, n) - start);
+  }
+}
+
 // The five attributes for screen pixels [ca, cb) of the span (a sub-range of
 // the staged span, normally the depth pre-pass's candidate range).
 void Renderer3D::span_attrs(SpanBuf& sb, s32 xstart, s32 xend, s32 ca, s32 cb, s32 wl, s32 wr, const s32* al, const s32* ar, bool attrs_constant, bool rgb_constant, bool fac_ready) const {
@@ -799,11 +817,15 @@ void Renderer3D::span_attrs(SpanBuf& sb, s32 xstart, s32 xend, s32 ca, s32 cb, s
     if (rgb_constant || (al[0] == ar[0] && al[1] == ar[1] && al[2] == ar[2])) {
       prof::add(prof::C_SPAN_FLAT_RGB, 1);
       fill_rgb_const(sb.vr + off, sb.vg + off, sb.vb + off, n, al);
-      kern::active::span_attrs2n(al, ar, sb.fac + off, n, sb.sc + off, sb.tc + off, fac_bound(xdiff, wl, wr));
+      const u32 fmax = fac_bound(xdiff, wl, wr);
+      live_runs(sb.pass + off, n, [&](u32 k, u32 len) { kern::active::span_attrs2n(al, ar, sb.fac + off + k, len, sb.sc + off + k, sb.tc + off + k, fmax); });
       return;
     }
     prof::add(prof::C_SPAN_LERP_RGB, 1);
-    kern::active::span_attrs5n(al, ar, sb.fac + off, n, sb.vr + off, sb.vg + off, sb.vb + off, sb.sc + off, sb.tc + off, fac_bound(xdiff, wl, wr));
+    const u32 fmax = fac_bound(xdiff, wl, wr);
+    live_runs(sb.pass + off, n, [&](u32 k, u32 len) {
+      kern::active::span_attrs5n(al, ar, sb.fac + off + k, len, sb.vr + off + k, sb.vg + off + k, sb.vb + off + k, sb.sc + off + k, sb.tc + off + k, fmax);
+    });
     return;
   }
   if (xdiff == 0) {
@@ -814,11 +836,13 @@ void Renderer3D::span_attrs(SpanBuf& sb, s32 xstart, s32 xend, s32 ca, s32 cb, s
   if (rgb_constant || (al[0] == ar[0] && al[1] == ar[1] && al[2] == ar[2])) {
     prof::add(prof::C_SPAN_FLAT_RGB, 1);
     fill_rgb_const(sb.vr + off, sb.vg + off, sb.vb + off, n, al);
-    kern::active::span_attrs2n_lin(al, ar, xv0, n, xdiff, sb.sc + off, sb.tc + off);
+    live_runs(sb.pass + off, n, [&](u32 k, u32 len) { kern::active::span_attrs2n_lin(al, ar, xv0 + static_cast<s32>(k), len, xdiff, sb.sc + off + k, sb.tc + off + k); });
     return;
   }
   prof::add(prof::C_SPAN_LERP_RGB, 1);
-  kern::active::span_attrs5n_lin(al, ar, xv0, n, xdiff, sb.vr + off, sb.vg + off, sb.vb + off, sb.sc + off, sb.tc + off);
+  live_runs(sb.pass + off, n, [&](u32 k, u32 len) {
+    kern::active::span_attrs5n_lin(al, ar, xv0 + static_cast<s32>(k), len, xdiff, sb.vr + off + k, sb.vg + off + k, sb.vb + off + k, sb.sc + off + k, sb.tc + off + k);
+  });
 }
 
 void Renderer3D::render_shadow_mask_line(Edge& e, s32 y) {
@@ -1263,12 +1287,21 @@ void Renderer3D::span_texels(const Shade& sh, SpanBuf& sb, s32 ca, s32 cb) const
   const u32 n16 = (n + 15) & ~15u;                         // the buffers carry sixteen entries of slack
   const s16* sa = sb.sc + off; const s16* ta = sb.tc + off;
   u32* col = sb.tcol + off; u32* alp = sb.talp + off;
+  // Only the live groups of the pass plane (see live_runs): a dead group's
+  // texels are never read, by the shader (which skips it too) or the resolve.
   if (const GatherNFn g = reinterpret_cast<GatherNFn>(sh.gather4)) {
-    g(sh, sa, ta, n4, col, alp);
-    prof::add(sh.texels ? prof::C_TEX_FAST : (sh.fmt == 5 ? prof::C_TEX_SLOW_FMT5 : prof::C_TEX_FAST), n4);
+    const prof::Counter c = sh.texels ? prof::C_TEX_FAST : (sh.fmt == 5 ? prof::C_TEX_SLOW_FMT5 : prof::C_TEX_FAST);
+    live_runs(sb.pass + off, n, [&](u32 k, u32 len) {
+      const u32 len4 = (len + 3) & ~3u;
+      g(sh, sa + k, ta + k, len4, col + k, alp + k);
+      prof::add(c, len4);
+    });
   } else {
-    prof::add(prof::C_TEX_SLOW_VIEWS, n4);
-    for (u32 i = 0; i < n4; i += 4) texture_gather4(sh, sa + i, ta + i, col + i, alp + i);
+    live_runs(sb.pass + off, n, [&](u32 k, u32 len) {
+      const u32 len4 = (len + 3) & ~3u;
+      prof::add(prof::C_TEX_SLOW_VIEWS, len4);
+      for (u32 i = 0; i < len4; i += 4) texture_gather4(sh, sa + k + i, ta + k + i, col + k + i, alp + k + i);
+    });
   }
   // The shader reads whole sixteens; the tail past the gather is padding it
   // never looks at, but it has to be a defined value.
@@ -1317,8 +1350,12 @@ void Renderer3D::span_shade(const Shade& sh, SpanBuf& sb, s32 ca, s32 cb) const 
   };
   // A pixel record is r | g << 8 | b << 16 | a << 24, so four byte planes
   // stored interleaved (st4) are the records themselves.
+  // Dead 16-pixel groups of the pass plane (no candidate lane) are skipped:
+  // nothing reads their records, and narrow() would only AND zeros.
+  auto dead16 = [pa](u32 i) { u64 a, b; std::memcpy(&a, pa + i, 8); std::memcpy(&b, pa + i + 8, 8); return (a | b) == 0; };
   if constexpr (!textured) {
     for (u32 i = 0; i < n; i += 16) {
+      if (dead16(i)) continue;
       const uint8x16x4_t rec = {vld1q_u8(ra + i), vld1q_u8(ga + i), vld1q_u8(ba + i), vpa};
       vst4q_u8(reinterpret_cast<u8*>(out + i), rec);
     }
@@ -1331,6 +1368,7 @@ void Renderer3D::span_shade(const Shade& sh, SpanBuf& sb, s32 ca, s32 cb) const 
     // add-long plus a multiply-accumulate-long in byte lanes (both channels
     // are 6-bit, so the product cannot leave 16 bits).
     for (u32 i = 0; i < n; i += 16) {
+      if (dead16(i)) continue;
       uint8x16_t ch[4], tv[4];
       texels16(tca + i, taca + i, tv);
       const uint8x16_t vv[4] = {vld1q_u8(ra + i), vld1q_u8(ga + i), vld1q_u8(ba + i), vpa};
@@ -1356,6 +1394,7 @@ void Renderer3D::span_shade(const Shade& sh, SpanBuf& sb, s32 ca, s32 cb) const 
   if (sh.polyalpha <= sh.alpha_ref) { std::memset(pa, 0, n); return; }
   const uint8x16_t v31 = vdupq_n_u8(31), v0 = vdupq_n_u8(0);
   for (u32 i = 0; i < n; i += 16) {
+    if (dead16(i)) continue;
     uint8x16_t tx[4];
     texels16(tca + i, taca + i, tx);
     const uint8x16_t tal = tx[3];
