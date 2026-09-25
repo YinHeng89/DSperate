@@ -731,10 +731,17 @@ void Io::cart_write_romctrl(u32 value) {
   const u32 xfer = (cart.romctrl & (1u << 27)) ? 8 : 5;
   u32 cmddelay = 8 + (cart.romctrl & 0x1FFF);
   if (bytes) cmddelay += (cart.romctrl >> 16) & 0x3F;
-  // Fast timing: the command's 8 clocks only, no gap1/gap2 latency. Games
-  // poll ROMCTRL through it: a DS_IO_CENSUS of eight titles found ROMCTRL
-  // reads outnumbering ROM data words about 7:1, nearly all this wait.
-  if (g_fast_timing) cmddelay = 8;
+  // The gap1/gap2 latency stays under the fast model too (DS_CART_GAPS=0
+  // drops it to the command's 8 clocks, the former fast default). Without
+  // it Tongari Boushi spins on its load screen forever -- the KEY2 gap
+  // timing of mGBA's "holy grail bugs 2" -- and Sonic Chronicles' FMV
+  // decoder runs off into unmapped memory. Games poll ROMCTRL through the
+  // gap (a DS_IO_CENSUS found ROMCTRL reads outnumbering data words 7:1),
+  // but on the device the gaps cost nothing on the hard tier and made
+  // Animal Crossing faster (median 9.1 -> 8.0 ms); only Pokemon W2 pays
+  // (+0.6 ms at a 3.6 ms median).
+  static const bool drop_gaps = std::getenv("DS_CART_GAPS") && std::getenv("DS_CART_GAPS")[0] == '0';
+  if (g_fast_timing && drop_gaps) cmddelay = 8;
   cart.event_armed = false;
   if (cart.romctrl & (1u << 30)) {            // write direction: not supported; end after the command
     nds_.sched.schedule(EventId::Cart, nds_.sched.now() + 2 * xfer * cmddelay, cart_ev, 0);

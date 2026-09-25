@@ -11,7 +11,8 @@
 // What fast removes is the per-access timing code in translated code (a table
 // load and the combine) and the refill lookup of every indirect branch; numC,
 // resolved when a block is translated, stays exact. Outside the CPU, fast also
-// drops the cartridge bus clock per ROM word (Io::cart_word_delay).
+// drops the cartridge bus clock per ROM word (Io::cart_word_delay); the
+// command's gap latency stays (games break without it, see cart_write_romctrl).
 #pragma once
 #include "core/cpu/cpu.h"
 

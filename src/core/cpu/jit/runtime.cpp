@@ -54,6 +54,8 @@ static std::map<u32, u64> retrans;             // guest pc -> translations
 static std::map<u64, u64> trans_by_frame;
 static std::map<u64, u64> retrans_by_frame;
 static std::map<u64, u64> store_sites;         // (victim pc << 32 | store guest addr) -> kills
+static std::map<u32, u64> by_region;           // (cpu << 8 | pc >> 24) -> translations
+static u64 sample_frame = ~0ull, sampled = 0;   // DS_CHURN_FRAME=N: print the first keys translated in frame N
 static u64 revive_none = 0, revive_stamp = 0, revive_span = 0, revive_len = 0, revive_bytes = 0, revive_ok = 0;   // why a revive did not happen
 static u64 inval = 0, killed = 0, trans = 0, frames_seen = 0, range_miss = 0, resets = 0;
 static u64 retime_calls = 0, retime_killed = 0;
@@ -86,6 +88,8 @@ static void report() {
   top(retrans, "retranslated block pcs", 20, pa);
   auto ps = [](u64 n, u64 k) { std::fprintf(stderr, "   %10llu  block %08x <- store at %08x\n", (unsigned long long)n, static_cast<u32>(k >> 32), static_cast<u32>(k)); };
   top(store_sites, "store address per victim block", 12, ps);
+  auto pr = [](u64 n, u32 k) { std::fprintf(stderr, "   %10llu  arm%d region %02x\n", (unsigned long long)n, (k >> 8) ? 7 : 9, k & 0xFF); };
+  top(by_region, "translations by cpu and region", 12, pr);
   std::fprintf(stderr, "[churn] revive: ok %llu, no parked %llu, stamp %llu, span %llu, len %llu, bytes differ %llu\n", (unsigned long long)revive_ok,
                (unsigned long long)revive_none, (unsigned long long)revive_stamp, (unsigned long long)revive_span, (unsigned long long)revive_len, (unsigned long long)revive_bytes);
   auto pf = [](u64 n, u64 f) { std::fprintf(stderr, "   %10llu  frame %llu (%llu re)\n",
@@ -383,6 +387,9 @@ Block* translate(JitCpu& jc, u32 key) {
   if (churn::on()) {
     churn::trans++;
     const u64 f = jc.ctx->nds->frame_count;
+    churn::by_region[(jc.arm9 ? 0u : 0x100u) | (key_pc(key) >> 24)]++;
+    if (churn::sample_frame == ~0ull) { const char* e = std::getenv("DS_CHURN_FRAME"); churn::sample_frame = e ? static_cast<u64>(std::atoll(e)) : 0; }
+    if (f == churn::sample_frame && churn::sampled < 80) { ++churn::sampled; std::fprintf(stderr, "[churn] frame %llu arm%d key %08x%s r15 %08x\n", (unsigned long long)f, jc.arm9 ? 9 : 7, key_pc(key), key_thumb(key) ? "t" : "", jc.ctx->hot.regs[15]); }
     churn::trans_by_frame[f]++;
     if (churn::retrans[key_pc(key)]++ > 0) churn::retrans_by_frame[f]++;
     const auto pw = churn::page_last_write.find(key_pc(key) & ~(mem::PAGE_SIZE - 1));
@@ -528,8 +535,10 @@ static bool cold_after_count(JitCpu& jc, u32 key) {
   return n < warm_threshold();
 }
 
+static void weeds_check(CpuContext& cpu, u32 pc);
 extern "C" const void* jit_h_lookup(CpuContext* cpu, u32 key) {
   JitCpu& jc = *static_cast<JitCpu*>(cpu->jit);
+  weeds_check(*cpu, key_pc(key));
   if (is_cold(jc, key)) { cpu->hot.regs[15] = key_r15(key); return g_rt.exit_r15; }   // the C side interprets it
   const u8* native = find_native(jc, key);
   if (g_rt.debug) std::fprintf(stderr, "[jit] lookup %08x -> %p (budget %d)\n", key, static_cast<const void*>(native), cpu->hot.cycle_budget);
@@ -900,6 +909,24 @@ void report(std::FILE* out) {
   }
 }
 
+// DS_JIT_WEEDS=1: the first time a CPU's pc leaves every region that can
+// hold code, print its registers (the branch that went wrong is in lr/sp).
+static void weeds_check(CpuContext& cpu, u32 pc) {
+  static const bool on = std::getenv("DS_JIT_WEEDS") != nullptr;
+  static bool shown[2] = {false, false};
+  if (!on) return;
+  const u32 r = pc >> 24;
+  const bool ok = r <= 0x03 || r == 0x06 || r == 0x08 || r == 0x09 || r == 0xFF || r == 0x0A;
+  const int i = cpu.which == Cpu::ARM9 ? 0 : 1;
+  if (ok || shown[i]) return;
+  shown[i] = true;
+  std::fprintf(stderr, "[weeds] arm%d frame %llu pc %08x cpsr %08x lr %08x sp %08x r0-r3 %08x %08x %08x %08x r4-r7 %08x %08x %08x %08x r12 %08x\n",
+               i ? 7 : 9, (unsigned long long)cpu.nds->frame_count, pc, cpu.hot.cpsr, cpu.hot.regs[14], cpu.hot.regs[13],
+               cpu.hot.regs[0], cpu.hot.regs[1], cpu.hot.regs[2], cpu.hot.regs[3], cpu.hot.regs[4], cpu.hot.regs[5], cpu.hot.regs[6], cpu.hot.regs[7], cpu.hot.regs[12]);
+  // The stack's top words: return addresses of the callers.
+  for (u32 k = 0; k < 16; ++k) { u32 w = 0; if (const u8* p = cpu.page_table.read_ptr(cpu.hot.regs[13] + k * 4)) std::memcpy(&w, p, 4); std::fprintf(stderr, "[weeds]   [sp+%02x] %08x\n", k * 4, w); }
+}
+
 const void* lookup(CpuContext& cpu) {
   JitCpu& jc = *static_cast<JitCpu*>(cpu.jit);
   Runtime& r = g_rt;
@@ -907,6 +934,7 @@ const void* lookup(CpuContext& cpu) {
     if (r.need_reset) reset_arena();
     const bool thumb = cpu.thumb();
     const u32 key = make_key(cpu.hot.regs[15] - (thumb ? 4 : 8), thumb);
+    weeds_check(cpu, key_pc(key));
     const u64 lut = jc.lut[(key >> 1) & (LUT_SIZE - 1)];
     if (static_cast<u32>(lut) != key && cold_after_count(jc, key)) {
       // Cold: the interpreter takes the rest of the slice, and translated
