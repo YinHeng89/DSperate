@@ -338,7 +338,7 @@ int main(int argc, char** argv) {
     else if (flag("--rtc-host")) rtc_host = true;                            // INEXACT by construction: runs stop being reproducible
     else if (arg("--firmware-override")) fw_override = argv[++i];            // load it, and write back what the firmware changed
     else if (flag("--no-aa")) no_aa = true;                                  // 3D anti-aliasing off (Renderer3D::set_aa); inexact, for measurement
-    else if (flag("--enhanced")) aa_enhanced = true;                         // video.aa = enhanced: forced AA without same-surface stacking (Renderer3D::set_aa)
+    else if (flag("--enhanced")) aa_enhanced = true;                         // video.aa = enhanced: forced coverage, blended with the outside neighbour (Renderer3D::set_aa)
     else if (arg("--load-state")) load_state = argv[++i];                   // restore a save state before running
     else if (arg("--frameskip")) frameskip = std::atoi(argv[++i]);          // skip drawing N of every N+1 frames (Gpu::set_frame_skip); a dump of a skipped frame is stale
     else if (flag("--frameskip-capture")) frameskip_capture = true;          // INEXACT: skip frames that display-capture too

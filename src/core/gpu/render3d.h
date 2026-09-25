@@ -205,6 +205,12 @@ private:
   const Gpu3D* gx_ = nullptr;
   const RenderState* rs_ = nullptr;
   bool game_aa_ = false;                  // AA blend runs (game asked and aa_ allows)
+  // The second pixel layer (the pixel underneath) is kept: accurate AA with
+  // the game's AA on. Enhanced blends an edge with its outside neighbour in
+  // the final pass instead, so it computes coverage but keeps no under layer:
+  // no push, under-layer depth test, translucent under plot, fog under, or
+  // shadow stencil bit 2.
+  bool under_layer_ = false;
   u8 aa_ = 1, aa_rendered_ = 1;           // aa_rendered_: the setting the kept frame was drawn with
   u32 mark_cov_ = 0x1000;                 // coverage edge marking leaves on a pixel (set_frame_aa)
   void set_frame_aa();
@@ -252,6 +258,7 @@ private:
     s32 y, ca, cb; u32 off;
     s32 xdraw, lim0, lim1, lim2;
     s32 l_cov, r_cov;
+    u32 l_dir, r_dir;
     int yedge;
     bool l_fill, r_fill, wf_skip;
   };
@@ -266,6 +273,7 @@ private:
     s32 wl, wr, zl, zr;      // endpoint w / z, swapped-edge order applied
     s32 al[5], ar[5];        // endpoint r g b s t, swapped-edge order applied
     s32 l_len, r_len, l_cov, r_cov;
+    u32 l_dir, r_dir;        // enhanced AA: attr bits 13-14, which neighbour the edge run blends toward (see precompute_lines)
     s32 xa, xb;              // the clipped screen range [xa, xb)
     int yedge;
     bool l_fill, r_fill, wf_skip;
