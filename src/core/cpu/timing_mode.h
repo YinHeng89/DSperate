@@ -10,9 +10,9 @@
 //          overlap and no region rules, and every jump's refill is a constant.
 // What fast removes is the per-access timing code in translated code (a table
 // load and the combine) and the refill lookup of every indirect branch; numC,
-// resolved when a block is translated, stays exact. Outside the CPU, fast also
-// drops the cartridge bus clock per ROM word (Io::cart_word_delay); the
-// command's gap latency stays (games break without it, see cart_write_romctrl).
+// resolved when a block is translated, stays exact. The cartridge keeps its
+// exact timing under fast (games break without it: Io::cart_write_romctrl,
+// Io::cart_word_delay); DS_CART_GAPS=0 / DS_CART_CLOCK=0 are the old shortcuts.
 #pragma once
 #include "core/cpu/cpu.h"
 

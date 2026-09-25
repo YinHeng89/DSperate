@@ -774,7 +774,12 @@ bool Io::cart_dma_armed() const { return nds_.dsi || nds_.dma.cart_armed(); }
 // words chain within one scheduler pass instead of an event (and a split CPU
 // slice) every 40 cycles.
 u32 Io::cart_word_delay() const {
-  if (g_fast_timing) return 0;
+  // The per-word bus clock stays under the fast model too (DS_CART_CLOCK=0
+  // drops it, the former fast default): with words arriving at once, Sonic
+  // Chronicles' FMV decoder reads a corrupted stream, writes over its stack
+  // and runs off into unmapped memory at frame ~1630 (see DS_JIT_WEEDS).
+  static const bool drop_clock = std::getenv("DS_CART_CLOCK") && std::getenv("DS_CART_CLOCK")[0] == '0';
+  if (g_fast_timing && drop_clock) return 0;
   const u32 xfer = (cart.romctrl & (1u << 27)) ? 8 : 5;
   u32 delay = 4;
   if (!(cart.transfer_pos & 0x1FF)) delay += (cart.romctrl >> 16) & 0x3F;
