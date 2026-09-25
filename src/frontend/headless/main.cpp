@@ -249,6 +249,7 @@ int main(int argc, char** argv) {
   const char* pc_profile = nullptr;
   int dump_from = 0, dump_count = 0;   // --dump-from/--dump-count: window of a large dump
   int cut_n = 0; const char* cut_path = nullptr;   // --dump-cut
+  const char* edges_path = nullptr; FILE* edges_out = nullptr;   // --dump-edges
   int frames = 60; bool direct = false;
 #if DSPERATE_JIT
   bool jit = true;                    // both CPUs; --interp clears it
@@ -323,7 +324,8 @@ int main(int argc, char** argv) {
     else if (arg("--trace")) trace = argv[++i];
     else if (arg("--max")) ts.max = std::strtoull(argv[++i], nullptr, 0);
     else if (arg("--dump-frames")) dump = argv[++i];
-    else if (arg("--dump-cut")) { cut_n = std::atoi(argv[++i]); cut_path = argv[++i]; }   // N FILE: enhanced AA cut at Nx (edge bytes exported, 1x unblended), both screens, raw 0xAARRGGBB
+    else if (arg("--dump-cut")) { cut_n = std::atoi(argv[++i]); cut_path = argv[++i]; }
+    else if (arg("--dump-edges")) edges_path = argv[++i];   // FILE: the enhanced AA edge bytes (Gpu::edge_plane), both screens, 256x192 each per frame   // N FILE: enhanced AA cut at Nx (edge bytes exported, 1x unblended), both screens, raw 0xAARRGGBB
     else if (arg("--hash-frames")) hash_frames = argv[++i];   // FILE: "frame top bottom" per frame, FNV-1a 64 of each screen's 0xAARRGGBB (the video golden hashes)
     else if (arg("--dump-scaled")) { scaled_n = std::atoi(argv[++i]); scaled_path = argv[++i]; }   // N FILE: both screens through the scanline scaler at Nx, raw BGRA
     else if (arg("--dump-from")) dump_from = std::atoi(argv[++i]);    // first frame to dump
@@ -615,6 +617,7 @@ int main(int argc, char** argv) {
     cut_px.resize(static_cast<size_t>(256 * cut_n) * static_cast<size_t>(192 * cut_n));
     nds.gpu.set_edge_export(true);
   }
+  if (edges_path) { edges_out = std::fopen(edges_path, "wb"); if (!edges_out) { std::fprintf(stderr, "could not open %s\n", edges_path); return 1; } nds.gpu.set_edge_export(true); }
   FILE* hash_out = hash_frames ? std::fopen(hash_frames, "w") : nullptr;
   if (hash_frames && !hash_out) { std::fprintf(stderr, "could not open %s\n", hash_frames); return 1; }
   ds::input::Log log;
@@ -822,6 +825,8 @@ int main(int argc, char** argv) {
     }
     if (scaled_out && i >= dump_from && (dump_count <= 0 || i < dump_from + dump_count))
       for (int k = 0; k < 2; ++k) std::fwrite(scaled_px[k].data(), 4, scaled_px[k].size(), scaled_out);
+    if (edges_out && i >= dump_from && (dump_count <= 0 || i < dump_from + dump_count))
+      for (int k = 0; k < 2; ++k) std::fwrite(nds.gpu.edge_plane(k), 1, ds::SCREEN_W * ds::SCREEN_H, edges_out);
     if (cut_out && i >= dump_from && (dump_count <= 0 || i < dump_from + dump_count))
       for (int k = 0; k < 2; ++k) {
         ds::gpu::edge_cut_screen(nds.gpu.framebuffer(k), nds.gpu.edge_plane(k), cut_n, cut_px.data());

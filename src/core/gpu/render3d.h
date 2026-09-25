@@ -154,6 +154,8 @@ public:
     bool always_fill;
     bool aa_plus;   // video.aa = enhanced: the resolve's same-surface rule
     bool aa_exempt; // enhanced: 3D used as 2D (a screen-aligned quad mapped one texel per pixel), left unblended
+    bool cutout;    // enhanced: an opaque polygon whose texture cuts pixels out (alpha-to-coverage on the cut edges)
+    s32 dsdx, dtdx, dsdy, dtdy;   // cutout: texcoord step per screen pixel and line from the polygon's plane (12.4), independent of what is staged
     bool attrs_constant, rgb_constant;   // uniform across the polygon; checked once
   };
 private:
@@ -262,6 +264,11 @@ private:
     alignas(16) u32 tcol[BATCH_CAP];     // texels for the span (textured polygons), colour15 and
     alignas(16) u32 talp[BATCH_CAP];     // 5-bit alpha, gathered once per span
     alignas(16) u32 col[BATCH_CAP];      // shaded pixel records (18-bit colour, alpha 24-28)
+    // Enhanced AA, cut-out textures (cutout_coverage): per pixel, 0xFF for
+    // none, else coverage bits 0-4 | 0x20 vertical axis | 0x40 outside on the
+    // negative side, the layout of the edge byte without its edge bit.
+    alignas(16) u8 ccov[BATCH_CAP];
+    u8 gath[BATCH_CAP / 16 + 1];         // per sixteen-pixel group: texels gathered (span_texels' live runs, or cutout_coverage's own sampling)
   };
 
   SpanBuf spanbuf_;   // one per renderer; staged across calls before pixel stages run over it once
@@ -445,6 +452,8 @@ private:
   void final_pass_ref(s32 y);
   // Enhanced AA: the line's blend with outside neighbours (both final passes), and the raw-row copies it reads.
   void enhanced_aa_line(s32 y);
+  void stamp_intersections(s32 y);
+  void cutout_coverage(const Shade& sh, SpanBuf& sb, const SpanJob* jobs, u32 n);
   void save_raw_row(s32 y);
   u32 raw_rows_[4][W]{};
   s32 raw_line_ = -100;

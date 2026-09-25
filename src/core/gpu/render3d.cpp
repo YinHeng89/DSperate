@@ -796,6 +796,26 @@ template <typename Fn>
     fn(start, std::min(k, n) - start);
   }
 }
+// The same over a span staged at buffer offset `off`, with the groups
+// aligned to the buffer rather than the span, so the per-span attribute
+// stage and the per-batch texel gather agree on which groups are live (a
+// lane the one stages must be a lane the other gathers, and the other way
+// round: the cut-out pass reads neighbours' texels). fn(k, len) is relative
+// to the span.
+template <typename Fn>
+[[gnu::always_inline]] inline void live_runs_at(const u8* pass, u32 off, u32 n, Fn&& fn) {
+  const u32 end = off + n;
+  auto dead = [pass](u32 g) { u64 a, b; std::memcpy(&a, pass + g * 16, 8); std::memcpy(&b, pass + g * 16 + 8, 8); return (a | b) == 0; };
+  u32 g = off / 16;
+  const u32 gend = (end + 15) / 16;
+  while (g < gend) {
+    if (dead(g)) { ++g; continue; }
+    const u32 gs = g;
+    for (++g; g < gend && !dead(g); ++g) {}
+    const u32 a = std::max(gs * 16, off), b = std::min(g * 16, end);
+    if (a < b) fn(a - off, b - a);
+  }
+}
 
 // The five attributes for screen pixels [ca, cb) of the span (a sub-range of
 // the staged span, normally the depth pre-pass's candidate range).
@@ -821,12 +841,12 @@ void Renderer3D::span_attrs(SpanBuf& sb, s32 xstart, s32 xend, s32 ca, s32 cb, s
       prof::add(prof::C_SPAN_FLAT_RGB, 1);
       fill_rgb_const(sb.vr + off, sb.vg + off, sb.vb + off, n, al);
       const u32 fmax = fac_bound(xdiff, wl, wr);
-      live_runs(sb.pass + off, n, [&](u32 k, u32 len) { kern::active::span_attrs2n(al, ar, sb.fac + off + k, len, sb.sc + off + k, sb.tc + off + k, fmax); });
+      live_runs_at(sb.pass, off, n, [&](u32 k, u32 len) { kern::active::span_attrs2n(al, ar, sb.fac + off + k, len, sb.sc + off + k, sb.tc + off + k, fmax); });
       return;
     }
     prof::add(prof::C_SPAN_LERP_RGB, 1);
     const u32 fmax = fac_bound(xdiff, wl, wr);
-    live_runs(sb.pass + off, n, [&](u32 k, u32 len) {
+    live_runs_at(sb.pass, off, n, [&](u32 k, u32 len) {
       kern::active::span_attrs5n(al, ar, sb.fac + off + k, len, sb.vr + off + k, sb.vg + off + k, sb.vb + off + k, sb.sc + off + k, sb.tc + off + k, fmax);
     });
     return;
@@ -839,11 +859,11 @@ void Renderer3D::span_attrs(SpanBuf& sb, s32 xstart, s32 xend, s32 ca, s32 cb, s
   if (rgb_constant || (al[0] == ar[0] && al[1] == ar[1] && al[2] == ar[2])) {
     prof::add(prof::C_SPAN_FLAT_RGB, 1);
     fill_rgb_const(sb.vr + off, sb.vg + off, sb.vb + off, n, al);
-    live_runs(sb.pass + off, n, [&](u32 k, u32 len) { kern::active::span_attrs2n_lin(al, ar, xv0 + static_cast<s32>(k), len, xdiff, sb.sc + off + k, sb.tc + off + k); });
+    live_runs_at(sb.pass, off, n, [&](u32 k, u32 len) { kern::active::span_attrs2n_lin(al, ar, xv0 + static_cast<s32>(k), len, xdiff, sb.sc + off + k, sb.tc + off + k); });
     return;
   }
   prof::add(prof::C_SPAN_LERP_RGB, 1);
-  live_runs(sb.pass + off, n, [&](u32 k, u32 len) {
+  live_runs_at(sb.pass, off, n, [&](u32 k, u32 len) {
     kern::active::span_attrs5n_lin(al, ar, xv0 + static_cast<s32>(k), len, xdiff, sb.vr + off + k, sb.vg + off + k, sb.vb + off + k, sb.sc + off + k, sb.tc + off + k);
   });
 }
@@ -1021,6 +1041,13 @@ void Renderer3D::resolve_span(const Shade& sh, const SpanBuf& sb, s32 y, s32 xa,
         }
         if constexpr (aa == 2) push = false;   // enhanced: coverage, but no layer underneath
       }
+      if constexpr (aa == 2) {
+        if (sh.cutout) {   // alpha-to-coverage (cutout_coverage), unless on the outline with hardware coverage
+          const u8 cc = sb.ccov[i];
+          if (cc != 0xFF && !((attr & 3) && ((attr >> 8) & 0x1F) != 0x1F))
+            attr = (attr & ~(0x1F00u | 0x2000u | 0x60u)) | ((cc & 0x1F) << 8) | ((cc & 0x20) << 8) | (cc & 0x40) | 0x24;
+        }
+      }
       if constexpr (aa == 2 && !shadow) {
         // Enhanced: an edge over the same edge of its surface neither pushes
         // the surface under nor lands under it (see same_edge), so the under
@@ -1161,6 +1188,27 @@ void Renderer3D::setup_shade(Shade& sh, const Polygon& p) {
   // only 0-or-31); alpha-0 lanes never reach the resolve (span_shade narrows
   // the pass plane), so the opaque resolve skips alpha logic entirely.
   sh.opaque = sh.polyalpha == 31 && (!sh.textured || (sh.blendmode & 1) || (sh.fmt != 1 && sh.fmt != 6));
+  // Enhanced: an opaque texture that can cut pixels out (colour 0 transparent
+  // in the paletted formats, fmt 5's transparent entries, fmt 7's bit 15).
+  sh.cutout = sh.aa_plus && !sh.aa_exempt && !sh.shadow && sh.polyalpha == 31 && sh.textured &&
+              ((sh.fmt >= 2 && sh.fmt <= 4 && sh.alpha0 == 0) || sh.fmt == 5 || sh.fmt == 7);
+  sh.dsdx = sh.dtdx = sh.dsdy = sh.dtdy = 0;
+  if (sh.cutout) {
+    // The texcoord gradients across and down the screen from the plane
+    // through the first three vertices spanning an area (affine: near enough
+    // for sub-samples, and the same whatever else is staged).
+    const Vertex& v0 = gx_->vertex(p.vtx[0]);
+    for (u32 i = 1; i + 1 < p.nverts; ++i) {
+      const Vertex& v1 = gx_->vertex(p.vtx[i]); const Vertex& v2 = gx_->vertex(p.vtx[i + 1]);
+      const s64 x1 = v1.sx - v0.sx, y1 = v1.sy - v0.sy, x2 = v2.sx - v0.sx, y2 = v2.sy - v0.sy;
+      const s64 area = x1 * y2 - x2 * y1;
+      if (!area) continue;
+      const s64 s1 = v1.tex[0] - v0.tex[0], s2 = v2.tex[0] - v0.tex[0], t1 = v1.tex[1] - v0.tex[1], t2 = v2.tex[1] - v0.tex[1];
+      sh.dsdx = static_cast<s32>((s1 * y2 - s2 * y1) / area); sh.dtdx = static_cast<s32>((t1 * y2 - t2 * y1) / area);
+      sh.dsdy = static_cast<s32>((x1 * s2 - x2 * s1) / area); sh.dtdy = static_cast<s32>((x1 * t2 - x2 * t1) / area);
+      break;
+    }
+  }
   sh.mode = pick_depth_mode(p);
   sh.resolve = select_resolve(sh);
 }
@@ -1369,6 +1417,8 @@ void Renderer3D::span_texels(const Shade& sh, SpanBuf& sb, s32 ca, s32 cb) const
   u32* col = sb.tcol + off; u32* alp = sb.talp + off;
   // Only the live groups of the pass plane (see live_runs): a dead group's
   // texels are never read, by the shader (which skips it too) or the resolve.
+  std::memset(sb.gath, 0, sizeof sb.gath);
+  live_runs(sb.pass + off, n, [&](u32 k, u32 len) { for (u32 q = (off + k) / 16; q <= (off + k + len - 1) / 16; ++q) sb.gath[q] = 1; });
   if (const GatherNFn g = reinterpret_cast<GatherNFn>(sh.gather4)) {
     const prof::Counter c = sh.texels ? prof::C_TEX_FAST : (sh.fmt == 5 ? prof::C_TEX_SLOW_FMT5 : prof::C_TEX_FAST);
     live_runs(sb.pass + off, n, [&](u32 k, u32 len) {
@@ -1707,6 +1757,21 @@ template <int mode, bool textured, int aa, bool opq>
             attr[k] = vorrq_u32(attr[k], vshlq_n_u32(cov, 8));
           }
           xcov += cov_step * static_cast<s32>(t0 + t1);
+        }
+        if constexpr (aa == 2) {
+          if (sh.cutout) {
+            // Alpha-to-coverage (cutout_coverage): a cut edge inside the
+            // polygon takes its coverage, axis and fixed side, unless the pixel
+            // is on the polygon's own outline with hardware coverage.
+            for (u32 k = 0; k < NH; ++k) {
+              const uint32x4_t cc = vmovl_u16(vget_low_u16(vmovl_u8(vreinterpret_u8_u32(vdup_n_u32(*reinterpret_cast<const u32*>(sb.ccov + i + k * 4))))));
+              const uint32x4_t valid = vmvnq_u32(vceqq_u32(cc, vdupq_n_u32(0xFF)));
+              const uint32x4_t real = vandq_u32(vtstq_u32(attr[k], vdupq_n_u32(3)), vmvnq_u32(vceqq_u32(vandq_u32(attr[k], vdupq_n_u32(0x1F00)), vdupq_n_u32(0x1F00))));
+              const uint32x4_t cut = vorrq_u32(vorrq_u32(vshlq_n_u32(vandq_u32(cc, vdupq_n_u32(0x1F)), 8), vshlq_n_u32(vandq_u32(cc, vdupq_n_u32(0x20)), 8)),
+                                               vorrq_u32(vandq_u32(cc, vdupq_n_u32(0x40)), vdupq_n_u32(0x24)));
+              attr[k] = vbslq_u32(vbicq_u32(valid, real), vorrq_u32(vbicq_u32(attr[k], vdupq_n_u32(0x1F00 | 0x2000 | 0x60)), cut), attr[k]);
+            }
+          }
         }
         for (u32 k = 0; k < NH; ++k) {
           const u32 ak = addr + k * 4, uk = under + k * 4;
@@ -2223,6 +2288,85 @@ void Renderer3D::resolve_batch_vec(const Shade& sh, const SpanJob* jobs, u32 n) 
 // span: span_texels/span_shade called once per batch (up to BATCH_PX pixels)
 // instead of per span, amortising their setup. Safe across one polygon's
 // spans since they lie on distinct scanlines.
+// Enhanced AA, alpha-to-coverage: the hardware has no coverage for the edge
+// a cut-out texture makes inside a polygon (foliage, fences, sprites on
+// quads), the largest class of edges it leaves jagged. For every opaque
+// texel of a cut-out polygon next to a transparent one -- along the span,
+// or on the batch's lines above and below at the same x -- the texture's
+// alpha is sampled on a 4x4 grid across the pixel (texcoords stepped by
+// the span's ds/dx and the neighbouring line's ds/dy) and the covered share
+// becomes the pixel's coverage; the axis and side come from which half of
+// the grid lost more samples. A pixel on the polygon's own outline keeps
+// the hardware's coverage (the resolve checks that).
+void Renderer3D::cutout_coverage(const Shade& sh, SpanBuf& sb, const SpanJob* jobs, u32 n) {
+  const u32 total = (batch_px_ + 15) & ~15u;
+  std::memset(sb.ccov, 0xFF, total);
+  // Without the vector stages (the portable build, and the scalar resolves)
+  // no texel alpha has been gathered: sample it here for the batch's pixels.
+  if (!sh.vec) {
+    // The same groups the vector gather covers (live_runs over the depth
+    // candidates), so both paths see the same transparent neighbours.
+    std::memset(sb.gath, 0, sizeof sb.gath);
+    live_runs(sb.pass, total, [&](u32 k, u32 len) { for (u32 q = k / 16; q <= (k + len - 1) / 16; ++q) sb.gath[q] = 1; });
+    for (u32 j = 0; j < n; ++j) {
+      const SpanJob& job = jobs[j];
+      for (s32 x = job.ca; x < job.cb; ++x) { const s32 i = static_cast<s32>(job.off) + (x - job.ca); if (sb.gath[i / 16]) texture_sample(sh, sb.sc[i], sb.tc[i], &sb.talp[i]); }
+    }
+  }
+  s16 ss[16], tt[16]; u32 aa[16];
+  // Texels were gathered for the live sixteen-pixel groups only (live_runs);
+  // a transparent neighbour is a gathered lane with zero alpha.
+  auto gathered = [&](s32 i) { return sb.gath[i / 16] != 0; };
+  auto transparent = [&](s32 i) { return i >= 0 && gathered(i) && !sb.talp[i]; };
+  // Nothing here reads another line: what a batch holds of a polygon's other
+  // lines depends on where the band's lines start, and the result must not.
+  const s32 dsx = sh.dsdx, dtx = sh.dtdx, dsy = sh.dsdy, dty = sh.dtdy;
+  for (u32 j = 0; j < n; ++j) {
+    const SpanJob& job = jobs[j];
+    for (s32 x = job.ca; x < job.cb; ++x) {
+      const s32 i = static_cast<s32>(job.off) + (x - job.ca);
+      if (!sb.pass[i] || !sb.talp[i]) continue;   // not drawn, or a transparent texel itself
+      const s32 il = x > job.ca ? i - 1 : -1, ir = x + 1 < job.cb ? i + 1 : -1;
+      // A transparent texel beside this one: along the span from the gathered
+      // neighbours, above or below from the texture itself.
+      bool cut = transparent(il) || transparent(ir);
+      if (!cut) {
+        u32 a_up, a_dn;
+        texture_sample(sh, static_cast<s16>(sb.sc[i] - dsy), static_cast<s16>(sb.tc[i] - dty), &a_up);
+        texture_sample(sh, static_cast<s16>(sb.sc[i] + dsy), static_cast<s16>(sb.tc[i] + dty), &a_dn);
+        cut = !a_up || !a_dn;
+      }
+      // DS_CUT_TRACE=x,y: the cut-out decision at one pixel (NEON against scalar checks).
+      static int trx = -2, try_ = -2;
+      if (trx == -2) { trx = try_ = -1; if (const char* t = std::getenv("DS_CUT_TRACE")) std::sscanf(t, "%d,%d", &trx, &try_); }
+      const bool tr = x == trx && job.y == try_;
+      if (tr) std::fprintf(stderr, "cut-trace frame %llu (%d,%d) vec %d pass %u talp %u il %d(%u,g%d) ir %d(%u,g%d) cut %d dsx %d dtx %d dsy %d dty %d s %d t %d fmt %u\n", (unsigned long long)nds_.frame_count, x, job.y, (int)sh.vec, sb.pass[i], sb.talp[i], il, il >= 0 ? sb.talp[il] : 0, il >= 0 ? (int)gathered(il) : -1, ir, ir >= 0 ? sb.talp[ir] : 0, ir >= 0 ? (int)gathered(ir) : -1, (int)cut, dsx, dtx, dsy, dty, sb.sc[i], sb.tc[i], sh.fmt);
+      if (!cut) continue;
+      for (int v = 0; v < 4; ++v)
+        for (int u = 0; u < 4; ++u) {
+          const s32 fu = 2 * u - 3, fv = 2 * v - 3;   // (u + 0.5) / 4 - 0.5 in eighths
+          ss[v * 4 + u] = static_cast<s16>(sb.sc[i] + (dsx * fu + dsy * fv) / 8);
+          tt[v * 4 + u] = static_cast<s16>(sb.tc[i] + (dtx * fu + dty * fv) / 8);
+        }
+      for (int k = 0; k < 16; ++k) texture_sample(sh, ss[k], tt[k], &aa[k]);   // the scalar sampler: sixteen lookups per cut pixel only
+      int col[4] = {0, 0, 0, 0}, row[4] = {0, 0, 0, 0}, covered = 0;
+      for (int v = 0; v < 4; ++v)
+        for (int u = 0; u < 4; ++u)
+          if (aa[v * 4 + u]) { ++covered; ++col[u]; ++row[v]; }
+      if (covered >= 16) continue;
+      const int ax = (col[0] + col[1]) - (col[2] + col[3]), ay = (row[0] + row[1]) - (row[2] + row[3]);
+      // Near a diagonal the two halves tie and the axis would flip from
+      // pixel to pixel (a comb along the edge): the horizontal axis wins
+      // unless the vertical split is clearly stronger.
+      const bool vertical = (ay < 0 ? -ay : ay) > (ax < 0 ? -ax : ax) + 2;
+      const bool neg = vertical ? ay < 0 : ax < 0;   // the less covered half is the outside
+      const u32 cov = covered ? static_cast<u32>(covered * 2 - 1) : 0u;
+      sb.ccov[i] = static_cast<u8>(cov | (vertical ? 0x20 : 0) | (neg ? 0x40 : 0));
+      if (tr) std::fprintf(stderr, "cut-trace   covered %d ccov %02x\n", covered, sb.ccov[i]);
+    }
+  }
+}
+
 void Renderer3D::flush_batch(const Shade& sh) {
   if (!njobs_) { batch_px_ = 0; return; }
   prof::add(prof::C_BATCHES, 1); prof::add(prof::C_BATCH_SPANS, njobs_); prof::add(prof::C_BATCH_PX, batch_px_);
@@ -2269,6 +2413,9 @@ void Renderer3D::flush_batch(const Shade& sh) {
     }
   }
 #endif
+  static const bool no_cut = std::getenv("DS_AA_NOCUT") != nullptr;   // DS_AA_NOCUT=1: enhanced without alpha-to-coverage
+  if (sh.cutout && !no_cut) cutout_coverage(sh, spanbuf_, jobs_.data(), njobs_);
+  else if (sh.cutout) std::memset(spanbuf_.ccov, 0xFF, (batch_px_ + 15) & ~15u);
   (this->*sh.resolve)(sh, jobs_.data(), njobs_);
   njobs_ = 0; batch_px_ = 0;
 }
@@ -2516,7 +2663,65 @@ void Renderer3D::save_raw_row(s32 y) {
   raw_prev_ok_ = raw_line_ == y - 1;
   raw_line_ = y;
 }
+// Enhanced AA: edges the hardware never covers -- two surfaces meeting
+// inside their polygons (an interpenetration: a wheel in a boiler), or a
+// silhouette whose outline run the raster left unfilled. A plain opaque
+// pixel (no edge run at all) next to a plain pixel of another surface gets
+// the boundary estimated from the two depth slopes: each surface's depth is
+// extended linearly from its pixel, using the slope toward the pixel beyond
+// it on the same row (rows beyond the neighbours are not read: the ring may
+// not hold them yet), and the crossing between the two centres is solved.
+// The nearer pixel of the pair takes the coverage of its own side, with the
+// outside fixed toward the other pixel (attr bits 5-6: side fixed, negative;
+// bit 0 marks the edge). Every pixel decides for itself from its four
+// neighbours and writes only its own line, so the result does not depend on
+// where a band's lines start; of several crossings the largest depth jump
+// names the axis, the horizontal one unless the vertical jump is clearly
+// larger (a diagonal would otherwise flip axis from pixel to pixel).
+void Renderer3D::stamp_intersections(s32 y) {
+  const u32 row = row_of(y) + 1, up = row_of(y - 1) + 1, dn = row_of(y + 1) + 1;
+  auto opaque_plain = [&](u32 n) { const u32 a = attr_[n]; return (color_[n] >> 24) != 0 && !(a & (1u << 22)) && !(a & 0xF); };
+  // Crossing from P's centre toward N's in 1/32 (-1: same surface), with
+  // P's slope from L beyond it and N's from R beyond it (0 = none).
+  auto crossing = [&](u32 P, u32 N, u32 L, u32 R) -> int {
+    const s64 zp = depth_[P], zn = depth_[N];
+    if (same_surface(static_cast<s32>(zp), static_cast<s32>(zn))) return -1;
+    const s64 dzA = (L && (color_[L] >> 24) && same_surface(static_cast<s32>(zp), static_cast<s32>(depth_[L]))) ? zp - static_cast<s64>(depth_[L]) : 0;
+    const s64 dzB = (R && (color_[R] >> 24) && same_surface(static_cast<s32>(zn), static_cast<s32>(depth_[R]))) ? static_cast<s64>(depth_[R]) - zn : 0;
+    const s64 den = dzA - dzB;
+    s64 t32 = 16;
+    if (den != 0) { t32 = ((zn - zp - dzB) * 32) / den; if (t32 < 0 || t32 > 32) t32 = 16; }
+    return static_cast<int>(t32);
+  };
+  for (int x = 0; x < 256; ++x) {
+    const u32 P = row + x;
+    if (!opaque_plain(P)) continue;
+    // Candidate pairs: right, left (horizontal), down, up (vertical). Only a
+    // pair where P is the nearer pixel can stamp P.
+    int best_t = -1; s64 best_jump = -1; bool best_vertical = false, best_neg = false;
+    auto consider = [&](u32 N, u32 L, u32 R, bool vertical, bool neg) {
+      if (!N || !opaque_plain(N) || depth_[P] > depth_[N]) return;
+      const int t = crossing(P, N, L, R);
+      if (t < 0) return;
+      s64 jump = static_cast<s64>(depth_[N]) - depth_[P]; if (jump < 0) jump = -jump;
+      // The horizontal axis wins unless the vertical jump is clearly larger.
+      const bool take = best_t < 0 || (vertical ? jump > (best_jump * 5) / 4 : (best_vertical ? jump * 5 >= best_jump * 4 : jump > best_jump));
+      if (take) { best_t = t; best_jump = jump; best_vertical = vertical; best_neg = neg; }
+    };
+    consider(x < 255 ? P + 1 : 0, x > 0 ? P - 1 : 0, x < 254 ? P + 2 : 0, false, false);
+    consider(x > 0 ? P - 1 : 0, x < 255 ? P + 1 : 0, x > 1 ? P - 2 : 0, false, true);
+    consider(y < 191 ? dn + x : 0, y > 0 ? up + x : 0, 0, true, false);
+    consider(y > 0 ? up + x : 0, y < 191 ? dn + x : 0, 0, true, true);
+    if (best_t < 0) continue;
+    // P's own surface covers [-16, t] of its 32-wide pixel toward the other.
+    const u32 cov = static_cast<u32>(std::clamp(best_t + 16 - 1, 0, 30));
+    attr_[P] = (attr_[P] & ~0x1F00u & ~0x2000u & ~0x60u) | 0x1 | (cov << 8) | (best_vertical ? 0x2000u : 0u) | 0x20u | (best_neg ? 0x40u : 0u);
+  }
+}
+
 void Renderer3D::enhanced_aa_line(s32 y) {
+  static const bool no_isect = std::getenv("DS_AA_NOISECT") != nullptr;   // DS_AA_NOISECT=1: enhanced without the depth-crossing edges
+  if (!no_isect) stamp_intersections(y);
   const u32 rb = row_of(y), row = rb + 1;
   const u32 ub = row_of(y - 1), db = row_of(y + 1);
   const u32* raw_y = raw_rows_[y & 3];
@@ -2544,6 +2749,7 @@ void Renderer3D::enhanced_aa_line(s32 y) {
   // colour into the pixel. Two -> the nearer of them (the hardware keeps the
   // nearest thing behind), an id change first.
   auto outside = [&](u32 attr, u32 z, u32 a, u32 b) -> u32 {
+    if (attr & 0x20) return (attr & 0x40) ? a : b;   // side fixed by stamp_intersections
     auto candidate = [&](u32 n) -> int {   // 0: no, 1: same id but clearly behind, 2: another id, not nearer
       const u32 nz = depth_[n];
       if ((attr_[n] >> 24) != (attr >> 24)) return nz >= z ? 2 : 0;
