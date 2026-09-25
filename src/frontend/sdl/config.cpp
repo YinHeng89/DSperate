@@ -270,7 +270,8 @@ R"(# DSperate settings. Command-line flags override this file. Two files next
                                 # of a second pixel layer). enhanced: the same coverage in every game,
                                 # blended with the neighbour outside the edge instead of that layer: about
                                 # as cheap as off, and it keeps the silhouettes the DS loses where a
-                                # surface covers its own edge; not pixel-exact. true / false still read
+                                # surface covers its own edge; 3D drawn as 2D (text and panels mapped one
+                                # texel per pixel) is left alone; not pixel-exact. true / false still read
                                 # as accurate / off, and the older smooth reads as enhanced
 # sink = auto                   # where frames go. auto picks per device: the display engine's hardware
                                 # scaler where /dev/disp answers (Miyoo A30 and other Allwinner boards),

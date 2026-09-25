@@ -144,6 +144,7 @@ public:
     // Edges all fill under AA, edge marking, blended translucency or wireframe; fixed per polygon.
     bool always_fill;
     bool aa_plus;   // video.aa = enhanced: the resolve's same-surface rule
+    bool aa_exempt; // enhanced: 3D used as 2D (a screen-aligned quad mapped one texel per pixel), left unblended
     bool attrs_constant, rgb_constant;   // uniform across the polygon; checked once
   };
 private:

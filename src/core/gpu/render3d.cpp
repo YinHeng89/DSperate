@@ -590,7 +590,7 @@ template <bool textured>
 
 [[gnu::always_inline]] inline void Renderer3D::plot_translucent(u32 addr, u32 color, u32 z, u32 polyattr, bool shadow) {
   const u32 dstattr = attr_[addr];
-  u32 attr = (polyattr & 0xE0F0) | ((polyattr >> 8) & 0xFF0000) | (1u << 22) | (dstattr & 0xFF007F0F);   // bits 13-14: the edge's blend direction (enhanced AA)
+  u32 attr = (polyattr & 0xFFF0) | ((polyattr >> 8) & 0xFF0000) | (1u << 22) | (dstattr & 0xFF007F0F);   // bits 13-14: the edge's blend direction; polyattr bits 8-12: full coverage an AA-exempt quad stamps (enhanced), else 0
   if (shadow) {
     // Shadows skip pixels of their own polygon id, opaque or translucent.
     if (dstattr & (1u << 22)) { if ((dstattr & 0x007F0000) == (attr & 0x007F0000)) return; }
@@ -1126,6 +1126,36 @@ void Renderer3D::setup_shade(Shade& sh, const Polygon& p) {
   sh.vec = false;
 #endif
   sh.aa_plus = aa_ == 2;
+  // Enhanced leaves 3D-as-2D alone: a textured screen-aligned rectangle
+  // smaller than the screen, with constant W, whose texture spans one texel
+  // per pixel (text, HUD panels). Its pixels take full coverage, opaque
+  // writes through the AA-off kernels with coverage 31 in polyattr and
+  // translucent plots by stamping it, so neither the quad's outline nor
+  // its texels get blended: the hardware plots such text on both layers and
+  // blends two copies of the same texel, a neighbour holds a different one.
+  // Full-screen quads (backgrounds, fades, tints) are left to the normal
+  // path: no outline to protect, and a stamp would switch AA off under them.
+  sh.aa_exempt = false;
+  if (sh.aa_plus && sh.textured && p.nverts == 4) {
+    s32 sx0 = 512, sx1 = -1, sy0 = 512, sy1 = -1, s0 = 0x7FFF, s1 = -0x8000, t0 = 0x7FFF, t1 = -0x8000;
+    u32 axis_ok = 1; const s32 w0 = gx_->vertex(p.vtx[0]).pos[3];
+    for (u32 i = 0; i < 4; ++i) {
+      const Vertex& v = gx_->vertex(p.vtx[i]);
+      sx0 = std::min(sx0, v.sx); sx1 = std::max(sx1, v.sx); sy0 = std::min(sy0, v.sy); sy1 = std::max(sy1, v.sy);
+      s0 = std::min<s32>(s0, v.tex[0]); s1 = std::max<s32>(s1, v.tex[0]); t0 = std::min<s32>(t0, v.tex[1]); t1 = std::max<s32>(t1, v.tex[1]);
+      if (v.pos[3] != w0) axis_ok = 0;
+      if ((v.sx != sx0 && v.sx != sx1) || (v.sy != sy0 && v.sy != sy1)) axis_ok = 0;   // every corner on the rectangle
+    }
+    // 12.4 texture coordinates: 16 units per texel. A rectangle placed on
+    // pixel corners spans x1 - x0 pixels, one placed on pixel centres one
+    // more; either way it is one texel per pixel.
+    auto one_to_one = [](s32 span, s32 px) { return span == px * 16 || span == (px + 1) * 16; };
+    const bool fullscreen = sx0 == 0 && sx1 >= 255 && sy0 == 0 && sy1 >= 191;
+    if (axis_ok && !fullscreen && sx1 > sx0 && sy1 > sy0 && one_to_one(s1 - s0, sx1 - sx0) && one_to_one(t1 - t0, sy1 - sy0)) {
+      sh.aa_exempt = true;
+      sh.polyattr |= 0x1F00;   // full coverage on every pixel the quad writes (plot_translucent ORs these bits in)
+    }
+  }
   sh.always_fill = (sh.dispcnt & ((1 << 4) | (1 << 5))) || (sh.polyalpha < 31 && (sh.dispcnt & (1 << 3))) || sh.wireframe;
   // Provably all-opaque: alpha 31 + (decal, or a format whose texel alpha is
   // only 0-or-31); alpha-0 lanes never reach the resolve (span_shade narrows
@@ -1532,7 +1562,7 @@ template <int mode, bool textured, int aa, bool opq>
   // destination has it) | dest coverage bits 0-4, byte 2 = polygon id | the
   // translucent bit, byte 3 = the destination's.
   const uint8x8_t pa0 = vdup_n_u8(static_cast<u8>(polyattr & 0xF0));
-  const uint8x8_t pa1 = vdup_n_u8(static_cast<u8>((polyattr >> 8) & 0xE0));
+  const uint8x8_t pa1 = vdup_n_u8(static_cast<u8>((polyattr >> 8) & 0xFF));   // bits 0-4: full coverage an AA-exempt quad stamps (enhanced), else 0
   const uint8x8_t pa2 = vdup_n_u8(static_cast<u8>((polyattr >> 24) | 0x40));
   const uint8x8_t pa2id = vand_u8(pa2, vdup_n_u8(0x7F));
   const uint8x8_t pa3id = vdup_n_u8(static_cast<u8>((polyattr >> 24) & 0x3F)), v40_8 = vdup_n_u8(0x40);
@@ -2118,6 +2148,7 @@ Renderer3D::ResolveFn Renderer3D::select_resolve(const Shade& sh) {
     DS_V2(0), DS_V2(1), DS_V2(2), DS_V2(3)
 #undef DS_V2
   };
+  if (sh.aa_exempt) return sh.vec ? kResolveVec[sh.mode][sh.textured][0][sh.opaque] : kResolve[sh.mode][sh.textured][0][sh.shadow];   // enhanced, 3D as 2D: the AA-off kernels
   if (sh.vec) return sh.aa_plus ? kResolveVec2[sh.mode][sh.textured][sh.opaque] : kResolveVec[sh.mode][sh.textured][(sh.dispcnt >> 4) & 1][sh.opaque];
 #endif
   static constexpr ResolveFn kResolve2[4][2][2] = {
