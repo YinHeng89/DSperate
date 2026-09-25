@@ -146,6 +146,7 @@ void Engine2D::debug_outhash(u32 line) {
 void Engine2D::render_line(u32 line) {
   struct AtExit { Engine2D* e; u32 line; ~AtExit() { if (g_outhash_on) e->debug_outhash(line); } } at_exit{this, line};
   cur_ = regs_.begin_line();
+  top_mode_ = TOP_NONE;
   if (!cur_.enabled) {
     // Powered-down engines output a fixed colour: black for A, white for B.
     out_.fill(num_ ? 0xFF3F3F3F : 0xFF000000);
@@ -216,6 +217,7 @@ void Engine2D::render_line(u32 line) {
             if ((cur_.layer_enable & (1 << bg)) && bg_[bg].any && (cur_.bgcnt[bg] & 3) == prio) { top = bg; break; }
         if (top >= 0 && line_all_opaque(bg_[top])) {
           prof::add(prof::C_2D_FAST_ONE, 1);
+          top_mode_ = top == 0 ? TOP_ALL_BG0 : TOP_NONE;
           kern::active::resolve16_one(bg_[top].v(), bg_[top].table, out_.data());
           return;
         }
@@ -933,7 +935,7 @@ void Engine2D::setup_tables() {
 // per-pixel derivations are kernels; the two palette gathers stay scalar.
 void Engine2D::select_layers() {
   setup_tables();
-  top16_.fill(LV_OPAQUE); top_tid_.fill(T_BACKDROP);
+  top16_.fill(LV_OPAQUE); top_tid_.fill(T_BACKDROP); top_mode_ = TOP_TIDS;
   second16_.fill(0); second_tid_.fill(T_NONE);   // nothing beneath: never a blend target
   const bool objs = (cur_.layer_enable & 0x10) && num_sprites_;
   const bool no_windows = !(cur_.dispcnt & 0xE000);
@@ -972,6 +974,13 @@ bool Engine2D::needs_second() const {
   return false;
 }
 
+void Engine2D::edge_mask(u8* out) const {
+  const bool is3d = !num_ && (cur_.dispcnt & 8) && cur_.enabled;
+  if (!edge3d_ || !is3d || top_mode_ == TOP_NONE) { std::memset(out, 0, 256); return; }
+  if (top_mode_ == TOP_ALL_BG0) { std::memcpy(out, edge3d_, 256); return; }
+  for (u32 x = 0; x < 256; ++x) out[x] = top_tid_[x] == T_BG0 ? edge3d_[x] : 0;
+}
+
 void Engine2D::resolve_full() {
   const bool is3d = !num_ && (cur_.dispcnt & 8);
   kern::active::resolve16_full(top16_.data(), top_tid_.data(), second16_.data(), second_tid_.data(), tables_, obj_attr_.data(), obj_alpha_.data(),
@@ -991,7 +1000,7 @@ bool Engine2D::line_all_opaque(const Layer& p) {
 // to the output) and the fade path (which still needs the layer ids).
 void Engine2D::select_top_only() {
   setup_tables();
-  top16_.fill(LV_OPAQUE); top_tid_.fill(T_BACKDROP);
+  top16_.fill(LV_OPAQUE); top_tid_.fill(T_BACKDROP); top_mode_ = TOP_TIDS;
   const bool objs = (cur_.layer_enable & 0x10) && num_sprites_;
   const bool no_windows = !(cur_.dispcnt & 0xE000);
   for (int prio = 3; prio >= 0; --prio) {

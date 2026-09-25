@@ -3,6 +3,7 @@
 //
 // Headless frontend: boots the BIOS/firmware (and optionally a ROM), runs N
 // frames, optionally tracing instructions or dumping frames/audio.
+#include "core/gpu/edge_cut.h"
 #include "core/nds.h"
 #include "core/cpu/timing_mode.h"
 #include "core/pc_sampler.h"
@@ -247,6 +248,7 @@ int main(int argc, char** argv) {
   int stats_from = 0;   // --stats-from N: first frame counted in the timing statistics
   const char* pc_profile = nullptr;
   int dump_from = 0, dump_count = 0;   // --dump-from/--dump-count: window of a large dump
+  int cut_n = 0; const char* cut_path = nullptr;   // --dump-cut
   int frames = 60; bool direct = false;
 #if DSPERATE_JIT
   bool jit = true;                    // both CPUs; --interp clears it
@@ -321,6 +323,7 @@ int main(int argc, char** argv) {
     else if (arg("--trace")) trace = argv[++i];
     else if (arg("--max")) ts.max = std::strtoull(argv[++i], nullptr, 0);
     else if (arg("--dump-frames")) dump = argv[++i];
+    else if (arg("--dump-cut")) { cut_n = std::atoi(argv[++i]); cut_path = argv[++i]; }   // N FILE: enhanced AA cut at Nx (edge bytes exported, 1x unblended), both screens, raw 0xAARRGGBB
     else if (arg("--hash-frames")) hash_frames = argv[++i];   // FILE: "frame top bottom" per frame, FNV-1a 64 of each screen's 0xAARRGGBB (the video golden hashes)
     else if (arg("--dump-scaled")) { scaled_n = std::atoi(argv[++i]); scaled_path = argv[++i]; }   // N FILE: both screens through the scanline scaler at Nx, raw BGRA
     else if (arg("--dump-from")) dump_from = std::atoi(argv[++i]);    // first frame to dump
@@ -605,6 +608,13 @@ int main(int argc, char** argv) {
   unsigned long long last9 = 0, last7 = 0;
   FILE* dump_out = dump ? std::fopen(dump, "wb") : nullptr;
   if (dump && !dump_out) { std::fprintf(stderr, "could not open %s\n", dump); return 1; }
+  FILE* cut_out = nullptr; std::vector<ds::u32> cut_px;
+  if (cut_n > 0 && cut_path) {
+    cut_out = std::fopen(cut_path, "wb");
+    if (!cut_out) { std::fprintf(stderr, "could not open %s\n", cut_path); return 1; }
+    cut_px.resize(static_cast<size_t>(256 * cut_n) * static_cast<size_t>(192 * cut_n));
+    nds.gpu.set_edge_export(true);
+  }
   FILE* hash_out = hash_frames ? std::fopen(hash_frames, "w") : nullptr;
   if (hash_frames && !hash_out) { std::fprintf(stderr, "could not open %s\n", hash_frames); return 1; }
   ds::input::Log log;
@@ -812,6 +822,11 @@ int main(int argc, char** argv) {
     }
     if (scaled_out && i >= dump_from && (dump_count <= 0 || i < dump_from + dump_count))
       for (int k = 0; k < 2; ++k) std::fwrite(scaled_px[k].data(), 4, scaled_px[k].size(), scaled_out);
+    if (cut_out && i >= dump_from && (dump_count <= 0 || i < dump_from + dump_count))
+      for (int k = 0; k < 2; ++k) {
+        ds::gpu::edge_cut_screen(nds.gpu.framebuffer(k), nds.gpu.edge_plane(k), cut_n, cut_px.data());
+        std::fwrite(cut_px.data(), 4, cut_px.size(), cut_out);
+      }
     if (dump_out && i >= dump_from && (dump_count <= 0 || i < dump_from + dump_count)) {
       // raw 0xAARRGGBB, top screen then bottom, 256x192 each, one record per frame
       std::fwrite(nds.gpu.framebuffer(0), 4, ds::SCREEN_W * ds::SCREEN_H, dump_out);

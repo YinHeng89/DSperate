@@ -123,6 +123,9 @@ public:
   Renderer3D::FrameRef frame_ref() const { return renderer_.frame_ref(); }
   u64 last_raster_ns() const { return renderer_.last_band_sum_ns(); }
   const u32* line(const Renderer3D::FrameRef& f, u32 y);
+  // The enhanced AA edge bytes of that line (after line(): synced), or null
+  // when not exported or the 3D layer is scrolled (render_xpos).
+  const u8* edge_line(const Renderer3D::FrameRef& f, u32 y) const { return render_xpos_ ? nullptr : f.edge_line(y); }
   // Finish async raster; needed before touching texture VRAM (raster workers may still read it).
   void sync_raster();
   void debug_dump(FILE* f) { renderer_.debug_dump(f); }

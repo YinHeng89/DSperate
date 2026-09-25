@@ -76,6 +76,11 @@ public:
 
   // Engine A: 256 RGB666 with 5-bit alpha in bits 24-28 (0 = transparent), or null.
   void set_3d_line(const Pixel* line) { line3d_ = line; }
+  // Enhanced AA edge bytes of the 3D line (null: none), and the line's edge
+  // bytes where the 3D layer is what shows (the top selected layer is BG0
+  // as the 3D layer), zero elsewhere.
+  void set_3d_edges(const u8* e) { edge3d_ = e; }
+  void edge_mask(u8* out) const;
 
   u32 bldcnt() const { return regs_.bldcnt(); }
   u32 eva() const { return regs_.eva(); }
@@ -139,6 +144,8 @@ private:
   alignas(16) std::array<u8, 256> top_id_{}, top_kind_{}, top_alpha_{}, second_id_{};
   alignas(16) std::array<Pixel, 256> out_{};
   const Pixel* line3d_ = nullptr;
+  const u8* edge3d_ = nullptr;
+  enum : u8 { TOP_NONE, TOP_ALL_BG0, TOP_TIDS } top_mode_ = TOP_NONE;   // how render_line decided the top layer (edge_mask)
 
   const VramMap& vram() const;
   const VramMap* vm_override_ = nullptr;

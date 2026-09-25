@@ -37,7 +37,8 @@ public:
   enum class Fit : u8 { Same, Changed, Lost };
   virtual Fit fit(SDL_Window* win, int w, int h) = 0;
   // One frame. False if nothing was shown.
-  virtual bool present(const u32* const fb[2], const View* views, int nviews, const Params& p) = 0;
+  // edges: per screen, the enhanced AA edge bytes for the panel-density cut (null: none).
+  virtual bool present(const u32* const fb[2], const u8* const edges[2], const View* views, int nviews, const Params& p) = 0;
   // The frontend's overlay for the coming frame: `lw`x`lh`, pitch `lw`,
   // 0xAARRGGBB with alpha honoured. Null if unavailable.
   virtual u32* overlay(int lw, int lh) = 0;

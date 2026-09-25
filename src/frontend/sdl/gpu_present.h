@@ -37,7 +37,9 @@ public:
   // out in; `rot` maps it onto the presented buffer. False if nothing shown.
   // `drawn`: rectangle the frontend's overlay drew this frame (see overlay()).
   // `grid`: LCD grid brightness on a seam, 0..256 (256 = off).
-  bool present(ScanoutOut& out, const u32* const fb[2], const View* views, int nviews, int rot, int lw, int lh, u8 inset_alpha,
+  // edges: the enhanced AA edge bytes per screen (Gpu::edge_plane) for the
+  // panel-density cut, or null entries for none.
+  bool present(ScanoutOut& out, const u32* const fb[2], const u8* const edges[2], const View* views, int nviews, int rot, int lw, int lh, u8 inset_alpha,
                SDL_Rect drawn = SDL_Rect{0, 0, 0, 0}, u32 grid = 256);
   // Canvas for the frontend's overlays (OSD, pause menu, notices) for the
   // coming frame: `lw`x`lh`, pitch `lw`, 0xAARRGGBB, alpha honoured,

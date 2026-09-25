@@ -2520,6 +2520,7 @@ void Renderer3D::enhanced_aa_line(s32 y) {
   const u32 rb = row_of(y), row = rb + 1;
   const u32 ub = row_of(y - 1), db = row_of(y + 1);
   const u32* raw_y = raw_rows_[y & 3];
+  u8* const eb = out_edge_dst_ ? out_edge_dst_ + y * 256 : nullptr;   // export the edge instead of blending it
   // The line above: saved by its own pass on this instance, else still raw
   // in the ring (a band's overlap line); the line below is raw in the ring.
   const u32* raw_up = raw_prev_ok_ ? raw_rows_[(y - 1) & 3] : &color_[ub];
@@ -2570,10 +2571,12 @@ void Renderer3D::enhanced_aa_line(s32 y) {
     if (attr & 0x2000) {
       const u32 n = outside(attr, depth_[addr], ub + 1 + x, db + 1 + x);
       if (!n) continue;
+      if (eb) { eb[x] = static_cast<u8>(0xA0 | (n == ub + 1 + x ? 0x40 : 0) | cov); continue; }   // panel cut: unblended, the byte says where
       bot = n == ub + 1 + x ? partner(n, raw_up, ub) : partner(n, raw_dn, db);
     } else {
       const u32 n = outside(attr, depth_[addr], addr - 1, addr + 1);
       if (!n) continue;
+      if (eb) { eb[x] = static_cast<u8>(0x80 | (n == addr - 1 ? 0x40 : 0) | cov); continue; }
       bot = partner(n, raw_y, rb);
     }
     if (cov == 0) { color_[addr] = bot; continue; }
@@ -2601,6 +2604,7 @@ void Renderer3D::final_pass_ref(s32 y) {
     const bool clear_fog = (rs_->dispcnt & (1 << 14)) || (rs_->clear_attr1 & 0x8000);
     work = (dispcnt & (1 << 7)) && clear_fog;
   }
+  if (out_edge_dst_) std::memset(out_edge_dst_ + y * 256, 0, 256);   // enhanced_aa_line fills the edge bytes
   if (game_aa_ && !under_layer_) save_raw_row(y);   // enhanced AA: the line before this pass touches it
   if (!work) { std::memcpy(&out_dst_[y * 256], &color_[row_of(y) + 1], 256 * sizeof(u32)); return; }
   if (dispcnt & (1 << 5)) {
@@ -2687,6 +2691,7 @@ void Renderer3D::final_pass(s32 y) {
     const bool clear_fog = (rs_->dispcnt & (1 << 14)) || (rs_->clear_attr1 & 0x8000);
     work = (dispcnt & (1 << 7)) && clear_fog;
   }
+  if (out_edge_dst_) std::memset(out_edge_dst_ + y * 256, 0, 256);   // enhanced_aa_line fills the edge bytes
   if (game_aa_ && !under_layer_) save_raw_row(y);   // enhanced AA: the line before this pass touches it
   if (!work) { std::memcpy(&out_dst_[y * 256], &color_[row_of(y) + 1], 256 * sizeof(u32)); return; }
   // Three passes as 16-pixel byte-plane kernels (ld4/st4), matching the
@@ -3026,6 +3031,7 @@ void Renderer3D::render(const Gpu3D& gx) {
   }
   // Buffer the display isn't reading; becomes the displayed one after dispatch.
   u32* const dst = out_[display_ ^ 1].data();
+  u8* const edst = edge_export_ ? edge_[display_ ^ 1].data() : nullptr;
   // DS_DEBUG_R3D_BINS=fwd|each: with DS_HOST_CORES=1, draw inline as 8 bins in ascending order, on this
   // one instance (fwd) or a fresh one per bin (each) -- the band path's seeding and overlap, reproducibly.
   // Must equal one band. DS_DEBUG_R3D_BINS_LOG=1 prints the cuts.
@@ -3041,22 +3047,22 @@ void Renderer3D::render(const Gpu3D& gx) {
       Renderer3D* r = this;
       if (dbg_bins[0] == 'e' && b > 0) {
         if (!fresh) fresh = std::make_unique<Renderer3D>(nds_);
-        fresh->aa_ = aa_;
+        fresh->aa_ = aa_; fresh->edge_export_ = edge_export_;
         fresh->prepare_worker(gx, list_polys_, list_count_, &poly_texels_, &rs_frame_);
         r = fresh.get();
       }
-      r->render_band(bin_y_[b], bin_y_[b + 1], dst);
+      r->render_band(bin_y_[b], bin_y_[b + 1], dst, edst);
     }
     display_ ^= 1; return;
   }
-  if (nb == 0) { pending_bands_ = 0; build_edges(); render_band(0, 192, dst); display_ ^= 1; return; }
+  if (nb == 0) { pending_bands_ = 0; build_edges(); render_band(0, 192, dst, edst); display_ ^= 1; return; }
 
   // Pool is never shrunk; only `nb` gets work, so the lag cut costs a
   // dispatch flag rather than creating/joining threads mid-scene.
   if (bands_.size() < nb - 1) {
     while (bands_.size() < nb - 1) bands_.push_back(std::make_unique<Renderer3D>(nds_));
   }
-  for (auto& b : bands_) b->aa_ = aa_;
+  for (auto& b : bands_) { b->aa_ = aa_; b->edge_export_ = edge_export_; }
   // Never replaced once big enough: the compositor may still be waiting on it
   // for the previous frame's bands (sync_line). Sized for 3 by default (the
   // usual max); unused workers are never woken (Pool::dispatch).
@@ -3068,7 +3074,7 @@ void Renderer3D::render(const Gpu3D& gx) {
   const Gpu3D& gxr = gx;
   // job_fn_ is a member since the job outlives this call. Workers claim bins
   // until exhausted (not one band each), so an uneven split costs nothing.
-  job_fn_ = [this, &gxr, dst](u32 w) {
+  job_fn_ = [this, &gxr, dst, edst](u32 w) {
     const u64 t0 = prof::now_ns();
     Renderer3D* r = this;
     if (w != 0) { r = bands_[w - 1].get(); r->prepare_worker(gxr, list_polys_, list_count_, &poly_texels_, &rs_frame_); }
@@ -3077,7 +3083,7 @@ void Renderer3D::render(const Gpu3D& gx) {
       const u32 b = pool_->claim();
       if (b >= nbins_) break;
       const s32 y0 = bin_y_[b], y1 = bin_y_[b + 1];
-      if (y0 < y1) r->render_band(y0, y1, dst);
+      if (y0 < y1) r->render_band(y0, y1, dst, edst);
       pool_->mark_done(b);
     }
     // Per worker, own slot, no synchronisation; read next frame after sync_all.
@@ -3091,7 +3097,7 @@ void Renderer3D::render(const Gpu3D& gx) {
     // Next generation's slot; sync_all above guarantees no thief two back is still reading it.
     DispatchCtx& c = ctx_[(gen_ + 1) & 1];
     c.gx = &gx; c.polys = list_polys_; c.npoly = list_count_; c.texels = poly_texels_; c.rs = rs_frame_;
-    c.bin_y = bin_y_; c.nbins = nbins_; c.dst = dst; c.aa = aa_;
+    c.bin_y = bin_y_; c.nbins = nbins_; c.dst = dst; c.edst = edst; c.aa = aa_; c.edge_export = edge_export_;
   }
   gen_ = pool_->dispatch(job_fn_, nb, nbins_);
   display_ ^= 1;
@@ -3184,6 +3190,7 @@ Renderer3D::FrameRef Renderer3D::frame_ref() const {
   f.nbins = pending_bands_;
   if (pending_bands_) f.bin_y = bin_y_;
   f.out = out_[display_].data();
+  f.edges = edge_export_ ? edge_[display_].data() : nullptr;
   return f;
 }
 
@@ -3241,12 +3248,12 @@ bool Renderer3D::steal_bins(u64 gen, u32 upto) {
     if (c >= cx.nbins) { result = pool_->done(gen, mask); break; }
     if (sb->gen != gen) {
       if (!sb->band) sb->band = std::make_unique<Renderer3D>(nds_);
-      sb->band->aa_ = cx.aa;
+      sb->band->aa_ = cx.aa; sb->band->edge_export_ = cx.edge_export;
       sb->band->prepare_worker(*cx.gx, cx.polys, cx.npoly, &cx.texels, &cx.rs);
       sb->gen = gen;
     }
     const s32 y0 = cx.bin_y[c], y1 = cx.bin_y[c + 1];
-    if (y0 < y1) sb->band->render_band(y0, y1, cx.dst);
+    if (y0 < y1) sb->band->render_band(y0, y1, cx.dst, cx.edst);
     pool_->thief_done(c);
     prof::add(prof::C_R3D_STOLEN, 1);
   }
@@ -3334,8 +3341,8 @@ void Renderer3D::seed_active(s32 y) {
 // Rasterise output lines [y0, y1) into dst. The final pass of a line reads
 // the lines either side of it, so one extra line above is rasterised (and
 // the border row stands in at the top and bottom of the screen).
-void Renderer3D::render_band(s32 y0, s32 y1, u32* dst) {
-  out_dst_ = dst;
+void Renderer3D::render_band(s32 y0, s32 y1, u32* dst, u8* edst) {
+  out_dst_ = dst; out_edge_dst_ = edst;
   raw_line_ = -100;   // enhanced AA: no raw row of this frame saved yet (the marker must not carry over from the last frame's lines)
   const s32 first = y0 > 0 ? y0 - 1 : 0;
   const s32 last = y1 + 1 < 192 ? y1 + 1 : 192;

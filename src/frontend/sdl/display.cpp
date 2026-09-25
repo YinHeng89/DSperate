@@ -413,16 +413,19 @@ bool Display::prepare_gpu(GpuFrame& f) {
   return true;
 }
 
-void Display::draw_gpu(const u32* const fb[SCREENS]) {
+void Display::draw_gpu(const u32* const fb[SCREENS], const u8* const edges[SCREENS]) {
   GpuFrame f;
-  if (prepare_gpu(f)) f.p->present(fb, f.v, f.n, f.params);
+  const u8* const none[SCREENS] = {nullptr, nullptr};
+  if (prepare_gpu(f)) f.p->present(fb, edges ? edges : none, f.v, f.n, f.params);
 }
 
-void Display::draw_async(Display* const ds[], int n, const u32* const fb[SCREENS]) {
+void Display::draw_async(Display* const ds[], int n, const u32* const fb[SCREENS], const u8* const edges[SCREENS]) {
   // One copy of the frame for every window: the core writes the next frame
   // into fb while the present thread reads this one. Reused once the job
   // that read it is done.
   static std::vector<u32> stage[SCREENS];
+  static std::vector<u8> stage_e[SCREENS];
+  static bool stage_has_e = false;
   static u64 stage_job = 0;
   // A frame reaches the sink at the next present, when its fence has long
   // signalled: on the Mali-G52 a present's compute takes ~5 ms from submit
@@ -445,11 +448,15 @@ void Display::draw_async(Display* const ds[], int n, const u32* const fb[SCREENS
     stage[s].resize(static_cast<size_t>(SCREEN_W) * SCREEN_H);
     std::memcpy(stage[s].data(), fb[s], stage[s].size() * sizeof(u32));
   }
+  stage_has_e = edges && edges[0] && edges[1];
+  if (stage_has_e)
+    for (int s = 0; s < SCREENS; ++s) { stage_e[s].resize(static_cast<size_t>(SCREEN_W) * SCREEN_H); std::memcpy(stage_e[s].data(), edges[s], stage_e[s].size()); }
   stage_job = pt.post([frames, nf] {
     const u32* const sfb[SCREENS] = {stage[0].data(), stage[1].data()};
+    const u8* const sfe[SCREENS] = {stage_has_e ? stage_e[0].data() : nullptr, stage_has_e ? stage_e[1].data() : nullptr};
     for (int k = 0; k < nf; ++k) {
       const GpuFrame& f = frames[k];
-      f.p->present(sfb, f.v, f.n, f.params);
+      f.p->present(sfb, sfe, f.v, f.n, f.params);
       if (retire) f.p->retire();
     }
   });

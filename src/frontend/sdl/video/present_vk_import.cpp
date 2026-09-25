@@ -28,10 +28,10 @@ public:
     lost_ = true;
     return Fit::Lost;
   }
-  bool present(const u32* const fb[2], const View* views, int nviews, const Params& p) override {
+  bool present(const u32* const fb[2], const u8* const edges[2], const View* views, int nviews, const Params& p) override {
     GpuPresent::View v[frontend::SCREENS];
     for (int i = 0; i < nviews && i < frontend::SCREENS; ++i) v[i] = GpuPresent::View{views[i].screen, sdl(views[i].rect), views[i].shown, views[i].blends, views[i].grid};
-    return gpu_->present(sink_, fb, v, nviews, p.rot, p.lw, p.lh, p.inset_alpha, sdl(p.drawn), p.grid);
+    return gpu_->present(sink_, fb, edges, v, nviews, p.rot, p.lw, p.lh, p.inset_alpha, sdl(p.drawn), p.grid);
   }
   u32* overlay(int lw, int lh) override { return gpu_->overlay(lw, lh); }
   void flush() override { gpu_->flush(sink_); sink_.flush(); }

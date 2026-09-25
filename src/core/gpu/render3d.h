@@ -67,6 +67,15 @@ public:
   // (forced AA, and a surface doesn't stack on itself: see same_owner).
   void set_aa(int level) { aa_ = static_cast<u8>(level); }
   int aa() const { return aa_; }
+  // Enhanced AA at panel density: instead of blending an edge pixel with its
+  // outside neighbour at 1x, the final pass leaves the pixel unblended and
+  // writes an edge byte beside the frame (FrameRef::edges) for the present
+  // stage to cut the panel block along the edge: bit 7 edge, bit 5 the run's
+  // axis (1: the covered fraction is vertical, the outside above or below),
+  // bit 6 the outside is the negative neighbour (left / up), bits 0-4 the
+  // coverage (the polygon's share of the pixel, (cov + 1) / 32).
+  void set_edge_export(bool on) { edge_export_ = on; }
+  bool edge_export() const { return edge_export_; }
 private:
   NDS& nds_;
   // Holds a whole chunk of scanlines at once (render_chunk draws chunk at a
@@ -212,6 +221,9 @@ private:
   // no push, under-layer depth test, translucent under plot, fog under, or
   // shadow stencil bit 2.
   bool under_layer_ = false;
+  bool edge_export_ = false;                            // see set_edge_export
+  std::array<u8, 256 * 192> edge_[2]{};                 // beside out_[2]
+  u8* out_edge_dst_ = nullptr;                          // this band's edge plane (null: not exporting)
   u8 aa_ = 1, aa_rendered_ = 1;           // aa_rendered_: the setting the kept frame was drawn with
   u32 mark_cov_ = 0x1000;                 // coverage edge marking leaves on a pixel (set_frame_aa)
   void set_frame_aa();
@@ -344,7 +356,7 @@ private:
   // range it emits, since the final pass reads two neighbours.
   void build_edges();   // from list_polys_ / list_count_, latched by render() or prepare_worker
   void seed_active(s32 y);
-  void render_band(s32 y0, s32 y1, u32* dst);
+  void render_band(s32 y0, s32 y1, u32* dst, u8* edst);
   void prepare_worker(const Gpu3D& gx, const Polygon* const* polys, u32 npoly, const std::vector<const u32*>* texels, const RenderState* rs);
   RenderState rs_frame_;   // coordinator's copy; the engine's own may be rewritten at the next VBlank mid-raster
   static u32 band_count(u32 polygons);
@@ -367,6 +379,8 @@ public:
   // outstanding (rendered inline or kept).
   struct FrameRef {
     const u32* out = nullptr;
+    const u8* edges = nullptr;   // enhanced AA edge plane (set_edge_export), or null
+    const u8* edge_line(u32 y) const { return edges ? edges + y * 256 : nullptr; }
     u64 gen = 0;
     u32 nbins = 0;
     std::array<s32, MAX_BINS + 1> bin_y{};
@@ -416,7 +430,9 @@ private:
     std::array<s32, MAX_BINS + 1> bin_y{};
     u32 nbins = 0;
     u32* dst = nullptr;
+    u8* edst = nullptr;
     u8 aa = 0;
+    bool edge_export = false;
   };
   DispatchCtx ctx_[2];
   struct StealBand { std::unique_ptr<Renderer3D> band; std::atomic<bool> busy{false}; u64 gen = ~u64{0}; };

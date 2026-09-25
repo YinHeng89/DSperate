@@ -292,7 +292,9 @@ int aa_mode(const std::string& v) {
   if (v == "accurate" || v == "true" || v == "1" || v == "yes" || v == "on") return 1;
   return 0;
 }
+int g_aa_mode = 0;   // the video.aa in effect (edge export follows it)
 void apply_aa(NDS& nds, int mode) {
+  g_aa_mode = mode;
   nds.gpu3d.renderer().set_aa(mode);
 }
 
@@ -3676,9 +3678,16 @@ sdl_ready:
         // A GPU present goes to the present thread on the aux core
         // (present_thread.h); DS_PRESENT_SYNC=1 keeps it here.
         static const bool present_sync = std::getenv("DS_PRESENT_SYNC") != nullptr;
+        // Enhanced AA at panel density (Renderer3D::set_edge_export): only the
+        // GPU presenter cuts the panel block, so the 1x blend stays for the
+        // others. DS_EDGE_CUT=0 keeps the 1x blend on the GPU path too.
+        static const bool edge_cut_allowed = !(std::getenv("DS_EDGE_CUT") && std::atoi(std::getenv("DS_EDGE_CUT")) == 0);
+        const bool want_edges = edge_cut_allowed && g_aa_mode == 2 && !present_sync && display.gpu_present() && (!dual_window || display2.gpu_present());
+        if (want_edges != nds.gpu.edge_export()) nds.gpu.set_edge_export(want_edges);
+        const u8* const edges[2] = {want_edges ? nds.gpu.edge_plane(0) : nullptr, want_edges ? nds.gpu.edge_plane(1) : nullptr};
         if (!present_sync && display.gpu_present() && (!dual_window || display2.gpu_present())) {
           ds::sdl::Display* const ds_[2] = {&display, &display2};
-          ds::sdl::Display::draw_async(ds_, dual_window ? 2 : 1, fb);
+          ds::sdl::Display::draw_async(ds_, dual_window ? 2 : 1, fb, edges);
         } else {
           // Pinned (thread layout), the emulation thread presents here as a
           // normal task: the kernel work a present queues on this core (a
