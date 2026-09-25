@@ -1910,7 +1910,7 @@ void Renderer3D::stage_line(Edge& e, s32 y, const LineSpan& ls) {
     } else {
       const u32 row = row_of(y) + 1 + xa;
       const u32 r = kern::active::depth_candidates(mode, sb.z + off, &depth_[row], &attr_[row],
-                                                   static_cast<u32>(xb - xa), sb.pass + off, (sh.dispcnt >> 4) & 1);
+                                                   static_cast<u32>(xb - xa), sb.pass + off, (sh.dispcnt & (1u << 4)) ? RSIZE : 0);
       if (r) { ca = xa + static_cast<s32>(r >> 16); cb = xa + static_cast<s32>(r & 0xFFFF); }
     }
   }

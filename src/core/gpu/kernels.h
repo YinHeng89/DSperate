@@ -130,9 +130,10 @@ inline Pixel resolve_one(const Pixel* tab, u16 c) {
   void NS##clear_image_run(const u16* col, const u16* dep, u32 n, u32 polyid, u32* color, u32* depth, u32* attr); \
   /* Depth pre-pass: pass[i] = 1 where z passes mode's test vs top pixel (0: z<dst; 1: z<=dst for opaque      \
      back-facing dst else z<dst; 2: within 0x200 either way; 3: within 0xFF), 2 where it fails but the top    \
-     pixel carries edge flags (candidate for the layer under, only when `under`), else 0. Returns             \
-     (first<<16)|(last+1) of non-zero entries, 0 if none. n may round up to a multiple of 4. */               \
-  u32  NS##depth_candidates(int mode, const s32* z, const u32* dstz, const u32* dstattr, u32 n, u8* pass, bool under);
+     pixel carries edge flags and the same test passes against the pixel underneath (dstz/dstattr +          \
+     under_off; only when under_off is non-zero), else 0. Returns (first<<16)|(last+1) of non-zero entries,   \
+     0 if none. n may round up to a multiple of 4. */                                                         \
+  u32  NS##depth_candidates(int mode, const s32* z, const u32* dstz, const u32* dstattr, u32 n, u8* pass, u32 under_off);
 
 namespace ref { DS_KERNEL_LIST() }
 #if DSPERATE_NEON

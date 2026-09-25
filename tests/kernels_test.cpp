@@ -541,18 +541,22 @@ static void test_span() {
 
 // Depth pre-pass: every mode, z values around the destination, edge flags.
 static void test_depth_candidates() {
-  alignas(16) s32 z[260]; alignas(16) u32 dz[260], da[260]; alignas(16) u8 pa[264], pb[264];
+  // Two layers: the pixel underneath sits UNDER entries after the top one.
+  constexpr u32 UNDER = 260;
+  alignas(16) s32 z[260]; alignas(16) u32 dz[2 * UNDER], da[2 * UNDER]; alignas(16) u8 pa[264], pb[264];
   for (u32 it = 0; it < 500; ++it) {
     const u32 n = 1 + rng() % 256;
-    for (u32 i = 0; i < 260; ++i) {
-      dz[i] = rng() & 0xFFFFFF; z[i] = static_cast<s32>(dz[i]) + static_cast<s32>(rng() % 0x801) - 0x400;
-      if (!(rng() & 3)) z[i] = static_cast<s32>(rng() & 0xFFFFFF);
+    for (u32 i = 0; i < 2 * UNDER; ++i) {
+      dz[i] = rng() & 0xFFFFFF;
+      if (i < 260) { z[i] = static_cast<s32>(dz[i]) + static_cast<s32>(rng() % 0x801) - 0x400; if (!(rng() & 3)) z[i] = static_cast<s32>(rng() & 0xFFFFFF); }
+      else if (rng() & 1) dz[i] = static_cast<u32>(z[i - UNDER]) + (rng() % 0x801) - 0x400;   // the lower pixel near z too
       da[i] = (rng() & 1 ? 0x10 : 0) | (rng() & 1 ? 0x00400000 : 0) | (rng() & 3 ? 0 : (rng() & 0xF));
     }
     std::memset(pa, 0xAA, sizeof pa); std::memset(pb, 0xAA, sizeof pb);
     const int mode = rng() & 3;
     const bool under = rng() & 1;
-    const u32 ra = kern::ref::depth_candidates(mode, z, dz, da, n, pa, under), rb = N::depth_candidates(mode, z, dz, da, n, pb, under);
+    const u32 uo = under ? UNDER : 0;
+    const u32 ra = kern::ref::depth_candidates(mode, z, dz, da, n, pa, uo), rb = N::depth_candidates(mode, z, dz, da, n, pb, uo);
     if (ra != rb) { std::fprintf(stderr, "FAIL depth_candidates range %08x vs %08x (iteration %u)\n", ra, rb, it); ++failures; }
     CHECK_SAME("depth pass", pa, pb, n);
     if (!under) for (u32 i = 0; i < n; ++i) if (pa[i] & 2) { std::fprintf(stderr, "FAIL depth_candidates names the under layer without AA (iteration %u)\n", it); ++failures; break; }

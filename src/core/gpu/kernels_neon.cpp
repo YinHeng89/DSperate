@@ -1381,24 +1381,37 @@ void clear_image_run(const u16* col, const u16* dep, u32 n, u32 polyid, u32* col
 }
 
 // One instantiation per depth mode: test decided once per span, not per four
-// pixels. `under` marks the lower layer a candidate when the top pixel carries edge flags.
+// pixels. `under` marks the lower layer a candidate when the top pixel carries
+// edge flags and the lower pixel passes the same test, so a span occluded by
+// both layers costs its depth stage alone (the resolve re-tests the lower
+// pixel; this only narrows what reaches it).
 template <int mode, bool under>
-static u32 depth_candidates_m(const s32* z, const u32* dstz, const u32* dstattr, u32 n, u8* pass) {
+static u32 depth_candidates_m(const s32* z, const u32* dstz, const u32* dstattr, u32 n, u8* pass, u32 under_off) {
   const uint32x4_t one = vdupq_n_u32(1), two = vdupq_n_u32(2);
   uint32x4_t any = vdupq_n_u32(0);
+  auto test = [](int32x4_t zv, int32x4_t d, uint32x4_t a) -> uint32x4_t {
+    if constexpr (mode == 0) { (void)a; return vcltq_s32(zv, d); }
+    else if constexpr (mode == 1) {
+      const uint32x4_t back = vceqq_u32(vandq_u32(a, vdupq_n_u32(0x00400010)), vdupq_n_u32(0x10));
+      return vbslq_u32(back, vcleq_s32(zv, d), vcltq_s32(zv, d));
+    } else if constexpr (mode == 2) { (void)a; return vcleq_u32(vreinterpretq_u32_s32(vaddq_s32(vsubq_s32(d, zv), vdupq_n_s32(0x200))), vdupq_n_u32(0x400)); }
+    else { (void)a; return vcleq_u32(vreinterpretq_u32_s32(vaddq_s32(vsubq_s32(d, zv), vdupq_n_s32(0xFF))), vdupq_n_u32(0x1FE)); }
+  };
   for (u32 i = 0; i < n; i += 4) {
     const int32x4_t zv = vld1q_s32(z + i), d = vreinterpretq_s32_u32(vld1q_u32(dstz + i));
     const uint32x4_t a = vld1q_u32(dstattr + i);
-    uint32x4_t ok;
-    if constexpr (mode == 0) ok = vcltq_s32(zv, d);
-    else if constexpr (mode == 1) {
-      const uint32x4_t back = vceqq_u32(vandq_u32(a, vdupq_n_u32(0x00400010)), vdupq_n_u32(0x10));
-      ok = vbslq_u32(back, vcleq_s32(zv, d), vcltq_s32(zv, d));
-    } else if constexpr (mode == 2) ok = vcleq_u32(vreinterpretq_u32_s32(vaddq_s32(vsubq_s32(d, zv), vdupq_n_s32(0x200))), vdupq_n_u32(0x400));
-    else ok = vcleq_u32(vreinterpretq_u32_s32(vaddq_s32(vsubq_s32(d, zv), vdupq_n_s32(0xFF))), vdupq_n_u32(0x1FE));
+    const uint32x4_t ok = test(zv, d, a);
     uint32x4_t v;
-    if constexpr (under) v = vbslq_u32(ok, one, vandq_u32(vtstq_u32(a, vdupq_n_u32(0xF)), two));
-    else { v = vandq_u32(ok, one); (void)two; }
+    if constexpr (under) {
+      const uint32x4_t cand = vbicq_u32(vtstq_u32(a, vdupq_n_u32(0xF)), ok);
+      v = vandq_u32(ok, one);
+      if (compat::maxv_u32(cand)) {
+        const int32x4_t ud = vreinterpretq_s32_u32(vld1q_u32(dstz + under_off + i));
+        uint32x4_t ua = a;
+        if constexpr (mode == 1) ua = vld1q_u32(dstattr + under_off + i);
+        v = vorrq_u32(v, vandq_u32(vandq_u32(cand, test(zv, ud, ua)), two));
+      }
+    } else { v = vandq_u32(ok, one); (void)two; (void)under_off; }
     const uint16x4_t v16 = vmovn_u32(v);
     const uint8x8_t v8 = vmovn_u16(vcombine_u16(v16, v16));
     vst1_lane_u32(reinterpret_cast<u32*>(pass + i), vreinterpret_u32_u8(v8), 0);
@@ -1411,20 +1424,20 @@ static u32 depth_candidates_m(const s32* z, const u32* dstz, const u32* dstattr,
   return (first << 16) | last;
 }
 
-u32 depth_candidates(int mode, const s32* z, const u32* dstz, const u32* dstattr, u32 n, u8* pass, bool under) {
-  if (under) {
+u32 depth_candidates(int mode, const s32* z, const u32* dstz, const u32* dstattr, u32 n, u8* pass, u32 under_off) {
+  if (under_off) {
     switch (mode) {
-    case 0:  return depth_candidates_m<0, true>(z, dstz, dstattr, n, pass);
-    case 1:  return depth_candidates_m<1, true>(z, dstz, dstattr, n, pass);
-    case 2:  return depth_candidates_m<2, true>(z, dstz, dstattr, n, pass);
-    default: return depth_candidates_m<3, true>(z, dstz, dstattr, n, pass);
+    case 0:  return depth_candidates_m<0, true>(z, dstz, dstattr, n, pass, under_off);
+    case 1:  return depth_candidates_m<1, true>(z, dstz, dstattr, n, pass, under_off);
+    case 2:  return depth_candidates_m<2, true>(z, dstz, dstattr, n, pass, under_off);
+    default: return depth_candidates_m<3, true>(z, dstz, dstattr, n, pass, under_off);
     }
   }
   switch (mode) {
-  case 0:  return depth_candidates_m<0, false>(z, dstz, dstattr, n, pass);
-  case 1:  return depth_candidates_m<1, false>(z, dstz, dstattr, n, pass);
-  case 2:  return depth_candidates_m<2, false>(z, dstz, dstattr, n, pass);
-  default: return depth_candidates_m<3, false>(z, dstz, dstattr, n, pass);
+  case 0:  return depth_candidates_m<0, false>(z, dstz, dstattr, n, pass, 0);
+  case 1:  return depth_candidates_m<1, false>(z, dstz, dstattr, n, pass, 0);
+  case 2:  return depth_candidates_m<2, false>(z, dstz, dstattr, n, pass, 0);
+  default: return depth_candidates_m<3, false>(z, dstz, dstattr, n, pass, 0);
   }
 }
 

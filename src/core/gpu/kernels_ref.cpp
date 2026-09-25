@@ -523,18 +523,20 @@ void clear_image_run(const u16* col, const u16* dep, u32 n, u32 polyid, u32* col
   }
 }
 
-u32 depth_candidates(int mode, const s32* z, const u32* dstz, const u32* dstattr, u32 n, u8* pass, bool under) {
+u32 depth_candidates(int mode, const s32* z, const u32* dstz, const u32* dstattr, u32 n, u8* pass, u32 under_off) {
   u32 first = n, last = 0;
-  for (u32 i = 0; i < n; ++i) {
-    const s32 d = static_cast<s32>(dstz[i]);
-    bool ok;
+  auto test = [mode](s32 zi, u32 dz, u32 da) {
+    const s32 d = static_cast<s32>(dz);
     switch (mode) {
-    case 0: ok = z[i] < d; break;
-    case 1: ok = (dstattr[i] & 0x00400010) == 0x00000010 ? z[i] <= d : z[i] < d; break;
-    case 2: ok = static_cast<u32>((d - z[i]) + 0x200) <= 0x400; break;
-    default: ok = static_cast<u32>((d - z[i]) + 0xFF) <= 0x1FE; break;
+    case 0: return zi < d;
+    case 1: return (da & 0x00400010) == 0x00000010 ? zi <= d : zi < d;
+    case 2: return static_cast<u32>((d - zi) + 0x200) <= 0x400;
+    default: return static_cast<u32>((d - zi) + 0xFF) <= 0x1FE;
     }
-    const u8 v = ok ? 1 : ((under && (dstattr[i] & 0xF)) ? 2 : 0);
+  };
+  for (u32 i = 0; i < n; ++i) {
+    const bool ok = test(z[i], dstz[i], dstattr[i]);
+    const u8 v = ok ? 1 : ((under_off && (dstattr[i] & 0xF) && test(z[i], dstz[i + under_off], dstattr[i + under_off])) ? 2 : 0);
     pass[i] = v;
     if (v) { if (i < first) first = i; last = i; }
   }
