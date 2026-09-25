@@ -407,7 +407,7 @@ void Bus::update_vram() {
         next.lcdc_mask != vram_map_.lcdc_mask) ? 1u : 0u) |
       ((view_moved(next.bbg, vram_map_.bbg) || view_moved(next.bobj, vram_map_.bobj) ||
         view_moved(next.bbg_extpal, vram_map_.bbg_extpal) || view_moved(next.bobj_extpal, vram_map_.bobj_extpal)) ? 2u : 0u);
-  const bool trapped = nds_.gpu.vram_remap_begin(moved_2d);
+  const bool trapped = nds_.gpu.vram_remap_begin(moved_2d, &next);
   vram_map_ = next;
   // Whole 16 MB region described as one host pointer per page, applied as a
   // diff. Blocks backed by one bank map into the page table; blocks with
@@ -479,6 +479,7 @@ static const gpu::VramView* vram_view_for(const gpu::VramMap& m, Cpu cpu, u32 ad
 
 u32 Bus::vram_read(Cpu cpu, u32 addr, u32 width) {
   if (addr >= 0x06800000 && nds_.gpu.lcdc_read_trapped()) nds_.gpu.lcdc_read_hit(addr);
+  if (bank_read_trapped(addr)) nds_.gpu.capture_read_hit();
   int bank; u32 off;
   const gpu::VramView* v = vram_view_for(vram_map_, cpu, addr, bank, off);
   if (v) return width == 8 ? vram_map_.read8(*v, off) : width == 16 ? vram_map_.read16(*v, off) : vram_map_.read32(*v, off);
@@ -651,6 +652,45 @@ void Bus::set_lcdc_read_trap(int bank, bool on) {
       else if (!(e & BASE_MASK)) e = lcdc_read_save_[k] | (e & TAG_CODE);
     }
   }
+}
+
+void Bus::set_bank_read_trap(int bank, bool on) {
+  assert(bank >= 0 && bank < 9);
+  Entry* const t = nds_.cpu(Cpu::ARM9).page_table.raw();
+  if (on) {
+    assert(!bank_trap_on_ && vram_hosts_valid_);
+    // Every page whose block the bank backs, alone (a host pointer inside
+    // the bank) or with others (an OR-read block, no host pointer).
+    const u8* const lo = vram_bank(bank);
+    const u8* const hi = lo + VRAM_BANK_SIZES[bank];
+    u8* const* hosts = vram_hosts_prev_[0].get();   // what the ARM9 table holds now
+    bank_trap_save_.clear();
+    std::memset(bank_trap_bits_, 0, sizeof bank_trap_bits_);
+    for (u32 p = 0; p < VRAM_PAGES; ++p) {
+      bool backed = hosts[p] && hosts[p] >= lo && hosts[p] < hi;
+      if (!backed && !hosts[p]) {
+        int b; u32 off;
+        const u32 addr = 0x06000000 + (p << PAGE_SHIFT);
+        if (const gpu::VramView* v = vram_view_for(vram_map_, Cpu::ARM9, addr, b, off)) backed = (v->mask[(off & v->addr_mask()) / gpu::VramView::BLOCK] >> bank) & 1;
+        else if (b == bank) backed = true;   // its LCDC slot, unmapped
+      }
+      if (!backed) continue;
+      Entry& e = t[(0x06000000 >> PAGE_SHIFT) + p];
+      bank_trap_save_.push_back({p, e});
+      if (e & BASE_MASK) e = TAG_SPECIAL | (e & TAG_CODE);
+      bank_trap_bits_[p >> 6] |= u64{1} << (p & 63);
+    }
+    bank_trap_on_ = true;
+    return;
+  }
+  if (!bank_trap_on_) return;
+  for (const auto& [p, saved] : bank_trap_save_) {
+    Entry& e = t[(0x06000000 >> PAGE_SHIFT) + p];
+    if (!(e & BASE_MASK)) e = saved | (e & TAG_CODE);
+  }
+  bank_trap_save_.clear();
+  std::memset(bank_trap_bits_, 0, sizeof bank_trap_bits_);
+  bank_trap_on_ = false;
 }
 
 u8 Bus::dma_read8(Cpu cpu, u32 addr) {

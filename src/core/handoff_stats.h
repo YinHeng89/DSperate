@@ -30,7 +30,8 @@ struct Hist {
 };
 
 struct Stats {
-  Hist wake[KINDS], wake_parked[KINDS], wait[KINDS], back[KINDS];
+  Hist wake[KINDS], wake_parked[KINDS], wait[KINDS], back[KINDS], job[KINDS];   // job: the worker's own run time per dispatch
+  std::atomic<u64> wait_site[KINDS][8]{};   // waits by the caller's join site (gpu.cpp JoinSite order)
 };
 Stats& stats();
 

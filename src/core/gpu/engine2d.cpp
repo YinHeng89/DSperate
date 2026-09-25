@@ -56,7 +56,7 @@ void Engine2D::reset() {
 
 // ---- memory helpers ---------------------------------------------------------
 
-const VramMap& Engine2D::vram() const { return nds_.bus.vram_map(); }
+const VramMap& Engine2D::vram() const { return vm_override_ ? *vm_override_ : nds_.bus.vram_map(); }
 const VramView& Engine2D::bg_vram() const { return num_ ? vram().bbg : vram().abg; }
 const VramView& Engine2D::obj_vram() const { return num_ ? vram().bobj : vram().aobj; }
 u16 Engine2D::bg_extpal(u32 slot, u32 pal, u32 idx) const {

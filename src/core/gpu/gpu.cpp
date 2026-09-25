@@ -169,17 +169,18 @@ void Gpu::vram_store_trap(Cpu cpu, u32 addr) {
   if (addr >= 0x06800000 && !trap_lcdc_) return;
   // A's deferred batch: a store reaching what it reads joins it, finishing
   // the frame and lifting the trap. B's windows only when B is deferred too.
+  const u32 stale = snapshot_stale_ ? 3u : 0u;
   if (a_deferred_) {
-    if (reach_engines(addr) & (b_deferred_ ? 3u : 1u)) { prof::add(prof::C_2D_A_JOIN_STORES, 1); join_worker(JoinSite::Trap); }
+    if ((reach_engines(addr) | stale) & (b_deferred_ ? 3u : 1u)) { prof::add(prof::C_2D_A_JOIN_STORES, 1); join_worker(JoinSite::Trap); }
     return;
   }
   // Charged to the engine its address reaches (both for anything unattributed).
-  const u32 mask = reach_engines(addr);
+  const u32 mask = reach_engines(addr) | stale;
   // Already per line everywhere it reaches: nothing to do but the lag-mode join below.
   if ((per_line_[0] || !(mask & 1)) && (per_line_[1] || !(mask & 2))) {
     // Lag mode: the store may land on a line engine B is still drawing.
     prof::add(prof::C_2D_LAG_STORES, 1);
-    const u32 reach = reach_engines(addr);
+    const u32 reach = reach_engines(addr) | stale;
     const bool b_joined = ((reach & 1) && inflight_[0]) || ((reach & 2) && inflight_[1]);
     if (b_joined) { prof::add(prof::C_2D_LAG_STORE_JOINS, 1); join_worker(JoinSite::Trap); }
     // Past either limit, drop lag and lift the trap unless the other engine is still
@@ -198,7 +199,7 @@ void Gpu::vram_store_trap(Cpu cpu, u32 addr) {
   // catch-up below only joins if the batching engine has lines due, so a store
   // reaching the in-flight line waits for it here.
   if (inflight_[0] || inflight_[1]) {
-    const u32 reach = reach_engines(addr);
+    const u32 reach = reach_engines(addr) | stale;
     if (((reach & 1) && inflight_[0]) || ((reach & 2) && inflight_[1])) join_worker(JoinSite::Trap);
   }
   // The budget is per engine: one engine streaming tiles must not spend the other's.
@@ -217,7 +218,59 @@ void Gpu::vram_store_trap(Cpu cpu, u32 addr) {
 
 // `moved_2d`: engines whose read views this remap actually moves. CENSUS
 // ONLY for now -- the catch-up below is still unconditional.
-bool Gpu::vram_remap_begin(u32 moved_2d) {
+bool Gpu::vram_remap_begin(u32 moved_2d, const VramMap* next) {
+  // A job in flight keeps rendering against its snapshot; the live map may
+  // change under it as long as the write trap still covers every bank it
+  // reads at the bank's new address: an engine window that is trapped, or
+  // LCDC while LCDC is trapped. A bank leaving for the ARM7 side or an
+  // untrapped window joins as before (the ARM7 is never trapped).
+  static const bool snap_off = std::getenv("DS_SNAP") && std::getenv("DS_SNAP")[0] == '0';   // debugging: always join
+  static const bool snap_capjoin = std::getenv("DS_SNAP_CAPJOIN") != nullptr;             // debugging: join under a capture
+  if (!snap_off && next && lines_in_flight() && trap_armed_) {
+    const VramMap& cur = nds_.bus.vram_map();
+    auto banks_of = [](const VramView& v) { u32 m = 0; for (u32 b = 0; b < v.blocks(); ++b) m |= v.mask[b]; return m; };
+    u32 old_banks = 0;
+    if (inflight_[0]) old_banks |= banks_of(cur.abg) | banks_of(cur.aobj) | banks_of(cur.abg_extpal) | banks_of(cur.aobj_extpal) | cur.lcdc_mask;
+    if (inflight_[1]) old_banks |= banks_of(cur.bbg) | banks_of(cur.bobj) | banks_of(cur.bbg_extpal) | banks_of(cur.bobj_extpal);
+    const u32 na = banks_of(next->abg) | banks_of(next->aobj) | banks_of(next->abg_extpal) | banks_of(next->aobj_extpal);
+    const u32 nb = banks_of(next->bbg) | banks_of(next->bobj) | banks_of(next->bbg_extpal) | banks_of(next->bobj_extpal);
+    const u32 n7 = banks_of(next->arm7), ntex = banks_of(next->texture) | banks_of(next->texpal);
+    bool covered = true;
+    // A capture in flight is still writing its bank. The ARM9 is kept off it
+    // by the read trap (re-applied over the new mapping after the remap); an
+    // engine in flight reads its own snapshot, where the bank is still LCDC.
+    // The ARM7, the texture units and an engine rendering inline against the
+    // live map cannot be kept off it, so those cases join.
+    if (capture_render_) {
+      const u32 cap = 1u << ((capcnt_render_ >> 16) & 3);
+      if (((n7 | ntex) & cap) || ((na & cap) && !inflight_[0]) || ((nb & cap) && !inflight_[1]) || snap_capjoin) covered = false;
+    }
+    for (u32 b = 0; b < 9 && covered; ++b) {
+      const u32 bit = 1u << b;
+      if (!(old_banks & bit)) continue;
+      if (n7 & bit) covered = false;
+      if ((na & bit) && !(trap_mask_ & 1)) covered = false;
+      if ((nb & bit) && !(trap_mask_ & 2)) covered = false;
+      if ((next->lcdc_mask & bit) && !trap_lcdc_) covered = false;
+    }
+    static const bool snap_log = std::getenv("DS_SNAP_LOG") != nullptr;
+    if (snap_log) std::fprintf(stderr, "[snap] frame %llu line %u remap covered=%d cap=%d capbank=%u inflight=%d%d moved=%u lcdcnext=%02x\n", (unsigned long long)nds_.frame_count, line_, covered ? 1 : 0, capture_render_ ? 1 : 0, (capcnt_render_ >> 16) & 3, inflight_[0] ? 1 : 0, inflight_[1] ? 1 : 0, moved_2d, next->lcdc_mask);
+    if (covered) {
+      prof::add(prof::C_VRAM_REMAP_SNAPSHOT, 1);
+      // An engine still in flight owes its cache reset at the join (its job
+      // reads the snapshot); one that is not renders inline against the live
+      // map and takes it now.
+      for (int e = 0; e < 2; ++e) { if (inflight_[e]) remap_pending_[e] = true; else engine[e].vram_remapped(); }
+      snapshot_stale_ = true;
+      // The read trap's saved entries would go stale under the rebuild: lift it now, back after.
+      if (read_trap_bank_ >= 0) {
+        if (read_trap_generic_) nds_.bus.set_bank_read_trap(read_trap_bank_, false); else nds_.bus.set_lcdc_read_trap(read_trap_bank_, false);
+        read_trap_generic_ = false; read_trap_reapply_ = true;
+      }
+      catch_up(3);   // lines still due below the frontier render now, against the map they were scanned with
+      return false;  // the trap stays as it is; vram_remap_end re-applies it over the remapped pages
+    }
+  }
   if (prof::enabled) {
     prof::add(prof::C_VRAM_REMAP, 1);
     prof::add(moved_2d ? prof::C_VRAM_REMAP_2D_MOVED : prof::C_VRAM_REMAP_2D_STILL, 1);
@@ -242,7 +295,39 @@ bool Gpu::vram_remap_begin(u32 moved_2d) {
   if (was) disarm_trap();
   return was;
 }
-void Gpu::vram_remap_end(bool trapped) { if (trapped) arm_trap(); }
+void Gpu::vram_remap_end(bool trapped) {
+  if (trapped) { arm_trap(); return; }
+  // Kept armed across the remap (a job in flight on its snapshot): the page
+  // table just rebuilt dropped the trap bits of every page it touched. The
+  // capture read trap comes back in its generic form, over every page the
+  // bank backs now -- the guest reads it through the new mapping otherwise.
+  if (trap_armed_) nds_.bus.set_vram_trap(true, trap_lcdc_, trap_mask_);
+  if (read_trap_reapply_) {
+    read_trap_reapply_ = false;
+    if (read_trap_bank_ >= 0) { nds_.bus.set_bank_read_trap(read_trap_bank_, true); read_trap_generic_ = true; }
+  }
+}
+
+void Gpu::capture_read_hit() {
+  prof::add(prof::C_2D_A_JOIN_READS, 1);
+  static const bool snap_log = std::getenv("DS_SNAP_LOG") != nullptr;
+  if (snap_log) std::fprintf(stderr, "[snap] frame %llu line %u capture read hit\n", (unsigned long long)nds_.frame_count, line_);
+  join_worker(JoinSite::Trap);
+}
+
+void Gpu::release_read_trap() {
+  if (read_trap_bank_ < 0) return;
+  if (read_trap_generic_) nds_.bus.set_bank_read_trap(read_trap_bank_, false);
+  else nds_.bus.set_lcdc_read_trap(read_trap_bank_, false);
+  read_trap_bank_ = -1; read_trap_generic_ = false; read_trap_reapply_ = false;
+}
+
+void Gpu::snapshot_map(int k) {
+  const VramMap& live = nds_.bus.vram_map();
+  if (job_map_gen_[k] == live.generation()) return;
+  job_map_[k] = live;
+  job_map_gen_[k] = live.generation();
+}
 
 void Gpu::arm_trap() {
   // Windows that need it: a batching engine's (its stores must render the lines
@@ -542,10 +627,10 @@ void Gpu::worker_b_job(void* self) {
 
 void Gpu::join_worker(JoinSite site) {
   if (!inflight_[0] && !inflight_[1] && !scale_inflight_) return;
-  if (b_deferred_) worker_b_.wait();
+  if (b_deferred_) worker_b_.wait(static_cast<int>(site));
   const bool dbg = g_dbg_join;
   if (dbg) std::fprintf(stderr, "[join] frame %llu line %u hblank %d a %u..%u b %u..%u deferred %d\n", (unsigned long long)nds_.frame_count, line_, hblank_done_ ? 1 : 0, job_first_[0], job_last_[0], job_first_[1], job_last_[1], a_deferred_ ? 1 : 0);
-  { const u64 t0 = prof::now_ns(); worker_.wait();
+  { const u64 t0 = prof::now_ns(); worker_.wait(static_cast<int>(site));
     const u64 dt = prof::now_ns() - t0;
     join_wait_ns_ += dt; prof::add_ns(prof::W2D_JOIN, dt);
     if (prof::enabled) {
@@ -557,6 +642,11 @@ void Gpu::join_worker(JoinSite site) {
       prof::add(kBySite[static_cast<int>(site)], dt);
     } }
   inflight_[0] = inflight_[1] = false; scale_inflight_ = false; bscale_n_ = 0;
+  for (int e = 0; e < 2; ++e) {
+    engine[e].set_vram_override(nullptr);
+    if (remap_pending_[e]) { engine[e].vram_remapped(); remap_pending_[e] = false; }
+  }
+  snapshot_stale_ = false;
   if (b_deferred_) {   // as finish_a: writes the guest made meanwhile were journaled past the frame
     b_deferred_ = false;
     if (line_ == 0 || (line_ == 262 && hblank_done_)) skipped_[1] = false;
@@ -569,7 +659,7 @@ void Gpu::join_worker(JoinSite site) {
 // Engine A's deferred batch has been joined: what render_ranges does at frame
 // end, done now (read trap, then journal, then frame end).
 void Gpu::finish_a() {
-  if (read_trap_bank_ >= 0) { nds_.bus.set_lcdc_read_trap(read_trap_bank_, false); read_trap_bank_ = -1; }
+  release_read_trap();
   if (line_ == 0 || (line_ == 262 && hblank_done_)) skipped_[0] = false;
   engine[0].apply_pending();
   if (frame_finished_) { engine[0].frame_done(); disarm_trap(); }
@@ -588,7 +678,7 @@ void Gpu::debug_dump(FILE* f) {
 void Gpu::render_ranges(u32 af, u32 al, u32 bf, u32 bl) {
   const bool a_has = af <= al, b_has = bf <= bl;
   if (!a_has && !b_has) return;
-  join_worker(JoinSite::RangesPre);
+  join_worker(JoinSite::RangesPre);   // a job handed now snapshots the live map: nothing stale may still be in flight
   capcnt_render_ = capcnt_; capture_render_ = capture_on_;
   lcdc_mask_render_ = nds_.bus.vram_map().lcdc_mask;   // latched so the job doesn't consult a live map that may be rebuilding
   const bool dbg = g_dbg_join;
@@ -597,6 +687,9 @@ void Gpu::render_ranges(u32 af, u32 al, u32 bf, u32 bl) {
     job_first_[0] = a ? af : 1; job_last_[0] = a ? al : 0;
     job_first_[1] = b ? bf : 1; job_last_[1] = b ? bl : 0;
     scale_inflight_ = bscale_n_ > 0;
+    snapshot_map(0);
+    if (a) engine[0].set_vram_override(&job_map_[0]);
+    if (b) engine[1].set_vram_override(&job_map_[0]);
     worker_.dispatch();
     inflight_[0] = a; inflight_[1] = b;
     // A capture in flight writes an LCDC bank the guest may read before the join: trap it.
@@ -628,6 +721,8 @@ void Gpu::render_ranges(u32 af, u32 al, u32 bf, u32 bl) {
       // frame) with the trap over the whole VRAM window (a lag frame's guards
       // only engine A's).
       bjob_first_ = bf; bjob_last_ = bl;
+      snapshot_map(1);
+      engine[1].set_vram_override(&job_map_[1]);
       worker_b_.dispatch();
       inflight_[1] = true; b_deferred_ = true; b_handed = true;
     }
@@ -674,7 +769,7 @@ void Gpu::render_ranges(u32 af, u32 al, u32 bf, u32 bl) {
     if (a_deferred_) { if (!b_deferred_) engine[1].frame_done(); }   // the deferred engines end (and lift traps) at the join
     else {
       join_worker(JoinSite::RangesPost);
-      if (read_trap_bank_ >= 0) { nds_.bus.set_lcdc_read_trap(read_trap_bank_, false); read_trap_bank_ = -1; }
+      release_read_trap();
       engine[0].frame_done(); engine[1].frame_done(); disarm_trap();
     }
   }
@@ -1153,7 +1248,7 @@ void Gpu::quiesce() {
 
 void Gpu::prepare_load() {
   join_worker();
-  if (read_trap_bank_ >= 0) { nds_.bus.set_lcdc_read_trap(read_trap_bank_, false); read_trap_bank_ = -1; }
+  release_read_trap();
   disarm_trap();
   lazy_frame_ = false; per_line_[0] = per_line_[1] = true;
   render_next_[0] = render_next_[1] = SCREEN_H; frame_finished_ = true;

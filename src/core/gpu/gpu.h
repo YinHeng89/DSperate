@@ -2,9 +2,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // DSperate - Nintendo DS emulator. Copyright (C) 2026 DSperate contributors.
 #pragma once
+#include <cstdio>
 #include <cstdlib>
 #include "core/types.h"
 #include "core/gpu/engine2d.h"
+#include "core/gpu/vram_map.h"
 #include "core/gpu/line_worker.h"
 #include "core/gpu/render3d.h"
 #include "core/profile.h"
@@ -79,7 +81,7 @@ public:
   // DMA run on that page may write straight through a lag-mode trap (no hand-off until
   // the next HBlank event, which cannot fire inside a run).
   bool vram_trap_settled() const { return !inflight_[0] && !inflight_[1] && per_line_[0] && per_line_[1]; }
-  bool vram_remap_begin(u32 moved_2d);  // before a VRAMCNT remap: catch up, lift the trap; returns whether it was set
+  bool vram_remap_begin(u32 moved_2d, const VramMap* next = nullptr);  // before a VRAMCNT remap: catch up, lift the trap; returns whether it was set (`next`: the map being switched to)
   void vram_remap_end(bool trapped);  // after: re-arm it
   void set_lazy(bool on) { lazy_enabled_ = on; }   // off: per-line rendering (tests)
 
@@ -106,6 +108,10 @@ public:
   bool lag_active() const { return lag_frame_ && !lazy_frame_; }
   // Bus::vram_read on an LCDC page under the capture read trap: join in-flight lines if reading the bank capture writes.
   bool lcdc_read_trapped() const { return read_trap_bank_ >= 0; }
+  // A guest read reached the capture's bank through a mapping a remap gave
+  // it while the capturing job is in flight: finish the job first.
+  void capture_read_hit();
+  void release_read_trap();   // whichever form the capture read trap is in
   void lcdc_read_hit(u32 addr) {
     if (static_cast<int>((addr >> 17) & 7) == read_trap_bank_) { prof::add(prof::C_2D_A_JOIN_READS, 1); join_worker(JoinSite::Trap); }
   }
@@ -235,6 +241,19 @@ private:
   bool frame_finished_ = false;   // frame_done() called for both engines
   bool trap_armed_ = false, trap_lcdc_ = false;
   u32  trap_mask_ = 0;            // windows trapped: bit 0 engine A's, bit 1 engine B's (Bus::set_vram_trap)
+  // Per-job VRAM map snapshots (0: worker_'s job, 1: worker_b_'s): a batch
+  // renders lines the panel already scanned against the map as it was when
+  // the job was handed, so a remap can rebuild the live map without joining
+  // -- when the write trap still covers every bank the job reads
+  // (vram_remap_begin). Copied only when the map's generation changed.
+  VramMap job_map_[2];
+  u32  job_map_gen_[2] = {~0u, ~0u};
+  bool remap_pending_[2] = {false, false};   // engine's vram_remapped() owed at the join
+  // A remap went through under a job in flight: the job reads the map as it
+  // was, so a trapped store is taken as reaching every in-flight engine
+  // (reach_engines answers for the live map's windows). Cleared at the join.
+  bool snapshot_stale_ = false;
+  void snapshot_map(int k);
   // Engines an address can change: bit 0 A, bit 1 B; LCDC only A (and only when trapped); else both.
   u32 reach_engines(u32 addr) const {
     if ((addr >> 24) != 0x06) return 3;
@@ -315,6 +334,8 @@ private:
   // remap changes vram_map_, so latching lcdc_mask_render_ here keeps capture off the shared object.
   u32  lcdc_mask_render_ = 0;
   int  read_trap_bank_ = -1;            // LCDC bank under the capture read trap, or -1
+  bool read_trap_generic_ = false;      // ... as Bus::set_bank_read_trap (every page the bank backs), after a remap
+  bool read_trap_reapply_ = false;      // vram_remap_end re-applies it (generic) over the rebuilt table
   // Engine B's scaling, handed to the worker with engine A's lagged lines:
   // the join is only for buffer reuse and frame end. Lines drawn here in lag
   // mode stash their output (output_engine); the worker scales it after engine A's lines.

@@ -50,6 +50,9 @@ public:
   // Render side.
   void replay_to(u32 stamp) { regs_.replay_to(stamp); }   // inclusive
   void vram_remapped() { extpal_checked_ = 0; objext_checked_ = 0; }
+  // A job in flight reads this map instead of the bus's live one (Gpu's
+  // per-job snapshot), so a VRAMCNT remap can rebuild the live map meanwhile.
+  void set_vram_override(const VramMap* m) { vm_override_ = m; }
   void apply_pending() { regs_.apply_pending(); }
   void frame_done() { regs_.frame_done(); }                // journal must be drained by now
   bool enabled() const { return regs_.enabled(); }
@@ -138,6 +141,7 @@ private:
   const Pixel* line3d_ = nullptr;
 
   const VramMap& vram() const;
+  const VramMap* vm_override_ = nullptr;
   const VramView& bg_vram() const;
   const VramView& obj_vram() const;
   const u16* palette() const { return regs_.palette(); }

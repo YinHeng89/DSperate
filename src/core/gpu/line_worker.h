@@ -71,9 +71,10 @@ public:
     }
   }
 
-  void wait() {
+  void wait(int site = 7) {
     const u32 n = req_.load(std::memory_order_relaxed);
     if (ack_.load(std::memory_order_acquire) == n) return;
+    if (handoff::enabled) handoff::stats().wait_site[kind_][site & 7].fetch_add(1, std::memory_order_relaxed);
     const u64 t0 = handoff::enabled ? handoff::now_ns() : 0;
     int spins = 4000;
     while (ack_.load(std::memory_order_acquire) != n) {
@@ -131,8 +132,9 @@ private:
         const u64 d = handoff::now_ns() - disp_ns_.load(std::memory_order_relaxed);
         (slept ? handoff::stats().wake_parked[kind_] : handoff::stats().wake[kind_]).add(d);
       }
+      const u64 j0 = handoff::enabled ? handoff::now_ns() : 0;
       fn_(arg_);
-      if (handoff::enabled) done_ns_.store(handoff::now_ns(), std::memory_order_relaxed);
+      if (handoff::enabled) { const u64 j1 = handoff::now_ns(); handoff::stats().job[kind_].add(j1 - j0); done_ns_.store(j1, std::memory_order_relaxed); }
       ack_.store(r, std::memory_order_release);
     }
   }

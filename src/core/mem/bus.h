@@ -8,6 +8,8 @@
 #include "core/gpu/vram_map.h"
 
 #include <memory>
+#include <utility>
+#include <vector>
 
 namespace ds {
 struct NDS;
@@ -67,6 +69,15 @@ public:
   // slow path while a display capture writing the bank is still in flight
   // (Gpu::join_worker). Saved/restored; a VRAMCNT remap lifts it first.
   void set_lcdc_read_trap(int bank, bool on);
+  // The same trap over every ARM9 page bank `bank` currently backs, whatever
+  // window it maps to (after a remap under a capture in flight: the guest
+  // must not read the bank through its new mapping before the job is done).
+  void set_bank_read_trap(int bank, bool on);
+  bool bank_read_trapped(u32 addr) const {
+    if (!bank_trap_on_ || addr < 0x06000000 || addr >= 0x07000000) return false;
+    const u32 p = (addr - 0x06000000) >> PAGE_SHIFT;
+    return (bank_trap_bits_[p >> 6] >> (p & 63)) & 1;
+  }
 
   // DMA accesses (no CPU cycle accounting). The 8-bit pair is for the cheat
   // engine (ar_engine.h), not real DMA which is 16/32-bit only.
@@ -116,6 +127,9 @@ public:
   std::unique_ptr<u8*[]> vram_hosts_[2] = {std::make_unique<u8*[]>(VRAM_PAGES), std::make_unique<u8*[]>(VRAM_PAGES)};   // update_vram scratch (next)
   std::unique_ptr<u8*[]> vram_hosts_prev_[2] = {std::make_unique<u8*[]>(VRAM_PAGES), std::make_unique<u8*[]>(VRAM_PAGES)};   // what the tables hold now
   bool vram_hosts_valid_ = false;
+  bool bank_trap_on_ = false;
+  std::vector<std::pair<u32, Entry>> bank_trap_save_;   // page index, entry before the trap
+  u64 bank_trap_bits_[VRAM_PAGES / 64] = {};
   // Pages of the ARM9 0x06000000 window with a host (rebuilt by update_vram):
   // the write trap toggles visit these, not all 8 K entries.
   u64 vram_mapped9_[VRAM_PAGES / 64] = {};

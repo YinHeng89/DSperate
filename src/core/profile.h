@@ -90,6 +90,9 @@ enum Counter : u32 { C_POLY_LINES, C_SPAN_PIXELS, C_RESOLVED_PIXELS, C_TEX_FAST,
   C_VRAM_REMAP, C_VRAM_REMAP_2D_MOVED, C_VRAM_REMAP_2D_STILL, C_VRAM_REMAP_PENDING,
   C_VRAM_REMAP_INFLIGHT,   // remaps taken while a 2D job is in flight (would change with a per-job VramMap snapshot)
   C_VRAM_REMAP_INFLIGHT_ALT, C_VRAM_REMAP_INFLIGHT_CAP, C_VRAM_REMAP_INFLIGHT_CLEAN,
+  // Where the banks an in-flight job reads end up after the remap (a per-job map snapshot would need the write trap to still cover them):
+  C_VRAM_REMAP_INFLIGHT_STAY, C_VRAM_REMAP_INFLIGHT_TO_OTHER, C_VRAM_REMAP_INFLIGHT_TO_LCDC, C_VRAM_REMAP_INFLIGHT_TO_ARM7, C_VRAM_REMAP_INFLIGHT_TO_TEX,
+  C_VRAM_REMAP_SNAPSHOT,   // remaps taken without a join: the in-flight job kept its snapshot
   // Frames with alternating display setup (display_phase_period() > 1) and frames with capture on.
   C_FRAMES_PHASE_ALT, C_FRAMES_CAPTURE, C_FRAMES_TOTAL,
   C_W2D_JOIN_NS_CATCHUP, C_W2D_JOIN_NS_TRAP, C_W2D_JOIN_NS_JOURNAL,

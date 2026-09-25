@@ -79,7 +79,7 @@ const char* const count_names[] = {"3d polygon lines", "3d span pixels", "3d res
   "rr: lines drawn inline", "rr: lines handed over",
   "vramcnt remaps", "vramcnt remaps: a 2d view moved", "vramcnt remaps: no 2d view moved", "vramcnt remaps with lines pending",
   "vramcnt remaps while a 2d job is in flight",
-  "  ...of those, on an alternating-phase frame", "  ...of those, the in-flight job is a capture", "  ...of those, on a clean frame (neither)",
+  "  ...of those, on an alternating-phase frame", "  ...of those, the in-flight job is a capture", "  ...of those, on a clean frame (neither)", "remap in flight: banks stay in their engine", "remap in flight: a bank moves to the other engine", "remap in flight: a bank moves to lcdc", "remap in flight: a bank moves to arm7", "remap in flight: a bank moves to texture only", "vramcnt remaps without a join (job on its snapshot)",
   "frames with an alternating display phase", "frames with capture on", "frames total",
   "2d join ns: catch_up", "2d join ns: vram trap", "2d join ns: journal full", "2d join ns: line 0", "2d join ns: vram remap", "2d join ns: render_ranges pre", "2d join ns: render_ranges post", "2d join ns: other",
   "3d polygon-chunk entries",

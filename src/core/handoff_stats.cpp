@@ -50,8 +50,12 @@ void report(std::FILE* f) {
     std::fprintf(f, "  %s:\n", kName[k]);
     line(f, "wake spin", s.wake[k]);
     line(f, "wake parked", s.wake_parked[k]);
+    line(f, "job", s.job[k]);
     line(f, "wait", s.wait[k]);
     line(f, "back", s.back[k]);
+    std::fprintf(f, "    waits by join site (catch_up, trap, journal, line0, remap, ranges_pre, ranges_post, other):");
+    for (int i = 0; i < 8; ++i) std::fprintf(f, " %llu", static_cast<unsigned long long>(s.wait_site[k][i].load()));
+    std::fputc('\n', f);
   }
 }
 
