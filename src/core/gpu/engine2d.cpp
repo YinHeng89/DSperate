@@ -16,6 +16,7 @@
 
 namespace ds::gpu {
 
+
 namespace {
 
 // Extended palettes live in VRAM, outside the write journal, so they're
@@ -147,6 +148,7 @@ void Engine2D::render_line(u32 line) {
   struct AtExit { Engine2D* e; u32 line; ~AtExit() { if (g_outhash_on) e->debug_outhash(line); } } at_exit{this, line};
   cur_ = regs_.begin_line();
   top_mode_ = TOP_NONE;
+  if (edge_vram_) { bg_edge_any_[0] = bg_edge_any_[1] = bg_edge_any_[2] = bg_edge_any_[3] = false; }
   if (!cur_.enabled) {
     // Powered-down engines output a fixed colour: black for A, white for B.
     out_.fill(num_ ? 0xFF3F3F3F : 0xFF000000);
@@ -217,7 +219,7 @@ void Engine2D::render_line(u32 line) {
             if ((cur_.layer_enable & (1 << bg)) && bg_[bg].any && (cur_.bgcnt[bg] & 3) == prio) { top = bg; break; }
         if (top >= 0 && line_all_opaque(bg_[top])) {
           prof::add(prof::C_2D_FAST_ONE, 1);
-          top_mode_ = top == 0 ? TOP_ALL_BG0 : TOP_NONE;
+          top_mode_ = TOP_ALL; top_all_bg_ = top;
           kern::active::resolve16_one(bg_[top].v(), bg_[top].table, out_.data());
           return;
         }
@@ -464,7 +466,7 @@ void Engine2D::draw_bg_extended(u32 line, int bg) {
     const u32 base = (cnt & 0x1F00) << 6;
     const bool direct = cnt & (1 << 2);
     if (direct) plane.table = kern::direct_table();
-    if (!mosaic && dx == 0x100 && dy == 0) { bitmap_row_degenerate(plane, base, xmask, ymask, yshift, ofx == 0, direct, rx, ry); return; }
+    if (!mosaic && dx == 0x100 && dy == 0) { bitmap_row_degenerate(bg, plane, base, xmask, ymask, yshift, ofx == 0, direct, rx, ry); return; }
     u32 mosaic_phase = 0;
     s32 mosaic_rx = rx, mosaic_ry = ry;
     for (u32 i = 0; i < 256; ++i, rx += dx, ry += dy,
@@ -530,7 +532,7 @@ void Engine2D::draw_bg_large(u32 line) {
   s32 rx = cur_.ref_x[0], ry = cur_.ref_y[0];
   const bool mosaic = (cnt & (1 << 6)) && cur_.bg_mosaic_w > 0;
   const u32 mw = cur_.bg_mosaic_w + 1;
-  if (!mosaic && dx == 0x100 && dy == 0) { bitmap_row_degenerate(plane, 0, xmask, ymask, yshift, ofx == 0, false, rx, ry); return; }
+  if (!mosaic && dx == 0x100 && dy == 0) { bitmap_row_degenerate(2, plane, 0, xmask, ymask, yshift, ofx == 0, false, rx, ry); return; }
   u32 mosaic_phase = 0;
   s32 mosaic_rx = rx, mosaic_ry = ry;
   for (u32 i = 0; i < 256; ++i, rx += dx, ry += dy,
@@ -550,7 +552,7 @@ void Engine2D::draw_bg_large(u32 line) {
 // width (or, with overflow transparent, to the span 0 <= column < width).
 // Each run is read a block at a time through the view's direct pointers
 // (an overlapping-bank block falls back to the OR read).
-void Engine2D::bitmap_row_degenerate(Layer& plane, u32 base, u32 xmask, u32 ymask, u32 yshift, bool wrap, bool direct, s32 rx, s32 ry) {
+void Engine2D::bitmap_row_degenerate(int bg, Layer& plane, u32 base, u32 xmask, u32 ymask, u32 yshift, bool wrap, bool direct, s32 rx, s32 ry) {
   const VramView& vv = bg_vram();
   const VramMap& vm = vram();
   if (!wrap && (static_cast<u32>(ry) & ~ymask)) return;
@@ -558,6 +560,10 @@ void Engine2D::bitmap_row_degenerate(Layer& plane, u32 base, u32 xmask, u32 ymas
   const u32 width = (xmask >> 8) + 1;
   const s32 x0 = rx >> 8;
   bool any = false;
+  // Enhanced AA: a direct-colour row read straight from one of banks A-D
+  // carries the captured pixels' edge bytes (Gpu::edge_vram_) beside it.
+  u8* const erow = (edge_vram_ && direct) ? bg_edge_[bg] : nullptr;
+  if (erow) std::memset(erow, 0, 256);
   auto emit = [&](u32 texel, u32 i, u32 n) {
     // [i, i + n) of the line from texel offset `texel` of the row.
     u32 addr = base + (direct ? texel << 1 : texel);
@@ -568,6 +574,11 @@ void Engine2D::bitmap_row_degenerate(Layer& plane, u32 base, u32 xmask, u32 ymas
       if (const u8* p = vv.ptr[a / VramView::BLOCK]) {
         const u8* src = p + (a & (VramView::BLOCK - 1));
         any |= direct ? kern::active::bmp_row_16(reinterpret_cast<const u16*>(src), m, plane.v() + i) : kern::active::bmp_row_8(src, m, plane.v() + i);
+        if (erow)
+          for (int b = 0; b < 4; ++b) {
+            const u8* bank = vm.bank(b);
+            if (src >= bank && src < bank + 0x20000) { std::memcpy(erow + i, edge_vram_ + b * 65536 + (src - bank) / 2, m); bg_edge_any_[bg] = true; break; }
+          }
       } else if (direct) {
         for (u32 k = 0; k < m; ++k) { const u16 c = vm.read16(vv, addr + k * 2); if (c & 0x8000) { plane.v()[i + k] = c; any = true; } }
       } else {
@@ -654,6 +665,7 @@ void Engine2D::render_sprites(u32 line) {
   // Only the attribute plane needs clearing: obj_v_/obj_alpha_ readers are
   // gated on OA_OPAQUE.
   obj_attr_.fill(0); obj_win_.fill(0);
+  if (edge_vram_) { std::memset(obj_edge_, 0, sizeof obj_edge_); obj_edge_any_ = false; }
   if (!spr_.obj_enable) return;
 
   const u16* oam = regs_.oam();
@@ -734,6 +746,21 @@ void Engine2D::draw_sprite_normal(const u16* attr, int w, int h, s32 x, s32 y, b
     }
     if (window) { for (u32 i = 0; i < xend - xoff; ++i) if (col[i] & 0x8000) obj_win_[x + i] = 1; return; }
     kern::active::obj_row_bmp16(col, xend - xoff, a, static_cast<u8>(alpha + 1), obj_v_.data() + x, obj_attr_.data() + x, obj_alpha_.data() + x);
+    if (edge_vram_ && row) {
+      // Enhanced AA: a bitmap sprite read straight from one of banks A-D
+      // carries the captured pixels' edge bytes on the pixels it won (the
+      // kernel's write: this colour, alpha and attributes now stand there).
+      for (int b = 0; b < 4; ++b) {
+        const u8* bank = vm.bank(b);
+        if (!(row >= bank && row < bank + 0x20000)) continue;
+        const u8* ebank = edge_vram_ + b * 65536 + (row - bank) / 2;
+        for (u32 i = xoff; i < xend; ++i) {
+          const u32 sx = hflip ? (w - 1 - i) : i;
+          if ((col[i - xoff] & 0x8000) && obj_v_[x + i - xoff] == col[i - xoff] && obj_alpha_[x + i - xoff] == alpha + 1 && (obj_attr_[x + i - xoff] & ~OA_OPAQUE) == a) { obj_edge_[x + i - xoff] = ebank[sx]; obj_edge_any_ = true; }
+        }
+        break;
+      }
+    }
     obj_prio_mask_ |= static_cast<u8>(1 << (a & OA_PRIO));
     return;
   }
@@ -975,10 +1002,16 @@ bool Engine2D::needs_second() const {
 }
 
 void Engine2D::edge_mask(u8* out) const {
+  // Per layer: the 3D layer's bytes on BG0 of engine A with 3D on, a bitmap
+  // BG's carried bytes, nothing for the rest.
   const bool is3d = !num_ && (cur_.dispcnt & 8) && cur_.enabled;
-  if (!edge3d_ || !is3d || top_mode_ == TOP_NONE) { std::memset(out, 0, 256); return; }
-  if (top_mode_ == TOP_ALL_BG0) { std::memcpy(out, edge3d_, 256); return; }
-  for (u32 x = 0; x < 256; ++x) out[x] = top_tid_[x] == T_BG0 ? edge3d_[x] : 0;
+  const u8* src[T_COUNT] = {};
+  if (is3d && edge3d_) src[T_BG0] = edge3d_;
+  for (int bg = 0; bg < 4; ++bg) if (bg_edge_any_[bg] && !src[bg]) src[bg] = bg_edge_[bg];
+  if (obj_edge_any_) src[T_OBJ_STD] = src[T_OBJ_EXT] = src[T_OBJ_DIRECT] = obj_edge_;
+  if (top_mode_ == TOP_NONE || !cur_.enabled) { std::memset(out, 0, 256); return; }
+  if (top_mode_ == TOP_ALL) { if (top_all_bg_ >= 0 && src[top_all_bg_]) std::memcpy(out, src[top_all_bg_], 256); else std::memset(out, 0, 256); return; }
+  for (u32 x = 0; x < 256; ++x) { const u8 t = top_tid_[x]; out[x] = t < T_COUNT && src[t] ? src[t][x] : 0; }
 }
 
 void Engine2D::resolve_full() {

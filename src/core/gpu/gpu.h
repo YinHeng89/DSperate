@@ -211,6 +211,18 @@ private:
   std::array<std::array<u32, SCREEN_W * SCREEN_H>, 2> fb_{};
   std::array<u8, SCREEN_W * SCREEN_H> edge_fb_[2]{};   // enhanced AA edge bytes per screen (edge_plane)
   bool edge_export_ = false;
+  // Edge bytes of captured pixels, one per 16-bit VRAM pixel of banks A-D:
+  // display capture fills them beside the colour, VRAM display reads them
+  // back, so a game that shows its 3D through a capture (GS:DD every frame,
+  // Spirit Tracks on alternate frames per screen) keeps its edges. CPU
+  // writes into a captured image are not tracked (stale bytes cut wrong).
+  std::vector<u8> edge_vram_;
+  // The previous frame's lines and edge bytes per screen: a line shown again
+  // unchanged (a game copying its captured frame around with the CPU, as
+  // GS:DD does for its other screen) keeps its edge bytes, since the edges
+  // are a function of the picture.
+  std::vector<u32> prev_fb_[2];
+  std::vector<u8> prev_edge_[2];
   ScaleTarget scale_[2];
   static constexpr u32 SCALED_ROW_MAX = 4096;
   alignas(16) u32 chunk_even_[2][SCREEN_W];   // chunky: the even line, held until the odd one completes the block

@@ -807,7 +807,10 @@ void Gpu::step_engine(int e, u32 line) {
 void Gpu::set_edge_export(bool on) {
   edge_export_ = on;
   nds_.gpu3d.renderer().set_edge_export(on);
-  if (!on) { edge_fb_[0].fill(0); edge_fb_[1].fill(0); }
+  if (!on) { edge_fb_[0].fill(0); edge_fb_[1].fill(0); edge_vram_.clear(); edge_vram_.shrink_to_fit(); for (int s = 0; s < 2; ++s) { prev_fb_[s].clear(); prev_edge_[s].clear(); } }
+  else { edge_vram_.assign(4 * 65536, 0); for (int s = 0; s < 2; ++s) { prev_fb_[s].assign(SCREEN_W * SCREEN_H, 0xFFFFFFFFu); prev_edge_[s].assign(SCREEN_W * SCREEN_H, 0); } }
+  engine[0].set_edge_vram(on ? edge_vram_.data() : nullptr);
+  engine[1].set_edge_vram(on ? edge_vram_.data() : nullptr);
 }
 
 void Gpu::output_engine(int e, u32 line) {
@@ -829,8 +832,22 @@ void Gpu::output_engine(int e, u32 line) {
   } else { for (u32 i = 0; i < 256; ++i) dst[i] = 0xFF000000; }
   if (edge_export_ && !scaled) {
     u8* const edst = edge_fb_[screen].data() + line * SCREEN_W;
-    if (screens_on_ && e == 0 && ((en.dispcnt() >> 16) & 3) == 1) en.edge_mask(edst);
-    else std::memset(edst, 0, SCREEN_W);
+    const u32 dmode = e == 0 ? (en.dispcnt() >> 16) & 3 : ((en.dispcnt() >> 16) & 1);
+    if (screens_on_ && dmode == 1) en.edge_mask(edst);
+    else if (screens_on_ && e == 0 && dmode == 2) {   // VRAM display: the captured image's edge bytes
+      const u32 bank = (en.dispcnt() >> 18) & 3;
+      if (lcdc_mask_render_ & (1u << bank)) std::memcpy(edst, edge_vram_.data() + bank * 65536 + line * 256, SCREEN_W);
+      else std::memset(edst, 0, SCREEN_W);
+    } else std::memset(edst, 0, SCREEN_W);
+    if (!scaled) {
+      // Same line as last frame and nothing new known about it: keep last frame's edge bytes.
+      u32* const pfb = prev_fb_[screen].data() + line * SCREEN_W;
+      u8* const ped = prev_edge_[screen].data() + line * SCREEN_W;
+      u64 any = 0; for (u32 i = 0; i < SCREEN_W; i += 8) { u64 w; std::memcpy(&w, edst + i, 8); any |= w; }
+      if (!any && std::memcmp(dst, pfb, SCREEN_W * sizeof(u32)) == 0) std::memcpy(edst, ped, SCREEN_W);
+      std::memcpy(pfb, dst, SCREEN_W * sizeof(u32));
+      std::memcpy(ped, edst, SCREEN_W);
+    }
   }
   if (scaled) {
     if (e == 1 && bscale_defer_ && bscale_n_ < SCREEN_H) {
@@ -1225,6 +1242,28 @@ void Gpu::capture(u32 line) {
     }
   }
 
+  if (edge_export_) {
+    // The edge bytes of what is captured, beside the colour (edge_vram_).
+    u8* const edst = edge_vram_.data() + dst_bank * 65536 + (((((cnt >> 18) & 3) << 14) + line * width) & 0xFFFF);
+    const u8* ea = nullptr; u8 tmp[256];
+    if (cnt & (1 << 24)) ea = nds_.gpu3d.edge_line(ref3d_, line);
+    else { engine[0].edge_mask(tmp); ea = tmp; }
+    const u8* eb = nullptr;
+    if (!(cnt & (1 << 25))) {
+      const u32 dispcnt = engine[0].dispcnt();
+      const u32 src_bank = (dispcnt >> 18) & 3;
+      if (lcdc & (1u << src_bank)) {
+        u32 off = line * 256;
+        if (((dispcnt >> 16) & 3) != 2) off += ((cnt >> 26) & 3) << 14;
+        eb = edge_vram_.data() + src_bank * 65536 + (off & 0xFFFF);
+      }
+    }
+    const u32 mode = (cnt >> 29) & 3;
+    const u32 eva = std::min<u32>(cnt & 0x1F, 16), evb = std::min<u32>((cnt >> 8) & 0x1F, 16);
+    const u8* pick = mode == 0 ? ea : mode == 1 ? eb : (eva >= evb ? ea : eb);   // a blend keeps the stronger source's edges
+    if (pick && pick != edst) std::memcpy(edst, pick, width);
+    else if (!pick) std::memset(edst, 0, width);
+  }
   switch ((cnt >> 29) & 3) {
   case 0:
     kern::active::capture_a15(src_a, width, dst);
