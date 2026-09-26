@@ -21,6 +21,7 @@ Spirv shader_lean_frag_early();   // ... without the alpha test (early depth tes
 Spirv shader_lean_frag_opq();     // ... a translucent polygon's alpha-31 pixels only (drawn as opaque)
 Spirv shader_lean_frag_trans();   // ... its other pixels only (the translucent passes)
 Spirv shader_lean_resolve(); // ... and the resolve into the 3D layer record
+Spirv shader_lean_resolve_1x();   // ... the same over single-sample attachments (aa off)
 
 } // namespace ds::gpu::vk
 

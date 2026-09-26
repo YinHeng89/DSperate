@@ -155,7 +155,7 @@ std::unique_ptr<Lean> Lean::create(Device& dev, bool msaa, std::string* why) {
     VkShaderModuleCreateInfo ci{}; ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO; ci.codeSize = s.bytes; ci.pCode = s.code;
     return a.vkCreateShaderModule(vk->dev, &ci, nullptr, out) == VK_SUCCESS;
   };
-  if (!shader(shader_lean_vert(), &d.mod_vert) || !shader(shader_lean_frag(), &d.mod_frag) || !shader(shader_lean_frag_early(), &d.mod_frag_early) || !shader(shader_lean_frag_opq(), &d.mod_frag_opq) || !shader(shader_lean_frag_trans(), &d.mod_frag_trans) || !shader(shader_lean_resolve(), &d.mod_res) || !shader(shader_tri_fs(), &d.mod_fs))
+  if (!shader(shader_lean_vert(), &d.mod_vert) || !shader(shader_lean_frag(), &d.mod_frag) || !shader(shader_lean_frag_early(), &d.mod_frag_early) || !shader(shader_lean_frag_opq(), &d.mod_frag_opq) || !shader(shader_lean_frag_trans(), &d.mod_frag_trans) || !shader(d.msaa ? shader_lean_resolve() : shader_lean_resolve_1x(), &d.mod_res) || !shader(shader_tri_fs(), &d.mod_fs))
     return fail("lean shaders rejected by the driver");
   d.nostencil = std::getenv("DS_LEAN_NOSTENCIL") && std::atoi(std::getenv("DS_LEAN_NOSTENCIL")) != 0;
 
