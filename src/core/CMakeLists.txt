@@ -117,7 +117,10 @@ set_property(SOURCE io/dsi_font.cpp APPEND PROPERTY OBJECT_DEPENDS
 # libvulkan is loaded with dlopen, so a build with this on still starts on a
 # device with no driver -- Device::create returns null and the frontend
 # presents on the CPU. 3D is always drawn on the CPU.
-option(DSPERATE_VULKAN "Build the Vulkan dma-buf import presenter" ON)
+option(DSPERATE_VULKAN "Build the Vulkan dma-buf import presenter and the GPU 3D raster" ON)
+# Always compiled: without the headers they are stubs that decline, so the
+# renderer and the presenters build the same everywhere.
+target_sources(dsperate_core PRIVATE gpu/vk/vk_device.cpp gpu/vk/vk_lean.cpp)
 if(DSPERATE_VULKAN)
   # The Vulkan headers are architecture-independent and nothing is linked
   # against (vk_device.cpp dlopens libvulkan on the device), so a cross build
@@ -129,7 +132,7 @@ if(DSPERATE_VULKAN)
     find_path(DSPERATE_VULKAN_INCLUDE vulkan/vulkan.h NO_CMAKE_FIND_ROOT_PATH)
   endif()
   if(DSPERATE_VULKAN_INCLUDE)
-    target_sources(dsperate_core PRIVATE gpu/vk/vk_device.cpp gpu/vk/vk_shaders.cpp gpu/vk/vk_lean.cpp)
+    target_sources(dsperate_core PRIVATE gpu/vk/vk_shaders.cpp)
     # GPU 3D raster (gpu-raster branch): SPIR-V is checked in and .incbin'd by
     # vk_shaders.cpp (no shader compiler needed at build time); re-link when a blob changes.
     set_property(SOURCE gpu/vk/vk_shaders.cpp APPEND PROPERTY COMPILE_DEFINITIONS

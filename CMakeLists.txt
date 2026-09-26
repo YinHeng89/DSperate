@@ -68,7 +68,7 @@ option(DSPERATE_HARDEN "Build with -fstack-protector and _FORTIFY_SOURCE" OFF)
 if(DSPERATE_HARDEN)
   add_compile_options(-fstack-protector)
 else()
-  add_compile_options(-fno-stack-protector -D_FORTIFY_SOURCE=0)
+  add_compile_options(-fno-stack-protector -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0)   # -U first: a toolchain that injects it warns about a redefinition otherwise
 endif()
 
 # e.g. "-mtune=cortex-a55" (scheduling only) or "-mcpu=cortex-a55" (also raises

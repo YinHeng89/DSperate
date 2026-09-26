@@ -27,6 +27,9 @@
 #include <vector>
 #include <algorithm>
 
+// Needs a V4L2 with multi-planar mem2mem and dma-buf buffers (older kernel headers lack them).
+#if defined(V4L2_PIX_FMT_XBGR32) && defined(V4L2_CAP_VIDEO_M2M_MPLANE)   // (V4L2_MEMORY_DMABUF is an enumerator, of the same vintage)
+
 namespace {
 struct dma_heap_allocation_data { uint64_t len; uint32_t fd; uint32_t fd_flags; uint64_t heap_flags; };
 #define DMA_HEAP_IOCTL_ALLOC _IOWR('H', 0x0, struct dma_heap_allocation_data)
@@ -47,7 +50,7 @@ int heap_alloc(size_t len) {
 int xioctl(int fd, unsigned long req, void* arg) { int r; do r = ioctl(fd, req, arg); while (r < 0 && errno == EINTR); return r; }
 
 bool set_fmt(int fd, uint32_t type, uint32_t w, uint32_t h, uint32_t pixfmt, uint32_t* stride, uint32_t* size) {
-  v4l2_format f{}; f.type = type;   // the RGA is a multi-planar mem2mem device (one plane for RGB)
+  v4l2_format f{}; f.type = static_cast<v4l2_buf_type>(type);   // the RGA is a multi-planar mem2mem device (one plane for RGB)
   f.fmt.pix_mp.width = w; f.fmt.pix_mp.height = h; f.fmt.pix_mp.pixelformat = pixfmt; f.fmt.pix_mp.field = V4L2_FIELD_NONE; f.fmt.pix_mp.num_planes = 1;
   if (xioctl(fd, VIDIOC_S_FMT, &f) < 0) { std::perror("S_FMT"); return false; }
   if (f.fmt.pix_mp.pixelformat != pixfmt) { std::printf("driver changed the format to %.4s\n", reinterpret_cast<char*>(&f.fmt.pix_mp.pixelformat)); }
@@ -58,7 +61,7 @@ bool set_fmt(int fd, uint32_t type, uint32_t w, uint32_t h, uint32_t pixfmt, uin
 }
 
 bool set_sel(int fd, uint32_t type, uint32_t target, int x, int y, int w, int h) {
-  v4l2_selection s{}; s.type = type; s.target = target; s.r = {x, y, static_cast<uint32_t>(w), static_cast<uint32_t>(h)};
+  v4l2_selection s{}; s.type = type; s.target = target; s.r.left = x; s.r.top = y; s.r.width = static_cast<uint32_t>(w); s.r.height = static_cast<uint32_t>(h);
   if (xioctl(fd, VIDIOC_S_SELECTION, &s) < 0) { std::perror(target == V4L2_SEL_TGT_CROP ? "S_SELECTION crop" : "S_SELECTION compose"); return false; }
   if (s.r.left != x || s.r.top != y || static_cast<int>(s.r.width) != w || static_cast<int>(s.r.height) != h)
     std::printf("selection adjusted to %d,%d %ux%u\n", s.r.left, s.r.top, s.r.width, s.r.height);
@@ -66,20 +69,20 @@ bool set_sel(int fd, uint32_t type, uint32_t target, int x, int y, int w, int h)
 }
 
 bool reqbufs(int fd, uint32_t type, uint32_t n) {
-  v4l2_requestbuffers rb{}; rb.type = type; rb.memory = V4L2_MEMORY_DMABUF; rb.count = n;
+  v4l2_requestbuffers rb{}; rb.type = static_cast<v4l2_buf_type>(type); rb.memory = V4L2_MEMORY_DMABUF; rb.count = n;
   if (xioctl(fd, VIDIOC_REQBUFS, &rb) < 0) { std::perror("REQBUFS dmabuf"); return false; }
   return rb.count >= n;
 }
 
 bool qbuf(int fd, uint32_t type, uint32_t index, int dmafd, uint32_t bytes) {
   v4l2_plane pl{}; pl.m.fd = dmafd; pl.length = bytes; if (type == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE) pl.bytesused = bytes;
-  v4l2_buffer b{}; b.type = type; b.memory = V4L2_MEMORY_DMABUF; b.index = index; b.m.planes = &pl; b.length = 1;
+  v4l2_buffer b{}; b.type = static_cast<v4l2_buf_type>(type); b.memory = V4L2_MEMORY_DMABUF; b.index = index; b.m.planes = &pl; b.length = 1;
   if (xioctl(fd, VIDIOC_QBUF, &b) < 0) { std::perror("QBUF"); return false; }
   return true;
 }
 bool dqbuf(int fd, uint32_t type) {
   v4l2_plane pl{};
-  v4l2_buffer b{}; b.type = type; b.memory = V4L2_MEMORY_DMABUF; b.m.planes = &pl; b.length = 1;
+  v4l2_buffer b{}; b.type = static_cast<v4l2_buf_type>(type); b.memory = V4L2_MEMORY_DMABUF; b.m.planes = &pl; b.length = 1;
   if (xioctl(fd, VIDIOC_DQBUF, &b) < 0) { std::perror("DQBUF"); return false; }
   return true;
 }
@@ -221,3 +224,7 @@ int main(int argc, char** argv) {
   }
   return 0;
 }
+
+#else
+int main() { std::fprintf(stderr, "rga_probe: this V4L2 has no multi-planar dma-buf mem2mem support\n"); return 2; }
+#endif

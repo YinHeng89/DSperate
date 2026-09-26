@@ -1,6 +1,31 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // DSperate - Nintendo DS emulator. Copyright (C) 2026 DSperate contributors.
 #include "core/gpu/vk/vk_lean.h"
+
+#if !DSPERATE_VULKAN
+// Built without the Vulkan headers: the raster declines, and the renderer
+// keeps drawing on the CPU (Renderer3D::set_gpu reports the reason).
+namespace ds::gpu::vk {
+struct Lean::Impl {};
+Lean::~Lean() = default;
+std::unique_ptr<Lean> Lean::create(Device&, bool, std::string* why) { if (why) *why = "built without Vulkan"; return nullptr; }
+bool Lean::msaa() const { return false; }
+GpuPoly* Lean::poly_buffer() { return nullptr; }
+GpuVert* Lean::vert_buffer() { return nullptr; }
+u32* Lean::texel_buffer(u32* cap) { if (cap) *cap = 0; return nullptr; }
+GpuPost* Lean::post_buffer() { return nullptr; }
+bool Lean::submit(u32, u32, u32, const GpuFrame&) { return false; }
+void Lean::wait() {}
+void Lean::wait_all() {}
+const u32* Lean::output() { return nullptr; }
+const u32* Lean::newest_ready(bool) { return nullptr; }
+bool Lean::has_frame() const { return false; }
+u64 Lean::gpu_ns() const { return 0; }
+u32 Lean::draws() const { return 0; }
+Lean::Stats Lean::stats(bool) { return {}; }
+} // namespace ds::gpu::vk
+#else
+
 #include "core/gpu/vk/vk_internal.h"
 #include "core/gpu/vk/vk_shaders.h"
 
@@ -609,3 +634,5 @@ const u32* Lean::newest_ready(bool allow_lag) {
 }
 
 } // namespace ds::gpu::vk
+
+#endif // DSPERATE_VULKAN

@@ -7,7 +7,10 @@
 #include <cstring>
 #include <vector>
 
-#if defined(__linux__)
+// Real only on Linux with the Vulkan headers (DSPERATE_VULKAN, from CMake);
+// elsewhere every entry point declines, so the renderer and the presenters
+// build the same and fall back.
+#if defined(__linux__) && DSPERATE_VULKAN
 #include <dlfcn.h>
 #include "core/gpu/vk/vk_internal.h"
 #define DS_VK_AVAILABLE 1

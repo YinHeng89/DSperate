@@ -41,11 +41,16 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <unistd.h>
+// The V4L2 this needs: multi-planar mem2mem, dma-buf buffers, XBGR32. Older
+// kernel headers (the A30's) lack them, and those devices have no RGA anyway.
+#if defined(V4L2_PIX_FMT_XBGR32) && defined(V4L2_CAP_VIDEO_M2M_MPLANE)   // (V4L2_MEMORY_DMABUF is an enumerator, of the same vintage)
+#define DS_RGA_V4L2 1
+#endif
 #endif
 
 namespace ds::sdl {
 
-#if defined(__linux__)
+#if DS_RGA_V4L2
 namespace {
 
 constexpr int kSlots = 2;               // frames in flight: the one being composed and the one the RGA reads
@@ -310,7 +315,7 @@ private:
   }
 
   bool set_format(u32 type, u32 w, u32 h, std::string* why) {
-    v4l2_format f{}; f.type = type;
+    v4l2_format f{}; f.type = static_cast<v4l2_buf_type>(type);
     f.fmt.pix_mp.width = w; f.fmt.pix_mp.height = h; f.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_XBGR32; f.fmt.pix_mp.field = V4L2_FIELD_NONE; f.fmt.pix_mp.num_planes = 1;
     if (xioctl(fd_, VIDIOC_S_FMT, &f) < 0 || f.fmt.pix_mp.width != w || f.fmt.pix_mp.height != h || f.fmt.pix_mp.pixelformat != V4L2_PIX_FMT_XBGR32) {
       if (why) *why = std::string("RGA refuses the ") + std::to_string(w) + "x" + std::to_string(h) + " frame format: " + std::strerror(errno);
@@ -321,7 +326,7 @@ private:
     return true;
   }
   bool reqbufs(u32 type, u32 n) {
-    v4l2_requestbuffers rb{}; rb.type = type; rb.memory = V4L2_MEMORY_DMABUF; rb.count = n;
+    v4l2_requestbuffers rb{}; rb.type = static_cast<v4l2_buf_type>(type); rb.memory = V4L2_MEMORY_DMABUF; rb.count = n;
     return xioctl(fd_, VIDIOC_REQBUFS, &rb) == 0 && rb.count >= n;
   }
   // The capture side follows the sink's buffer: a format change is refused
@@ -345,17 +350,17 @@ private:
   bool stream_one(u32 type, bool on) { int tt = static_cast<int>(type); return xioctl(fd_, on ? VIDIOC_STREAMON : VIDIOC_STREAMOFF, &tt) == 0; }
   bool stream(bool on) { return stream_one(V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE, on) & stream_one(V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE, on); }
   bool select(u32 type, u32 target, int x, int y, int w, int h) {
-    v4l2_selection s{}; s.type = type; s.target = target; s.r = {x, y, static_cast<u32>(w), static_cast<u32>(h)};
+    v4l2_selection s{}; s.type = type; s.target = target; s.r.left = x; s.r.top = y; s.r.width = static_cast<u32>(w); s.r.height = static_cast<u32>(h);
     return xioctl(fd_, VIDIOC_S_SELECTION, &s) == 0;
   }
   bool queue(u32 type, int dmafd, u32 bytes) {
     v4l2_plane pl{}; pl.m.fd = dmafd; pl.length = bytes; if (type == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE) pl.bytesused = bytes;
-    v4l2_buffer b{}; b.type = type; b.memory = V4L2_MEMORY_DMABUF; b.index = 0; b.m.planes = &pl; b.length = 1;
+    v4l2_buffer b{}; b.type = static_cast<v4l2_buf_type>(type); b.memory = V4L2_MEMORY_DMABUF; b.index = 0; b.m.planes = &pl; b.length = 1;
     return xioctl(fd_, VIDIOC_QBUF, &b) == 0;
   }
   bool dequeue(u32 type) {
     v4l2_plane pl{};
-    v4l2_buffer b{}; b.type = type; b.memory = V4L2_MEMORY_DMABUF; b.m.planes = &pl; b.length = 1;
+    v4l2_buffer b{}; b.type = static_cast<v4l2_buf_type>(type); b.memory = V4L2_MEMORY_DMABUF; b.m.planes = &pl; b.length = 1;
     return xioctl(fd_, VIDIOC_DQBUF, &b) == 0;
   }
   // One synchronous job: source rectangle of `sfd` into `r` of `dfd`.
@@ -386,7 +391,7 @@ private:
 
 std::unique_ptr<FramePresenter> open_rga_presenter(ScanoutOut& sink, std::string* why) { return RgaPresenter::open(sink, why); }
 #else
-std::unique_ptr<FramePresenter> open_rga_presenter(ScanoutOut&, std::string* why) { if (why) *why = "RGA present needs Linux V4L2"; return nullptr; }
+std::unique_ptr<FramePresenter> open_rga_presenter(ScanoutOut&, std::string* why) { if (why) *why = "RGA present needs Linux V4L2 with dma-buf mem2mem"; return nullptr; }
 #endif
 
 } // namespace ds::sdl
