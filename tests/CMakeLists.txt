@@ -152,7 +152,7 @@ target_link_libraries(test_sd_card PRIVATE dsperate_core)
 add_test(NAME sd_card COMMAND test_sd_card)
 
 # GPU raster probe (gpu-raster branch): times a recorded frame on the Vulkan raster. Not a test.
-if(DSPERATE_VULKAN)
+if(DSPERATE_VULKAN AND DSPERATE_VULKAN_INCLUDE)   # the headers may be missing on a build host (CI), which switches the raster off
   add_executable(vk_probe vk_probe.cpp)
   target_link_libraries(vk_probe PRIVATE dsperate_core ${CMAKE_DL_LIBS})   # the Vulkan loader is dlopen'd; a static-libstdc++ toolchain needs dl named here
   target_include_directories(vk_probe PRIVATE ${DSPERATE_VULKAN_INCLUDE})
