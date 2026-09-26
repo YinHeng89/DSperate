@@ -1087,6 +1087,7 @@ const u32* Raster::output() const { return static_cast<const u32*>(d_->out_nat[(
 const u32* Raster::output_prev() const { return static_cast<const u32*>(d_->out_nat[(d_->gen + 1) % 3].ptr); }
 
 u64 Raster::output_hires_handle() const { return d_->out[(d_->gen + 2) % 3].handle; }
+const u32* Raster::output_hires() const { return static_cast<const u32*>(d_->out[(d_->gen + 2) % 3].ptr); }
 size_t Raster::output_hires_bytes() const { return d_->out[0].size; }
 u64 Raster::output_edge_handle() const { const u32 s = (d_->gen + 2) % 3; return d_->edge_valid[s] ? d_->edge[s].handle : 0; }
 bool Raster::smooth() const { return d_->smooth; }

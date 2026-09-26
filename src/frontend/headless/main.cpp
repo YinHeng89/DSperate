@@ -251,6 +251,7 @@ int main(int argc, char** argv) {
   int cut_n = 0; const char* cut_path = nullptr;   // --dump-cut
   const char* edges_path = nullptr; FILE* edges_out = nullptr;   // --dump-edges
   long gpu_dump_frame = -1; const char* gpu_dump_path = nullptr;   // --dump-gpu-frame
+  bool gpu3d = false;   // --gpu3d
   int frames = 60; bool direct = false;
 #if DSPERATE_JIT
   bool jit = true;                    // both CPUs; --interp clears it
@@ -345,7 +346,8 @@ int main(int argc, char** argv) {
     else if (flag("--rtc-host")) rtc_host = true;                            // INEXACT by construction: runs stop being reproducible
     else if (arg("--firmware-override")) fw_override = argv[++i];            // load it, and write back what the firmware changed
     else if (flag("--no-aa")) no_aa = true;                                  // 3D anti-aliasing off (Renderer3D::set_aa); inexact, for measurement
-    else if (flag("--enhanced")) aa_enhanced = true;                         // video.aa = enhanced: forced coverage, blended with the outside neighbour (Renderer3D::set_aa)
+    else if (flag("--enhanced")) aa_enhanced = true;
+    else if (flag("--gpu3d")) gpu3d = true;   // the 3D layer on the GPU (Renderer3D::set_gpu, vk_lean.h); declines to the CPU without Vulkan                         // video.aa = enhanced: forced coverage, blended with the outside neighbour (Renderer3D::set_aa)
     else if (arg("--load-state")) load_state = argv[++i];                   // restore a save state before running
     else if (arg("--frameskip")) frameskip = std::atoi(argv[++i]);          // skip drawing N of every N+1 frames (Gpu::set_frame_skip); a dump of a skipped frame is stale
     else if (flag("--frameskip-capture")) frameskip_capture = true;          // INEXACT: skip frames that display-capture too
@@ -620,6 +622,7 @@ int main(int argc, char** argv) {
     nds.gpu.set_edge_export(true);
   }
   if (gpu_dump_path && gpu_dump_frame >= 0) nds.gpu3d.renderer().set_gpu_dump(gpu_dump_path, static_cast<ds::u64>(gpu_dump_frame));
+  if (gpu3d) { std::string why; if (!nds.gpu3d.renderer().set_gpu(true, &why)) std::fprintf(stderr, "gpu3d: unavailable (%s), drawing on the CPU\n", why.c_str()); }
   if (edges_path) { edges_out = std::fopen(edges_path, "wb"); if (!edges_out) { std::fprintf(stderr, "could not open %s\n", edges_path); return 1; } nds.gpu.set_edge_export(true); }
   FILE* hash_out = hash_frames ? std::fopen(hash_frames, "w") : nullptr;
   if (hash_frames && !hash_out) { std::fprintf(stderr, "could not open %s\n", hash_frames); return 1; }

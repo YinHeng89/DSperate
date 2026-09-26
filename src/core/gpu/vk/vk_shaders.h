@@ -30,6 +30,10 @@ Spirv shader_tri_tail_ms();  // ... the tail and the mask once per sample
 Spirv shader_tri_mask_ms();
 Spirv shader_tri_resolve();  // ... and the resolve subpass (four samples into the 1x planes)
 Spirv shader_tri_fs();       // its fullscreen triangle
+Spirv shader_lean_vert();    // lean path (vk_lean.cpp): fans at 1x, MSAA vertex placement
+Spirv shader_lean_frag();    // ... its one fragment stage
+Spirv shader_lean_frag_early();   // ... without the alpha test (early depth test) for polygons that cannot fail it
+Spirv shader_lean_resolve(); // ... and the resolve into the 3D layer record
 
 } // namespace ds::gpu::vk
 

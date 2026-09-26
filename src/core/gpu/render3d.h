@@ -5,6 +5,7 @@
 #include <cstdio>
 #include "core/types.h"
 #include "core/gpu/texcache.h"
+#include <unordered_map>
 
 #include <array>
 #include <atomic>
@@ -18,6 +19,7 @@
 namespace ds { struct NDS; }
 
 namespace ds::gpu {
+namespace vk { class Device; class Lean; }
 
 class Gpu3D;
 struct Polygon;
@@ -78,6 +80,12 @@ public:
   // --dump-gpu-frame: write NDS frame `frame`'s polygon list in the GPU raster's layout
   // (vk_dump.h) to `path`; the frame is drawn on the CPU as usual.
   void set_gpu_dump(const char* path, u64 frame) { gpu_dump_path_ = path; gpu_dump_frame_ = frame; }
+  // The GPU 3D raster (vk_lean.h): the frame's polygon list drawn on the GPU
+  // at 1x with MSAA, one frame of lag allowed under load; a refused frame
+  // (texture arena full, list past the buffers) goes to the band workers.
+  // May decline (no Vulkan); `why` takes the reason. Coordinator only.
+  bool set_gpu(bool on, std::string* why = nullptr);
+  bool gpu_active() const { return gpu_on_; }
   bool edge_export() const { return edge_export_; }
 private:
   NDS& nds_;
@@ -390,7 +398,11 @@ public:
   // of the display frame (Gpu::begin_frame); nbins is 0 when nothing is
   // outstanding (rendered inline or kept).
   struct FrameRef {
-    const u32* out = nullptr;
+    // A GPU frame's record is picked on the first line read, not when the
+    // ref is taken at the start of the display frame: the GPU gets the lines
+    // before the compositor's batch as well (see sync_line).
+    mutable const u32* out = nullptr;
+    bool gpu = false, allow_lag = true;
     const u8* edges = nullptr;   // enhanced AA edge plane (set_edge_export), or null
     const u8* edge_line(u32 y) const { return edges ? edges + y * 256 : nullptr; }
     u64 gen = 0;
@@ -398,8 +410,11 @@ public:
     std::array<s32, MAX_BINS + 1> bin_y{};
     const u32* line(u32 y) const { return out + y * 256; }
   };
-  FrameRef frame_ref() const;
-  void sync_line(const FrameRef& f, s32 y);   // any thread; each call waits for one band at most
+  // `allow_lag`: a GPU frame not finished yet may be stood in for by the one
+  // before it (one frame of 3D latency instead of a stall); a display-capture
+  // frame must not (stale VRAM readback is wrong emulation).
+  FrameRef frame_ref(bool allow_lag = true) const;
+  void sync_line(const FrameRef& f, s32 y);   // any thread; each call waits for one band at most (a GPU frame: resolves the record once)
   void sync_all();
   u64 last_band_sum_ns() const { return band_sum_ns_[0]; }   // serial raster cost of the last synced frame (sum over bands)
 private:
@@ -420,6 +435,14 @@ private:
   std::vector<const u32*> poly_texels_;
   const char* gpu_dump_path_ = nullptr; u64 gpu_dump_frame_ = ~u64{0};
   void gpu_dump(const Gpu3D& gx, const Polygon* const* polys, u32 npoly);
+  std::shared_ptr<vk::Device> vk_dev_;
+  std::unique_ptr<vk::Lean> lean_;
+  bool gpu_on_ = false;
+  bool gpu_frame_ = false;   // the last drawn frame went to the GPU: lean_ holds the picture, not out_[]
+  struct GpuResident { u32 off = 0, words = 0, version = 0; };
+  std::unordered_map<u32, GpuResident> gpu_resident_;   // decoded texture (cache id) -> arena offset
+  u32 gpu_arena_top_ = 0;
+  bool gpu_submit(const Gpu3D& gx, const Polygon* const* polys, u32 npoly);   // false: draw on the CPU instead
   std::vector<std::unique_ptr<Renderer3D>> bands_;      // workers 1..n-1 (band 0 is this)
   u64 band_ns_[8] = {};                                 // last frame's per-band wall time (workers write their own slot)
   u64 band_sum_ns_[2] = {0, 0};                         // summed band time (serial raster cost) of the last two frames

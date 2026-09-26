@@ -1403,6 +1403,8 @@ static int run(int argc, char** argv) {
   Disp::Layout& layout = vs.layout;
   std::vector<Disp::Mode>& layout_cycle = vs.layout_cycle;
   ds::prof::set_level(std::getenv("DS_PROFILE"));
+  // DS_GPU3D=1: the 3D layer on the GPU (Renderer3D::set_gpu); a config key follows once it has proven itself.
+  if (const char* g = std::getenv("DS_GPU3D"); g && std::atoi(g) != 0) { std::string why; if (!nds.gpu3d.renderer().set_gpu(true, &why)) std::fprintf(stderr, "gpu3d: unavailable (%s), drawing on the CPU\n", why.c_str()); else std::fprintf(stderr, "gpu3d: on\n"); }
   std::signal(SIGINT, on_signal);
   std::signal(SIGTERM, on_signal);
 
@@ -3682,7 +3684,7 @@ sdl_ready:
         // GPU presenter cuts the panel block, so the 1x blend stays for the
         // others. DS_EDGE_CUT=0 keeps the 1x blend on the GPU path too.
         static const bool edge_cut_allowed = !(std::getenv("DS_EDGE_CUT") && std::atoi(std::getenv("DS_EDGE_CUT")) == 0);
-        const bool want_edges = edge_cut_allowed && g_aa_mode == 2 && !present_sync && display.gpu_present() && (!dual_window || display2.gpu_present());
+        const bool want_edges = edge_cut_allowed && g_aa_mode == 2 && !present_sync && display.gpu_present() && (!dual_window || display2.gpu_present()) && !nds.gpu3d.renderer().gpu_active();
         if (want_edges != nds.gpu.edge_export()) nds.gpu.set_edge_export(want_edges);
         const u8* const edges[2] = {want_edges ? nds.gpu.edge_plane(0) : nullptr, want_edges ? nds.gpu.edge_plane(1) : nullptr};
         if (!present_sync && display.gpu_present() && (!dual_window || display2.gpu_present())) {

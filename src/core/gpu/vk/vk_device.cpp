@@ -59,7 +59,7 @@ struct Device::Impl {
   VkInstance inst = VK_NULL_HANDLE;
   VkPhysicalDevice phys = VK_NULL_HANDLE;
   VkDevice dev = VK_NULL_HANDLE;
-  VkQueue  queue = VK_NULL_HANDLE;
+  VkQueue  queue = VK_NULL_HANDLE, queue2 = VK_NULL_HANDLE;
   u32      qfam = 0;
   bool     has_host_import = false;
   bool     device_local = true;   // the chosen CpuRead type is also DEVICE_LOCAL
@@ -192,7 +192,7 @@ std::unique_ptr<Device> Device::create(std::string* why) {
   d.api.vkEnumerateDeviceExtensionProperties(d.phys, nullptr, &ne, nullptr);
   std::vector<VkExtensionProperties> exts(ne);
   d.api.vkEnumerateDeviceExtensionProperties(d.phys, nullptr, &ne, exts.data());
-  bool has_atomic64_ext = false, has_fd = false, has_dmabuf = false, has_modifier = false, has_fmtlist = false, has_foreign = false, has_roaa = false, has_swapchain = false;
+  bool has_gprio = false, has_atomic64_ext = false, has_fd = false, has_dmabuf = false, has_modifier = false, has_fmtlist = false, has_foreign = false, has_roaa = false, has_swapchain = false;
   for (const auto& e : exts) {
     if (!std::strcmp(e.extensionName, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME)) d.has_host_import = true;
     if (!std::strcmp(e.extensionName, VK_KHR_SHADER_ATOMIC_INT64_EXTENSION_NAME)) has_atomic64_ext = true;
@@ -203,6 +203,7 @@ std::unique_ptr<Device> Device::create(std::string* why) {
     if (!std::strcmp(e.extensionName, VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME)) has_foreign = true;
     if (!std::strcmp(e.extensionName, VK_EXT_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_EXTENSION_NAME)) has_roaa = true;
     if (!std::strcmp(e.extensionName, VK_KHR_SWAPCHAIN_EXTENSION_NAME)) has_swapchain = true;
+    if (!std::strcmp(e.extensionName, VK_EXT_GLOBAL_PRIORITY_EXTENSION_NAME)) has_gprio = true;
   }
   self->limits_.present = !inst_exts.empty() && has_swapchain;
   self->limits_.dmabuf_import = has_fd && has_dmabuf;
@@ -232,9 +233,10 @@ std::unique_ptr<Device> Device::create(std::string* why) {
   std::vector<VkQueueFamilyProperties> qf(nq);
   d.api.vkGetPhysicalDeviceQueueFamilyProperties(d.phys, &nq, qf.data());
   bool found = false;
+  u32 nqueues = 1;
   for (u32 i = 0; i < nq; ++i)
     if (qf[i].queueFlags & VK_QUEUE_COMPUTE_BIT) {
-      d.qfam = i; found = true;
+      d.qfam = i; found = true; nqueues = std::min(2u, qf[i].queueCount);
       self->limits_.graphics = (qf[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) != 0;
       if (qf[i].timestampValidBits) self->limits_.timestamp_period_ns = props.limits.timestampPeriod;
       break;
@@ -261,12 +263,29 @@ std::unique_ptr<Device> Device::create(std::string* why) {
   if (self->limits_.ordered_attachments) { enroaa.pNext = enf.pNext; enf.pNext = &enroaa; }
   if (self->limits_.msaa4) enf.features.sampleRateShading = VK_TRUE;
 
-  const float prio = 1.0f;
+  // Two queues where the family has them: the second is the 3D raster's
+  // own. The present path's jobs wait on the panel (a dma-buf still being
+  // scanned out), and on one queue a raster job submitted after such a job
+  // waits with it: a frame of latency for two milliseconds of work.
+  const float prio[2] = {1.0f, 1.0f};
   VkDeviceQueueCreateInfo qi{};
   qi.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
   qi.queueFamilyIndex = d.qfam;
-  qi.queueCount = 1;
-  qi.pQueuePriorities = &prio;
+  qi.queueCount = nqueues;
+  qi.pQueuePriorities = prio;
+  // DS_VK_PRIORITY=low|medium|high|realtime: the queue's priority against
+  // other processes' GPU work (the Wayland compositor's), where the driver
+  // offers it (VK_EXT_global_priority). The 3D layer of a capture frame is
+  // needed a few milliseconds after its submit, so it must not queue behind
+  // the compositor. Default high when available.
+  VkDeviceQueueGlobalPriorityCreateInfoEXT gp{};
+  gp.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_GLOBAL_PRIORITY_CREATE_INFO_EXT;
+  {
+    const char* p = std::getenv("DS_VK_PRIORITY");
+    const std::string ps = p ? p : "high";
+    gp.globalPriority = ps == "low" ? VK_QUEUE_GLOBAL_PRIORITY_LOW_EXT : ps == "medium" ? VK_QUEUE_GLOBAL_PRIORITY_MEDIUM_EXT : ps == "realtime" ? VK_QUEUE_GLOBAL_PRIORITY_REALTIME_EXT : VK_QUEUE_GLOBAL_PRIORITY_HIGH_EXT;
+    if (has_gprio && ps != "off") { want.push_back(VK_EXT_GLOBAL_PRIORITY_EXTENSION_NAME); qi.pNext = &gp; }
+  }
   VkDeviceCreateInfo di{};
   di.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
   di.queueCreateInfoCount = 1;
@@ -274,8 +293,14 @@ std::unique_ptr<Device> Device::create(std::string* why) {
   di.enabledExtensionCount = static_cast<u32>(want.size());
   di.ppEnabledExtensionNames = want.empty() ? nullptr : want.data();
   if (self->limits_.int64_atomics || self->limits_.ordered_attachments || self->limits_.msaa4) di.pNext = &enf;
-  if (d.api.vkCreateDevice(d.phys, &di, nullptr, &d.dev) != VK_SUCCESS) return set("vkCreateDevice failed");
+  if (d.api.vkCreateDevice(d.phys, &di, nullptr, &d.dev) != VK_SUCCESS) {
+    // A priority the process may not take (VK_ERROR_NOT_PERMITTED) or a driver quirk: once more without it.
+    if (!qi.pNext) return set("vkCreateDevice failed");
+    qi.pNext = nullptr; want.pop_back(); di.enabledExtensionCount = static_cast<u32>(want.size());
+    if (d.api.vkCreateDevice(d.phys, &di, nullptr, &d.dev) != VK_SUCCESS) return set("vkCreateDevice failed");
+  } else if (qi.pNext) self->name_ += " (queue priority)";
   d.api.vkGetDeviceQueue(d.dev, d.qfam, 0, &d.queue);
+  if (nqueues > 1) { d.api.vkGetDeviceQueue(d.dev, d.qfam, 1, &d.queue2); self->name_ += " (2 queues)"; }
 
   u32 dummy = 0;
   if (!d.find_mem(~0u, Access::CpuRead, &dummy, &d.device_local)) return set("no HOST_CACHED memory type");
@@ -286,6 +311,7 @@ std::unique_ptr<Device> Device::create(std::string* why) {
   d.internal.inst = d.inst;
   d.internal.dev = d.dev;
   d.internal.queue = d.queue;
+  d.internal.queue2 = d.queue2;
   d.internal.phys = d.phys;
   d.internal.qfam = d.qfam;
   return self;

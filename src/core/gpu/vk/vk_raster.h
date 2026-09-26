@@ -35,6 +35,7 @@ public:
   // for the present stage. Same buffer as output() when S == 1.
   u64 output_hires_handle() const;
   size_t output_hires_bytes() const;
+  const u32* output_hires() const;   // the same layer CPU-readable (probe / dumps), 256S x 192S words
   // Smooth filter's edge plane (0 if the frame wrote none), and whether on.
   u64 output_edge_handle() const;
   bool smooth() const;

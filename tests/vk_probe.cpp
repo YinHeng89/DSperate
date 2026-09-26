@@ -9,8 +9,10 @@
 #include "core/gpu/vk/vk_device.h"
 #include "core/gpu/vk/vk_dump.h"
 #include "core/gpu/vk/vk_raster.h"
+#include "core/gpu/vk/vk_lean.h"
 
 #include <chrono>
+#include <thread>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -47,40 +49,76 @@ int main(int argc, char** argv) {
   if (!dev) { std::fprintf(stderr, "no Vulkan device: %s\n", why.c_str()); return 1; }
   std::printf("device: %s (graphics %d, msaa4 %d, int64 atomics %d, timestamps %s)\n", dev->name().c_str(), (int)dev->limits().graphics, (int)dev->limits().msaa4,
               (int)dev->limits().int64_atomics, dev->limits().timestamp_period_ns > 0 ? "yes" : "no");
-  std::unique_ptr<Raster> r = Raster::create(*dev, 1, &why);
-  if (!r || !r->ready()) { std::fprintf(stderr, "raster unavailable: %s\n", why.c_str()); return 1; }
-  std::printf("raster: %s path%s\n", r->tri() ? "triangle" : "compute", r->timing() ? ", timing on" : "");
+  const u32 scale = [] { const char* e = std::getenv("DS_PROBE_SCALE"); const int v = e ? std::atoi(e) : 1; return static_cast<u32>(v >= 1 && v <= 4 ? v : 1); }();   // internal resolution (triangle path)
+  // DS_VK_LEAN=1: the lean pipeline (vk_lean.h) instead of the restored raster.
+  const bool lean = std::getenv("DS_VK_LEAN") && std::atoi(std::getenv("DS_VK_LEAN")) != 0;
+  std::unique_ptr<Raster> r;
+  std::unique_ptr<Lean> L;
+  if (lean) {
+    L = Lean::create(*dev, &why);
+    if (!L || !L->ready()) { std::fprintf(stderr, "lean raster unavailable: %s\n", why.c_str()); return 1; }
+  } else {
+    r = Raster::create(*dev, scale, &why);
+    if (!r || !r->ready()) { std::fprintf(stderr, "raster unavailable: %s\n", why.c_str()); return 1; }
+    std::printf("raster: %s path%s\n", r->tri() ? "triangle" : "compute", r->timing() ? ", timing on" : "");
+  }
 
   auto upload = [&]() {
-    std::memcpy(r->poly_buffer(), gp.data(), sizeof(GpuPoly) * gp.size());
-    std::memcpy(r->vert_buffer(), gv.data(), sizeof(GpuVert) * gv.size());
-    u32 cap = 0; u32* t = r->texel_buffer(&cap);
+    GpuPoly* pb = lean ? L->poly_buffer() : r->poly_buffer();
+    GpuVert* vb = lean ? L->vert_buffer() : r->vert_buffer();
+    u32 cap = 0; u32* t = lean ? L->texel_buffer(&cap) : r->texel_buffer(&cap);
+    std::memcpy(pb, gp.data(), sizeof(GpuPoly) * gp.size());
+    std::memcpy(vb, gv.data(), sizeof(GpuVert) * gv.size());
     if (tex.size() > cap) { std::fprintf(stderr, "texel arena too small (%zu > %u)\n", tex.size(), cap); std::exit(1); }
     std::memcpy(t, tex.data(), sizeof(u32) * tex.size());
-    *r->post_buffer() = h.post;
-    std::memcpy(r->shadow_run_buffer(), shrun.data(), sizeof(u32) * shrun.size());
-    std::memcpy(r->rowpoly_buffer(), rowpoly.data(), sizeof(u32) * rowpoly.size());
+    *(lean ? L->post_buffer() : r->post_buffer()) = h.post;
+    if (!lean) {
+      std::memcpy(r->shadow_run_buffer(), shrun.data(), sizeof(u32) * shrun.size());
+      std::memcpy(r->rowpoly_buffer(), rowpoly.data(), sizeof(u32) * rowpoly.size());
+    }
   };
+  auto submit = [&]() { return lean ? L->submit(h.npoly, h.nvert, h.ntexels, h.f) : r->submit(h.npoly, h.nvert, h.ntexels, h.f); };
+  auto waitf = [&]() { if (lean) L->wait(); else r->wait(); };
 
   // Warm-up: pipelines, first-use allocations.
   upload();
-  if (!r->submit(h.npoly, h.nvert, h.ntexels, h.f)) { std::fprintf(stderr, "submit refused\n"); return 1; }
-  r->wait();
+  if (!submit()) { std::fprintf(stderr, "submit refused\n"); return 1; }
+  waitf();
 
   std::vector<double> ms; ms.reserve(iters);
+  std::vector<double> wait_ms; wait_ms.reserve(iters);
+  std::vector<double> gms; gms.reserve(iters);
   const auto t0 = std::chrono::steady_clock::now();
   for (int i = 0; i < iters; ++i) {
     const auto a = std::chrono::steady_clock::now();
     upload();
-    if (!r->submit(h.npoly, h.nvert, h.ntexels, h.f)) { std::fprintf(stderr, "submit refused at %d\n", i); return 1; }
-    r->wait();
+    if (!submit()) { std::fprintf(stderr, "submit refused at %d\n", i); return 1; }
+    // DS_PROBE_SLEEP=ms: sleep after the submit, then time the wait alone: a
+    // wait that still takes the frame's GPU time means the job did not run
+    // until the wait (driver deferral).
+    static const int sleep_ms = std::getenv("DS_PROBE_SLEEP") ? std::atoi(std::getenv("DS_PROBE_SLEEP")) : 0;
+    if (sleep_ms) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
+      const auto w0 = std::chrono::steady_clock::now();
+      waitf();
+      wait_ms.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count());
+    } else waitf();
     ms.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - a).count());
+    if (lean && L->gpu_ns()) gms.push_back(static_cast<double>(L->gpu_ns()) / 1e6);
+  }
+  if (!wait_ms.empty()) {
+    std::sort(wait_ms.begin(), wait_ms.end());
+    std::printf("wait after sleep: median %.2f ms, p90 %.2f, max %.2f\n", wait_ms[wait_ms.size() / 2], wait_ms[std::min(wait_ms.size() - 1, static_cast<size_t>(0.9 * wait_ms.size()))], wait_ms.back());
+  }
+  if (lean && !gms.empty()) {
+    std::sort(gms.begin(), gms.end());
+    std::printf("lean: GPU time per frame median %.2f ms, p90 %.2f, max %.2f; %u draws\n", gms[gms.size() / 2], gms[std::min(gms.size() - 1, static_cast<size_t>(0.9 * gms.size()))], gms.back(), L->draws());
   }
   const double total = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
   std::sort(ms.begin(), ms.end());
   auto q = [&](double p) { return ms[std::min(ms.size() - 1, static_cast<size_t>(p * ms.size()))]; };
   std::printf("submit+wait per frame: median %.2f ms, p90 %.2f, p99 %.2f, max %.2f (%d frames, %.1f ms total)\n", q(0.5), q(0.9), q(0.99), ms.back(), iters, total);
-  if (r->timing()) {
+  if (!lean && r->timing()) {
     const Raster::PassTimes& t = r->pass_times();
     if (t.frames) {
       const char* names[] = {"span", "bin", "vis", "raster", "post"};
@@ -90,11 +128,12 @@ int main(int argc, char** argv) {
     }
   }
   if (ppm) {
-    const u32* out = r->output();
+    const u32 S = lean ? 1u : r->scale();
+    const u32* out = lean ? L->output() : (S > 1 ? r->output_hires() : r->output());
     std::FILE* o = std::fopen(ppm, "wb");
     if (!o) { std::fprintf(stderr, "cannot write %s\n", ppm); return 1; }
-    std::fprintf(o, "P6\n256 192\n255\n");
-    for (u32 i = 0; i < 256 * 192; ++i) {
+    std::fprintf(o, "P6\n%u %u\n255\n", 256 * S, 192 * S);
+    for (u32 i = 0; i < 256 * 192 * S * S; ++i) {
       const u32 c = out[i];
       const unsigned char px[3] = {static_cast<unsigned char>((c & 0x3F) * 255 / 63), static_cast<unsigned char>(((c >> 8) & 0x3F) * 255 / 63), static_cast<unsigned char>(((c >> 16) & 0x3F) * 255 / 63)};
       std::fwrite(px, 1, 3, o);

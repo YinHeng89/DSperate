@@ -548,7 +548,7 @@ void Gpu::begin_frame() {
   if (capture_on_) capture_recent_ = CAPTURE_STICKY; else if (capture_recent_) --capture_recent_;
   // 3D frame this display frame reads, latched here since the raster moves on
   // at line 215 while the compositor may still be reading it.
-  ref3d_ = nds_.gpu3d.frame_ref();
+  ref3d_ = nds_.gpu3d.frame_ref(!capture_on_);   // a capture frame reads the 3D of this frame, never the one before
   update_phase();
   if (prof::enabled) {
     prof::add(prof::C_FRAMES_TOTAL, 1);

@@ -2,6 +2,7 @@
 // DSperate - Nintendo DS emulator. Copyright (C) 2026 DSperate contributors.
 #include "core/gpu/render3d.h"
 #include "core/gpu/vk/vk_dump.h"
+#include "core/gpu/vk/vk_lean.h"
 #include <unordered_map>
 #include "core/handoff_stats.h"
 #include "core/div64.h"
@@ -21,6 +22,7 @@
 #include "core/profile.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <cstdio>
@@ -3694,6 +3696,8 @@ void Renderer3D::render(const Gpu3D& gx) {
   }
   texels_in_ = &poly_texels_;
   if (gpu_dump_path_ && nds_.frame_count == gpu_dump_frame_) gpu_dump(gx, polys, npoly);
+  if (gpu_on_ && gpu_submit(gx, polys, npoly)) { gpu_frame_ = true; pending_bands_ = 0; return; }
+  gpu_frame_ = false;
   if (prof::enabled && !prep_done) { prof::add_timed(prof::R3D_PREP, prof::now_ns() - t_prep0); prep_done = true; }
 
   u32 nb = band_count(live);
@@ -3859,9 +3863,16 @@ void Renderer3D::debug_dump(FILE* f) {
   if (pool_) pool_->debug_dump(f);
 }
 
-Renderer3D::FrameRef Renderer3D::frame_ref() const {
+Renderer3D::FrameRef Renderer3D::frame_ref(bool allow_lag) const {
   FrameRef f;
   f.gen = gen_;
+  if (gpu_frame_ && lean_ && lean_->has_frame()) {
+    // A GPU frame: no bands to wait for; the record (the newest the GPU has
+    // finished, or, allowed, the one before) is picked at the first line
+    // read. Edge planes are a CPU-raster feature.
+    f.nbins = 0; f.gpu = true; f.allow_lag = allow_lag; f.out = nullptr; f.edges = nullptr;
+    return f;
+  }
   f.nbins = pending_bands_;
   if (pending_bands_) f.bin_y = bin_y_;
   f.out = out_[display_].data();
@@ -3869,11 +3880,131 @@ Renderer3D::FrameRef Renderer3D::frame_ref() const {
   return f;
 }
 
+bool Renderer3D::set_gpu(bool on, std::string* why) {
+  if (!on) { sync_all(); if (lean_) lean_->wait(); gpu_on_ = false; return true; }
+  if (gpu_on_) return true;
+  std::string reason;
+  if (!vk_dev_) vk_dev_ = vk::Device::shared(&reason);
+  if (!vk_dev_) { if (why) *why = reason; return false; }
+  if (!lean_) lean_ = vk::Lean::create(*vk_dev_, &reason);
+  if (!lean_ || !lean_->ready()) { lean_.reset(); if (why) *why = reason; return false; }
+  lean_->wait_all(); gpu_resident_.clear(); gpu_arena_top_ = 0;
+  gpu_on_ = true;
+  return true;
+}
+
+// The frame in the raster's layout, straight into its mapped buffers (the
+// same conversion as gpu_dump, with the decoded textures kept resident in
+// the arena across frames: a texture is copied when new or re-decoded).
+// A refusal (arena full, list past the buffers) sends the frame to the CPU;
+// the arena starts over on the next frame after a fill.
+// DS_GPU_TRACE=1: per-600-frame stderr summary of the GPU path's CPU cost
+// (submit build, submit call, the compositor's wait) and the lag rule's outcomes.
+namespace {
+struct GpuTrace {
+  bool on = std::getenv("DS_GPU_TRACE") && std::atoi(std::getenv("DS_GPU_TRACE")) != 0;
+  double build_ms = 0, submit_ms = 0, wait_ms = 0, wait_max = 0; u32 frames = 0, waited = 0, refused = 0, draws = 0;
+  void tick(vk::Lean& lean) {
+    if (++frames < 600) return;
+    const vk::Lean::Stats st = lean.stats(true);
+    std::fprintf(stderr, "gpu3d trace: build %.2f ms/frame, submit %.2f (slot wait %.2f, prep %.2f, record %.2f, queue %.2f), compositor wait %.2f (max %.2f), waits %u/600, refused %u; newest %u lagged %u stalled %u nolag %u; gpu %.2f ms (%u timed); latency %.2f ms (%u exact); read gap %.2f ms; %.0f draws/frame\n",
+                 build_ms / frames, submit_ms / frames, st.slot_wait_ms / frames, st.prep_ms / frames, st.record_ms / frames, st.queue_ms / frames, wait_ms / frames, wait_max, waited, refused, st.newest, st.lagged, st.stalled, st.nolag, st.timed ? st.gpu_ms / st.timed : 0.0, st.timed, st.lat_n ? st.lat_ms / st.lat_n : 0.0, st.lat_n, st.gap_n ? st.gap_ms / st.gap_n : 0.0, static_cast<double>(draws) / frames);
+    build_ms = submit_ms = wait_ms = wait_max = 0; frames = waited = refused = draws = 0;
+  }
+};
+GpuTrace g_gpu_trace;
+inline double now_ms() { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+}
+
+bool Renderer3D::gpu_submit(const Gpu3D& gx, const Polygon* const* polys, u32 npoly) {
+  using namespace ds::gpu::vk;
+  const double t0 = g_gpu_trace.on ? now_ms() : 0;
+  struct Done { double t0; vk::Lean& lean; bool ok = false; ~Done() { if (g_gpu_trace.on) { if (!ok) ++g_gpu_trace.refused; g_gpu_trace.tick(lean); } } } done{t0, *lean_};
+  GpuPoly* const gp = lean_->poly_buffer();
+  GpuVert* const gv = lean_->vert_buffer();
+  u32 texcap = 0; u32* const tex = lean_->texel_buffer(&texcap);
+  GpuPost* const ps = lean_->post_buffer();
+  u32 np = 0, nv = 0, nrows = 0, first_ordered = ~0u, opaque_rows = 0;
+  const bool alpha_all_fail = rs_->alpha_ref >= 31;
+  for (u32 i = 0; i < npoly; ++i) {
+    const Polygon& p = *polys[i];
+    if (p.degenerate) continue;
+    if (np >= DS_MAX_POLYS || nv + p.nverts > DS_MAX_VERTS) return false;
+    if (first_ordered == ~0u && (alpha_all_fail || p.translucent || p.shadow_mask || p.shadow)) { first_ordered = np; opaque_rows = nrows; }
+    GpuPoly& o = gp[np];
+    o = GpuPoly{};
+    o.first_vert = nv; o.nverts = p.nverts; o.attr = p.attr; o.texparam = p.texparam;
+    o.ytop = p.ytop; o.ybot = p.ybot; o.vtop = p.vtop; o.vbot = p.vbot;
+    o.flags = (p.translucent ? DS_PF_TRANSLUCENT : 0u) | (p.wbuffer ? DS_PF_WBUFFER : 0u) | (p.facing ? DS_PF_FRONTFACING : 0u) |
+              (p.shadow_mask ? DS_PF_SHADOW_MASK : 0u) | (p.shadow ? DS_PF_SHADOW : 0u);
+    s32 xmin = 0x7FFFFFFF, xmax = -0x7FFFFFFF;
+    for (u32 j = 0; j < p.nverts; ++j) {
+      const Vertex& v = gx.vertex(p.vtx[j]);
+      GpuVert& d = gv[nv + j];
+      d.sx = v.sx; d.sy = v.sy; d.z = p.z[j]; d.w = p.w[j]; d.r = v.fcol[0]; d.g = v.fcol[1]; d.b = v.fcol[2]; d.s = v.tex[0]; d.t = v.tex[1];
+      d.pad_[0] = d.pad_[1] = d.pad_[2] = 0;
+      xmin = std::min(xmin, d.sx); xmax = std::max(xmax, d.sx);
+    }
+    o.xmin = xmin; o.xmax = xmax;
+    nv += p.nverts;
+    const s32 ry0 = p.ytop < 0 ? 0 : p.ytop, ry1 = p.ybot > 191 ? 191 : p.ybot;
+    nrows += ry1 >= ry0 ? static_cast<u32>(ry1 - ry0) + 1 : 0;
+    const u32 fmt = (p.texparam >> 26) & 7;
+    if ((dispcnt_ & 1) && fmt != 0) {
+      Shade sh; texture_fields(sh, p);
+      const TextureCache::Ref r = texcache_.lookup_ref(*vm_, sh.fmt, sh.base, static_cast<u32>(sh.width), static_cast<u32>(sh.height), sh.texpal, sh.alpha0);
+      if (!r.texels) return false;
+      GpuResident& res = gpu_resident_[r.id];
+      if (res.words != r.words || res.version != r.version) {
+        if (gpu_arena_top_ + r.words > texcap) { lean_->wait_all(); gpu_resident_.clear(); gpu_arena_top_ = 0; return false; }
+        std::memcpy(tex + gpu_arena_top_, r.texels, static_cast<size_t>(r.words) * sizeof(u32));
+        res.off = gpu_arena_top_; res.words = r.words; res.version = r.version;
+        gpu_arena_top_ += r.words;
+      }
+      o.tex_offset = res.off; o.tex_w = static_cast<u32>(sh.width); o.tex_h = static_cast<u32>(sh.height); o.flags |= DS_PF_TEXTURED;
+      const bool may_alpha = (p.texparam & (1u << 29)) || fmt == 5 || fmt == 7 || fmt == 1 || fmt == 6;
+      if (may_alpha && r.transparent) o.flags |= DS_PF_TEX_ALPHA;
+    }
+    ++np;
+  }
+  if (first_ordered == ~0u) { first_ordered = np; opaque_rows = nrows; }
+  *ps = GpuPost{};
+  ps->fog_color = rs_->fog_color; ps->fog_offset = rs_->fog_offset; ps->fog_shift = rs_->fog_shift;
+  for (u32 i = 0; i < rs_->fog_density.size() && i < 34; ++i) ps->density[i] = rs_->fog_density[i];
+  for (u32 i = 0; i < rs_->edge.size() && i < 8; ++i) ps->edge[i] = rs_->edge[i];
+  for (u32 i = 0; i < rs_->toon.size() && i < 32; ++i) ps->toon[i] = rs_->toon[i];
+  GpuFrame f{};
+  f.npoly = np; f.scale = 1; f.dispcnt = dispcnt_; f.alpha_ref = rs_->alpha_ref;
+  f.first_ordered = first_ordered; f.opaque_rows = opaque_rows; f.nrows = nrows;
+  for (u32 i = 0; i < npoly; ++i) if (!polys[i]->degenerate) { if (polys[i]->wbuffer) f.flags |= DS_FF_WBUFFER; break; }
+  {
+    const u16 c = static_cast<u16>(rs_->clear_attr1);
+    auto ch = [](u16 v, u32 shift) { u32 x = (shift == 0 ? (v << 1) : (v >> shift)) & 0x3E; return x ? x + 1 : x; };
+    f.clear_color = ch(c, 0) | (ch(c, 4) << 8) | (ch(c, 9) << 16) | (((rs_->clear_attr1 >> 16) & 0x1F) << 24);
+    f.clear_depth = ((rs_->clear_attr2 & 0x7FFF) * 0x200) + 0x1FF;
+    f.clear_attr = (rs_->clear_attr1 & 0x3F000000) | (rs_->clear_attr1 & 0x8000);
+  }
+  if (rs_->dispcnt & (1u << 14)) return false;   // rear-plane bitmap: the CPU draws it
+  const double t1 = g_gpu_trace.on ? now_ms() : 0;
+  done.ok = lean_->submit(np, nv, gpu_arena_top_, f);
+  if (g_gpu_trace.on && done.ok) g_gpu_trace.draws += lean_->draws();
+  if (g_gpu_trace.on) { const double t2 = now_ms(); g_gpu_trace.build_ms += t1 - t0; g_gpu_trace.submit_ms += t2 - t1; }
+  return done.ok;
+}
+
 // Wait only for the band that owns display line `y` of frame `f`: bands are
 // independent, so the compositor can read the top while the bottom still
 // draws. Reads nothing render() changes (the ref carries the cut/generation),
 // so it can run on the compositor thread while emulation dispatches the next frame.
 void Renderer3D::sync_line(const FrameRef& f, s32 y) {
+  if (f.gpu) {
+    if (!f.out) {
+      const double t0 = g_gpu_trace.on ? now_ms() : 0;
+      f.out = lean_->newest_ready(f.allow_lag);
+      if (g_gpu_trace.on) { const double w = now_ms() - t0; g_gpu_trace.wait_ms += w; g_gpu_trace.wait_max = std::max(g_gpu_trace.wait_max, w); if (w > 0.2) ++g_gpu_trace.waited; }
+    }
+    return;
+  }
   if (!f.nbins || !pool_) return;
   u32 b = 0;
   while (b + 1 < f.nbins && y >= f.bin_y[b + 1]) ++b;
@@ -4082,6 +4213,7 @@ void Renderer3D::render_band(s32 y0, s32 y1, u32* dst, u8* edst) {
 template <class S> void Renderer3D::sync_output(S& s) {
   sync_all();
   if constexpr (S::reading) { reset(); texcache_.clear(); }
+  if constexpr (!S::reading) { if (gpu_frame_ && lean_) { if (const u32* g = lean_->newest_ready(false)) std::memcpy(out_[display_].data(), g, sizeof(u32) * 256 * 192); } }
   s.begin("R3DO");
   s.fields(rendered_once_, out_[display_]);   // reset() above leaves display_ at 0 on a load
   s.end();

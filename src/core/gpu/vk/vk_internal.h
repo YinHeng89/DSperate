@@ -35,14 +35,14 @@ namespace ds::gpu::vk {
   F(vkResetCommandBuffer) F(vkBeginCommandBuffer) F(vkEndCommandBuffer) \
   F(vkCmdBindPipeline) F(vkCmdBindDescriptorSets) F(vkCmdPushConstants) \
   F(vkCmdDispatch) F(vkCmdPipelineBarrier) F(vkCmdFillBuffer) \
-  F(vkCreateFence) F(vkDestroyFence) F(vkResetFences) F(vkWaitForFences) \
+  F(vkCreateFence) F(vkDestroyFence) F(vkResetFences) F(vkWaitForFences) F(vkGetFenceStatus) \
   F(vkCreateQueryPool) F(vkDestroyQueryPool) F(vkCmdResetQueryPool) F(vkCmdWriteTimestamp) F(vkGetQueryPoolResults) \
   F(vkQueueSubmit) \
   F(vkCreateImage) F(vkDestroyImage) F(vkGetImageMemoryRequirements) F(vkBindImageMemory) \
   F(vkCreateImageView) F(vkDestroyImageView) F(vkGetImageSubresourceLayout) F(vkCreateBufferView) F(vkDestroyBufferView) \
   F(vkGetMemoryFdPropertiesKHR) F(vkGetPhysicalDeviceImageFormatProperties2) \
   F(vkCreateGraphicsPipelines) F(vkCreateRenderPass) F(vkDestroyRenderPass) F(vkCreateFramebuffer) F(vkDestroyFramebuffer) \
-  F(vkCmdBeginRenderPass) F(vkCmdEndRenderPass) F(vkCmdNextSubpass) F(vkCmdDraw) F(vkCmdCopyImageToBuffer) F(vkGetPhysicalDeviceFormatProperties) F(vkCmdClearAttachments)
+  F(vkCmdBeginRenderPass) F(vkCmdEndRenderPass) F(vkCmdNextSubpass) F(vkCmdDraw) F(vkCmdSetStencilReference) F(vkCmdCopyImageToBuffer) F(vkGetPhysicalDeviceFormatProperties) F(vkCmdClearAttachments)
 
 // Presentation (VK_KHR_surface / VK_KHR_swapchain; null when not enabled) and
 // what a graphics presenter records beyond the raster's needs.
@@ -67,6 +67,7 @@ struct DeviceInternal {
   VkInstance       inst = VK_NULL_HANDLE;
   VkDevice         dev = VK_NULL_HANDLE;
   VkQueue          queue = VK_NULL_HANDLE;
+  VkQueue          queue2 = VK_NULL_HANDLE;   // the 3D raster's own queue (null: one queue, shared under queue_mutex)
   VkPhysicalDevice phys = VK_NULL_HANDLE;
   u32              qfam = 0;
   VkDeviceSize     non_coherent_atom = 1;

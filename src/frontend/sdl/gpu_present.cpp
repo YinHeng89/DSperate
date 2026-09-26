@@ -75,6 +75,7 @@ struct GpuPresent::Impl {
   int pending_slot = -1;
   u64 frame = 0;
   u64 wait_ns = 0, waits = 0, frames = 0, late = 0;   // exit-line stats: fence wait time
+  u64 now_ns = 0, now_n = 0;                            // DS_PRESENT_WAITNOW=1: the job's submit-to-signal time (diagnostic; serialises the present)
   u64 t_begin = 0, t_upload = 0, t_submit = 0, t_retire = 0;   // present() time breakdown, per frame
 
   bool ok() const { return pipe != VK_NULL_HANDLE; }
@@ -225,6 +226,7 @@ struct GpuPresent::Impl {
                    waits ? static_cast<double>(wait_ns) / static_cast<double>(waits) / 1e6 : 0.0, static_cast<unsigned long long>(late));
       std::fprintf(stderr, "gpu present: per frame -- retire %.3f ms (fence + end_frame), begin_frame %.3f, upload %.3f, record+submit %.3f\n",
                    static_cast<double>(t_retire) * k, static_cast<double>(t_begin) * k, static_cast<double>(t_upload) * k, static_cast<double>(t_submit) * k);
+      if (now_n) std::fprintf(stderr, "gpu present: submit-to-signal %.3f ms mean (DS_PRESENT_WAITNOW)\n", static_cast<double>(now_ns) / static_cast<double>(now_n) / 1e6);
     }
   }
 };
@@ -414,6 +416,8 @@ bool GpuPresent::present(ScanoutOut& out, const u32* const fb[2], const u8* cons
   a.vkResetFences(d.vk->dev, 1, &d.fence[slot]);
   if (a.vkQueueSubmit(d.vk->queue, 1, &sub, d.fence[slot]) != VK_SUCCESS) { out.end_frame(); return false; }
   d.fence_live[slot] = true;
+  static const bool waitnow = std::getenv("DS_PRESENT_WAITNOW") != nullptr;
+  if (waitnow) { const u64 w0 = now(); a.vkWaitForFences(d.vk->dev, 1, &d.fence[slot], VK_TRUE, ~0ull); d.now_ns += now() - w0; ++d.now_n; }
   d.pending_slot = slot; d.pending_buf = buf;
   d.t_submit += now() - t3;
   ++d.frame; ++d.frames;
