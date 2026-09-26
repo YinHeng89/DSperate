@@ -220,8 +220,13 @@ std::unique_ptr<Lean> Lean::create(Device& dev, std::string* why) {
   };
   {
     VkFormatProperties fp{};
-    a.vkGetPhysicalDeviceFormatProperties(vk->phys, VK_FORMAT_D24_UNORM_S8_UINT, &fp);
-    if (!(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT)) d.ds_format = VK_FORMAT_D32_SFLOAT_S8_UINT;
+    // Float depth first: W-buffer mode stores 1/w, and at DS depths of tens
+    // of thousands neighbouring values are 1e-9 apart, below a 24-bit fixed
+    // step (6e-8), so a shadow volume's face and the ground it meets compared
+    // equal. A float keeps the relative precision. DS_LEAN_D24=1 forces D24S8.
+    a.vkGetPhysicalDeviceFormatProperties(vk->phys, VK_FORMAT_D32_SFLOAT_S8_UINT, &fp);
+    const bool d32 = (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) && !(std::getenv("DS_LEAN_D24") && std::atoi(std::getenv("DS_LEAN_D24")) != 0);
+    d.ds_format = d32 ? VK_FORMAT_D32_SFLOAT_S8_UINT : VK_FORMAT_D24_UNORM_S8_UINT;
   }
   const VkImageUsageFlags transient = VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT;
   if (!make_image(VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT | transient, VK_IMAGE_ASPECT_COLOR_BIT, d.col_ms, samples)) return fail("MSAA colour attachment");
@@ -304,8 +309,11 @@ std::unique_ptr<Lean> Lean::create(Device& dev, std::string* why) {
         so.passOp = VK_STENCIL_OP_REPLACE; so.writeMask = S_MASK; break;
       case P_SHADOW_PREP:   // the shadow's own id: the mask bit off where the code matches (reference = code, its mask bit 0)
         so.compareOp = VK_COMPARE_OP_EQUAL; so.compareMask = S_CODE; so.passOp = VK_STENCIL_OP_REPLACE; so.writeMask = S_MASK; break;
-      case P_SHADOW:   // shadow: drawn (blended) where the mask bit is still set
-        so.compareOp = VK_COMPARE_OP_EQUAL; so.compareMask = S_MASK; so.reference = S_MASK; break;
+      case P_SHADOW:   // shadow: drawn (blended) where the mask bit is set (NOT_EQUAL to the reference's clear bit), and the
+        // pixel then takes the shadow's id with the mask bit cleared (reference = T | code, replaced into mask | T | code):
+        // a face sharing an edge in the same draw finds the bit clear, and a later run of the same id is kept off by
+        // the prep pass (code equal). Faces and overlapping volumes darken once, as on the DS.
+        so.compareOp = VK_COMPARE_OP_NOT_EQUAL; so.compareMask = S_MASK; so.passOp = VK_STENCIL_OP_REPLACE; so.writeMask = S_MASK | S_T | S_CODE; break;
     }
     dss.front = so; dss.back = so;
     VkPipelineColorBlendAttachmentState cba[2]{};
@@ -412,6 +420,13 @@ bool Lean::submit(u32 npoly, u32 nvert, u32 ntexels, const GpuFrame& fin) {
     for (u32 k = 0; k < npoly; ++k) if (gp[k].flags & (DS_PF_TRANSLUCENT | DS_PF_SHADOW)) want((gp[k].attr >> 24) & 0x3F);
   }
   auto code_of = [&](const GpuPoly& p) -> u32 { return code[(p.attr >> 24) & 0x3F]; };
+  if (std::getenv("DS_LEAN_LIST") && std::atoi(std::getenv("DS_LEAN_LIST")) != 0) {   // id histogram per kind (debug)
+    u32 hist[64][4] = {};
+    for (u32 k = 0; k < npoly; ++k) { const u32 id = (gp[k].attr >> 24) & 0x3F, kind = (gp[k].flags & DS_PF_SHADOW_MASK) ? 3 : (gp[k].flags & DS_PF_SHADOW) ? 2 : (gp[k].flags & DS_PF_TRANSLUCENT) ? 1 : 0; ++hist[id][kind]; }
+    std::fprintf(stderr, "lean ids gen %llu:", (unsigned long long)d.gen);
+    for (u32 id = 0; id < 64; ++id) if (hist[id][0] | hist[id][1] | hist[id][2] | hist[id][3]) std::fprintf(stderr, " id%u[o%u t%u s%u m%u]", id, hist[id][0], hist[id][1], hist[id][2], hist[id][3]);
+    std::fputc('\n', stderr);
+  }
 
   const double t_rec = now_ms();
   VkCommandBuffer cb = d.cmd[slot];
@@ -482,14 +497,22 @@ bool Lean::submit(u32 npoly, u32 nvert, u32 ntexels, const GpuFrame& fin) {
       ++j;
     }
     const u32 n = j - i;
+    // DS_LEAN_LIST=1: the tail's runs (kind, id, count, depth range) for the frames with shadows, to stderr.
+    static const bool list_trace = std::getenv("DS_LEAN_LIST") && std::atoi(std::getenv("DS_LEAN_LIST")) != 0;
+    if (list_trace && (mask || shadow)) {
+      s32 zlo = 0x7FFFFFFF, zhi = -1; for (u32 k = i; k < j; ++k) for (u32 v = 0; v < gp[k].nverts; ++v) { const s32 z = gv[gp[k].first_vert + v].z; zlo = std::min(zlo, z); zhi = std::max(zhi, z); }
+      std::fprintf(stderr, "lean list gen %llu: %s id %u code %u x%u polys %u..%u z %d..%d attr %08x\n", (unsigned long long)d.gen, mask ? "MASK" : "SHADOW", id, c, n, i, j - 1, zlo, zhi, p.attr);
+    }
     if (mask) {
       // A mask polygon after a non-mask one starts a new set: the DS clears the mask stencil (per line; here for the frame).
-      if (any_mask && !prev_mask) { use(d.pipe[wbuf][P_MASK_CLEAR]); a.vkCmdSetStencilReference(cb, VK_STENCIL_FACE_FRONT_AND_BACK, 0); a.vkCmdDraw(cb, 3, 1, 0, 0); ++draws; }
+      static const bool no_clear = std::getenv("DS_LEAN_NOMASKCLEAR") != nullptr;   // debug
+      if (any_mask && !prev_mask && !no_clear) { use(d.pipe[wbuf][P_MASK_CLEAR]); a.vkCmdSetStencilReference(cb, VK_STENCIL_FACE_FRONT_AND_BACK, 0); a.vkCmdDraw(cb, 3, 1, 0, 0); ++draws; }
       any_mask = true;
       use(d.pipe[wbuf][P_MASK]); a.vkCmdSetStencilReference(cb, VK_STENCIL_FACE_FRONT_AND_BACK, S_MASK); draw(i, n);
     } else if (shadow) {
-      use(d.pipe[wbuf][P_SHADOW_PREP]); a.vkCmdSetStencilReference(cb, VK_STENCIL_FACE_FRONT_AND_BACK, c); draw(i, n);
-      use(d.pipe[wbuf][P_SHADOW]); a.vkCmdSetStencilReference(cb, VK_STENCIL_FACE_FRONT_AND_BACK, S_MASK); draw(i, n);
+      static const bool no_prep = std::getenv("DS_LEAN_NOPREP") != nullptr;   // debug
+      if (!no_prep) { use(d.pipe[wbuf][P_SHADOW_PREP]); a.vkCmdSetStencilReference(cb, VK_STENCIL_FACE_FRONT_AND_BACK, c); draw(i, n); }
+      use(d.pipe[wbuf][P_SHADOW]); a.vkCmdSetStencilReference(cb, VK_STENCIL_FACE_FRONT_AND_BACK, S_T | c); draw(i, n);
     } else if (trans) {
       if (!d.nostencil) { use(d.pipe[wbuf][dw ? P_TRANS_A_DW : P_TRANS_A]); a.vkCmdSetStencilReference(cb, VK_STENCIL_FACE_FRONT_AND_BACK, S_DRAWN | S_T | c); draw(i, n); }
       use(d.pipe[wbuf][dw ? P_TRANS_B_DW : P_TRANS_B]); a.vkCmdSetStencilReference(cb, VK_STENCIL_FACE_FRONT_AND_BACK, S_DRAWN | S_T | c); draw(i, n);
