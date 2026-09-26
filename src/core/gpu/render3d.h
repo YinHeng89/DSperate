@@ -268,6 +268,7 @@ private:
     // none, else coverage bits 0-4 | 0x20 vertical axis | 0x40 outside on the
     // negative side, the layout of the edge byte without its edge bit.
     alignas(16) u8 ccov[BATCH_CAP];
+    alignas(16) u8 seam[BATCH_CAP + 16];        // enhanced: seam_pass's per-lane flag (edge-run lanes)
     u8 gath[BATCH_CAP / 16 + 1];         // per sixteen-pixel group: texels gathered (span_texels' live runs, or cutout_coverage's own sampling)
   };
 
@@ -308,7 +309,7 @@ private:
   void stage_line(Edge& e, s32 y, const LineSpan& ls);   // depth pre-pass, attribute staging, batch job
   u32  texture_sample(const Shade& sh, s32 s, s32 t, u32* alpha) const;
   template <bool textured> u32 shade_pixel(const Shade& sh, u32 vr, u32 vg, u32 vb, s32 s, s32 t) const;
-  void plot_translucent(u32 addr, u32 color, u32 z, u32 polyattr, bool shadow);
+  void plot_translucent(u32 addr, u32 color, u32 z, u32 polyattr, bool shadow, u32 own = 0);
   template <int mode> bool depth_pass(u32 addr, s32 z, u32 dstattr) const;
   // One contiguous range of a span; called only from batch kernels and the
   // vector kernel's scalar fallback so it inlines into them.
@@ -349,6 +350,7 @@ private:
   template <typename Range> [[gnu::always_inline]] inline void walk_span(const SpanJob& j, Range&& range);
   void render_shadow_mask_line(Edge& e, s32 y);
   void flush_batch(const Shade& sh);
+  void seam_pass(const Shade& sh, const SpanJob* jobs, u32 n);
   // Rasterises [ya, yb) polygon at a time, not line at a time: active set
   // merged once per chunk, each polygon draws its whole covered run before
   // the next starts. Per-pixel order unchanged (list order), so blend/stencil
@@ -457,9 +459,7 @@ private:
   void save_raw_row(s32 y);
   u32 raw_rows_[4][W]{};
   s32 raw_line_ = -100;
-  bool cut_trace_ = false;   // DS_CUT_TRACE set: per-polygon trace in resolve_span
-  u32 trace_last_[8] = {}; u32 trace_n_ = 0;   // DS_CUT_TRACE: the last polygon that plotted the traced pixel, for the DS_EDGE_TRACE line
-  bool cut_diag_ = false;    // DS_CUT_DIAG set: attr bit 23 marks cut-out polygon pixels that were no candidate; exported as edge byte 0x08
+  u32 trace_last_[8] = {}; u32 trace_n_ = 0; u32 trown_last_[6] = {}; u32 seam_last_[6] = {}; u32 seam_n_ = 0; u64 frame_tag_ = 0;   // DS_CUT_TRACE: the last polygon that plotted the traced pixel, for the DS_EDGE_TRACE line
   bool raw_prev_ok_ = false;
   void final_pass_debug(s32 y);   // DS_AA_DEBUG: the final pass with each 3D edge pixel painted by what the AA does with it
 public:

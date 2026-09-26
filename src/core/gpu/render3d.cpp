@@ -588,7 +588,7 @@ template <bool textured>
   return r | (g << 8) | (b << 16) | (a << 24);
 }
 
-[[gnu::always_inline]] inline void Renderer3D::plot_translucent(u32 addr, u32 color, u32 z, u32 polyattr, bool shadow) {
+[[gnu::always_inline]] inline void Renderer3D::plot_translucent(u32 addr, u32 color, u32 z, u32 polyattr, bool shadow, u32 own) {
   const u32 dstattr = attr_[addr];
   // Kept from the destination: edge flags (0-3), the enhanced stamps' fixed
   // side (5-6), coverage and axis (8-14), the diag tag (23) and the id.
@@ -599,6 +599,10 @@ template <bool textured>
     else if ((dstattr & 0x3F000000) == (polyattr & 0x3F000000)) return;
   } else if ((dstattr & 0x007F0000) == (attr & 0x007F0000)) return;   // equal translucent ids don't blend
   if (!(dstattr & (1u << 15))) attr &= ~(1u << 15);
+  // Enhanced: the translucent polygon's own outline (flags, coverage, run
+  // axis and side, bit 7 marking it as its own) replaces whatever edge the
+  // destination held, so a cloud's silhouette is cut like an opaque one.
+  if (own) attr = (attr & ~0x7F8Fu) | own;
   color = alpha_blend(dispcnt_, color, color_[addr], color >> 24);
   if (z != 0xFFFFFFFFu) depth_[addr] = z;
   color_[addr] = color;
@@ -979,6 +983,9 @@ void Renderer3D::set_frame_aa() {
 
 // Two depths of one surface: within 1/64 of the nearer plus a small constant
 // (depth steps across a polygon edge and the fill-rule overlap stay inside).
+// DS_CUT_TRACE / DS_CUT_DIAG: read once for every renderer instance (each band worker has its own).
+static const bool cut_trace_ = std::getenv("DS_CUT_TRACE") != nullptr;
+static const bool cut_diag_ = std::getenv("DS_CUT_DIAG") != nullptr;
 static inline bool same_surface(s32 za, s32 zb) { const s32 d = za > zb ? za - zb : zb - za; return d <= (std::min(za, zb) >> 6) + 0x200; }
 // Enhanced AA: the top pixel (attr ta, colour tc, depth tz) is an opaque edge
 // of the surface a new opaque edge pixel (attr pa, depth z) belongs to --
@@ -1005,6 +1012,8 @@ void Renderer3D::resolve_span(const Shade& sh, const SpanBuf& sb, s32 y, s32 xa,
   u32 resolved = 0;                // counted once after the loop, not per pixel
   for (s32 x = xa; x < xb; ++x) {
     const u32 i = static_cast<u32>(x - sb.x0);
+    bool seam_lane = false;
+    if constexpr (aa == 2 && !shadow) { if (part != 1) seam_lane = sb.seam[i] != 0; }   // seam_pass
     if (!sb.pass[i]) continue;    // neither the top pixel nor the one underneath can take it
     u32 addr = row + static_cast<u32>(x);
     u32 dstattr = attr_[addr];
@@ -1030,7 +1039,7 @@ void Renderer3D::resolve_span(const Shade& sh, const SpanBuf& sb, s32 y, s32 xa,
       static int trx = -2, try_ = -2;
       if (trx == -2) { trx = try_ = -1; if (const char* tr = std::getenv("DS_CUT_TRACE")) std::sscanf(tr, "%d,%d", &trx, &try_); }
       if (x == trx && y == try_) {
-        std::fprintf(stderr, "cut-trace frame %llu (%d,%d) poly: fmt %u polyalpha %u textured %d cutout %d exempt %d opaque %d texel alpha %u z %d part %d\n", (unsigned long long)nds_.frame_count, x, y, sh.fmt, sh.polyalpha, (int)sh.textured, (int)sh.cutout, (int)sh.aa_exempt, (int)sh.opaque, alpha, z, part);
+        std::fprintf(stderr, "cut-trace frame %llu (%d,%d) poly: fmt %u polyalpha %u textured %d cutout %d exempt %d opaque %d texel alpha %u z %d part %d\n", (unsigned long long)frame_tag_, x, y, sh.fmt, sh.polyalpha, (int)sh.textured, (int)sh.cutout, (int)sh.aa_exempt, (int)sh.opaque, alpha, z, part);
         // Also kept for the final pass's DS_EDGE_TRACE line (stderr from the band threads is not reliable): the last polygon that plotted the pixel.
         const u32 tl[8] = {sh.fmt, sh.polyalpha, static_cast<u32>(sh.cutout), static_cast<u32>(sh.aa_exempt), alpha, static_cast<u32>(z), static_cast<u32>(part), sh.alpha0};
         std::memcpy(trace_last_, tl, sizeof tl);
@@ -1066,6 +1075,7 @@ void Renderer3D::resolve_span(const Shade& sh, const SpanBuf& sb, s32 y, s32 xa,
         }
       }
       if constexpr (aa == 2 && !shadow) {
+        if (seam_lane) attr |= 0x1F00u;   // over the other side's edge of the same surface: a seam
         // Enhanced: an edge over the same edge of its surface neither pushes
         // the surface under nor lands under it (see same_edge), so the under
         // layer keeps what is behind the surface; the larger coverage stands.
@@ -1084,7 +1094,23 @@ void Renderer3D::resolve_span(const Shade& sh, const SpanBuf& sb, s32 y, s32 xa,
       depth_[addr] = z; color_[addr] = color; attr_[addr] = attr;
     } else {
       const u32 zz = (sh.polyattr_z) ? static_cast<u32>(z) : 0xFFFFFFFFu;
-      plot_translucent(addr, color, zz, polyattr, shadow);
+      u32 own = 0;
+      if constexpr (aa == 2) {
+        // The translucent polygon's outline coverage, read without advancing
+        // the ramp (the ramp counts opaque plots only, as in the vector path).
+        static const bool no_trown = std::getenv("DS_NO_TROWN") != nullptr;
+        if (!shadow && part != 1 && !no_trown) {
+          s32 cov = part == 0 ? l_cov : r_cov;
+          if (cov & static_cast<s32>(0x80000000u)) cov = part == 0 ? std::min(xcov >> 5, 31) : std::max(0x1F - (xcov >> 5), 0);
+          cov &= 0x1F;
+          cov |= static_cast<s32>((polyattr >> 8) & 0x1F);   // an AA-exempt quad stamps full coverage (as the vector path's lane attribute has it)
+          if (cov < 31) own = static_cast<u32>(edge & 0x600F) | (static_cast<u32>(cov) << 8) | 0x80u;
+          if (cut_trace_) { static int trx = -2, try_ = -2; if (trx == -2) { trx = try_ = -1; if (const char* tr = std::getenv("DS_CUT_TRACE")) std::sscanf(tr, "%d,%d", &trx, &try_); }
+            if (x == trx && y == try_) { const u32 tl[6] = {1u, static_cast<u32>(part), static_cast<u32>(xcov), static_cast<u32>(cov), alpha, own}; std::memcpy(trown_last_, tl, sizeof tl); } }
+        }
+      }
+      plot_translucent(addr, color, zz, polyattr, shadow, own);
+      if (seam_lane) attr_[addr] |= 0x1F00u;   // a seam stays one after the plot (the vector path applies it after its step)
       if (aa == 1 && (dstattr & 0xF) && addr < static_cast<u32>(RSIZE)) plot_translucent(addr + RSIZE, color, zz, polyattr, shadow);
     }
   }
@@ -1637,7 +1663,7 @@ template <int mode, bool textured, int aa, bool opq>
   const uint8x8_t pa3id = vdup_n_u8(static_cast<u8>((polyattr >> 24) & 0x3F)), v40_8 = vdup_n_u8(0x40);
   const uint8x8_t v7f8 = vdup_n_u8(0x7F), v3f8 = vdup_n_u8(0x3F);
   const uint8x8_t one8 = vdup_n_u8(1), v32_8 = vdup_n_u8(32), zero8 = vdup_n_u8(0);
-  auto plot8 = [&](u32 base, const uint32x4_t* m, const uint8x8x4_t& src, const int32x4_t* z) __attribute__((always_inline)) {
+  auto plot8 = [&](u32 base, const uint32x4_t* m, const uint8x8x4_t& src, const int32x4_t* z, const uint32x4_t* at) __attribute__((always_inline)) {
     const uint8x8x4_t da = vld4_u8(ab + base * 4), dc = vld4_u8(cb + base * 4);
     uint8x8_t m8 = vmovn_u16(vcombine_u16(vmovn_u32(m[0]), vmovn_u32(m[1])));
     if (sh.shadow) {
@@ -1664,6 +1690,18 @@ template <int mode, bool textured, int aa, bool opq>
     uint8x8x4_t oa;
     oa.val[0] = vbsl_u8(m8, vorr_u8(pa0, vand_u8(da.val[0], vdup_n_u8(0x6F))), da.val[0]);   // dest edge flags and the enhanced stamps' fixed side (bits 5-6)
     oa.val[1] = vbsl_u8(m8, vorr_u8(vand_u8(pa1, vorr_u8(da.val[1], v7f8)), vand_u8(da.val[1], v7f8)), da.val[1]);   // keeps coverage and bits 5-6 (blend direction)
+    if (at) {
+      if (cut_trace_) { static int trx = -2, try_ = -2; if (trx == -2) { trx = try_ = -1; if (const char* tr = std::getenv("DS_CUT_TRACE")) std::sscanf(tr, "%d,%d", &trx, &try_); }
+        if (y == try_ && trx >= static_cast<int>(base - row0) && trx < static_cast<int>(base - row0) + 8) { const int l = trx - static_cast<int>(base - row0); u32 av[8]; vst1q_u32(av, at[0]); vst1q_u32(av + 4, at[1]); u8 mm[8]; vst1_u8(mm, m8);
+          const u32 tl[6] = {2u, static_cast<u32>(part), static_cast<u32>(xcov), (av[l] >> 8) & 0x1F, mm[l], av[l]}; std::memcpy(trown_last_, tl, sizeof tl); } }
+      // Enhanced: the polygon's own outline lanes (coverage below full)
+      // carry their flags, coverage, axis and side, bit 7 marking them.
+      const uint8x8_t a0 = vmovn_u16(vcombine_u16(vmovn_u32(at[0]), vmovn_u32(at[1])));
+      const uint8x8_t a1 = vmovn_u16(vcombine_u16(vmovn_u32(vshrq_n_u32(at[0], 8)), vmovn_u32(vshrq_n_u32(at[1], 8))));
+      const uint8x8_t use = vand_u8(m8, vcgt_u8(vdup_n_u8(0x1F), vand_u8(a1, vdup_n_u8(0x1F))));
+      oa.val[0] = vbsl_u8(use, vorr_u8(vorr_u8(pa0, vand_u8(a0, vdup_n_u8(0x0F))), vorr_u8(vand_u8(da.val[0], vdup_n_u8(0x60)), vdup_n_u8(0x80))), oa.val[0]);
+      oa.val[1] = vbsl_u8(use, vorr_u8(vand_u8(pa1, vorr_u8(da.val[1], v7f8)), vand_u8(a1, v7f8)), oa.val[1]);
+    }
     oa.val[2] = vbsl_u8(m8, vorr_u8(pa2, vand_u8(da.val[2], vdup_n_u8(0x80))), da.val[2]);   // dest bit 23 (diag tag)
     oa.val[3] = da.val[3];
     vst4_u8(ab + base * 4, oa);
@@ -1759,10 +1797,13 @@ template <int mode, bool textured, int aa, bool opq>
       const u64 kinds = lanes8(kv[0], kv[1]);
       if (pe) rk_census(kinds, p8);
       if (!kinds) return;
-      if (opq || (kinds & 0x0909090909090909ull)) {
-        // One attribute word for both layers: coverage accumulates in x order
-        // over every opaque pixel of the span, whichever layer it lands on.
-        uint32x4_t attr[2] = {vdupq_n_u32(attr_base), vdupq_n_u32(attr_base)};
+      // One attribute word for both layers: coverage accumulates in x order
+      // over every opaque pixel of the span, whichever layer it lands on.
+      // Enhanced also reads it for a translucent polygon's outline lanes
+      // (their coverage is the ramp as the opaque plots before them left it).
+      uint32x4_t attr[2] = {vdupq_n_u32(attr_base), vdupq_n_u32(attr_base)};
+      const bool opaque_lanes = opq || (kinds & 0x0909090909090909ull);
+      if (opaque_lanes || (aa == 2 && part != 1 && !sh.shadow && (kinds & 0x0202020202020202ull))) {
         if (aa && cov_accum) {
           u32 t0, t1 = 0;
           uint32x4_t pre[2];
@@ -1777,6 +1818,8 @@ template <int mode, bool textured, int aa, bool opq>
           }
           xcov += cov_step * static_cast<s32>(t0 + t1);
         }
+      }
+      if (opaque_lanes) {
         if constexpr (aa == 2) {
           if (sh.cutout) {
             // Alpha-to-coverage (cutout_coverage): a cut edge inside the
@@ -1843,10 +1886,11 @@ template <int mode, bool textured, int aa, bool opq>
         if (kinds & 0x1212121212121212ull) {
           const uint8x8x4_t src = vld4_u8(reinterpret_cast<const u8*>(sb.col + i));
           if (kinds & 0x0202020202020202ull) {
-            plot8(addr, mt1, src, z);
-            if (kinds & 0x0404040404040404ull) plot8(under, mb, src, z);
+            static const bool no_trown = std::getenv("DS_NO_TROWN") != nullptr;
+            plot8(addr, mt1, src, z, (aa == 2 && part != 1 && !sh.shadow && !no_trown) ? attr : nullptr);
+            if (kinds & 0x0404040404040404ull) plot8(under, mb, src, z, nullptr);
           }
-          if constexpr (two) { if (kinds & 0x1010101010101010ull) plot8(under, mt2, src, z); }
+          if constexpr (two) { if (kinds & 0x1010101010101010ull) plot8(under, mt2, src, z, nullptr); }
         }
       }
     };
@@ -1872,10 +1916,33 @@ template <int mode, bool textured, int aa, bool opq>
       group(std::false_type{}, nullptr);
     }
   };
+  // Enhanced: the seam test of resolve_span (seam_of) on the edge parts --
+  // the destination is the other side's edge pixel of the same surface --
+  // decided from the old destination before the step and applied after it,
+  // so it covers lanes that lose the depth test and lanes that win alike.
+  [[maybe_unused]] auto seam_mask = [&](s32 x, s32 rem, uint32x4_t* sm) __attribute__((always_inline)) {
+    const u32 i = static_cast<u32>(x - sb.x0);
+    const uint16x8_t w = vmovl_u8(vld1_u8(sb.seam + i));   // seam_pass's per-lane flags
+    sm[0] = vtstq_u32(vmovl_u16(vget_low_u16(w)), vdupq_n_u32(0xFF));
+    sm[1] = vtstq_u32(compat::movl_high_u16(w), vdupq_n_u32(0xFF));
+    for (u32 k = 0; k < 2; ++k) sm[k] = vandq_u32(sm[k], vcltq_u32(vaddq_u32(lane, vdupq_n_u32(k * 4)), vdupq_n_u32(static_cast<u32>(rem))));
+  };
+  [[maybe_unused]] auto seam_apply = [&](s32 x, s32 rem, const uint32x4_t* sm) __attribute__((always_inline)) {
+    const u32 addr = row0 + static_cast<u32>(x);
+    for (u32 k = 0; k < 2; ++k) {
+      if (static_cast<s32>(k * 4) >= rem) break;
+      vst1q_u32(&attr_[addr + k * 4], vorrq_u32(vld1q_u32(&attr_[addr + k * 4]), vandq_u32(sm[k], vdupq_n_u32(0x1F00))));
+    }
+  };
   for (s32 x = xa; x < xb;) {
     const s32 rem = xb - x;
-    if (rem <= 4) { step(std::integral_constant<u32, 1>{}, x, rem); x += 4; }
-    else { step(std::integral_constant<u32, 2>{}, x, rem); x += 8; }
+    uint32x4_t sm[2] = {v0, v0};
+    [[maybe_unused]] const bool seams = aa == 2 && part != 1 && !sh.shadow;
+    if (seams) seam_mask(x, rem, sm);
+    if (rem <= 4) { step(std::integral_constant<u32, 1>{}, x, rem); }
+    else { step(std::integral_constant<u32, 2>{}, x, rem); }
+    if (seams) seam_apply(x, rem, sm);
+    x += rem <= 4 ? 4 : 8;
   }
   if (pe) prof::add(prof::C_RESOLVED_PIXELS, resolved_px);
 }
@@ -2496,7 +2563,7 @@ void Renderer3D::cutout_coverage(const Shade& sh, SpanBuf& sb, const SpanJob* jo
           if ((s1 >> 4) == (s0 >> 4) && (t1 >> 4) == (t0 >> 4)) continue;
           sv[d][nv[d]] = s1; tv[d][nv[d]] = t1; vidx[d][nv[d]] = static_cast<s16>(i); ++nv[d];
         }
-        if (x == trx && job.y == try_) std::fprintf(stderr, "cut-trace frame %llu (%d,%d) vec %d pass %u talp %u il %d(%u,g%d) ir %d(%u,g%d) dsx %d dtx %d dsy %d dty %d s %d t %d fmt %u\n", (unsigned long long)nds_.frame_count, x, job.y, (int)sh.vec, sb.pass[i], sb.talp[i], il, il >= 0 ? sb.talp[il] : 0, il >= 0 ? (int)gathered(il) : -1, ir, ir >= 0 ? sb.talp[ir] : 0, ir >= 0 ? (int)gathered(ir) : -1, dsx, dtx, dsy, dty, sb.sc[i], sb.tc[i], sh.fmt);
+        if (x == trx && job.y == try_) std::fprintf(stderr, "cut-trace frame %llu (%d,%d) vec %d pass %u talp %u il %d(%u,g%d) ir %d(%u,g%d) dsx %d dtx %d dsy %d dty %d s %d t %d fmt %u\n", (unsigned long long)frame_tag_, x, job.y, (int)sh.vec, sb.pass[i], sb.talp[i], il, il >= 0 ? sb.talp[il] : 0, il >= 0 ? (int)gathered(il) : -1, ir, ir >= 0 ? sb.talp[ir] : 0, ir >= 0 ? (int)gathered(ir) : -1, dsx, dtx, dsy, dty, sb.sc[i], sb.tc[i], sh.fmt);
       }
     }
   }
@@ -2554,8 +2621,35 @@ void Renderer3D::cutout_coverage(const Shade& sh, SpanBuf& sb, const SpanJob* jo
   }
 }
 
+// Enhanced: the seam test (seam_of) for every lane of the batch's edge runs,
+// before the resolves, so both resolves see the same lanes whatever a batch
+// or a step skips: a lane whose destination is the other side's edge of the
+// same surface gets full coverage there and then, and the resolves give a
+// pixel they write in its place full coverage too (sb.seam).
+void Renderer3D::seam_pass(const Shade& sh, const SpanJob* jobs, u32 n) {
+  SpanBuf& sb = spanbuf_;
+  const u32 polyattr = sh.polyattr;
+  for (u32 k = 0; k < n; ++k)
+    walk_span(jobs[k], [&](s32 y, s32 lo, s32 hi, int part, int edge, s32, s32, s32&) {
+      if (part == 1) return;
+      const u32 row = row_of(y) + 1;
+      for (s32 x = lo; x < hi; ++x) {
+        const u32 i = static_cast<u32>(x - sb.x0), addr = row + static_cast<u32>(x), da = attr_[addr];
+        const u32 a = da & 3, b = static_cast<u32>(edge) & 3;
+        bool seam = ((a == 1 && b == 2) || (a == 2 && b == 1)) && ((da ^ polyattr) & 0x3F000000u) == 0 && !(da & (1u << 22)) &&
+                    same_surface(static_cast<s32>(depth_[addr]), sb.z[i]);
+        sb.seam[i] = seam ? 1 : 0;
+        if (seam) attr_[addr] = da | 0x1F00u;
+        if (cut_trace_) { static int trx = -2, try_ = -2; if (trx == -2) { trx = try_ = -1; if (const char* tr = std::getenv("DS_CUT_TRACE")) std::sscanf(tr, "%d,%d", &trx, &try_); }
+          if (x == trx && y == try_) { const u32 tl[6] = {3u, static_cast<u32>(part), da, depth_[addr], static_cast<u32>(sb.z[i]), static_cast<u32>(seam) | (static_cast<u32>(edge) & 0xF) << 8 | (sb.pass[i] ? 0x10000u : 0u)}; std::memcpy(seam_last_, tl, sizeof tl); ++seam_n_; } }
+      }
+    });
+}
+
 void Renderer3D::flush_batch(const Shade& sh) {
   if (!njobs_) { batch_px_ = 0; return; }
+  static const bool no_seam = std::getenv("DS_NO_SEAM") != nullptr;
+  if (aa_ == 2 && sh.aa_plus && !sh.shadow && !no_seam) seam_pass(sh, jobs_.data(), njobs_);
   prof::add(prof::C_BATCHES, 1); prof::add(prof::C_BATCH_SPANS, njobs_); prof::add(prof::C_BATCH_PX, batch_px_);
 #if DSPERATE_NEON
   if (sh.vec) {
@@ -2870,6 +2964,9 @@ void Renderer3D::stamp_intersections(s32 y) {
   // A pixel under a translucent layer still holds the opaque surface's depth
   // (or the layer's, when it wrote depth: then its own outline is found),
   // so the translucency state does not exclude it.
+  // A full-coverage edge pixel is left out on purpose: its edge lies on the
+  // pixel boundary (integer vertex positions), and a crossing solved from
+  // the depth slopes would move that edge to a place it is not.
   auto opaque_plain = [&](u32 n) { const u32 a = attr_[n]; return (color_[n] >> 24) != 0 && !(a & 0xF); };
   // Crossing from P's centre toward N's in 1/32 (-1: same surface), with
   // P's slope from L beyond it and N's from R beyond it (0 = none).
@@ -2972,7 +3069,7 @@ void Renderer3D::enhanced_aa_line(s32 y) {
     if (attr & 0x20) n = (attr & 0x40) ? a : b;
     else n = (attr & 0x4000) ? a : b;
     if ((attr_[n] >> 24) != (attr >> 24) && depth_[n] < z) return 0;
-    if (!eb && ((attr_[n] ^ attr) & (1u << 22))) return 0;
+    if (!eb && !(attr & 0x80) && ((attr_[n] ^ attr) & (1u << 22))) return 0;   // a translucent polygon's own edge (bit 7) blends with what lies outside it
     return n;
   };
   // DS_EDGE_TRACE=x,y: one pixel's attribute, coverage, depth and its four
@@ -2981,13 +3078,15 @@ void Renderer3D::enhanced_aa_line(s32 y) {
   if (trx == -2) { trx = try_ = -1; if (const char* t = std::getenv("DS_EDGE_TRACE")) std::sscanf(t, "%d,%d", &trx, &try_); }
   if (y == try_ && trx >= 0 && trx < 256) {
     const u32 a = row + trx;
-    auto px = [&](const char* tag, u32 n) { std::fprintf(stderr, "  %s id %3u z %08x attr %08x flags %x cov %2u tr %d fog %d\n", tag, attr_[n] >> 24, depth_[n], attr_[n], attr_[n] & 0xF, (attr_[n] >> 8) & 0x1F, (attr_[n] >> 22) & 1, (attr_[n] >> 15) & 1); };
-    std::fprintf(stderr, "edge-trace frame %llu (%d,%d) line_touched %d\n", (unsigned long long)nds_.frame_count, trx, try_, (int)line_touched_[y]);
+    auto px = [&](const char* tag, u32 n) { std::fprintf(stderr, "  %s id %3u z %08x attr %08x flags %x cov %2u tr %d fog %d colour %08x\n", tag, attr_[n] >> 24, depth_[n], attr_[n], attr_[n] & 0xF, (attr_[n] >> 8) & 0x1F, (attr_[n] >> 22) & 1, (attr_[n] >> 15) & 1, color_[n]); };
+    std::fprintf(stderr, "edge-trace frame %llu (%d,%d) line_touched %d\n", (unsigned long long)frame_tag_, trx, try_, (int)line_touched_[y]);
     px("self ", a); px("left ", a - 1); px("right", a + 1); px("up   ", ub + 1 + trx); px("down ", db + 1 + trx);
     const u32 attr = attr_[a], cov = (attr >> 8) & 0x1F;
     const char* why = !(attr & 0xF) ? "no edge flags" : cov == 0x1F ? "full coverage" : !outside(attr, depth_[a], (attr & 0x2000) ? ub + 1 + trx : a - 1, (attr & 0x2000) ? db + 1 + trx : a + 1) ? "no partner" : "edge";
     std::fprintf(stderr, "  -> %s (axis %s, side %s, forced %d)\n", why, (attr & 0x2000) ? "vertical" : "horizontal", (attr & 0x4000) ? "up/left" : "down/right", (attr >> 5) & 3);
-    if (cut_trace_) { std::fprintf(stderr, "  last poly (of %u): fmt %u polyalpha %u cutout %u exempt %u texel alpha %u z %08x part %u alpha0 %u\n", trace_n_, trace_last_[0], trace_last_[1], trace_last_[2], trace_last_[3], trace_last_[4], trace_last_[5], trace_last_[6], trace_last_[7]); trace_n_ = 0; }
+    if (cut_trace_) { std::fprintf(stderr, "  last poly (of %u): fmt %u polyalpha %u cutout %u exempt %u texel alpha %u z %08x part %u alpha0 %u\n", trace_n_, trace_last_[0], trace_last_[1], trace_last_[2], trace_last_[3], trace_last_[4], trace_last_[5], trace_last_[6], trace_last_[7]); trace_n_ = 0;
+      if (trown_last_[0]) { std::fprintf(stderr, "  translucent outline (%s): part %u xcov %u cov %u alpha/m8 %u own/attr %08x\n", trown_last_[0] == 1 ? "scalar" : "neon", trown_last_[1], trown_last_[2], trown_last_[3], trown_last_[4], trown_last_[5]); std::memset(trown_last_, 0, sizeof trown_last_); }
+      if (seam_last_[0]) { std::fprintf(stderr, "  seam test (%s, %u tests): part %u dst attr %08x dst z %08x new z %08x seam %u new flags %x pass %u\n", seam_last_[0] == 1 ? "scalar" : "neon", seam_n_, seam_last_[1], seam_last_[2], seam_last_[3], seam_last_[4], seam_last_[5] & 1, (seam_last_[5] >> 8) & 0xF, (seam_last_[5] >> 16) & 1); std::memset(seam_last_, 0, sizeof seam_last_); seam_n_ = 0; } }
   }
   for (int x = 0; x < 256; ++x) {
     if (!(x & 7)) {   // skip eight pixels without edge flags at once
@@ -3409,8 +3508,7 @@ void Renderer3D::clear_line(s32 y) {
 }
 
 void Renderer3D::render(const Gpu3D& gx) {
-  cut_trace_ = std::getenv("DS_CUT_TRACE") != nullptr;
-  cut_diag_ = std::getenv("DS_CUT_DIAG") != nullptr;
+
   // Before anything: the previous frame's bands read the texture cache and
   // this object's state, and the identical-frame path below mutates the cache
   // even when it renders nothing.
@@ -3427,6 +3525,11 @@ void Renderer3D::render(const Gpu3D& gx) {
   { u64 sum = 0; for (u32 w = 0; w < last_nb_ && w < 8; ++w) sum += band_ns_[w]; band_sum_ns_[1] = band_sum_ns_[0]; band_sum_ns_[0] = sum; }
   rs_frame_ = gx.render_state();
   rs_ = &rs_frame_;
+  // Trace frame tag: this render's number, handed to the bands before they
+  // start (nds_.frame_count moves on while they still run).
+  frame_tag_ = nds_.frame_count;
+  for (auto& b : bands_) if (b) b->frame_tag_ = frame_tag_;
+  for (auto& sb : steal_) if (sb.band) sb.band->frame_tag_ = frame_tag_;
   set_frame_aa();
   if (aa_debug()) { aa_debug_frame(rs_->dispcnt); game_aa_ = true; dispcnt_ |= 1u << 4; }
   expand_toon();
@@ -3491,7 +3594,7 @@ void Renderer3D::render(const Gpu3D& gx) {
     pending_bands_ = 0; build_edges();
     compute_bins(8, 1);
     static const bool log = std::getenv("DS_DEBUG_R3D_BINS_LOG") != nullptr;
-    if (log) { std::fprintf(stderr, "[bins] frame %llu", (unsigned long long)nds_.frame_count); for (u32 b = 0; b <= 8; ++b) std::fprintf(stderr, " %d", bin_y_[b]); std::fputc('\n', stderr); }
+    if (log) { std::fprintf(stderr, "[bins] frame %llu", (unsigned long long)frame_tag_); for (u32 b = 0; b <= 8; ++b) std::fprintf(stderr, " %d", bin_y_[b]); std::fputc('\n', stderr); }
     static std::unique_ptr<Renderer3D> fresh;
     for (u32 b = 0; b < 8; ++b) {
       if (bin_y_[b] >= bin_y_[b + 1]) continue;
