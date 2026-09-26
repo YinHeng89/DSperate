@@ -62,7 +62,7 @@ struct Lean::Impl {
   VkDescriptorSet set[kSlots] = {}, set_in = VK_NULL_HANDLE;
   VkRenderPass rp = VK_NULL_HANDLE;
   VkFramebuffer fb = VK_NULL_HANDLE;
-  VkPipeline pipe[2][P_COUNT] = {};   // [wbuffer][kind]
+  VkPipeline pipe[2][2][P_COUNT] = {};   // [wbuffer][depth-equal][kind]
   VkPipeline pipe_resolve = VK_NULL_HANDLE;
   VkCommandPool cpool = VK_NULL_HANDLE;
   VkCommandBuffer cmd[kSlots] = {};
@@ -82,7 +82,7 @@ struct Lean::Impl {
     if (!vk) return;
     const Api& a = *api;
     for (u32 i = 0; i < kSlots; ++i) if (fence_live[i]) { a.vkWaitForFences(vk->dev, 1, &fence[i], VK_TRUE, ~0ull); fence_live[i] = false; }
-    for (auto& row : pipe) for (auto& p : row) if (p) a.vkDestroyPipeline(vk->dev, p, nullptr);
+    for (auto& wb : pipe) for (auto& row : wb) for (auto& p : row) if (p) a.vkDestroyPipeline(vk->dev, p, nullptr);
     if (pipe_resolve) a.vkDestroyPipeline(vk->dev, pipe_resolve, nullptr);
     if (fb) a.vkDestroyFramebuffer(vk->dev, fb, nullptr);
     if (rp) a.vkDestroyRenderPass(vk->dev, rp, nullptr);
@@ -275,7 +275,7 @@ std::unique_ptr<Lean> Lean::create(Device& dev, std::string* why) {
   }
 
   // Pipelines: one vertex/fragment pair, the DS rules in depth, stencil and blend state.
-  auto pipeline = [&](bool wbuf, u32 kind, VkPipeline* out) {
+  auto pipeline = [&](bool wbuf, bool eq, u32 kind, VkPipeline* out) {
     VkPipelineShaderStageCreateInfo st[2]{};
     st[0].sType = st[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     // The mask clear is a full-screen triangle; it and the shadow prep touch the stencil only (no fragment stage).
@@ -290,7 +290,7 @@ std::unique_ptr<Lean> Lean::create(Device& dev, std::string* why) {
     VkPipelineMultisampleStateCreateInfo ms{}; ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO; ms.rasterizationSamples = samples;
     VkPipelineDepthStencilStateCreateInfo dss{}; dss.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
     dss.depthTestEnable = stencil_only ? VK_FALSE : VK_TRUE;
-    dss.depthCompareOp = wbuf ? VK_COMPARE_OP_GREATER : VK_COMPARE_OP_LESS;
+    dss.depthCompareOp = wbuf ? (eq ? VK_COMPARE_OP_GREATER_OR_EQUAL : VK_COMPARE_OP_GREATER) : (eq ? VK_COMPARE_OP_LESS_OR_EQUAL : VK_COMPARE_OP_LESS);
     dss.depthWriteEnable = (kind == P_OPAQUE || kind == P_OPAQUE_EARLY || kind == P_TRANS_A_DW || kind == P_TRANS_B_DW) ? VK_TRUE : VK_FALSE;
     dss.stencilTestEnable = VK_TRUE;
     VkStencilOpState so{};
@@ -337,7 +337,7 @@ std::unique_ptr<Lean> Lean::create(Device& dev, std::string* why) {
     gpi.pDepthStencilState = &dss; gpi.pColorBlendState = &cbs; gpi.pDynamicState = &dys; gpi.layout = d.layout; gpi.renderPass = d.rp; gpi.subpass = 0;
     return a.vkCreateGraphicsPipelines(vk->dev, VK_NULL_HANDLE, 1, &gpi, nullptr, out) == VK_SUCCESS;
   };
-  for (u32 wb = 0; wb < 2; ++wb) for (u32 k = 0; k < P_COUNT; ++k) if (!pipeline(wb != 0, k, &d.pipe[wb][k])) return fail("graphics pipeline");
+  for (u32 wb = 0; wb < 2; ++wb) for (u32 eq = 0; eq < 2; ++eq) for (u32 k = 0; k < P_COUNT; ++k) if (!pipeline(wb != 0, eq != 0, k, &d.pipe[wb][eq][k])) return fail("graphics pipeline");
   {
     VkPipelineShaderStageCreateInfo st[2]{};
     st[0].sType = st[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
@@ -471,14 +471,14 @@ bool Lean::submit(u32 npoly, u32 nvert, u32 ntexels, const GpuFrame& fin) {
     };
     d.key.clear(); d.key.reserve(first_ordered);
     // Key: alpha-tested last, then by stencil code (one reference per run; nearly all are code 0), then near to far.
-    for (u32 k = 0; k < first_ordered; ++k) { const bool at = (gp[k].flags & DS_PF_TEX_ALPHA) != 0; d.key.emplace_back((at ? (s64{1} << 40) : 0) + (s64{code_of(gp[k])} << 32) + nearest(gp[k]), k); }
+    for (u32 k = 0; k < first_ordered; ++k) { const bool at = (gp[k].flags & DS_PF_TEX_ALPHA) != 0, eq = (gp[k].attr & 0x4000u) != 0; d.key.emplace_back((at ? (s64{1} << 40) : 0) + (eq ? (s64{1} << 38) : 0) + (s64{code_of(gp[k])} << 32) + nearest(gp[k]), k); }
     std::sort(d.key.begin(), d.key.end());
     for (u32 k = 0; k < first_ordered; ++k) { out_p[k] = gp[d.key[k].second]; if (!(out_p[k].flags & DS_PF_TEX_ALPHA)) ++n_early; }
     for (u32 k = 0; k < first_ordered;) {
-      const u32 c = code_of(out_p[k]); const bool early = k < n_early;
+      const u32 c = code_of(out_p[k]); const bool early = k < n_early, eq = (out_p[k].attr & 0x4000u) != 0;
       u32 j = k + 1;
-      while (j < first_ordered && code_of(out_p[j]) == c && (j < n_early) == early) ++j;
-      use(d.pipe[wbuf][early ? P_OPAQUE_EARLY : P_OPAQUE]); a.vkCmdSetStencilReference(cb, VK_STENCIL_FACE_FRONT_AND_BACK, S_DRAWN | c); draw(k, j - k);
+      while (j < first_ordered && code_of(out_p[j]) == c && (j < n_early) == early && ((out_p[j].attr & 0x4000u) != 0) == eq) ++j;
+      use(d.pipe[wbuf][eq][early ? P_OPAQUE_EARLY : P_OPAQUE]); a.vkCmdSetStencilReference(cb, VK_STENCIL_FACE_FRONT_AND_BACK, S_DRAWN | c); draw(k, j - k);
       k = j;
     }
   }
@@ -489,11 +489,12 @@ bool Lean::submit(u32 npoly, u32 nvert, u32 ntexels, const GpuFrame& fin) {
     const GpuPoly& p = gp[i];
     const u32 mode = (p.attr >> 4) & 3, id = (p.attr >> 24) & 0x3F, c = code[id];
     const bool mask = (p.flags & DS_PF_SHADOW_MASK) != 0, shadow = (p.flags & DS_PF_SHADOW) != 0;
-    const bool trans = (p.flags & DS_PF_TRANSLUCENT) != 0, dw = (p.attr & (1u << 11)) != 0;
+    const bool trans = (p.flags & DS_PF_TRANSLUCENT) != 0, dw = (p.attr & (1u << 11)) != 0, eq = (p.attr & 0x4000u) != 0;
+    VkPipeline* const pipes = d.pipe[wbuf][eq];
     u32 j = i + 1;
     while (j < npoly) {
       const GpuPoly& q = gp[j];
-      if (((q.attr >> 4) & 3) != mode || ((q.attr >> 24) & 0x3F) != id || ((q.flags & (DS_PF_SHADOW_MASK | DS_PF_SHADOW | DS_PF_TRANSLUCENT)) != (p.flags & (DS_PF_SHADOW_MASK | DS_PF_SHADOW | DS_PF_TRANSLUCENT))) || ((q.attr & (1u << 11)) != 0) != dw) break;
+      if (((q.attr >> 4) & 3) != mode || ((q.attr >> 24) & 0x3F) != id || ((q.attr & 0x4000u) != 0) != eq || ((q.flags & (DS_PF_SHADOW_MASK | DS_PF_SHADOW | DS_PF_TRANSLUCENT)) != (p.flags & (DS_PF_SHADOW_MASK | DS_PF_SHADOW | DS_PF_TRANSLUCENT))) || ((q.attr & (1u << 11)) != 0) != dw) break;
       ++j;
     }
     const u32 n = j - i;
@@ -506,18 +507,18 @@ bool Lean::submit(u32 npoly, u32 nvert, u32 ntexels, const GpuFrame& fin) {
     if (mask) {
       // A mask polygon after a non-mask one starts a new set: the DS clears the mask stencil (per line; here for the frame).
       static const bool no_clear = std::getenv("DS_LEAN_NOMASKCLEAR") != nullptr;   // debug
-      if (any_mask && !prev_mask && !no_clear) { use(d.pipe[wbuf][P_MASK_CLEAR]); a.vkCmdSetStencilReference(cb, VK_STENCIL_FACE_FRONT_AND_BACK, 0); a.vkCmdDraw(cb, 3, 1, 0, 0); ++draws; }
+      if (any_mask && !prev_mask && !no_clear) { use(pipes[P_MASK_CLEAR]); a.vkCmdSetStencilReference(cb, VK_STENCIL_FACE_FRONT_AND_BACK, 0); a.vkCmdDraw(cb, 3, 1, 0, 0); ++draws; }
       any_mask = true;
-      use(d.pipe[wbuf][P_MASK]); a.vkCmdSetStencilReference(cb, VK_STENCIL_FACE_FRONT_AND_BACK, S_MASK); draw(i, n);
+      use(pipes[P_MASK]); a.vkCmdSetStencilReference(cb, VK_STENCIL_FACE_FRONT_AND_BACK, S_MASK); draw(i, n);
     } else if (shadow) {
       static const bool no_prep = std::getenv("DS_LEAN_NOPREP") != nullptr;   // debug
-      if (!no_prep) { use(d.pipe[wbuf][P_SHADOW_PREP]); a.vkCmdSetStencilReference(cb, VK_STENCIL_FACE_FRONT_AND_BACK, c); draw(i, n); }
-      use(d.pipe[wbuf][P_SHADOW]); a.vkCmdSetStencilReference(cb, VK_STENCIL_FACE_FRONT_AND_BACK, S_T | c); draw(i, n);
+      if (!no_prep) { use(pipes[P_SHADOW_PREP]); a.vkCmdSetStencilReference(cb, VK_STENCIL_FACE_FRONT_AND_BACK, c); draw(i, n); }
+      use(pipes[P_SHADOW]); a.vkCmdSetStencilReference(cb, VK_STENCIL_FACE_FRONT_AND_BACK, S_T | c); draw(i, n);
     } else if (trans) {
-      if (!d.nostencil) { use(d.pipe[wbuf][dw ? P_TRANS_A_DW : P_TRANS_A]); a.vkCmdSetStencilReference(cb, VK_STENCIL_FACE_FRONT_AND_BACK, S_DRAWN | S_T | c); draw(i, n); }
-      use(d.pipe[wbuf][dw ? P_TRANS_B_DW : P_TRANS_B]); a.vkCmdSetStencilReference(cb, VK_STENCIL_FACE_FRONT_AND_BACK, S_DRAWN | S_T | c); draw(i, n);
+      if (!d.nostencil) { use(pipes[dw ? P_TRANS_A_DW : P_TRANS_A]); a.vkCmdSetStencilReference(cb, VK_STENCIL_FACE_FRONT_AND_BACK, S_DRAWN | S_T | c); draw(i, n); }
+      use(pipes[dw ? P_TRANS_B_DW : P_TRANS_B]); a.vkCmdSetStencilReference(cb, VK_STENCIL_FACE_FRONT_AND_BACK, S_DRAWN | S_T | c); draw(i, n);
     } else {
-      use(d.pipe[wbuf][P_OPAQUE]); a.vkCmdSetStencilReference(cb, VK_STENCIL_FACE_FRONT_AND_BACK, S_DRAWN | c); draw(i, n);
+      use(pipes[P_OPAQUE]); a.vkCmdSetStencilReference(cb, VK_STENCIL_FACE_FRONT_AND_BACK, S_DRAWN | c); draw(i, n);
     }
     prev_mask = mask;
     i = j;

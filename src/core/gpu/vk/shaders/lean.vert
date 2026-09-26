@@ -37,7 +37,14 @@ void main() {
   // per-polygon normalised depth the DS compares; 1/z interpolated
   // perspective-correct reproduces it, and the test runs GREATER.
   bool wbuf = (pc.f.flags & DS_FF_WBUFFER) != 0u;
-  float zc = wbuf ? (1.0 / max(z, 1.0)) * w : (z / 16777215.0) * w;
+  // Depth-equal polygons (POLYGON_ATTR bit 14: decals on a surface) pass
+  // within a tolerance of the pixel's depth, +-0x200 Z-buffered, +-0xFF
+  // W-buffered. Here: the polygon sits that much nearer and its pipeline
+  // tests less-or-equal, so a decal at, or slightly behind, its surface
+  // draws. (A decal well in front would pass too; the DS fails it. Rare.)
+  float zd = z;
+  if ((p.attr & 0x4000u) != 0u) zd = max(z - (wbuf ? 255.0 : 512.0), 0.0);
+  float zc = wbuf ? (1.0 / max(zd, 1.0)) * w : (zd / 16777215.0) * w;
   gl_Position = vec4(x * w, y * w, zc, w);
   v_poly = pi;
   v_rgb = vec3(float(vt.r), float(vt.g), float(vt.b));
