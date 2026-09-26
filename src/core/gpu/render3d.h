@@ -457,6 +457,9 @@ private:
   void save_raw_row(s32 y);
   u32 raw_rows_[4][W]{};
   s32 raw_line_ = -100;
+  bool cut_trace_ = false;   // DS_CUT_TRACE set: per-polygon trace in resolve_span
+  u32 trace_last_[8] = {}; u32 trace_n_ = 0;   // DS_CUT_TRACE: the last polygon that plotted the traced pixel, for the DS_EDGE_TRACE line
+  bool cut_diag_ = false;    // DS_CUT_DIAG set: attr bit 23 marks cut-out polygon pixels that were no candidate; exported as edge byte 0x08
   bool raw_prev_ok_ = false;
   void final_pass_debug(s32 y);   // DS_AA_DEBUG: the final pass with each 3D edge pixel painted by what the AA does with it
 public:
