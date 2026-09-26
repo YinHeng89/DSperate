@@ -125,8 +125,6 @@ const Setting kVideoSettings[] = {
           "3D EDGES: THE HARDWARE'S BLEND ON THE CPU RASTER, 4X MSAA ON THE GPU RASTER"),
   boolean("video.gpu3d", "GPU 3D", "false", FlagLive, Dep::None,
           "DRAW THE 3D LAYER ON THE GPU. NEEDS VULKAN; THE CPU DRAWS IT OTHERWISE"),
-  boolean("video.gpu_present", "HARDWARE PRESENT", "true", FlagDeferred, Dep::None,
-          "SCALE AND LAY OUT THE SCREENS OFF THE CPU: THE RGA WHERE THE DEVICE HAS ONE, ELSE VULKAN. NEEDS A DIRECT-TO-PANEL DISPLAY"),
   boolean("video.fps", "FPS COUNTER", "false", FlagLive, Dep::None,
           "FRAMES PER SECOND IN THE CORNER OF THE SCREEN"),
   boolean("video.fullscreen", "FULLSCREEN", "false", FlagDeferred, Dep::Windowed, nullptr),

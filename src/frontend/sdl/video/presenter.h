@@ -31,6 +31,10 @@ public:
   };
 
   const std::string& name() const { return name_; }   // for the log: what presents, on which device
+  // Which hardware presents: the menu greys out what a presenter cannot do
+  // (the RGA scales bilinear only, and draws no grid, seams or chunky cells).
+  enum class Kind : u8 { Vulkan, Rga };
+  virtual Kind kind() const = 0;
 
   // The output is `w`x`h` presented pixels now. Same: nothing to do.
   // Lost: the presenter cannot continue and Display falls back to software.

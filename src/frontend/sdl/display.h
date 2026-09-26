@@ -127,6 +127,7 @@ public:
   enum class GpuPresentMode : u8 { Auto, Rga, Vulkan };
   void set_gpu_present(bool on, GpuPresentMode mode = GpuPresentMode::Auto) { gpu_wanted_ = on; gpu_mode_ = mode; }
   bool gpu_present() const { return gpu_ != nullptr; }
+  bool rga_present() const { return gpu_ && gpu_->kind() == FramePresenter::Kind::Rga; }   // bilinear only; no grid, seams or chunky
   const void* cell_map(int screen) const { return cells_[screen].x.cells ? &cells_[screen] : nullptr; }
   // Locks the panel-sized texture and fills in one target per screen. False
   // if the lock failed, in which case the caller must fall back to draw().

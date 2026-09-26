@@ -22,6 +22,7 @@ public:
   }
   ~VkImportPresenter() override { if (!lost_) gpu_->flush(sink_); sink_.set_gpu_writes(false); }
 
+  Kind kind() const override { return Kind::Vulkan; }
   Fit fit(SDL_Window* win, int w, int h) override {
     if (w == sink_.width() && h == sink_.height()) return Fit::Same;
     if (sink_.reopen(win, w, h) && gpu_->reimport(sink_)) return Fit::Changed;

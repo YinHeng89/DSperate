@@ -84,6 +84,7 @@ public:
     for (Src& s : src_) for (int k = 0; k < frontend::SCREENS; ++k) { if (s.px[k]) munmap(s.px[k], kFrameBytes); if (s.fd[k] >= 0) close(s.fd[k]); }
   }
 
+  Kind kind() const override { return Kind::Rga; }
   Fit fit(SDL_Window* win, int w, int h) override {
     if (w == sink_.width() && h == sink_.height()) return Fit::Same;
     std::string why;

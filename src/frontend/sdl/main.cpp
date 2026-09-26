@@ -2394,13 +2394,17 @@ sdl_ready:
         if (net_live && *net_live) return "NOT DURING A NETWORK SESSION";
         return cfg.num("emu.frameskip", 0) > 0 ? "" : "ONLY WITH FRAMESKIP ON";
       case ds::sdl::Dep::PanelEffects:
+        if (display.rga_present()) return "THE RGA ALWAYS SCALES BILINEAR";
         return panel_effects() ? "" : "THIS SCREEN SCALES IN HARDWARE";
       case ds::sdl::Dep::GridSeam:
+        if (display.rga_present()) return "NOT ON THE RGA PRESENT";
         if (!panel_effects()) return "THIS SCREEN SCALES IN HARDWARE";
         return flag("video.linear", false) ? "BILINEAR IS ON" : "";
       case ds::sdl::Dep::Chunky:
+        if (display.rga_present()) return "NOT ON THE RGA PRESENT";
         return flag("video.linear", false) ? "BILINEAR IS ON" : "";
       case ds::sdl::Dep::ChunkyCell:
+        if (display.rga_present()) return "NOT ON THE RGA PRESENT";
         if (flag("video.linear", false)) return "BILINEAR IS ON";
         return cfg.str("video.chunky", "false") == "false" ? "ONLY WITH CHUNKY ON" : "";
       case ds::sdl::Dep::Windowed:
