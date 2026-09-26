@@ -9,11 +9,14 @@
 // frames into small CMA source buffers (192 KB each), the RGA does the rest
 // in ~1 ms a view, and the present thread waits on it with poll().
 //
-// The frontend's overlay (OSD, pause menu) is blended by the CPU into the
-// finished buffer over the rectangle it drew, after the RGA jobs.
-// Not done here: the LCD grid, the inset's alpha (the PiP view is drawn
-// opaque), rotation (the presenter refuses to open; the scanline scaler
-// handles rotated panels).
+// What the RGA cannot do is done by the CPU on the finished buffer, over
+// the pixels concerned only: the frontend's overlay (OSD, pause menu) over
+// the rectangle it drew; a fading PiP inset, which the RGA scales into a
+// scratch buffer and the CPU blends in; the LCD grid's seam columns and
+// rows (the same placement as the scanline scaler's). The filter is the
+// RGA's bilinear; nearest, seams and chunky cells do not exist on this
+// route (the menu greys them out). Rotation: the presenter refuses to open
+// and the scanline scaler handles rotated panels.
 #include "frontend/sdl/video/presenter.h"
 #include "frontend/sdl/scanout.h"
 #include "frontend/sdl/dmaheap.h"
@@ -82,6 +85,8 @@ public:
     sink_.set_gpu_writes(false);
     if (fd_ >= 0) { stream(false); close(fd_); }
     for (Src& s : src_) for (int k = 0; k < frontend::SCREENS; ++k) { if (s.px[k]) munmap(s.px[k], kFrameBytes); if (s.fd[k] >= 0) close(s.fd[k]); }
+    if (scratch_px_) munmap(scratch_px_, scratch_bytes_);
+    if (scratch_fd_ >= 0) close(scratch_fd_);
   }
 
   Kind kind() const override { return Kind::Rga; }
@@ -101,6 +106,9 @@ public:
     const int buf = sink_.current();
     ScanoutOut::DmabufPlane plane;
     if (buf < 0 || !sink_.dmabuf_plane(buf, plane)) { sink_.end_frame(); return false; }
+    // DS_RGA_DUMP=N:FILE: the finished panel buffer of the N-th presented frame, raw XRGB rows, and the views (diagnostic).
+    static const char* dump = std::getenv("DS_RGA_DUMP");
+    static const u64 dump_at = dump && std::strchr(dump, ':') ? std::strtoull(dump, nullptr, 10) : 300;
     const Src& s = src_[frame_ % kSlots];
     // The 1x frames into the RGA's source buffers (CPU write, cache cleaned for the device).
     for (int k = 0; k < frontend::SCREENS; ++k) {
@@ -130,7 +138,27 @@ public:
       if (r.x + r.w > static_cast<int>(plane.width)) { const int over = r.x + r.w - static_cast<int>(plane.width); sw -= over * sw / r.w; r.w -= over; }
       if (r.y + r.h > static_cast<int>(plane.height)) { const int over = r.y + r.h - static_cast<int>(plane.height); sh -= over * sh / r.h; r.h -= over; }
       if (r.w <= 0 || r.h <= 0 || sw <= 0 || sh <= 0) continue;
-      if (!job(s.fd[v.screen], sx, sy, sw, sh, plane.fd, r)) { lost_ = true; sink_.end_frame(); return false; }
+      const bool fade = v.blends && p.inset_alpha < 255;
+      if (fade && !scratch_ready(plane)) { std::fprintf(stderr, "rga present: no scratch buffer for the fading inset (%s); drawn opaque\n", std::strerror(errno)); }
+      const bool via_scratch = fade && scratch_fd_ >= 0;
+      if (dump && frame_ == dump_at) std::fprintf(stderr, "rga present: view %d screen %d rect %d,%d %dx%d shown %d blends %d alpha %u fade %d scratch %d\n", i, v.screen, v.rect.x, v.rect.y, v.rect.w, v.rect.h, v.shown, v.blends, p.inset_alpha, fade, via_scratch);
+      if (!job(s.fd[v.screen], sx, sy, sw, sh, via_scratch ? scratch_fd_ : plane.fd, r)) { lost_ = true; sink_.end_frame(); return false; }
+      if (via_scratch) {
+        // The inset over what is there, at its alpha (a fade timer on the PiP).
+        dmaheap::sync_begin_write(plane.fd);
+        const u32 pitch = plane.stride_bytes / 4, a = p.inset_alpha, ia = 255 - a;
+        for (int y = r.y; y < r.y + r.h; ++y) {
+          u32* d = px + static_cast<size_t>(y) * pitch;
+          const u32* sp = scratch_px_ + static_cast<size_t>(y) * pitch;
+          for (int x = r.x; x < r.x + r.w; ++x) {
+            const u32 sv = sp[x], dv = d[x];
+            const u32 rb = ((sv & 0xFF00FF) * a + (dv & 0xFF00FF) * ia) >> 8, g = ((sv & 0xFF00) * a + (dv & 0xFF00) * ia) >> 8;
+            d[x] = 0xFF000000u | (rb & 0xFF00FF) | (g & 0xFF00);
+          }
+        }
+        dmaheap::sync_end_write(plane.fd);
+      }
+      if (v.grid && p.grid < 256) grid_view(px, plane, r, v.rect, p.grid);
       shown = true;
     }
     // The overlay's rectangle, blended by the CPU (0xAARRGGBB over XRGB).
@@ -156,6 +184,10 @@ public:
       }
       o.dirty = p.drawn;   // cleared before this slot's next use
     } else o.dirty = frontend::Rect{};
+    if (dump && frame_ == dump_at) {
+      const char* path = std::strchr(dump, ':') ? std::strchr(dump, ':') + 1 : dump;
+      if (std::FILE* f = std::fopen(path, "wb")) { std::fwrite(px, 1, static_cast<size_t>(plane.stride_bytes) * plane.height, f); std::fclose(f); std::fprintf(stderr, "rga present: wrote %s (%ux%u, pitch %u)\n", path, plane.width, plane.height, plane.stride_bytes / 4); }
+    }
     // The jobs are synchronous, so the buffer is complete: to the sink now.
     sink_.end_frame();
     ++frame_;
@@ -179,6 +211,50 @@ private:
   explicit RgaPresenter(ScanoutOut& sink) : sink_(sink) {}
 
   struct Src { int fd[frontend::SCREENS] = {-1, -1}; u32* px[frontend::SCREENS] = {}; };
+
+  // A panel-sized buffer the RGA scales a fading inset into (allocated on first need).
+  bool scratch_ready(const ScanoutOut::DmabufPlane& plane) {
+    const size_t need = static_cast<size_t>(plane.stride_bytes) * plane.height;
+    if (scratch_fd_ >= 0 && scratch_bytes_ >= need) return true;
+    if (scratch_fd_ >= 0) { munmap(scratch_px_, scratch_bytes_); close(scratch_fd_); scratch_fd_ = -1; scratch_px_ = nullptr; }
+    scratch_fd_ = dmaheap::alloc(need, [](int) { return true; }, "rga");
+    if (scratch_fd_ < 0) return false;
+    scratch_px_ = static_cast<u32*>(mmap(nullptr, need, PROT_READ | PROT_WRITE, MAP_SHARED, scratch_fd_, 0));
+    if (scratch_px_ == MAP_FAILED) { scratch_px_ = nullptr; close(scratch_fd_); scratch_fd_ = -1; return false; }
+    scratch_bytes_ = need;
+    return true;
+  }
+
+  // The LCD grid over one view: the first panel column / row of each source
+  // pixel / line darkened to gf/256, for runs at least ceil(scale) wide,
+  // every source pixel (or every other at exactly 2x) -- the scanline
+  // scaler's placement (kern::scale_row_grid). `r` is the clipped rect on
+  // the buffer, `full` the view's rect the runs are laid out in.
+  void grid_view(u32* px, const ScanoutOut::DmabufPlane& plane, const frontend::Rect& r, const frontend::Rect& full, u32 gf) {
+    const int dim[2] = {full.w, full.h}, srcn[2] = {static_cast<int>(ds::SCREEN_W), static_cast<int>(ds::SCREEN_H)}, org[2] = {full.x, full.y};
+    std::vector<u8>* marks[2] = {&grid_col_, &grid_row_};
+    for (int axis = 0; axis < 2; ++axis) {
+      const u32 n = static_cast<u32>(std::max(0, dim[axis])), sn = static_cast<u32>(srcn[axis]);
+      std::vector<u8>& m = *marks[axis];
+      m.assign(n, 0);
+      if (n == 0 || n > 4096) continue;
+      const u32 min_run = std::max<u32>(2, (n + sn - 1) / sn), pitch = n == 2 * sn ? 2 : 1;
+      for (u32 s = 0; s < sn; ++s) {
+        const u32 x0 = (s * n + sn - 1) / sn, x1 = ((s + 1) * n + sn - 1) / sn;
+        if (x1 - x0 >= min_run && s % pitch == 0 && x0 < n) m[x0] = 1;
+      }
+    }
+    auto dim_px = [gf](u32 v) { return 0xFF000000u | ((((v & 0xFF00FF) * gf) >> 8) & 0xFF00FF) | ((((v & 0xFF00) * gf) >> 8) & 0xFF00); };
+    dmaheap::sync_begin_write(plane.fd);
+    const u32 pitch = plane.stride_bytes / 4;
+    for (int y = r.y; y < r.y + r.h; ++y) {
+      u32* d = px + static_cast<size_t>(y) * pitch;
+      const int ly = y - org[1];
+      if (ly >= 0 && ly < static_cast<int>(grid_row_.size()) && grid_row_[static_cast<size_t>(ly)]) { for (int x = r.x; x < r.x + r.w; ++x) d[x] = dim_px(d[x]); continue; }
+      for (int x = r.x; x < r.x + r.w; ++x) { const int lx = x - org[0]; if (lx >= 0 && lx < static_cast<int>(grid_col_.size()) && grid_col_[static_cast<size_t>(lx)]) d[x] = dim_px(d[x]); }
+    }
+    dmaheap::sync_end_write(plane.fd);
+  }
   struct Over { std::vector<u32> px; int w = 0, h = 0; frontend::Rect dirty; };
 
   bool init(std::string* why) {
@@ -266,6 +342,8 @@ private:
   int fd_ = -1;
   u32 src_bytes_ = 0, dst_bytes_ = 0, dst_stride_ = 0;
   Src src_[kSlots];
+  int scratch_fd_ = -1; u32* scratch_px_ = nullptr; size_t scratch_bytes_ = 0;
+  std::vector<u8> grid_col_, grid_row_;
   Over over_[kSlots];
   std::vector<bool> cleared_;   // per sink buffer: letterbox blacked for this layout
   u64 frame_ = 0, layout_sig_ = 0;

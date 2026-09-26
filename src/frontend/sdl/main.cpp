@@ -2397,7 +2397,7 @@ sdl_ready:
         if (display.rga_present()) return "THE RGA ALWAYS SCALES BILINEAR";
         return panel_effects() ? "" : "THIS SCREEN SCALES IN HARDWARE";
       case ds::sdl::Dep::GridSeam:
-        if (display.rga_present()) return "NOT ON THE RGA PRESENT";
+        if (display.rga_present()) return std::strcmp(s.key, "video.seam") == 0 ? "THE RGA DRAWS THE DARK GRID ONLY" : "";
         if (!panel_effects()) return "THIS SCREEN SCALES IN HARDWARE";
         return flag("video.linear", false) ? "BILINEAR IS ON" : "";
       case ds::sdl::Dep::Chunky:
