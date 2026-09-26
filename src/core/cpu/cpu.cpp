@@ -20,12 +20,8 @@ FastTiming g_fast = [] {
   return f;
 }();
 bool g_fast_timing = [] {
-  if (const char* e = std::getenv("DS_TIMING")) return std::strcmp(e, "exact") != 0;
-#if DSPERATE_JIT && !defined(__aarch64__)
-  return false;
-#else
-  return true;
-#endif
+  if (const char* e = std::getenv("DS_TIMING")) return std::strcmp(e, "exact") != 0 && kFastTimingAvailable;
+  return kFastTimingAvailable;
 }();
 
 namespace {
