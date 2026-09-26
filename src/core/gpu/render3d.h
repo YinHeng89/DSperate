@@ -5,6 +5,7 @@
 #include <cstdio>
 #include "core/types.h"
 #include "core/gpu/texcache.h"
+#include "core/gpu/vk/vk_layout.h"
 #include <unordered_map>
 
 #include <array>
@@ -437,6 +438,15 @@ private:
   void gpu_dump(const Gpu3D& gx, const Polygon* const* polys, u32 npoly);
   std::shared_ptr<vk::Device> vk_dev_;
   std::unique_ptr<vk::Lean> lean_;
+  // The GPU submit (command recording + queue call, ~0.9 ms) runs on its own
+  // thread, off the emulation thread: gpu_submit() fills the staging buffers
+  // and the texel arena, then posts the Lean::submit call. gpu_job_wait()
+  // before anything that reads the result or rewrites the staging.
+  struct GpuJob { std::thread thread; std::mutex m; std::condition_variable cv; bool pending = false, quit = false, ok = false; u32 np = 0, nv = 0, ntex = 0; vk::GpuFrame f{}; };
+  std::unique_ptr<GpuJob> gpu_job_;
+  void gpu_job_start();
+  void gpu_job_post(u32 np, u32 nv, u32 ntex, const vk::GpuFrame& f);
+  bool gpu_job_wait();   // the last posted submit's result (true: on the GPU)
   bool gpu_on_ = false;
   bool gpu_frame_ = false;   // the last drawn frame went to the GPU: lean_ holds the picture, not out_[]
   struct GpuResident { u32 off = 0, words = 0, version = 0; };

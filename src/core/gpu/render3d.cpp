@@ -372,7 +372,41 @@ public:
 };
 
 Renderer3D::Renderer3D(NDS& nds) : nds_(nds) { out_dst_ = out_[0].data(); reset(); }
-Renderer3D::~Renderer3D() = default;
+Renderer3D::~Renderer3D() {
+  if (gpu_job_) { { std::lock_guard<std::mutex> lk(gpu_job_->m); gpu_job_->quit = true; } gpu_job_->cv.notify_all(); if (gpu_job_->thread.joinable()) gpu_job_->thread.join(); }
+}
+
+void Renderer3D::gpu_job_start() {
+  if (gpu_job_) return;
+  gpu_job_ = std::make_unique<GpuJob>();
+  GpuJob* j = gpu_job_.get();
+  j->thread = std::thread([this, j] {
+    place_current_thread(ThreadRole::Band, 1);   // a band core: the band workers idle while the GPU draws
+    std::unique_lock<std::mutex> lk(j->m);
+    for (;;) {
+      j->cv.wait(lk, [j] { return j->pending || j->quit; });
+      if (j->quit) return;
+      const u32 np = j->np, nv = j->nv, ntex = j->ntex; const vk::GpuFrame f = j->f;
+      lk.unlock();
+      const bool ok = lean_->submit(np, nv, ntex, f);
+      lk.lock();
+      j->ok = ok; j->pending = false;
+      j->cv.notify_all();
+    }
+  });
+}
+void Renderer3D::gpu_job_post(u32 np, u32 nv, u32 ntex, const vk::GpuFrame& f) {
+  GpuJob* j = gpu_job_.get();
+  { std::lock_guard<std::mutex> lk(j->m); j->np = np; j->nv = nv; j->ntex = ntex; j->f = f; j->pending = true; }
+  j->cv.notify_all();
+}
+bool Renderer3D::gpu_job_wait() {
+  GpuJob* j = gpu_job_.get();
+  if (!j) return false;
+  std::unique_lock<std::mutex> lk(j->m);
+  j->cv.wait(lk, [j] { return !j->pending; });
+  return j->ok;
+}
 
 void Renderer3D::reset() {
   color_.fill(0); depth_.fill(0); attr_.fill(0); out_[0].fill(0); out_[1].fill(0);
@@ -3881,7 +3915,7 @@ Renderer3D::FrameRef Renderer3D::frame_ref(bool allow_lag) const {
 }
 
 bool Renderer3D::set_gpu(bool on, std::string* why) {
-  if (!on) { sync_all(); if (lean_) lean_->wait(); gpu_on_ = false; return true; }
+  if (!on) { sync_all(); gpu_job_wait(); if (lean_) lean_->wait(); gpu_on_ = false; return true; }
   if (gpu_on_) return true;
   std::string reason;
   if (!vk_dev_) vk_dev_ = vk::Device::shared(&reason);
@@ -3889,6 +3923,7 @@ bool Renderer3D::set_gpu(bool on, std::string* why) {
   if (!lean_) lean_ = vk::Lean::create(*vk_dev_, &reason);
   if (!lean_ || !lean_->ready()) { lean_.reset(); if (why) *why = reason; return false; }
   lean_->wait_all(); gpu_resident_.clear(); gpu_arena_top_ = 0;
+  gpu_job_start();
   gpu_on_ = true;
   return true;
 }
@@ -3920,6 +3955,7 @@ bool Renderer3D::gpu_submit(const Gpu3D& gx, const Polygon* const* polys, u32 np
   using namespace ds::gpu::vk;
   const double t0 = g_gpu_trace.on ? now_ms() : 0;
   struct Done { double t0; vk::Lean& lean; bool ok = false; ~Done() { if (g_gpu_trace.on) { if (!ok) ++g_gpu_trace.refused; g_gpu_trace.tick(lean); } } } done{t0, *lean_};
+  gpu_job_wait();   // the previous submit is done with the staging buffers (long since: it takes ~1 ms)
   GpuPoly* const gp = lean_->poly_buffer();
   GpuVert* const gv = lean_->vert_buffer();
   u32 texcap = 0; u32* const tex = lean_->texel_buffer(&texcap);
@@ -3956,7 +3992,7 @@ bool Renderer3D::gpu_submit(const Gpu3D& gx, const Polygon* const* polys, u32 np
       if (!r.texels) return false;
       GpuResident& res = gpu_resident_[r.id];
       if (res.words != r.words || res.version != r.version) {
-        if (gpu_arena_top_ + r.words > texcap) { lean_->wait_all(); gpu_resident_.clear(); gpu_arena_top_ = 0; return false; }
+        if (gpu_arena_top_ + r.words > texcap) { gpu_job_wait(); lean_->wait_all(); gpu_resident_.clear(); gpu_arena_top_ = 0; return false; }
         std::memcpy(tex + gpu_arena_top_, r.texels, static_cast<size_t>(r.words) * sizeof(u32));
         res.off = gpu_arena_top_; res.words = r.words; res.version = r.version;
         gpu_arena_top_ += r.words;
@@ -3985,10 +4021,15 @@ bool Renderer3D::gpu_submit(const Gpu3D& gx, const Polygon* const* polys, u32 np
     f.clear_attr = (rs_->clear_attr1 & 0x3F000000) | (rs_->clear_attr1 & 0x8000);
   }
   if (rs_->dispcnt & (1u << 14)) return false;   // rear-plane bitmap: the CPU draws it
+  // A frame the lean raster cannot take (too many polygons / vertices) is
+  // refused here, synchronously, so the CPU bands draw it; the submit itself
+  // goes to the GPU job thread. Its own failure (a driver error) shows as a
+  // dropped frame at the next read, never as a CPU fallback.
+  if (np > DS_MAX_POLYS || nv > DS_MAX_VERTS) return false;
   const double t1 = g_gpu_trace.on ? now_ms() : 0;
-  done.ok = lean_->submit(np, nv, gpu_arena_top_, f);
-  if (g_gpu_trace.on && done.ok) g_gpu_trace.draws += lean_->draws();
-  if (g_gpu_trace.on) { const double t2 = now_ms(); g_gpu_trace.build_ms += t1 - t0; g_gpu_trace.submit_ms += t2 - t1; }
+  gpu_job_post(np, nv, gpu_arena_top_, f);
+  done.ok = true;
+  if (g_gpu_trace.on) { g_gpu_trace.draws += lean_->draws(); const double t2 = now_ms(); g_gpu_trace.build_ms += t1 - t0; g_gpu_trace.submit_ms += t2 - t1; }   // draws: the frame before's
   return done.ok;
 }
 
@@ -4000,6 +4041,7 @@ void Renderer3D::sync_line(const FrameRef& f, s32 y) {
   if (f.gpu) {
     if (!f.out) {
       const double t0 = g_gpu_trace.on ? now_ms() : 0;
+      gpu_job_wait();
       f.out = lean_->newest_ready(f.allow_lag);
       if (g_gpu_trace.on) { const double w = now_ms() - t0; g_gpu_trace.wait_ms += w; g_gpu_trace.wait_max = std::max(g_gpu_trace.wait_max, w); if (w > 0.2) ++g_gpu_trace.waited; }
     }
@@ -4213,7 +4255,7 @@ void Renderer3D::render_band(s32 y0, s32 y1, u32* dst, u8* edst) {
 template <class S> void Renderer3D::sync_output(S& s) {
   sync_all();
   if constexpr (S::reading) { reset(); texcache_.clear(); }
-  if constexpr (!S::reading) { if (gpu_frame_ && lean_) { if (const u32* g = lean_->newest_ready(false)) std::memcpy(out_[display_].data(), g, sizeof(u32) * 256 * 192); } }
+  if constexpr (!S::reading) { if (gpu_frame_ && lean_) { gpu_job_wait(); if (const u32* g = lean_->newest_ready(false)) std::memcpy(out_[display_].data(), g, sizeof(u32) * 256 * 192); } }
   s.begin("R3DO");
   s.fields(rendered_once_, out_[display_]);   // reset() above leaves display_ at 0 on a load
   s.end();
