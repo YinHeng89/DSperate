@@ -1403,8 +1403,6 @@ static int run(int argc, char** argv) {
   Disp::Layout& layout = vs.layout;
   std::vector<Disp::Mode>& layout_cycle = vs.layout_cycle;
   ds::prof::set_level(std::getenv("DS_PROFILE"));
-  // DS_GPU3D=1: the 3D layer on the GPU (Renderer3D::set_gpu); a config key follows once it has proven itself.
-  if (const char* g = std::getenv("DS_GPU3D"); g && std::atoi(g) != 0) { std::string why; if (!nds.gpu3d.renderer().set_gpu(true, &why)) std::fprintf(stderr, "gpu3d: unavailable (%s), drawing on the CPU\n", why.c_str()); else std::fprintf(stderr, "gpu3d: on\n"); }
   std::signal(SIGINT, on_signal);
   std::signal(SIGTERM, on_signal);
 
@@ -1498,6 +1496,10 @@ sdl_ready:
     }
   }
   if (!open_displays(vs, display, display2)) { SDL_Quit(); return 1; }
+  // DS_GPU3D=1: the 3D layer on the GPU (Renderer3D::set_gpu); a config key
+  // follows once it has proven itself. After the displays: the Vulkan device
+  // opens the DRM node, and under direct KMS the display must take master first.
+  if (const char* g = std::getenv("DS_GPU3D"); g && std::atoi(g) != 0) { std::string why; if (!nds.gpu3d.renderer().set_gpu(true, &why)) std::fprintf(stderr, "gpu3d: unavailable (%s), drawing on the CPU\n", why.c_str()); else std::fprintf(stderr, "gpu3d: on\n"); }
   // Let fullscreen windows take their final size before the ROM loads (see
   // Display::settle_step); bounded, in case no configure comes.
   {
