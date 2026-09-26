@@ -33,9 +33,6 @@
 
 namespace ds::gpu {
 
-bool aa_debug();              // DS_AA_DEBUG: see final_pass_debug
-void aa_debug_frame(u32 dispcnt);
-
 #if DSPERATE_NEON
 // The A64-only NEON intrinsics the kernels use, in both spellings.
 namespace compat = kern::compat;
@@ -626,21 +623,15 @@ template <bool textured>
   return r | (g << 8) | (b << 16) | (a << 24);
 }
 
-[[gnu::always_inline]] inline void Renderer3D::plot_translucent(u32 addr, u32 color, u32 z, u32 polyattr, bool shadow, u32 own) {
+[[gnu::always_inline]] inline void Renderer3D::plot_translucent(u32 addr, u32 color, u32 z, u32 polyattr, bool shadow) {
   const u32 dstattr = attr_[addr];
-  // Kept from the destination: edge flags (0-3), the enhanced stamps' fixed
-  // side (5-6), coverage and axis (8-14), the diag tag (23) and the id.
-  u32 attr = (polyattr & 0xFFF0) | ((polyattr >> 8) & 0xFF0000) | (1u << 22) | (dstattr & 0xFF807F6F);   // bits 13-14: the edge's blend direction; polyattr bits 8-12: full coverage an AA-exempt quad stamps (enhanced), else 0
+  u32 attr = (polyattr & 0xE0F0) | ((polyattr >> 8) & 0xFF0000) | (1u << 22) | (dstattr & 0xFF001F0F);
   if (shadow) {
     // Shadows skip pixels of their own polygon id, opaque or translucent.
     if (dstattr & (1u << 22)) { if ((dstattr & 0x007F0000) == (attr & 0x007F0000)) return; }
     else if ((dstattr & 0x3F000000) == (polyattr & 0x3F000000)) return;
   } else if ((dstattr & 0x007F0000) == (attr & 0x007F0000)) return;   // equal translucent ids don't blend
   if (!(dstattr & (1u << 15))) attr &= ~(1u << 15);
-  // Enhanced: the translucent polygon's own outline (flags, coverage, run
-  // axis and side, bit 7 marking it as its own) replaces whatever edge the
-  // destination held, so a cloud's silhouette is cut like an opaque one.
-  if (own) attr = (attr & ~0x7F8Fu) | own;
   color = alpha_blend(dispcnt_, color, color_[addr], color >> 24);
   if (z != 0xFFFFFFFFu) depth_[addr] = z;
   color_[addr] = color;
@@ -840,26 +831,6 @@ template <typename Fn>
     fn(start, std::min(k, n) - start);
   }
 }
-// The same over a span staged at buffer offset `off`, with the groups
-// aligned to the buffer rather than the span, so the per-span attribute
-// stage and the per-batch texel gather agree on which groups are live (a
-// lane the one stages must be a lane the other gathers, and the other way
-// round: the cut-out pass reads neighbours' texels). fn(k, len) is relative
-// to the span.
-template <typename Fn>
-[[gnu::always_inline]] inline void live_runs_at(const u8* pass, u32 off, u32 n, Fn&& fn) {
-  const u32 end = off + n;
-  auto dead = [pass](u32 g) { u64 a, b; std::memcpy(&a, pass + g * 16, 8); std::memcpy(&b, pass + g * 16 + 8, 8); return (a | b) == 0; };
-  u32 g = off / 16;
-  const u32 gend = (end + 15) / 16;
-  while (g < gend) {
-    if (dead(g)) { ++g; continue; }
-    const u32 gs = g;
-    for (++g; g < gend && !dead(g); ++g) {}
-    const u32 a = std::max(gs * 16, off), b = std::min(g * 16, end);
-    if (a < b) fn(a - off, b - a);
-  }
-}
 
 // The five attributes for screen pixels [ca, cb) of the span (a sub-range of
 // the staged span, normally the depth pre-pass's candidate range).
@@ -885,12 +856,12 @@ void Renderer3D::span_attrs(SpanBuf& sb, s32 xstart, s32 xend, s32 ca, s32 cb, s
       prof::add(prof::C_SPAN_FLAT_RGB, 1);
       fill_rgb_const(sb.vr + off, sb.vg + off, sb.vb + off, n, al);
       const u32 fmax = fac_bound(xdiff, wl, wr);
-      live_runs_at(sb.pass, off, n, [&](u32 k, u32 len) { kern::active::span_attrs2n(al, ar, sb.fac + off + k, len, sb.sc + off + k, sb.tc + off + k, fmax); });
+      live_runs(sb.pass + off, n, [&](u32 k, u32 len) { kern::active::span_attrs2n(al, ar, sb.fac + off + k, len, sb.sc + off + k, sb.tc + off + k, fmax); });
       return;
     }
     prof::add(prof::C_SPAN_LERP_RGB, 1);
     const u32 fmax = fac_bound(xdiff, wl, wr);
-    live_runs_at(sb.pass, off, n, [&](u32 k, u32 len) {
+    live_runs(sb.pass + off, n, [&](u32 k, u32 len) {
       kern::active::span_attrs5n(al, ar, sb.fac + off + k, len, sb.vr + off + k, sb.vg + off + k, sb.vb + off + k, sb.sc + off + k, sb.tc + off + k, fmax);
     });
     return;
@@ -903,11 +874,11 @@ void Renderer3D::span_attrs(SpanBuf& sb, s32 xstart, s32 xend, s32 ca, s32 cb, s
   if (rgb_constant || (al[0] == ar[0] && al[1] == ar[1] && al[2] == ar[2])) {
     prof::add(prof::C_SPAN_FLAT_RGB, 1);
     fill_rgb_const(sb.vr + off, sb.vg + off, sb.vb + off, n, al);
-    live_runs_at(sb.pass, off, n, [&](u32 k, u32 len) { kern::active::span_attrs2n_lin(al, ar, xv0 + static_cast<s32>(k), len, xdiff, sb.sc + off + k, sb.tc + off + k); });
+    live_runs(sb.pass + off, n, [&](u32 k, u32 len) { kern::active::span_attrs2n_lin(al, ar, xv0 + static_cast<s32>(k), len, xdiff, sb.sc + off + k, sb.tc + off + k); });
     return;
   }
   prof::add(prof::C_SPAN_LERP_RGB, 1);
-  live_runs_at(sb.pass, off, n, [&](u32 k, u32 len) {
+  live_runs(sb.pass + off, n, [&](u32 k, u32 len) {
     kern::active::span_attrs5n_lin(al, ar, xv0 + static_cast<s32>(k), len, xdiff, sb.vr + off + k, sb.vg + off + k, sb.vb + off + k, sb.sc + off + k, sb.tc + off + k);
   });
 }
@@ -974,7 +945,7 @@ void Renderer3D::render_shadow_mask_line(Edge& e, s32 y) {
   // Set stencil bits where the depth test fails; draw nothing. Bit 2 (the
   // pixel underneath) only ever steers writes to the under layer, which is
   // dead without AA -- see dispcnt_.
-  const bool under = under_layer_;
+  const bool under = dispcnt_ & (1 << 4);
   const u32 row = row_of(y) + 1;
   auto stencil_span = [&](s32 xlimit) {
     for (; x < xlimit; ++x) {
@@ -1007,40 +978,9 @@ void Renderer3D::render_shadow_mask_line(Edge& e, s32 y) {
   e.xr = e.right.step();
 }
 
-// The frame's AA as the raster honours it: the game's DISP3DCNT.4 unless
-// video.aa is off; enhanced forces it on, and a game that never asked for AA
-// keeps its edge-marking outlines solid rather than the hardware's 50%.
-void Renderer3D::set_frame_aa() {
-  const bool asked = rs_->dispcnt & (1u << 4);
-  game_aa_ = aa_ && asked;
-  dispcnt_ = rs_->dispcnt & (aa_ ? ~0u : ~(1u << 4));
-  mark_cov_ = 0x1000;
-  under_layer_ = game_aa_;
-  if (aa_ == 2) { game_aa_ = true; under_layer_ = false; dispcnt_ |= 1u << 4; if (!asked) mark_cov_ = 0x1F00; }
-}
-
-// Two depths of one surface: within 1/64 of the nearer plus a small constant
-// (depth steps across a polygon edge and the fill-rule overlap stay inside).
-// DS_CUT_TRACE / DS_CUT_DIAG: read once for every renderer instance (each band worker has its own).
-static const bool cut_trace_ = std::getenv("DS_CUT_TRACE") != nullptr;
-static const bool cut_diag_ = std::getenv("DS_CUT_DIAG") != nullptr;
-static inline bool same_surface(s32 za, s32 zb) { const s32 d = za > zb ? za - zb : zb - za; return d <= (std::min(za, zb) >> 6) + 0x200; }
-// Enhanced AA: the top pixel (attr ta, colour tc, depth tz) is an opaque edge
-// of the surface a new opaque edge pixel (attr pa, depth z) belongs to --
-// same polygon id, same depth -- and on the same side of it (left or right
-// run on both). Both then cover the same part of the pixel: a back face under
-// its front face's silhouette, or neighbouring triangles at a silhouette
-// vertex. The DS stacks the surface on itself there and loses what is behind
-// it. Where two polygons of a surface meet from opposite sides, the pixel is
-// split between them and the hardware's stacking blends them correctly, so
-// that case is left alone.
-static inline bool same_edge(u32 ta, u32 tc, s32 tz, u32 pa, s32 z) {
-  return (ta & pa & 0x3) && (tc >> 24) && !(ta & (1u << 22)) && !((ta ^ pa) & 0x3F000000u) && same_surface(tz, z);
-}
-
 // Per-pixel resolve of [xa, xb): stencil, depth test (top then under pixel),
 // shading, alpha test, opaque/translucent writes. part: 0=left edge, 1=inside, 2=right edge.
-template <int mode, bool textured, int aa, bool shadow>
+template <int mode, bool textured, bool aa, bool shadow>
 void Renderer3D::resolve_span(const Shade& sh, const SpanBuf& sb, s32 y, s32 xa, s32 xb, int part, int edge, s32 l_cov, s32 r_cov, s32& xcov) {
   const u32 polyattr = sh.polyattr;
   const u8* stencil = &stencil_[256 * static_cast<u32>((y + 1) & (RING - 1))];
@@ -1050,20 +990,18 @@ void Renderer3D::resolve_span(const Shade& sh, const SpanBuf& sb, s32 y, s32 xa,
   u32 resolved = 0;                // counted once after the loop, not per pixel
   for (s32 x = xa; x < xb; ++x) {
     const u32 i = static_cast<u32>(x - sb.x0);
-    bool seam_lane = false;
-    if constexpr (aa == 2 && !shadow) { if (part != 1) seam_lane = sb.seam[i] != 0; }   // seam_pass
     if (!sb.pass[i]) continue;    // neither the top pixel nor the one underneath can take it
     u32 addr = row + static_cast<u32>(x);
     u32 dstattr = attr_[addr];
     if (shadow) {
       const u8 st = stencil[x];
       if (!st) continue;
-      if (!(st & 1)) { if (aa != 1) continue; addr += RSIZE; }   // under layer only: dead without accurate AA
+      if (!(st & 1)) { if (!aa) continue; addr += RSIZE; }   // under layer only: dead without AA
       if (!(st & 2)) dstattr &= ~0xFu;      // no shadow under anti-aliased edges
     }
     const s32 z = sb.z[i];
     if (!depth_pass<mode>(addr, z, dstattr)) {
-      if (aa != 1 || !(dstattr & 0xF) || addr >= static_cast<u32>(RSIZE)) continue;
+      if (!aa || !(dstattr & 0xF) || addr >= static_cast<u32>(RSIZE)) continue;
       addr += RSIZE;
       dstattr = attr_[addr];
       if (!depth_pass<mode>(addr, z, dstattr)) continue;
@@ -1073,17 +1011,6 @@ void Renderer3D::resolve_span(const Shade& sh, const SpanBuf& sb, s32 y, s32 xa,
     const u32 color = shade_pixel<textured>(sh, vr, vg, vb, s, t);
     ++resolved;
     const u32 alpha = color >> 24;
-    if (cut_trace_) {   // DS_CUT_TRACE=x,y: every polygon that reaches the pixel, before its depth test
-      static int trx = -2, try_ = -2;
-      if (trx == -2) { trx = try_ = -1; if (const char* tr = std::getenv("DS_CUT_TRACE")) std::sscanf(tr, "%d,%d", &trx, &try_); }
-      if (x == trx && y == try_) {
-        std::fprintf(stderr, "cut-trace frame %llu (%d,%d) poly: fmt %u polyalpha %u textured %d cutout %d exempt %d opaque %d texel alpha %u z %d part %d\n", (unsigned long long)frame_tag_, x, y, sh.fmt, sh.polyalpha, (int)sh.textured, (int)sh.cutout, (int)sh.aa_exempt, (int)sh.opaque, alpha, z, part);
-        // Also kept for the final pass's DS_EDGE_TRACE line (stderr from the band threads is not reliable): the last polygon that plotted the pixel.
-        const u32 tl[8] = {sh.fmt, sh.polyalpha, static_cast<u32>(sh.cutout), static_cast<u32>(sh.aa_exempt), alpha, static_cast<u32>(z), static_cast<u32>(part), sh.alpha0};
-        std::memcpy(trace_last_, tl, sizeof tl);
-        ++trace_n_;
-      }
-    }
     if (alpha <= sh.alpha_ref) continue;
     if (alpha == 31) {
       u32 attr = polyattr | edge;
@@ -1099,32 +1026,6 @@ void Renderer3D::resolve_span(const Shade& sh, const SpanBuf& sb, s32 y, s32 xa,
           attr |= ((cov & 0x1F) << 8);
           push = true;
         }
-        if constexpr (aa == 2) push = false;   // enhanced: coverage, but no layer underneath
-      }
-      if constexpr (aa == 2) {
-        if (sh.cutout) {   // alpha-to-coverage (cutout_coverage), unless on the outline with hardware coverage
-          // A hardware edge with less than half coverage is a real outline
-          // sliver; above that it is as likely a seam of the mesh (a wheel
-          // drawn as a fan of triangles), where the texture hole is what shows.
-          const u8 cc = sb.ccov[i];
-          if (cc != 0xFF && !((attr & 3) && ((attr >> 8) & 0x1F) < 16))
-            attr = (attr & ~(0x1F00u | 0x2000u | 0x60u)) | ((cc & 0x1F) << 8) | ((cc & 0x20) << 8) | (cc & 0x40) | 0x24;
-          else if (cut_diag_ && cc == 0xFF) attr |= 1u << 23;   // DS_CUT_DIAG: a cut-out polygon's pixel that was no candidate
-        }
-      }
-      if constexpr (aa == 2 && !shadow) {
-        if (seam_lane) attr |= 0x1F00u;   // over the other side's edge of the same surface: a seam
-        // Enhanced: an edge over the same edge of its surface neither pushes
-        // the surface under nor lands under it (see same_edge), so the under
-        // layer keeps what is behind the surface; the larger coverage stands.
-        const u32 top = addr < static_cast<u32>(RSIZE) ? addr : addr - RSIZE;
-        const u32 ta = attr_[top];
-        if (same_edge(ta, color_[top], static_cast<s32>(depth_[top]), attr, z)) {
-          const u32 cov = std::max((ta >> 8) & 0x1F, (attr >> 8) & 0x1F);
-          if (top != addr) { attr_[top] = (ta & ~0x1F00u) | (cov << 8); continue; }   // lost to it: only the coverage counts
-          attr = (attr & ~0x1F00u) | (cov << 8);
-          push = false;
-        }
       }
       if (push && addr < static_cast<u32>(RSIZE)) {
         color_[addr + RSIZE] = color_[addr]; depth_[addr + RSIZE] = depth_[addr]; attr_[addr + RSIZE] = attr_[addr];
@@ -1132,24 +1033,8 @@ void Renderer3D::resolve_span(const Shade& sh, const SpanBuf& sb, s32 y, s32 xa,
       depth_[addr] = z; color_[addr] = color; attr_[addr] = attr;
     } else {
       const u32 zz = (sh.polyattr_z) ? static_cast<u32>(z) : 0xFFFFFFFFu;
-      u32 own = 0;
-      if constexpr (aa == 2) {
-        // The translucent polygon's outline coverage, read without advancing
-        // the ramp (the ramp counts opaque plots only, as in the vector path).
-        static const bool no_trown = std::getenv("DS_NO_TROWN") != nullptr;
-        if (!shadow && part != 1 && !no_trown && sh.polyalpha >= 4) {   // an almost invisible polygon leaves no step to cut
-          s32 cov = part == 0 ? l_cov : r_cov;
-          if (cov & static_cast<s32>(0x80000000u)) cov = part == 0 ? std::min(xcov >> 5, 31) : std::max(0x1F - (xcov >> 5), 0);
-          cov &= 0x1F;
-          cov |= static_cast<s32>((polyattr >> 8) & 0x1F);   // an AA-exempt quad stamps full coverage (as the vector path's lane attribute has it)
-          if (cov < 31) own = static_cast<u32>(edge & 0x600F) | (static_cast<u32>(cov) << 8) | 0x80u;
-          if (cut_trace_) { static int trx = -2, try_ = -2; if (trx == -2) { trx = try_ = -1; if (const char* tr = std::getenv("DS_CUT_TRACE")) std::sscanf(tr, "%d,%d", &trx, &try_); }
-            if (x == trx && y == try_) { const u32 tl[6] = {1u, static_cast<u32>(part), static_cast<u32>(xcov), static_cast<u32>(cov), alpha, own}; std::memcpy(trown_last_, tl, sizeof tl); } }
-        }
-      }
-      plot_translucent(addr, color, zz, polyattr, shadow, own);
-      if (seam_lane) attr_[addr] |= 0x1F00u;   // a seam stays one after the plot (the vector path applies it after its step)
-      if (aa == 1 && (dstattr & 0xF) && addr < static_cast<u32>(RSIZE)) plot_translucent(addr + RSIZE, color, zz, polyattr, shadow);
+      plot_translucent(addr, color, zz, polyattr, shadow);
+      if (aa && (dstattr & 0xF) && addr < static_cast<u32>(RSIZE)) plot_translucent(addr + RSIZE, color, zz, polyattr, shadow);
     }
   }
   if (resolved) prof::add(prof::C_RESOLVED_PIXELS, resolved);
@@ -1200,10 +1085,6 @@ void Renderer3D::setup_shade(Shade& sh, const Polygon& p) {
   if (!p.facing) sh.polyattr |= (1 << 4);
   sh.polyattr_z = (p.attr & (1 << 11)) != 0;
   sh.polyalpha = (p.attr >> 16) & 0x1F;
-  // DS_AA_DEBUG: bit 23 tags an opaque polygon whose texture can cut pixels
-  // out (colour 0 transparent, fmt 5's transparent entries, fmt 7's bit 15).
-  if (aa_debug() && sh.polyalpha == 31 && sh.textured && ((sh.fmt >= 2 && sh.fmt <= 4 && sh.alpha0 == 0) || sh.fmt == 5 || sh.fmt == 7))
-    sh.polyattr |= 1u << 23;
   sh.wireframe = sh.polyalpha == 0;
   sh.shadow = p.shadow;
   sh.dispcnt = dispcnt_;   // AA bit as the raster honours it, not as written
@@ -1233,65 +1114,11 @@ void Renderer3D::setup_shade(Shade& sh, const Polygon& p) {
   sh.gather4 = nullptr;
   sh.vec = false;
 #endif
-  sh.aa_plus = aa_ == 2;
-  // Enhanced leaves 3D-as-2D alone: a textured screen-aligned rectangle
-  // smaller than the screen, with constant W, whose texture spans one texel
-  // per pixel (text, HUD panels). Its pixels take full coverage, opaque
-  // writes through the AA-off kernels with coverage 31 in polyattr and
-  // translucent plots by stamping it, so neither the quad's outline nor
-  // its texels get blended: the hardware plots such text on both layers and
-  // blends two copies of the same texel, a neighbour holds a different one.
-  // Full-screen quads (backgrounds, fades, tints) are left to the normal
-  // path: no outline to protect, and a stamp would switch AA off under them.
-  sh.aa_exempt = false;
-  if (sh.aa_plus && sh.textured && p.nverts == 4) {
-    s32 sx0 = 512, sx1 = -1, sy0 = 512, sy1 = -1, s0 = 0x7FFF, s1 = -0x8000, t0 = 0x7FFF, t1 = -0x8000;
-    u32 axis_ok = 1; const s32 w0 = gx_->vertex(p.vtx[0]).pos[3];
-    for (u32 i = 0; i < 4; ++i) {
-      const Vertex& v = gx_->vertex(p.vtx[i]);
-      sx0 = std::min(sx0, v.sx); sx1 = std::max(sx1, v.sx); sy0 = std::min(sy0, v.sy); sy1 = std::max(sy1, v.sy);
-      s0 = std::min<s32>(s0, v.tex[0]); s1 = std::max<s32>(s1, v.tex[0]); t0 = std::min<s32>(t0, v.tex[1]); t1 = std::max<s32>(t1, v.tex[1]);
-      if (v.pos[3] != w0) axis_ok = 0;
-      if ((v.sx != sx0 && v.sx != sx1) || (v.sy != sy0 && v.sy != sy1)) axis_ok = 0;   // every corner on the rectangle
-    }
-    // 12.4 texture coordinates: 16 units per texel. A rectangle placed on
-    // pixel corners spans x1 - x0 pixels, one placed on pixel centres one
-    // more; either way it is one texel per pixel.
-    auto one_to_one = [](s32 span, s32 px) { return span == px * 16 || span == (px + 1) * 16; };
-    const bool fullscreen = sx0 == 0 && sx1 >= 255 && sy0 == 0 && sy1 >= 191;
-    if (axis_ok && !fullscreen && sx1 > sx0 && sy1 > sy0 && one_to_one(s1 - s0, sx1 - sx0) && one_to_one(t1 - t0, sy1 - sy0)) {
-      sh.aa_exempt = true;
-      sh.polyattr |= 0x1F00;   // full coverage on every pixel the quad writes (plot_translucent ORs these bits in)
-    }
-  }
   sh.always_fill = (sh.dispcnt & ((1 << 4) | (1 << 5))) || (sh.polyalpha < 31 && (sh.dispcnt & (1 << 3))) || sh.wireframe;
   // Provably all-opaque: alpha 31 + (decal, or a format whose texel alpha is
   // only 0-or-31); alpha-0 lanes never reach the resolve (span_shade narrows
   // the pass plane), so the opaque resolve skips alpha logic entirely.
   sh.opaque = sh.polyalpha == 31 && (!sh.textured || (sh.blendmode & 1) || (sh.fmt != 1 && sh.fmt != 6));
-  // Enhanced: a texture that can cut pixels out (colour 0 transparent in
-  // the paletted formats, fmt 5's transparent entries, fmt 7's bit 15, and
-  // the alpha-0 texels of A3I5 / A5I3, whose fully opaque texels plot as
-  // opaque pixels like the rest).
-  sh.cutout = sh.aa_plus && !sh.aa_exempt && !sh.shadow && sh.polyalpha == 31 && sh.textured &&
-              ((sh.fmt >= 2 && sh.fmt <= 4 && sh.alpha0 == 0) || sh.fmt == 5 || sh.fmt == 7 || sh.fmt == 1 || sh.fmt == 6);
-  sh.dsdx = sh.dtdx = sh.dsdy = sh.dtdy = 0;
-  if (sh.cutout) {
-    // The texcoord gradients across and down the screen from the plane
-    // through the first three vertices spanning an area (affine: near enough
-    // for sub-samples, and the same whatever else is staged).
-    const Vertex& v0 = gx_->vertex(p.vtx[0]);
-    for (u32 i = 1; i + 1 < p.nverts; ++i) {
-      const Vertex& v1 = gx_->vertex(p.vtx[i]); const Vertex& v2 = gx_->vertex(p.vtx[i + 1]);
-      const s64 x1 = v1.sx - v0.sx, y1 = v1.sy - v0.sy, x2 = v2.sx - v0.sx, y2 = v2.sy - v0.sy;
-      const s64 area = x1 * y2 - x2 * y1;
-      if (!area) continue;
-      const s64 s1 = v1.tex[0] - v0.tex[0], s2 = v2.tex[0] - v0.tex[0], t1 = v1.tex[1] - v0.tex[1], t2 = v2.tex[1] - v0.tex[1];
-      sh.dsdx = static_cast<s32>((s1 * y2 - s2 * y1) / area); sh.dtdx = static_cast<s32>((t1 * y2 - t2 * y1) / area);
-      sh.dsdy = static_cast<s32>((x1 * s2 - x2 * s1) / area); sh.dtdy = static_cast<s32>((x1 * t2 - x2 * t1) / area);
-      break;
-    }
-  }
   sh.mode = pick_depth_mode(p);
   sh.resolve = select_resolve(sh);
 }
@@ -1500,8 +1327,6 @@ void Renderer3D::span_texels(const Shade& sh, SpanBuf& sb, s32 ca, s32 cb) const
   u32* col = sb.tcol + off; u32* alp = sb.talp + off;
   // Only the live groups of the pass plane (see live_runs): a dead group's
   // texels are never read, by the shader (which skips it too) or the resolve.
-  std::memset(sb.gath, 0, sizeof sb.gath);
-  live_runs(sb.pass + off, n, [&](u32 k, u32 len) { for (u32 q = (off + k) / 16; q <= (off + k + len - 1) / 16; ++q) sb.gath[q] = 1; });
   if (const GatherNFn g = reinterpret_cast<GatherNFn>(sh.gather4)) {
     const prof::Counter c = sh.texels ? prof::C_TEX_FAST : (sh.fmt == 5 ? prof::C_TEX_SLOW_FMT5 : prof::C_TEX_FAST);
     live_runs(sb.pass + off, n, [&](u32 k, u32 len) {
@@ -1660,7 +1485,7 @@ void Renderer3D::rk_census(u64 kinds, u64 p8) {
   ++rk_groups_;
 }
 
-template <int mode, bool textured, int aa, bool opq>
+template <int mode, bool textured, bool aa, bool opq>
 [[gnu::always_inline]] inline void Renderer3D::resolve_span_vec(const Shade& sh, const SpanBuf& sb, s32 y, s32 xa, s32 xb, int part, int edge, s32 l_cov, s32 r_cov, s32& xcov) {
   // The profiling flag is read once per span, not once per eight-pixel
   // group: prof::add tests the global inside the innermost loop otherwise
@@ -1681,7 +1506,6 @@ template <int mode, bool textured, int aa, bool opq>
     else {
       push = true; cov_accum = cov_sel & static_cast<s32>(0x80000000u); if (!cov_accum) attr_base |= ((cov_sel & 0x1F) << 8);
     }
-    if constexpr (aa == 2) push = false;   // enhanced: coverage, but no layer underneath
   }
   const s32 cov_step = cov_sel & 0x3FF;
   const bool blend_on = sh.dispcnt & (1 << 3);
@@ -1695,13 +1519,13 @@ template <int mode, bool textured, int aa, bool opq>
   // destination has it) | dest coverage bits 0-4, byte 2 = polygon id | the
   // translucent bit, byte 3 = the destination's.
   const uint8x8_t pa0 = vdup_n_u8(static_cast<u8>(polyattr & 0xF0));
-  const uint8x8_t pa1 = vdup_n_u8(static_cast<u8>((polyattr >> 8) & 0xFF));   // bits 0-4: full coverage an AA-exempt quad stamps (enhanced), else 0
+  const uint8x8_t pa1 = vdup_n_u8(static_cast<u8>((polyattr >> 8) & 0xE0));
   const uint8x8_t pa2 = vdup_n_u8(static_cast<u8>((polyattr >> 24) | 0x40));
   const uint8x8_t pa2id = vand_u8(pa2, vdup_n_u8(0x7F));
   const uint8x8_t pa3id = vdup_n_u8(static_cast<u8>((polyattr >> 24) & 0x3F)), v40_8 = vdup_n_u8(0x40);
-  const uint8x8_t v7f8 = vdup_n_u8(0x7F), v3f8 = vdup_n_u8(0x3F);
+  const uint8x8_t v7f8 = vdup_n_u8(0x7F), v0f8 = vdup_n_u8(0x0F), v1f8 = vdup_n_u8(0x1F), v3f8 = vdup_n_u8(0x3F);
   const uint8x8_t one8 = vdup_n_u8(1), v32_8 = vdup_n_u8(32), zero8 = vdup_n_u8(0);
-  auto plot8 = [&](u32 base, const uint32x4_t* m, const uint8x8x4_t& src, const int32x4_t* z, const uint32x4_t* at) __attribute__((always_inline)) {
+  auto plot8 = [&](u32 base, const uint32x4_t* m, const uint8x8x4_t& src, const int32x4_t* z) __attribute__((always_inline)) {
     const uint8x8x4_t da = vld4_u8(ab + base * 4), dc = vld4_u8(cb + base * 4);
     uint8x8_t m8 = vmovn_u16(vcombine_u16(vmovn_u32(m[0]), vmovn_u32(m[1])));
     if (sh.shadow) {
@@ -1726,21 +1550,9 @@ template <int mode, bool textured, int aa, bool opq>
     oc.val[3] = vbsl_u8(m8, vbsl_u8(none, sa, vmax_u8(sa, dsta)), dc.val[3]);
     vst4_u8(cb + base * 4, oc);
     uint8x8x4_t oa;
-    oa.val[0] = vbsl_u8(m8, vorr_u8(pa0, vand_u8(da.val[0], vdup_n_u8(0x6F))), da.val[0]);   // dest edge flags and the enhanced stamps' fixed side (bits 5-6)
-    oa.val[1] = vbsl_u8(m8, vorr_u8(vand_u8(pa1, vorr_u8(da.val[1], v7f8)), vand_u8(da.val[1], v7f8)), da.val[1]);   // keeps coverage and bits 5-6 (blend direction)
-    if (at) {
-      if (cut_trace_) { static int trx = -2, try_ = -2; if (trx == -2) { trx = try_ = -1; if (const char* tr = std::getenv("DS_CUT_TRACE")) std::sscanf(tr, "%d,%d", &trx, &try_); }
-        if (y == try_ && trx >= static_cast<int>(base - row0) && trx < static_cast<int>(base - row0) + 8) { const int l = trx - static_cast<int>(base - row0); u32 av[8]; vst1q_u32(av, at[0]); vst1q_u32(av + 4, at[1]); u8 mm[8]; vst1_u8(mm, m8);
-          const u32 tl[6] = {2u, static_cast<u32>(part), static_cast<u32>(xcov), (av[l] >> 8) & 0x1F, mm[l], av[l]}; std::memcpy(trown_last_, tl, sizeof tl); } }
-      // Enhanced: the polygon's own outline lanes (coverage below full)
-      // carry their flags, coverage, axis and side, bit 7 marking them.
-      const uint8x8_t a0 = vmovn_u16(vcombine_u16(vmovn_u32(at[0]), vmovn_u32(at[1])));
-      const uint8x8_t a1 = vmovn_u16(vcombine_u16(vmovn_u32(vshrq_n_u32(at[0], 8)), vmovn_u32(vshrq_n_u32(at[1], 8))));
-      const uint8x8_t use = vand_u8(m8, vcgt_u8(vdup_n_u8(0x1F), vand_u8(a1, vdup_n_u8(0x1F))));
-      oa.val[0] = vbsl_u8(use, vorr_u8(vorr_u8(pa0, vand_u8(a0, vdup_n_u8(0x0F))), vorr_u8(vand_u8(da.val[0], vdup_n_u8(0x60)), vdup_n_u8(0x80))), oa.val[0]);
-      oa.val[1] = vbsl_u8(use, vorr_u8(vand_u8(pa1, vorr_u8(da.val[1], v7f8)), vand_u8(a1, v7f8)), oa.val[1]);
-    }
-    oa.val[2] = vbsl_u8(m8, vorr_u8(pa2, vand_u8(da.val[2], vdup_n_u8(0x80))), da.val[2]);   // dest bit 23 (diag tag)
+    oa.val[0] = vbsl_u8(m8, vorr_u8(pa0, vand_u8(da.val[0], v0f8)), da.val[0]);
+    oa.val[1] = vbsl_u8(m8, vorr_u8(vand_u8(pa1, vorr_u8(da.val[1], v7f8)), vand_u8(da.val[1], v1f8)), da.val[1]);
+    oa.val[2] = vbsl_u8(m8, pa2, da.val[2]);
     oa.val[3] = da.val[3];
     vst4_u8(ab + base * 4, oa);
     if (sh.polyattr_z) {
@@ -1758,18 +1570,6 @@ template <int mode, bool textured, int aa, bool opq>
     return static_cast<u64>(vget_lane_u64(vreinterpret_u64_u8(vmovn_u16(vcombine_u16(vmovn_u32(a), vmovn_u32(b)))), 0));
   };
   constexpr u64 HALF[2] = {0x00000000FFFFFFFFull, 0xFFFFFFFF00000000ull};
-  // Enhanced AA: same_edge() on four lanes (top attr, colour, depth vs the new
-  // edge's; the new edge's side is the span part's, attr_base & 3).
-  [[maybe_unused]] const uint32x4_t own_mask = vdupq_n_u32(0x3F400000u), own_id = vdupq_n_u32(polyattr & 0x3F000000u);
-  [[maybe_unused]] const uint32x4_t side = vdupq_n_u32(attr_base & 0x3);
-  [[maybe_unused]] auto same_edge_v = [&](uint32x4_t ta, uint32x4_t tc, int32x4_t tz, int32x4_t zz) __attribute__((always_inline)) {
-    const uint32x4_t live = vandq_u32(vtstq_u32(tc, vdupq_n_u32(0xFF000000u)), vtstq_u32(ta, side));
-    const uint32x4_t mine = vceqq_u32(vandq_u32(ta, own_mask), own_id);   // same id, not translucent
-    const int32x4_t thr = vaddq_s32(vshrq_n_s32(vminq_s32(tz, zz), 6), vdupq_n_s32(0x200));
-    return vandq_u32(vandq_u32(live, mine), vcleq_s32(vabdq_s32(tz, zz), thr));
-  };
-  [[maybe_unused]] auto cov_of = [](uint32x4_t at) __attribute__((always_inline)) { return vandq_u32(vshrq_n_u32(at, 8), vdupq_n_u32(0x1F)); };
-  [[maybe_unused]] auto with_cov = [](uint32x4_t at, uint32x4_t cov) __attribute__((always_inline)) { return vorrq_u32(vbicq_u32(at, vdupq_n_u32(0x1F00)), vshlq_n_u32(cov, 8)); };
   const bool untextured_passes = !textured && sh.polyalpha > sh.alpha_ref;
   if (!textured && !untextured_passes) return;   // alpha test fails for every pixel
   // Edge runs (1-3 pixels wide, handed separately by the three-part walk)
@@ -1824,7 +1624,7 @@ template <int mode, bool textured, int aa, bool opq>
           // bit 0 per lane: opaque, bit 1: translucent, bit 2: translucent with a pixel underneath;
           // bits 3 and 4: the same opaque / translucent, landing on the pixel underneath.
           // The under layer is dead without AA (dispcnt_), so bit 2 is off there.
-          if constexpr (aa == 1) {
+          if constexpr (aa) {
             mb[k] = vandq_u32(mt1[k], vtstq_u32(dstattr[k], vdupq_n_u32(0xF)));
             if (sh.shadow) mb[k] = vandq_u32(mb[k], vtstq_u32(pv[k], vdupq_n_u32(4)));   // no shadow under anti-aliased edges (stencil bit 1)
           }
@@ -1835,13 +1635,10 @@ template <int mode, bool textured, int aa, bool opq>
       const u64 kinds = lanes8(kv[0], kv[1]);
       if (pe) rk_census(kinds, p8);
       if (!kinds) return;
-      // One attribute word for both layers: coverage accumulates in x order
-      // over every opaque pixel of the span, whichever layer it lands on.
-      // Enhanced also reads it for a translucent polygon's outline lanes
-      // (their coverage is the ramp as the opaque plots before them left it).
-      uint32x4_t attr[2] = {vdupq_n_u32(attr_base), vdupq_n_u32(attr_base)};
-      const bool opaque_lanes = opq || (kinds & 0x0909090909090909ull);
-      if (opaque_lanes || (aa == 2 && part != 1 && !sh.shadow && (kinds & 0x0202020202020202ull))) {
+      if (opq || (kinds & 0x0909090909090909ull)) {
+        // One attribute word for both layers: coverage accumulates in x order
+        // over every opaque pixel of the span, whichever layer it lands on.
+        uint32x4_t attr[2] = {vdupq_n_u32(attr_base), vdupq_n_u32(attr_base)};
         if (aa && cov_accum) {
           u32 t0, t1 = 0;
           uint32x4_t pre[2];
@@ -1856,66 +1653,25 @@ template <int mode, bool textured, int aa, bool opq>
           }
           xcov += cov_step * static_cast<s32>(t0 + t1);
         }
-      }
-      if (opaque_lanes) {
-        if constexpr (aa == 2) {
-          if (sh.cutout) {
-            // Alpha-to-coverage (cutout_coverage): a cut edge inside the
-            // polygon takes its coverage, axis and fixed side, unless the pixel
-            // is on the polygon's own outline with hardware coverage.
-            for (u32 k = 0; k < NH; ++k) {
-              const uint32x4_t cc = vmovl_u16(vget_low_u16(vmovl_u8(vreinterpret_u8_u32(vdup_n_u32(*reinterpret_cast<const u32*>(sb.ccov + i + k * 4))))));
-              const uint32x4_t valid = vmvnq_u32(vceqq_u32(cc, vdupq_n_u32(0xFF)));
-              const uint32x4_t real = vandq_u32(vtstq_u32(attr[k], vdupq_n_u32(3)), vcltq_u32(vandq_u32(attr[k], vdupq_n_u32(0x1F00)), vdupq_n_u32(0x1000)));   // outline sliver: coverage below half
-              const uint32x4_t cut = vorrq_u32(vorrq_u32(vshlq_n_u32(vandq_u32(cc, vdupq_n_u32(0x1F)), 8), vshlq_n_u32(vandq_u32(cc, vdupq_n_u32(0x20)), 8)),
-                                               vorrq_u32(vandq_u32(cc, vdupq_n_u32(0x40)), vdupq_n_u32(0x24)));
-              attr[k] = vbslq_u32(vbicq_u32(valid, real), vorrq_u32(vbicq_u32(attr[k], vdupq_n_u32(0x1F00 | 0x2000 | 0x60)), cut), attr[k]);
-              if (cut_diag_) attr[k] = vorrq_u32(attr[k], vandq_u32(vmvnq_u32(valid), vdupq_n_u32(1u << 23)));
-            }
-          }
-        }
         for (u32 k = 0; k < NH; ++k) {
           const u32 ak = addr + k * 4, uk = under + k * 4;
           if (kinds & (0x0101010101010101ull & HALF[k])) {
             const uint32x4_t dstcol = vld1q_u32(&color_[ak]);
             const int32x4_t dstz = vld1q_s32(reinterpret_cast<const s32*>(&depth_[ak]));
-            uint32x4_t pm = mo1[k], at = attr[k];
-            if constexpr (aa == 2) {
-              // Enhanced: an edge over the same edge of its surface doesn't
-              // push it under; the larger coverage stands (see resolve_span,
-              // which leaves shadow polygons out of it).
-              if ((attr_base & 0x3) && !sh.shadow) {
-                const uint32x4_t same = vandq_u32(mo1[k], same_edge_v(dstattr[k], dstcol, dstz, z[k]));
-                pm = vbicq_u32(mo1[k], same);
-                at = vbslq_u32(same, with_cov(attr[k], vmaxq_u32(cov_of(dstattr[k]), cov_of(attr[k]))), attr[k]);
-              }
-            }
             if (push) {
-              vst1q_u32(&color_[uk], vbslq_u32(pm, dstcol, vld1q_u32(&color_[uk])));
-              vst1q_s32(reinterpret_cast<s32*>(&depth_[uk]), vbslq_s32(pm, dstz, vld1q_s32(reinterpret_cast<const s32*>(&depth_[uk]))));
-              vst1q_u32(&attr_[uk], vbslq_u32(pm, dstattr[k], vld1q_u32(&attr_[uk])));
+              vst1q_u32(&color_[uk], vbslq_u32(mo1[k], dstcol, vld1q_u32(&color_[uk])));
+              vst1q_s32(reinterpret_cast<s32*>(&depth_[uk]), vbslq_s32(mo1[k], dstz, vld1q_s32(reinterpret_cast<const s32*>(&depth_[uk]))));
+              vst1q_u32(&attr_[uk], vbslq_u32(mo1[k], dstattr[k], vld1q_u32(&attr_[uk])));
             }
             vst1q_s32(reinterpret_cast<s32*>(&depth_[ak]), vbslq_s32(mo1[k], z[k], dstz));
             vst1q_u32(&color_[ak], vbslq_u32(mo1[k], colour[k], dstcol));
-            vst1q_u32(&attr_[ak], vbslq_u32(mo1[k], at, dstattr[k]));
+            vst1q_u32(&attr_[ak], vbslq_u32(mo1[k], attr[k], dstattr[k]));
           }
           if constexpr (two) {
             if (kinds & (0x0808080808080808ull & HALF[k])) {
-              uint32x4_t m2k = mo2[k];
-              if constexpr (aa == 2) {
-                // Lost to the same edge of its surface: no under write, the
-                // larger coverage goes to the top pixel. Lanes are disjoint
-                // from mo1's, so the top read back here is the one just stored.
-                if (attr_base & 0x3) {
-                  const uint32x4_t ta = vld1q_u32(&attr_[ak]);
-                  const uint32x4_t same = vandq_u32(mo2[k], same_edge_v(ta, vld1q_u32(&color_[ak]), vld1q_s32(reinterpret_cast<const s32*>(&depth_[ak])), z[k]));
-                  vst1q_u32(&attr_[ak], vbslq_u32(same, with_cov(ta, vmaxq_u32(cov_of(ta), cov_of(attr[k]))), ta));
-                  m2k = vbicq_u32(mo2[k], same);
-                }
-              }
-              vst1q_s32(reinterpret_cast<s32*>(&depth_[uk]), vbslq_s32(m2k, z[k], vld1q_s32(reinterpret_cast<const s32*>(&depth_[uk]))));
-              vst1q_u32(&color_[uk], vbslq_u32(m2k, colour[k], vld1q_u32(&color_[uk])));
-              vst1q_u32(&attr_[uk], vbslq_u32(m2k, attr[k], vld1q_u32(&attr_[uk])));
+              vst1q_s32(reinterpret_cast<s32*>(&depth_[uk]), vbslq_s32(mo2[k], z[k], vld1q_s32(reinterpret_cast<const s32*>(&depth_[uk]))));
+              vst1q_u32(&color_[uk], vbslq_u32(mo2[k], colour[k], vld1q_u32(&color_[uk])));
+              vst1q_u32(&attr_[uk], vbslq_u32(mo2[k], attr[k], vld1q_u32(&attr_[uk])));
             }
           }
         }
@@ -1924,17 +1680,16 @@ template <int mode, bool textured, int aa, bool opq>
         if (kinds & 0x1212121212121212ull) {
           const uint8x8x4_t src = vld4_u8(reinterpret_cast<const u8*>(sb.col + i));
           if (kinds & 0x0202020202020202ull) {
-            static const bool no_trown = std::getenv("DS_NO_TROWN") != nullptr;
-            plot8(addr, mt1, src, z, (aa == 2 && part != 1 && !sh.shadow && !no_trown && sh.polyalpha >= 4) ? attr : nullptr);
-            if (kinds & 0x0404040404040404ull) plot8(under, mb, src, z, nullptr);
+            plot8(addr, mt1, src, z);
+            if (kinds & 0x0404040404040404ull) plot8(under, mb, src, z);
           }
-          if constexpr (two) { if (kinds & 0x1010101010101010ull) plot8(under, mt2, src, z, nullptr); }
+          if constexpr (two) { if (kinds & 0x1010101010101010ull) plot8(under, mt2, src, z); }
         }
       }
     };
     // Without AA the pre-pass never sets bit 1 (the under layer is dead), so
     // the two-layer group compiles out of that instantiation.
-    if (aa == 1 && (p8 & 0x0202020202020202ull)) {
+    if (aa && (p8 & 0x0202020202020202ull)) {
       uint32x4_t m2[2] = {v0, v0};
       for (u32 k = 0; k < NH; ++k) {
         const int32x4_t dz = vld1q_s32(reinterpret_cast<const s32*>(&depth_[under + k * 4]));
@@ -1954,33 +1709,10 @@ template <int mode, bool textured, int aa, bool opq>
       group(std::false_type{}, nullptr);
     }
   };
-  // Enhanced: the seam test of resolve_span (seam_of) on the edge parts --
-  // the destination is the other side's edge pixel of the same surface --
-  // decided from the old destination before the step and applied after it,
-  // so it covers lanes that lose the depth test and lanes that win alike.
-  [[maybe_unused]] auto seam_mask = [&](s32 x, s32 rem, uint32x4_t* sm) __attribute__((always_inline)) {
-    const u32 i = static_cast<u32>(x - sb.x0);
-    const uint16x8_t w = vmovl_u8(vld1_u8(sb.seam + i));   // seam_pass's per-lane flags
-    sm[0] = vtstq_u32(vmovl_u16(vget_low_u16(w)), vdupq_n_u32(0xFF));
-    sm[1] = vtstq_u32(compat::movl_high_u16(w), vdupq_n_u32(0xFF));
-    for (u32 k = 0; k < 2; ++k) sm[k] = vandq_u32(sm[k], vcltq_u32(vaddq_u32(lane, vdupq_n_u32(k * 4)), vdupq_n_u32(static_cast<u32>(rem))));
-  };
-  [[maybe_unused]] auto seam_apply = [&](s32 x, s32 rem, const uint32x4_t* sm) __attribute__((always_inline)) {
-    const u32 addr = row0 + static_cast<u32>(x);
-    for (u32 k = 0; k < 2; ++k) {
-      if (static_cast<s32>(k * 4) >= rem) break;
-      vst1q_u32(&attr_[addr + k * 4], vorrq_u32(vld1q_u32(&attr_[addr + k * 4]), vandq_u32(sm[k], vdupq_n_u32(0x1F00))));
-    }
-  };
   for (s32 x = xa; x < xb;) {
     const s32 rem = xb - x;
-    uint32x4_t sm[2] = {v0, v0};
-    [[maybe_unused]] const bool seams = aa == 2 && part != 1 && !sh.shadow;
-    if (seams) seam_mask(x, rem, sm);
-    if (rem <= 4) { step(std::integral_constant<u32, 1>{}, x, rem); }
-    else { step(std::integral_constant<u32, 2>{}, x, rem); }
-    if (seams) seam_apply(x, rem, sm);
-    x += rem <= 4 ? 4 : 8;
+    if (rem <= 4) { step(std::integral_constant<u32, 1>{}, x, rem); x += 4; }
+    else { step(std::integral_constant<u32, 2>{}, x, rem); x += 8; }
   }
   if (pe) prof::add(prof::C_RESOLVED_PIXELS, resolved_px);
 }
@@ -2082,25 +1814,11 @@ void Renderer3D::precompute_lines(Edge& e, s32 y0, s32 y1) {
     // the bottom-line test and the edge_params (which walk dx) are per scanline.
     const bool ybot_line = y == ybot1;
     const bool bottom_fill = ybot_line && e.next_sx_differ;
-    // Enhanced AA: the axis the edge run's outside lies on, as attr bit 13:
-    // an X-major edge crosses the row at a shallow angle, so the uncovered
-    // part of the pixel is above or below; a Y-major run's is left or right.
-    // Which side is decided in the final pass from the neighbours themselves.
-    // Bit 14: the outside is the up/left neighbour. A Y-major run's outside
-    // is beside it (left run: left); an X-major run's is above when the
-    // polygon lies below the edge (a left edge stepping left as y grows, a
-    // right edge stepping right), else below.
-    auto dir_of = [](const auto& s, bool left) -> u32 {
-      if (!s.xmajor) return left ? 0x4000u : 0u;
-      return 0x2000u | ((s.negative == left) ? 0x4000u : 0u);
-    };
-    u32 l_dir = 0, r_dir = 0;
     if (xstart > xend) {
       // Swapped edges: hardware walks them backwards, breaking X-major edge lengths/AA in a specific way.
       astart = 1;
       e.right.edge_params<true>(aa, &l_len, &l_cov);
       e.left.edge_params<true>(aa, &r_len, &r_cov);
-      if (aa_ == 2) { l_dir = dir_of(e.right, true); r_dir = dir_of(e.left, false); }
       std::swap(xstart, xend); std::swap(wl, wr); std::swap(zl, zr);
       if (always_fill) { l_fill = r_fill = true; }
       else {
@@ -2110,7 +1828,6 @@ void Renderer3D::precompute_lines(Edge& e, s32 y0, s32 y1) {
     } else {
       e.left.edge_params<false>(aa, &l_len, &l_cov);
       e.right.edge_params<false>(aa, &r_len, &r_cov);
-      if (aa_ == 2) { l_dir = dir_of(e.left, true); r_dir = dir_of(e.right, false); }
       // Fill rules: left edge fills when slope<=1, right when >1/vertical; negative
       // X-major edge's bottom pixel fills next to a flat bottom; overlapping edges fill.
       if (always_fill) { l_fill = r_fill = true; }
@@ -2129,7 +1846,6 @@ void Renderer3D::precompute_lines(Edge& e, s32 y0, s32 y1) {
     ls.xstart = xstart; ls.xend = xend;
     ls.wl = wl; ls.wr = wr; ls.zl = zl; ls.zr = zr;
     ls.l_len = l_len; ls.r_len = r_len; ls.l_cov = l_cov; ls.r_cov = r_cov;
-    ls.l_dir = l_dir; ls.r_dir = r_dir;
     ls.xa = x; ls.xb = std::min(xend + 1, 256);
     ls.yedge = yedge;
     ls.l_fill = l_fill; ls.r_fill = r_fill;
@@ -2177,26 +1893,12 @@ void Renderer3D::precompute_lines(Edge& e, s32 y0, s32 y1) {
     // the bottom-line test and the edge_params (which walk dx) are per scanline.
     const bool ybot_line = y == ybot1;
     const bool bottom_fill = ybot_line && e.next_sx_differ;
-    // Enhanced AA: the axis the edge run's outside lies on, as attr bit 13:
-    // an X-major edge crosses the row at a shallow angle, so the uncovered
-    // part of the pixel is above or below; a Y-major run's is left or right.
-    // Which side is decided in the final pass from the neighbours themselves.
-    // Bit 14: the outside is the up/left neighbour. A Y-major run's outside
-    // is beside it (left run: left); an X-major run's is above when the
-    // polygon lies below the edge (a left edge stepping left as y grows, a
-    // right edge stepping right), else below.
-    auto dir_of = [](const auto& s, bool left) -> u32 {
-      if (!s.xmajor) return left ? 0x4000u : 0u;
-      return 0x2000u | ((s.negative == left) ? 0x4000u : 0u);
-    };
-    u32 l_dir = 0, r_dir = 0;
     if (xstart > xend) {
       vlcur = e.vcr; vlnext = e.vnr;
       vrcur = e.vcl; vrnext = e.vnl;
       istart = &e.right.interp; iend = &e.left.interp;
       e.right.edge_params<true>(aa, &l_len, &l_cov);
       e.left.edge_params<true>(aa, &r_len, &r_cov);
-      if (aa_ == 2) { l_dir = dir_of(e.right, true); r_dir = dir_of(e.left, false); }
       std::swap(xstart, xend); std::swap(wl, wr); std::swap(zl, zr);
       if (always_fill) { l_fill = r_fill = true; }
       else {
@@ -2209,7 +1911,6 @@ void Renderer3D::precompute_lines(Edge& e, s32 y0, s32 y1) {
       istart = &e.left.interp; iend = &e.right.interp;
       e.left.edge_params<false>(aa, &l_len, &l_cov);
       e.right.edge_params<false>(aa, &r_len, &r_cov);
-      if (aa_ == 2) { l_dir = dir_of(e.left, true); r_dir = dir_of(e.right, false); }
       if (always_fill) { l_fill = r_fill = true; }
       else {
         l_fill = e.nx_l || (bottom_fill && e.lxm) ||
@@ -2226,7 +1927,6 @@ void Renderer3D::precompute_lines(Edge& e, s32 y0, s32 y1) {
     ls.xstart = xstart; ls.xend = xend;
     ls.wl = wl; ls.wr = wr; ls.zl = zl; ls.zr = zr;
     ls.l_len = l_len; ls.r_len = r_len; ls.l_cov = l_cov; ls.r_cov = r_cov;
-    ls.l_dir = l_dir; ls.r_dir = r_dir;
     ls.xa = x; ls.xb = std::min(xend + 1, 256);
     ls.yedge = yedge;
     ls.l_fill = l_fill; ls.r_fill = r_fill;
@@ -2292,7 +1992,7 @@ void Renderer3D::stage_line(Edge& e, s32 y, const LineSpan& ls) {
     span_stage(sb, ls.xstart, ls.xend, xa, xb, ls.wl, ls.wr, ls.zl, ls.zr, p.wbuffer, nullptr, nullptr, false, off);
 #endif
     const u32 row = row_of(y) + 1 + xa;
-    const u32 under_off = under_layer_ ? RSIZE : 0;
+    const u32 under_off = (sh.dispcnt & (1u << 4)) ? RSIZE : 0;
     u32 r;
     if (sh.shadow) {
       // Shadow polygons test against whichever pixel their stencil names. The
@@ -2317,7 +2017,7 @@ void Renderer3D::stage_line(Edge& e, s32 y, const LineSpan& ls) {
 
   SpanJob& j = jobs_[njobs_++];
   j.y = y; j.ca = ca; j.cb = cb; j.off = off + static_cast<u32>(ca - xa);
-  j.xdraw = xa; j.yedge = ls.yedge; j.l_cov = ls.l_cov; j.r_cov = ls.r_cov; j.l_dir = ls.l_dir; j.r_dir = ls.r_dir;
+  j.xdraw = xa; j.yedge = ls.yedge; j.l_cov = ls.l_cov; j.r_cov = ls.r_cov;
   j.lim0 = std::min({ls.xstart + ls.l_len, ls.xend + 1, 256});
   j.lim1 = std::min({ls.xend - ls.r_len + 1, ls.xend + 1, 256});
   j.lim2 = std::min(ls.xend + 1, 256);
@@ -2345,23 +2045,8 @@ Renderer3D::ResolveFn Renderer3D::select_resolve(const Shade& sh) {
     DS_V(0), DS_V(1), DS_V(2), DS_V(3)
 #undef DS_V
   };
-  // Enhanced AA: its own instantiations, so accurate's stay as they are.
-  static constexpr ResolveFn kResolveVec2[4][2][2] = {
-#define DS_V2(m) {{&Renderer3D::resolve_batch_vec<m, false, 2, false>, &Renderer3D::resolve_batch_vec<m, false, 2, true>},  \
-                  {&Renderer3D::resolve_batch_vec<m, true, 2, false>,  &Renderer3D::resolve_batch_vec<m, true, 2, true>}}
-    DS_V2(0), DS_V2(1), DS_V2(2), DS_V2(3)
-#undef DS_V2
-  };
-  if (sh.aa_exempt) return sh.vec ? kResolveVec[sh.mode][sh.textured][0][sh.opaque] : kResolve[sh.mode][sh.textured][0][sh.shadow];   // enhanced, 3D as 2D: the AA-off kernels
-  if (sh.vec) return sh.aa_plus ? kResolveVec2[sh.mode][sh.textured][sh.opaque] : kResolveVec[sh.mode][sh.textured][(sh.dispcnt >> 4) & 1][sh.opaque];
+  if (sh.vec) return kResolveVec[sh.mode][sh.textured][(sh.dispcnt >> 4) & 1][sh.opaque];
 #endif
-  static constexpr ResolveFn kResolve2[4][2][2] = {
-#define DS_R2(m) {{&Renderer3D::resolve_batch<m, false, 2, false>, &Renderer3D::resolve_batch<m, false, 2, true>},  \
-                  {&Renderer3D::resolve_batch<m, true, 2, false>,  &Renderer3D::resolve_batch<m, true, 2, true>}}
-    DS_R2(0), DS_R2(1), DS_R2(2), DS_R2(3)
-#undef DS_R2
-  };
-  if (sh.aa_plus) return kResolve2[sh.mode][sh.textured][sh.shadow];
   return kResolve[sh.mode][sh.textured][(sh.dispcnt >> 4) & 1][sh.shadow];
 }
 
@@ -2381,17 +2066,17 @@ template <typename Range>
     x = xlimit;
   };
   if (j.l_cov & static_cast<s32>(0x80000000u)) { xcov = (j.l_cov >> 12) & 0x3FF; if (xcov == 0x3FF) xcov = 0; }
-  if (!j.l_fill) x = j.lim0; else draw_span(j.lim0, 0, j.yedge | 0x1 | static_cast<int>(j.l_dir));
+  if (!j.l_fill) x = j.lim0; else draw_span(j.lim0, 0, j.yedge | 0x1);
   if (j.wf_skip) x = std::max(x, j.lim1); else draw_span(j.lim1, 1, j.yedge);
   if (j.r_cov & static_cast<s32>(0x80000000u)) { xcov = (j.r_cov >> 12) & 0x3FF; if (xcov == 0x3FF) xcov = 0; }
-  if (j.r_fill) draw_span(j.lim2, 2, j.yedge | 0x2 | static_cast<int>(j.r_dir));
+  if (j.r_fill) draw_span(j.lim2, 2, j.yedge | 0x2);
 }
 
 // One call per batch instead of per span. The range body inlines into the
 // job loop, so the kernel's 272-byte frame, its twelve register-pair saves
 // and every piece of setup that depends only on the Shade are paid once for
 // the whole batch and lifted out of the loop by the compiler.
-template <int mode, bool textured, int aa, bool shadow>
+template <int mode, bool textured, bool aa, bool shadow>
 void Renderer3D::resolve_batch(const Shade& sh, const SpanJob* jobs, u32 n) {
   const SpanBuf& sb = spanbuf_;
   for (u32 k = 0; k < n; ++k)
@@ -2401,7 +2086,7 @@ void Renderer3D::resolve_batch(const Shade& sh, const SpanJob* jobs, u32 n) {
 }
 
 #if DSPERATE_NEON
-template <int mode, bool textured, int aa, bool opq>
+template <int mode, bool textured, bool aa, bool opq>
 void Renderer3D::resolve_batch_vec(const Shade& sh, const SpanJob* jobs, u32 n) {
   const SpanBuf& sb = spanbuf_;
   rk_or_ = 0; rk_mixed_ = false; rk_groups_ = 0;
@@ -2427,267 +2112,8 @@ void Renderer3D::resolve_batch_vec(const Shade& sh, const SpanJob* jobs, u32 n) 
 // span: span_texels/span_shade called once per batch (up to BATCH_PX pixels)
 // instead of per span, amortising their setup. Safe across one polygon's
 // spans since they lie on distinct scanlines.
-// Enhanced AA, alpha-to-coverage: the hardware has no coverage for the edge
-// a cut-out texture makes inside a polygon (foliage, fences, sprites on
-// quads), the largest class of edges it leaves jagged. For every opaque
-// texel of a cut-out polygon next to a transparent one -- along the span,
-// or on the batch's lines above and below at the same x -- the texture's
-// alpha is sampled on a 4x4 grid across the pixel (texcoords stepped by
-// the span's ds/dx and the neighbouring line's ds/dy) and the covered share
-// becomes the pixel's coverage; the axis and side come from which half of
-// the grid lost more samples. A pixel on the polygon's own outline keeps
-// the hardware's coverage (the resolve checks that).
-void Renderer3D::cutout_coverage(const Shade& sh, SpanBuf& sb, const SpanJob* jobs, u32 n) {
-  const u32 total = (batch_px_ + 15) & ~15u;
-  std::memset(sb.ccov, 0xFF, total);
-  // Without the vector stages (the portable build, and the scalar resolves)
-  // no texel alpha has been gathered: sample it here for the batch's pixels.
-  if (!sh.vec) {
-    // The same groups the vector gather covers (live_runs over the depth
-    // candidates), so both paths see the same transparent neighbours.
-    std::memset(sb.gath, 0, sizeof sb.gath);
-    live_runs(sb.pass, total, [&](u32 k, u32 len) { for (u32 q = k / 16; q <= (k + len - 1) / 16; ++q) sb.gath[q] = 1; });
-    for (u32 j = 0; j < n; ++j) {
-      const SpanJob& job = jobs[j];
-      for (s32 x = job.ca; x < job.cb; ++x) { const s32 i = static_cast<s32>(job.off) + (x - job.ca); if (sb.gath[i / 16]) texture_sample(sh, sb.sc[i], sb.tc[i], &sb.talp[i]); }
-    }
-  }
-  // Texel alpha for arrays of texcoords: the batch gather where there is
-  // one (NEON), the scalar sampler otherwise; the two agree on every texel.
-  // Arrays carry 16 entries of slack past `cnt`.
-  auto sample_n = [&](const s16* s, const s16* t, u32 cnt, u32* alpha) {
-#if DSPERATE_NEON
-    if (const GatherNFn g = reinterpret_cast<GatherNFn>(sh.gather4)) { alignas(16) u32 col[BATCH_CAP + 16]; g(sh, s, t, (cnt + 3) & ~3u, col, alpha); return; }
-#endif
-    for (u32 k = 0; k < cnt; ++k) texture_sample(sh, s[k], t[k], &alpha[k]);
-  };
-  // Texels were gathered for the live sixteen-pixel groups only (live_runs);
-  // a transparent neighbour is a gathered lane with zero alpha.
-  auto gathered = [&](s32 i) { return sb.gath[i / 16] != 0; };
-  auto transparent = [&](s32 i) { return i >= 0 && gathered(i) && !sb.talp[i]; };
-  // Nothing here reads another line: what a batch holds of a polygon's other
-  // lines depends on where the band's lines start, and the result must not.
-  const s32 dsx = sh.dsdx, dtx = sh.dtdx, dsy = sh.dsdy, dty = sh.dtdy;
-  // DS_CUT_TRACE=x,y: the cut-out decision at one pixel (NEON against scalar checks).
-  static int trx = -2, try_ = -2;
-  if (trx == -2) { trx = try_ = -1; if (const char* t = std::getenv("DS_CUT_TRACE")) std::sscanf(t, "%d,%d", &trx, &try_); }
-
-  // A batch whose gathered texels are all opaque is a polygon of a cut-out
-  // format whose texture has no hole where it is drawn (most terrain): no
-  // cut edge to find, and the vertical samples below would be the cost of a
-  // second texel gather for nothing. A hole crossing the batch only between
-  // its lines is missed, which leaves that edge as the hardware draws it.
-  // Only the spans' own lanes of gathered groups carry a valid alpha on
-  // every build (the vector gather reads whole groups, the scalar sampler
-  // only the spans), so only those decide.
-  //
-  // Pass 1: every drawn opaque texel. A transparent texel beside it along
-  // the span (the gathered neighbours) makes it a candidate at once; the
-  // rest are tested above and below by two texture samples each, in bulk.
-  // A neighbouring line's texcoord often lands in the pixel's own texel
-  // (textures magnified past 1:1, and the ds/dy of a screen-aligned quad):
-  // that texel is the opaque one already known, so only the samples whose
-  // texel differs are taken (the texel is s >> 4, t >> 4 of the 16-bit
-  // coordinate, before the wrap).
-  // Sample directions: the four corners of the 4x4 grid pass 2 samples
-  // (3/8 of a pixel out on both axes), so whatever hole the grid could
-  // find also makes the pixel a candidate -- a spoke's hole lies between
-  // the neighbouring pixel centres, which a one-pixel step misses.
-  constexpr int kDirs = 4;
-  const s32 doff[kDirs][2] = {{(-3 * dsx - 3 * dsy) / 8, (-3 * dtx - 3 * dty) / 8}, {(3 * dsx - 3 * dsy) / 8, (3 * dtx - 3 * dty) / 8},
-                              {(-3 * dsx + 3 * dsy) / 8, (-3 * dtx + 3 * dty) / 8}, {(3 * dsx + 3 * dsy) / 8, (3 * dtx + 3 * dty) / 8}};
-  const bool denab[kDirs] = {true, true, true, true};
-  const u8 dside[kDirs] = {0x40, 0x00, 0x40, 0x00};   // the transparent side (left / right), for the no-grid variant
-  alignas(16) s16 sv[kDirs][BATCH_CAP + 16], tv[kDirs][BATCH_CAP + 16];
-  alignas(16) u32 av[kDirs][BATCH_CAP + 16];
-  s16 vidx[kDirs][BATCH_CAP], cand[BATCH_CAP], candx[BATCH_CAP], candy[BATCH_CAP];
-  u8 mark[BATCH_CAP], cdir[BATCH_CAP];   // cdir: the candidate's side bits when no grid is sampled (0x20 vertical, 0x40 negative)
-  u32 nv[kDirs] = {}, nc = 0;
-  std::memset(mark, 0, total);
-  auto step = [&](s16 v, s32 dv) { return static_cast<s16>(v + dv); };
-  bool scalar = trx >= 0;
-#if DSPERATE_NEON
-  if (!scalar) {
-    // Sixteen lanes at a time: tz = transparent texel, tr = tz in a gathered
-    // group (a valid transparent neighbour). tr has a zeroed lane on either
-    // side of the batch so the neighbour loads never leave it.
-    alignas(16) u8 tz[BATCH_CAP + 16], trbuf[16 + BATCH_CAP + 16];
-    u8* const tr = trbuf + 16;
-    std::memset(trbuf, 0, 16); std::memset(tr + total, 0, 16);
-    const uint32x4_t zero = vdupq_n_u32(0);
-    for (u32 i = 0; i < total; i += 16) {
-      const uint16x8_t lo = vcombine_u16(vmovn_u32(vceqq_u32(vld1q_u32(sb.talp + i), zero)), vmovn_u32(vceqq_u32(vld1q_u32(sb.talp + i + 4), zero)));
-      const uint16x8_t hi = vcombine_u16(vmovn_u32(vceqq_u32(vld1q_u32(sb.talp + i + 8), zero)), vmovn_u32(vceqq_u32(vld1q_u32(sb.talp + i + 12), zero)));
-      const uint8x16_t z = vcombine_u8(vmovn_u16(lo), vmovn_u16(hi));
-      vst1q_u8(tz + i, z);
-      vst1q_u8(tr + i, vandq_u8(z, vdupq_n_u8(sb.gath[i / 16] ? 0xFF : 0)));
-    }
-    static const u8 kIdx[16] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
-    static const u8 kBit[16] = {1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128};
-    const uint8x16_t idx = vld1q_u8(kIdx), bit = vld1q_u8(kBit);
-    auto bits = [&](uint8x16_t m) -> u32 {
-      const uint64x2_t w = vpaddlq_u32(vpaddlq_u16(vpaddlq_u8(vandq_u8(m, bit))));
-      return static_cast<u32>(vgetq_lane_u64(w, 0)) | (static_cast<u32>(vgetq_lane_u64(w, 1)) << 8);
-    };
-    bool hole = false;
-    for (u32 j = 0; j < n && !hole; ++j) {
-      const SpanJob& job = jobs[j];
-      const u32 len = static_cast<u32>(job.cb - job.ca);
-      uint8x16_t acc = vdupq_n_u8(0);
-      for (u32 k = 0; k < len; k += 16) {
-        uint8x16_t t = vld1q_u8(tr + job.off + k);
-        if (len - k < 16) t = vandq_u8(t, vcltq_u8(idx, vdupq_n_u8(static_cast<u8>(len - k))));
-        acc = vorrq_u8(acc, t);
-      }
-      hole = compat::maxv_u8(acc) != 0;
-    }
-    if (!hole) return;
-    int16x8_t vds[kDirs], vdt[kDirs];
-    for (int d = 0; d < kDirs; ++d) { vds[d] = vdupq_n_s16(static_cast<s16>(doff[d][0])); vdt[d] = vdupq_n_s16(static_cast<s16>(doff[d][1])); }
-    for (u32 j = 0; j < n; ++j) {
-      const SpanJob& job = jobs[j];
-      const u32 len = static_cast<u32>(job.cb - job.ca);
-      for (u32 k = 0; k < len; k += 16) {
-        const u32 i = job.off + k;
-        const uint8x16_t inspan = len - k < 16 ? vcltq_u8(idx, vdupq_n_u8(static_cast<u8>(len - k))) : vdupq_n_u8(0xFF);
-        uint8x16_t drawn = vandq_u8(vbicq_u8(vmvnq_u8(vceqq_u8(vld1q_u8(sb.pass + i), vdupq_n_u8(0))), vld1q_u8(tz + i)), inspan);
-        if (compat::maxv_u8(drawn) == 0) continue;
-        uint8x16_t left = vld1q_u8(tr + i - 1), right = vld1q_u8(tr + i + 1);
-        if (k == 0) left = vandq_u8(left, vmvnq_u8(vceqq_u8(idx, vdupq_n_u8(0))));               // no neighbour before ca
-        if (len - k <= 16) right = vandq_u8(right, vcltq_u8(idx, vdupq_n_u8(static_cast<u8>(len - k - 1))));   // none past cb
-        const uint8x16_t horiz = vandq_u8(drawn, vorrq_u8(left, right));
-        const u32 lbits = bits(left);
-        for (u32 m = bits(horiz); m; m &= m - 1) {
-          const u32 l = static_cast<u32>(__builtin_ctz(m));
-          cand[nc] = static_cast<s16>(i + l); candx[nc] = -1; candy[nc] = -1; cdir[nc] = (lbits >> l) & 1 ? 0x40 : 0; ++nc;
-        }
-        const uint8x16_t rest = vbicq_u8(drawn, horiz);
-        if (compat::maxv_u8(rest) == 0) continue;
-        const int16x8_t s0a = vld1q_s16(sb.sc + i), s0b = vld1q_s16(sb.sc + i + 8), t0a = vld1q_s16(sb.tc + i), t0b = vld1q_s16(sb.tc + i + 8);
-        for (int d = 0; d < kDirs; ++d) {
-          if (!denab[d]) continue;
-          const int16x8_t s1a = vaddq_s16(s0a, vds[d]), s1b = vaddq_s16(s0b, vds[d]);
-          const int16x8_t t1a = vaddq_s16(t0a, vdt[d]), t1b = vaddq_s16(t0b, vdt[d]);
-          const uint16x8_t samea = vandq_u16(vceqq_s16(vshrq_n_s16(s1a, 4), vshrq_n_s16(s0a, 4)), vceqq_s16(vshrq_n_s16(t1a, 4), vshrq_n_s16(t0a, 4)));
-          const uint16x8_t sameb = vandq_u16(vceqq_s16(vshrq_n_s16(s1b, 4), vshrq_n_s16(s0b, 4)), vceqq_s16(vshrq_n_s16(t1b, 4), vshrq_n_s16(t0b, 4)));
-          const uint8x16_t need = vbicq_u8(rest, vcombine_u8(vmovn_u16(samea), vmovn_u16(sameb)));
-          for (u32 m = bits(need); m; m &= m - 1) {
-            const u32 l = static_cast<u32>(__builtin_ctz(m)), q = i + l;
-            sv[d][nv[d]] = step(sb.sc[q], doff[d][0]); tv[d][nv[d]] = step(sb.tc[q], doff[d][1]); vidx[d][nv[d]] = static_cast<s16>(q); ++nv[d];
-          }
-        }
-      }
-    }
-  } else
-#endif
-  {
-    bool hole = false;
-    for (u32 j = 0; j < n && !hole; ++j) {
-      const SpanJob& job = jobs[j];
-      for (s32 x = job.ca; x < job.cb; ++x) { const s32 i = static_cast<s32>(job.off) + (x - job.ca); if (gathered(i) && !sb.talp[i]) { hole = true; break; } }
-    }
-    if (!hole) return;
-    for (u32 j = 0; j < n; ++j) {
-      const SpanJob& job = jobs[j];
-      for (s32 x = job.ca; x < job.cb; ++x) {
-        const s32 i = static_cast<s32>(job.off) + (x - job.ca);
-        if (!sb.pass[i] || !sb.talp[i]) continue;   // not drawn, or a transparent texel itself
-        const s32 il = x > job.ca ? i - 1 : -1, ir = x + 1 < job.cb ? i + 1 : -1;
-        if (transparent(il) || transparent(ir)) { cand[nc] = static_cast<s16>(i); candx[nc] = static_cast<s16>(x); candy[nc] = static_cast<s16>(job.y); cdir[nc] = transparent(il) ? 0x40 : 0; ++nc; continue; }
-        const s16 s0 = sb.sc[i], t0 = sb.tc[i];
-        for (int d = 0; d < kDirs; ++d) {
-          if (!denab[d]) continue;
-          const s16 s1 = step(s0, doff[d][0]), t1 = step(t0, doff[d][1]);
-          if ((s1 >> 4) == (s0 >> 4) && (t1 >> 4) == (t0 >> 4)) continue;
-          sv[d][nv[d]] = s1; tv[d][nv[d]] = t1; vidx[d][nv[d]] = static_cast<s16>(i); ++nv[d];
-        }
-        if (x == trx && job.y == try_) std::fprintf(stderr, "cut-trace frame %llu (%d,%d) vec %d pass %u talp %u il %d(%u,g%d) ir %d(%u,g%d) dsx %d dtx %d dsy %d dty %d s %d t %d fmt %u\n", (unsigned long long)frame_tag_, x, job.y, (int)sh.vec, sb.pass[i], sb.talp[i], il, il >= 0 ? sb.talp[il] : 0, il >= 0 ? (int)gathered(il) : -1, ir, ir >= 0 ? sb.talp[ir] : 0, ir >= 0 ? (int)gathered(ir) : -1, dsx, dtx, dsy, dty, sb.sc[i], sb.tc[i], sh.fmt);
-      }
-    }
-  }
-  (void)scalar;
-  for (int d = 0; d < kDirs; ++d) {
-    if (!nv[d]) continue;
-    sample_n(sv[d], tv[d], nv[d], av[d]);
-    for (u32 k = 0; k < nv[d]; ++k)
-      if (!av[d][k] && !mark[vidx[d][k]]) { mark[vidx[d][k]] = 1; cand[nc] = vidx[d][k]; candx[nc] = -1; candy[nc] = -1; cdir[nc] = dside[d]; ++nc; }
-  }
-  if (!nc) return;
-  // DS_CUT_SOFT=2 / DS_ALL_SOFT=2: no grid. Every candidate is half covered
-  // with the outside toward the transparent neighbour that found it (the
-  // present-time resample ramps it); this is the cheap variant to compare.
-  static const bool nogrid = [] { const char* a = std::getenv("DS_CUT_SOFT"); const char* b = std::getenv("DS_ALL_SOFT"); return (a && std::atoi(a) == 2) || (b && std::atoi(b) == 2); }();
-  if (nogrid) {
-    for (u32 c = 0; c < nc; ++c) sb.ccov[cand[c]] = static_cast<u8>(15 | cdir[c]);
-    return;
-  }
-
-  // Pass 2: the candidates' 4x4 grids, sampled in chunks.
-  constexpr u32 kChunk = 32;   // candidates per gather: 512 samples
-  alignas(16) s16 ss[kChunk * 16 + 16], tt[kChunk * 16 + 16];
-  alignas(16) u32 aa[kChunk * 16 + 16];
-  for (u32 c0 = 0; c0 < nc; c0 += kChunk) {
-    const u32 cn = std::min(kChunk, nc - c0);
-    for (u32 c = 0; c < cn; ++c) {
-      const s32 i = cand[c0 + c];
-      for (int v = 0; v < 4; ++v)
-        for (int u = 0; u < 4; ++u) {
-          const s32 fu = 2 * u - 3, fv = 2 * v - 3;   // (u + 0.5) / 4 - 0.5 in eighths
-          ss[c * 16 + v * 4 + u] = static_cast<s16>(sb.sc[i] + (dsx * fu + dsy * fv) / 8);
-          tt[c * 16 + v * 4 + u] = static_cast<s16>(sb.tc[i] + (dtx * fu + dty * fv) / 8);
-        }
-    }
-    sample_n(ss, tt, cn * 16, aa);
-    for (u32 c = 0; c < cn; ++c) {
-      const s32 i = cand[c0 + c];
-      const u32* a = aa + c * 16;
-      int col[4] = {0, 0, 0, 0}, row[4] = {0, 0, 0, 0}, covered = 0;
-      for (int v = 0; v < 4; ++v)
-        for (int u = 0; u < 4; ++u)
-          if (a[v * 4 + u]) { ++covered; ++col[u]; ++row[v]; }
-      if (covered >= 16) continue;
-      const int ax = (col[0] + col[1]) - (col[2] + col[3]), ay = (row[0] + row[1]) - (row[2] + row[3]);
-      // Near a diagonal the two halves tie and the axis would flip from
-      // pixel to pixel (a comb along the edge): the horizontal axis wins
-      // unless the vertical split is clearly stronger.
-      const bool vertical = (ay < 0 ? -ay : ay) > (ax < 0 ? -ax : ax) + 2;
-      const bool neg = vertical ? ay < 0 : ax < 0;   // the less covered half is the outside
-      const u32 cov = covered ? static_cast<u32>(covered * 2 - 1) : 0u;
-      sb.ccov[i] = static_cast<u8>(cov | (vertical ? 0x20 : 0) | (neg ? 0x40 : 0));
-      if (trx >= 0 && candx[c0 + c] == trx && candy[c0 + c] == try_) std::fprintf(stderr, "cut-trace   covered %d ccov %02x\n", covered, sb.ccov[i]);
-    }
-  }
-}
-
-// Enhanced: the seam test (seam_of) for every lane of the batch's edge runs,
-// before the resolves, so both resolves see the same lanes whatever a batch
-// or a step skips: a lane whose destination is the other side's edge of the
-// same surface gets full coverage there and then, and the resolves give a
-// pixel they write in its place full coverage too (sb.seam).
-void Renderer3D::seam_pass(const Shade& sh, const SpanJob* jobs, u32 n) {
-  SpanBuf& sb = spanbuf_;
-  const u32 polyattr = sh.polyattr;
-  for (u32 k = 0; k < n; ++k)
-    walk_span(jobs[k], [&](s32 y, s32 lo, s32 hi, int part, int edge, s32, s32, s32&) {
-      if (part == 1) return;
-      const u32 row = row_of(y) + 1;
-      for (s32 x = lo; x < hi; ++x) {
-        const u32 i = static_cast<u32>(x - sb.x0), addr = row + static_cast<u32>(x), da = attr_[addr];
-        const u32 a = da & 3, b = static_cast<u32>(edge) & 3;
-        bool seam = ((a == 1 && b == 2) || (a == 2 && b == 1)) && ((da ^ polyattr) & 0x3F000000u) == 0 && !(da & (1u << 22)) &&
-                    same_surface(static_cast<s32>(depth_[addr]), sb.z[i]);
-        sb.seam[i] = seam ? 1 : 0;
-        if (seam) attr_[addr] = da | 0x1F00u;
-        if (cut_trace_) { static int trx = -2, try_ = -2; if (trx == -2) { trx = try_ = -1; if (const char* tr = std::getenv("DS_CUT_TRACE")) std::sscanf(tr, "%d,%d", &trx, &try_); }
-          if (x == trx && y == try_) { const u32 tl[6] = {3u, static_cast<u32>(part), da, depth_[addr], static_cast<u32>(sb.z[i]), static_cast<u32>(seam) | (static_cast<u32>(edge) & 0xF) << 8 | (sb.pass[i] ? 0x10000u : 0u)}; std::memcpy(seam_last_, tl, sizeof tl); ++seam_n_; } }
-      }
-    });
-}
-
 void Renderer3D::flush_batch(const Shade& sh) {
   if (!njobs_) { batch_px_ = 0; return; }
-  static const bool no_seam = std::getenv("DS_NO_SEAM") != nullptr;
-  if (aa_ == 2 && sh.aa_plus && !sh.shadow && !no_seam) seam_pass(sh, jobs_.data(), njobs_);
   prof::add(prof::C_BATCHES, 1); prof::add(prof::C_BATCH_SPANS, njobs_); prof::add(prof::C_BATCH_PX, batch_px_);
 #if DSPERATE_NEON
   if (sh.vec) {
@@ -2732,9 +2158,6 @@ void Renderer3D::flush_batch(const Shade& sh) {
     }
   }
 #endif
-  static const bool no_cut = std::getenv("DS_AA_NOCUT") != nullptr;   // DS_AA_NOCUT=1: enhanced without alpha-to-coverage
-  if (sh.cutout && !no_cut) cutout_coverage(sh, spanbuf_, jobs_.data(), njobs_);
-  else if (sh.cutout) std::memset(spanbuf_.ccov, 0xFF, (batch_px_ + 15) & ~15u);
   (this->*sh.resolve)(sh, jobs_.data(), njobs_);
   njobs_ = 0; batch_px_ = 0;
 }
@@ -2840,376 +2263,11 @@ u32 Renderer3D::fog_density(u32 addr) const {
   return d;
 }
 
-
-// ---- DS_AA_DEBUG: where the 3D anti-aliasing leaves edges jagged ----------
-// Headless diagnostic for the enhanced AA work. DS AA is forced on and every
-// 3D pixel is classed by what the AA blend does with it; the class is painted
-// over the picture (the rest dimmed) and the counts are printed at exit.
-//   1: edges the blend handles, and the misses -- a surface stacked on itself
-//      (red), unflagged boundaries (yellow), cut-out texture outlines (magenta)
-//   2: every 3D-on-3D edge, by what makes it one (id change, depth jump,
-//      crease, cut-out, translucent on top)
-// Frames are not the game's picture while it is set: never quote a hash or a
-// timing from such a run.
-bool aa_debug() { static const bool on = std::getenv("DS_AA_DEBUG") != nullptr; return on; }
-// DS_AA_DEBUG=2: every potential 3D-on-3D edge instead, by what makes it one.
-static int aa_debug_mode() { static const int m = [] { const char* e = std::getenv("DS_AA_DEBUG"); return e ? std::atoi(e) : 0; }(); return m; }
-
-namespace {
-enum AaClass : u8 { AC_NONE, AC_CLEAR, AC_BLEND, AC_SAME, AC_BOUND, AC_CUT, AC_SAME_IN,
-                   E_COVERED, E_ID, E_DEPTH, E_CREASE, E_CUT, E_TRANS, AC_COUNT };
-constexpr const char* kAaClassNames[AC_COUNT] = {"", "edge over clear (alpha blend)", "edge blended with another surface",
-  "edge blended with its own surface (DS miss, 2a)", "boundary without edge flags (DS miss, 2b)", "cut-out texture boundary (DS miss, 1)", "edge blended with its own surface inside the mesh (harmless)",
-  "3D-3D edge the DS blends", "3D-3D edge: polygon id change, unblended", "3D-3D edge: same id, depth jump, unblended",
-  "3D-3D edge: depth crease (surfaces meeting at an angle), unblended", "3D-3D edge: cut-out texture", "3D-3D edge: translucent on top"};
-constexpr u32 kAaClassColor[AC_COUNT] = {0, 0x3F2000u, 0x003F00u, 0x00003Fu, 0x003F3Fu, 0x3F003Fu, 0x101010u,
-                                         0x003F00u, 0x00003Fu, 0x003F3Fu, 0x00203Fu, 0x3F003Fu, 0x3F3F00u};   // 6-bit r | g << 8 | b << 16
-struct AaStats {
-  std::atomic<u64> px[AC_COUNT] = {};
-  std::atomic<u64> frames = 0, frames_game_aa = 0, frames_marking = 0;
-  ~AaStats() {
-    if (!frames) return;
-    std::fprintf(stderr, "aa-debug: %llu frames, game AA (DISP3DCNT.4) on %llu, edge marking on %llu\n",
-                 static_cast<unsigned long long>(frames.load()), static_cast<unsigned long long>(frames_game_aa.load()), static_cast<unsigned long long>(frames_marking.load()));
-    for (int c = AC_CLEAR; c < AC_COUNT; ++c)
-      std::fprintf(stderr, "aa-debug: %10.1f px/frame  %s\n", static_cast<double>(px[c].load()) / static_cast<double>(frames.load()), kAaClassNames[c]);
-  }
-};
-AaStats g_aa_stats;
-} // namespace
-
-void aa_debug_frame(u32 dispcnt) {
-  ++g_aa_stats.frames;
-  if (dispcnt & (1u << 4)) ++g_aa_stats.frames_game_aa;
-  if (dispcnt & (1u << 5)) ++g_aa_stats.frames_marking;
-}
-
-void Renderer3D::final_pass_debug(s32 y) {
-  // Classed from the stack as the raster left it, before marking and the blend.
-  u8 cls[256] = {};
-  const u32 row = row_of(y) + 1, up = row_of(y - 1) + 1, dn = row_of(y + 1) + 1;
-  u64 n[AC_COUNT] = {};
-  if (aa_debug_mode() == 2) {
-    for (int x = 0; x < 256; ++x) {
-      const u32 addr = row + x;
-      const u32 attr = attr_[addr];
-      if (!(color_[addr] >> 24)) continue;
-      const s32 z = static_cast<s32>(depth_[addr]);
-      const u32 id = attr >> 24;
-      u8 c = AC_NONE;
-      const bool covered = (attr & 0xF) && ((attr >> 8) & 0x1F) != 0x1F && (color_[addr + RSIZE] >> 24) &&
-        !((attr_[addr + RSIZE] >> 24) == id && same_surface(z, static_cast<s32>(depth_[addr + RSIZE])));
-      const u32 nb[4] = {addr - 1, addr + 1, up + x, dn + x};
-      for (const u32 q : nb) {
-        if (!(color_[q] >> 24)) continue;   // 3D against the clear is not this pass's business
-        const u32 qa = attr_[q];
-        const s32 qz = static_cast<s32>(depth_[q]);
-        if (qz < z) continue;   // near side only
-        if ((qa >> 24) != id) { c = E_ID; break; }
-        if (!same_surface(z, qz)) { c = E_DEPTH; break; }
-      }
-      if (c == AC_NONE) {
-        // Crease: depth's second difference across the pixel, either axis,
-        // against a slope-relative threshold -- two faces meeting at an angle.
-        auto bend = [&](u32 a, u32 b) {
-          if (!(color_[a] >> 24) || !(color_[b] >> 24)) return false;
-          const s64 d2 = static_cast<s64>(depth_[a]) + depth_[b] - 2 * static_cast<s64>(z);
-          const s64 slope = std::llabs(static_cast<s64>(depth_[a]) - depth_[b]);
-          return std::llabs(d2) > (slope >> 1) + (z >> 8) + 0x40;
-        };
-        if (bend(addr - 1, addr + 1) || bend(up + x, dn + x)) c = E_CREASE;
-      }
-      if (c != AC_NONE) {
-        if (attr & (1u << 22)) c = E_TRANS;
-        else if (covered) c = E_COVERED;
-        else if (attr & (1u << 23)) c = E_CUT;
-      }
-      cls[x] = c; ++n[c];
-    }
-  } else
-  for (int x = 0; x < 256; ++x) {
-    const u32 addr = row + x;
-    const u32 attr = attr_[addr];
-    if (!(color_[addr] >> 24) || (attr & (1u << 22))) continue;   // clear, or translucent on top
-    const u32 cov = (attr >> 8) & 0x1F;
-    u8 c = AC_NONE;
-    // A neighbour of another surface that is farther away: this pixel is the
-    // near side of a visible boundary.
-    const u32 id = attr >> 24, z = depth_[addr];
-    const u32 nb[4] = {addr - 1, addr + 1, up + x, dn + x};
-    u32 far_attr = 0; bool far = false;
-    for (const u32 q : nb) {
-      const u32 qa = attr_[q];
-      if (!(color_[q] >> 24)) continue;   // against the clear it shows as the DS draws it
-      if ((qa >> 24) == id && same_surface(static_cast<s32>(z), static_cast<s32>(depth_[q]))) continue;
-      if (depth_[q] <= z) continue;
-      far = true; far_attr = qa; break;
-    }
-    if ((attr & 0xF) && cov != 0x1F) {
-      const u32 ua = attr_[addr + RSIZE];
-      if (!(color_[addr + RSIZE] >> 24)) c = AC_CLEAR;
-      else if ((ua >> 24) == (attr >> 24) && !(ua & (1u << 22)) && same_surface(static_cast<s32>(depth_[addr]), static_cast<s32>(depth_[addr + RSIZE]))) c = far ? AC_SAME : AC_SAME_IN;
-      else c = AC_BLEND;
-    } else if (far) c = ((attr | far_attr) & (1u << 23)) ? AC_CUT : AC_BOUND;
-    cls[x] = c;
-    ++n[c];
-  }
-  for (int c = AC_CLEAR; c < AC_COUNT; ++c) if (n[c]) g_aa_stats.px[c] += n[c];
-  final_pass_ref(y);
-  u32* out = &out_dst_[y * 256];
-  for (int x = 0; x < 256; ++x) {
-    const u32 v = out[x];
-    out[x] = cls[x] ? (kAaClassColor[cls[x]] | 0x1F000000u) : ((v & 0x3E3E3Eu) >> 1) | (v & 0xFF000000u);   // classes painted, the rest dimmed
-  }
-}
+// Whether two depths lie on one surface (a depth-scaled tolerance); reused by the targeted AA.
+[[maybe_unused]] static inline bool same_surface(s32 za, s32 zb) { const s32 d = za > zb ? za - zb : zb - za; return d <= (std::min(za, zb) >> 6) + 0x200; }
 
 // The scalar passes: the specification the NEON final_pass is checked against
 // (selftest_final_pass), and the whole of final_pass on non-NEON builds.
-// Enhanced AA (video.aa = enhanced, no layer underneath): each edge pixel
-// blends with the neighbour on its outside, which stands in for the pixel
-// the hardware keeps underneath. The partner is that neighbour's colour as
-// the raster left it, before this frame's final pass touched it (fog, edge
-// marking and blends of already finished lines would otherwise leak in:
-// a band's first line saw its overlap line unfogged, a line of unfogged
-// pixels at every band boundary in fog), fogged by its own depth when fog
-// is on and its fog bit is set, as the hardware fogs the pixel underneath.
-// The axis is attr bit 13 (see precompute_lines); across it, the neighbour
-// whose polygon id differs from this pixel's, or the farther one when both
-// match; none when its translucent state differs (a haze quad's boundary).
-// One scalar body for both final passes, so NEON and portable agree.
-void Renderer3D::save_raw_row(s32 y) {
-  std::memcpy(raw_rows_[y & 3], &color_[row_of(y)], W * sizeof(u32));
-  raw_prev_ok_ = raw_line_ == y - 1;
-  raw_line_ = y;
-}
-// Enhanced AA: edges the hardware never covers -- two surfaces meeting
-// inside their polygons (an interpenetration: a wheel in a boiler), or a
-// silhouette whose outline run the raster left unfilled. A plain opaque
-// pixel (no edge run at all) next to a plain pixel of another surface gets
-// the boundary estimated from the two depth slopes: each surface's depth is
-// extended linearly from its pixel, using the slope toward the pixel beyond
-// it on the same row (rows beyond the neighbours are not read: the ring may
-// not hold them yet), and the crossing between the two centres is solved.
-// The nearer pixel of the pair takes the coverage of its own side, with the
-// outside fixed toward the other pixel (attr bits 5-6: side fixed, negative;
-// bit 0 marks the edge). Every pixel decides for itself from its four
-// neighbours and writes only its own line, so the result does not depend on
-// where a band's lines start; of several crossings the largest depth jump
-// names the axis, the horizontal one unless the vertical jump is clearly
-// larger (a diagonal would otherwise flip axis from pixel to pixel).
-void Renderer3D::stamp_intersections(s32 y) {
-  const u32 row = row_of(y) + 1, up = row_of(y - 1) + 1, dn = row_of(y + 1) + 1;
-  // A pixel under a translucent layer still holds the opaque surface's depth
-  // (or the layer's, when it wrote depth: then its own outline is found),
-  // so the translucency state does not exclude it.
-  // A full-coverage edge pixel is left out on purpose: its edge lies on the
-  // pixel boundary (integer vertex positions), and a crossing solved from
-  // the depth slopes would move that edge to a place it is not.
-  auto opaque_plain = [&](u32 n) { const u32 a = attr_[n]; return (color_[n] >> 24) != 0 && !(a & 0xF); };
-  // Crossing from P's centre toward N's in 1/32 (-1: same surface), with
-  // P's slope from L beyond it and N's from R beyond it (0 = none).
-  // A fold: P and N on one surface by depth, but the depth slope on P's
-  // side (from L) and on N's side (to R) disagree by more than half the
-  // larger slope, so two planes meet between them (an intersection right
-  // at its line, where the depths agree by definition; a wall on a floor).
-  // The fixed part of the tolerance grows with depth (z >> 8): far terrain's
-  // interpolation kinks are single-pixel noise, not folds worth an edge.
-  auto fold = [](s64 a, s64 b, s64 z) { const s64 d = a > b ? a - b : b - a, aa = a < 0 ? -a : a, bb = b < 0 ? -b : b; return d > ((aa > bb ? aa : bb) >> 1) + 0x40 + (z >> 8); };
-  // Crossing from P's centre toward N's in 1/32 (-1: same surface), with
-  // P's slope from L beyond it and N's from R beyond it (0 = none).
-  // `strength` ranks the pair: the depth jump, or a fold's slope difference.
-  auto crossing = [&](u32 P, u32 N, u32 L, u32 R, s64& strength) -> int {
-    const s64 zp = depth_[P], zn = depth_[N];
-    const bool same = same_surface(static_cast<s32>(zp), static_cast<s32>(zn));
-    const bool lok = L && (color_[L] >> 24) && same_surface(static_cast<s32>(zp), static_cast<s32>(depth_[L]));
-    const bool rok = R && (color_[R] >> 24) && same_surface(static_cast<s32>(zn), static_cast<s32>(depth_[R]));
-    const s64 dzA = lok ? zp - static_cast<s64>(depth_[L]) : 0;
-    const s64 dzB = rok ? static_cast<s64>(depth_[R]) - zn : 0;
-    if (same) {
-      if (!lok || !rok || !fold(dzA, dzB, zp)) return -1;
-      strength = dzA > dzB ? dzA - dzB : dzB - dzA;
-    } else strength = zn > zp ? zn - zp : zp - zn;
-    const s64 den = dzA - dzB;
-    s64 t32 = 16;
-    if (den != 0) { t32 = ((zn - zp - dzB) * 32) / den; if (t32 < 0 || t32 > 32) t32 = 16; }
-    return static_cast<int>(t32);
-  };
-  // Prefilter: a pixel needs the work below only if a horizontal or vertical
-  // neighbour is on another surface. Sixteen pixels a step (NEON) or a plain
-  // loop; the same test as same_surface().
-  alignas(16) u8 flag[256 + 16] = {};
-  {
-    auto differ = [](u32 za, u32 zb) { const u32 d = za > zb ? za - zb : zb - za; return d > ((za < zb ? za : zb) >> 6) + 0x200; };
-#if DSPERATE_NEON
-    const uint32x4_t v200 = vdupq_n_u32(0x200);
-    const int32x4_t v40 = vdupq_n_s32(0x40);
-    for (int x = 0; x < 256; x += 4) {
-      const uint32x4_t zp = vld1q_u32(&depth_[row + x]);
-      auto test = [&](const u32* q) -> uint32x4_t {
-        const uint32x4_t zq = vld1q_u32(q);
-        const uint32x4_t d = vabdq_u32(zp, zq), tol = vaddq_u32(vshrq_n_u32(vminq_u32(zp, zq), 6), v200);
-        return vcgtq_u32(d, tol);
-      };
-      // A fold (see fold() below): the slopes on the two sides disagree.
-      auto foldv = [&](const u32* a, const u32* b) -> uint32x4_t {
-        const int32x4_t za = vreinterpretq_s32_u32(vld1q_u32(a)), zb = vreinterpretq_s32_u32(vld1q_u32(b)), zc = vreinterpretq_s32_u32(zp);
-        const int32x4_t sa = vsubq_s32(zc, za), sb = vsubq_s32(zb, zc);
-        const int32x4_t d = vabdq_s32(sa, sb), tol = vaddq_s32(vaddq_s32(vshrq_n_s32(vmaxq_s32(vabsq_s32(sa), vabsq_s32(sb)), 1), v40), vshrq_n_s32(zc, 8));
-        return vcgtq_s32(d, tol);
-      };
-      uint32x4_t f = vorrq_u32(vorrq_u32(test(&depth_[row + x + 1]), test(&depth_[row + x - 1])), vorrq_u32(test(&depth_[dn + x]), test(&depth_[up + x])));
-      f = vorrq_u32(f, vorrq_u32(foldv(&depth_[row + x - 1], &depth_[row + x + 1]), foldv(&depth_[up + x], &depth_[dn + x])));
-      const uint16x4_t f16 = vmovn_u32(f);
-      vst1_lane_u32(reinterpret_cast<u32*>(flag + x), vreinterpret_u32_u8(vmovn_u16(vcombine_u16(f16, f16))), 0);
-    }
-#else
-    auto folds = [&](u32 a, u32 c, u32 b) { const s64 sa = static_cast<s64>(c) - a, sb = static_cast<s64>(b) - c; return fold(sa, sb, c); };
-    for (int x = 0; x < 256; ++x) {
-      const u32 zp = depth_[row + x];
-      flag[x] = differ(zp, depth_[row + x + 1]) || differ(zp, depth_[row + x - 1]) || differ(zp, depth_[dn + x]) || differ(zp, depth_[up + x]) ||
-                folds(depth_[row + x - 1], zp, depth_[row + x + 1]) || folds(depth_[up + x], zp, depth_[dn + x]);
-    }
-#endif
-    (void)differ;
-  }
-  for (int x = 0; x < 256; ++x) {
-    if (!flag[x]) continue;
-    const u32 P = row + x;
-    if (!opaque_plain(P)) continue;
-    // Candidate pairs: right, left (horizontal), down, up (vertical). Only a
-    // pair where P is the nearer pixel can stamp P.
-    int best_t = -1; s64 best_jump = -1; bool best_vertical = false, best_neg = false;
-    auto consider = [&](u32 N, u32 L, u32 R, bool vertical, bool neg) {
-      if (!N || !opaque_plain(N) || depth_[P] > depth_[N]) return;
-      s64 jump = 0;
-      const int t = crossing(P, N, L, R, jump);
-      if (t < 0) return;
-      // The horizontal axis wins unless the vertical jump is clearly larger.
-      const bool take = best_t < 0 || (vertical ? jump > (best_jump * 5) / 4 : (best_vertical ? jump * 5 >= best_jump * 4 : jump > best_jump));
-      if (take) { best_t = t; best_jump = jump; best_vertical = vertical; best_neg = neg; }
-    };
-    consider(x < 255 ? P + 1 : 0, x > 0 ? P - 1 : 0, x < 254 ? P + 2 : 0, false, false);
-    consider(x > 0 ? P - 1 : 0, x < 255 ? P + 1 : 0, x > 1 ? P - 2 : 0, false, true);
-    consider(y < 191 ? dn + x : 0, y > 0 ? up + x : 0, 0, true, false);
-    consider(y > 0 ? up + x : 0, y < 191 ? dn + x : 0, 0, true, true);
-    if (best_t < 0) continue;
-    // P's own surface covers [-16, t] of its 32-wide pixel toward the other.
-    const u32 cov = static_cast<u32>(std::clamp(best_t + 16 - 1, 0, 30));
-    attr_[P] = (attr_[P] & ~0x1F00u & ~0x2000u & ~0x60u) | 0x1 | (cov << 8) | (best_vertical ? 0x2000u : 0u) | 0x20u | (best_neg ? 0x40u : 0u);
-  }
-}
-
-void Renderer3D::enhanced_aa_line(s32 y) {
-  static const bool no_isect = std::getenv("DS_AA_NOISECT") != nullptr;   // DS_AA_NOISECT=1: enhanced without the depth-crossing edges
-  if (!no_isect) stamp_intersections(y);
-  const u32 rb = row_of(y), row = rb + 1;
-  const u32 ub = row_of(y - 1), db = row_of(y + 1);
-  const u32* raw_y = raw_rows_[y & 3];
-  u8* const eb = out_edge_dst_ ? out_edge_dst_ + y * 256 : nullptr;   // export the edge instead of blending it
-  // The line above: saved by its own pass on this instance, else still raw
-  // in the ring (a band's overlap line); the line below is raw in the ring.
-  const u32* raw_up = raw_prev_ok_ ? raw_rows_[(y - 1) & 3] : &color_[ub];
-  const u32* raw_dn = &color_[db];
-  const bool fog = dispcnt_ & (1 << 7), fogcolor = !(dispcnt_ & (1 << 6));
-  u32 fr = 0, fg = 0, fb = 0, fa = 0;
-  if (fog) { rgb15_to_666(static_cast<u16>(rs_->fog_color), fr, fg, fb); fa = (rs_->fog_color >> 16) & 0x1F; }
-  auto partner = [&](u32 n, const u32* raw, u32 base) -> u32 {
-    u32 c = raw[n - base];
-    if (!fog || !(attr_[n] & (1 << 15))) return c;
-    const u32 d = fog_density(n);
-    u32 r = c & 0x3F, g = (c >> 8) & 0x3F, b = (c >> 16) & 0x3F, a = (c >> 24) & 0x1F;
-    if (fogcolor) { r = ((fr * d) + (r * (128 - d))) >> 7; g = ((fg * d) + (g * (128 - d))) >> 7; b = ((fb * d) + (b * (128 - d))) >> 7; }
-    a = ((fa * d) + (a * (128 - d))) >> 7;
-    return r | (g << 8) | (b << 16) | (a << 24);
-  };
-  // The outside of the edge is the side the rasteriser recorded (attr bit
-  // 14: up/left, else down/right; bits 5-6 when stamp_intersections fixed
-  // it). That neighbour stands in for what lies behind the edge unless it
-  // is another polygon nearer than this one (an occluder: its own edge
-  // handles that pixel). The 1x blend also wants both pixels in the same
-  // translucency state, or a haze layer's edge would pull an unhazed colour
-  // in; the panel cut copies final colours and needs no such guard.
-  auto outside = [&](u32 attr, u32 z, u32 a, u32 b) -> u32 {
-    u32 n;
-    if (attr & 0x20) n = (attr & 0x40) ? a : b;
-    else n = (attr & 0x4000) ? a : b;
-    if ((attr_[n] >> 24) != (attr >> 24) && depth_[n] < z) return 0;
-    if (!eb && !(attr & 0x80) && ((attr_[n] ^ attr) & (1u << 22))) return 0;   // a translucent polygon's own edge (bit 7) blends with what lies outside it
-    return n;
-  };
-  // DS_EDGE_TRACE=x,y: one pixel's attribute, coverage, depth and its four
-  // neighbours, and what this pass decides for it, every frame.
-  static int trx = -2, try_ = -2;
-  if (trx == -2) { trx = try_ = -1; if (const char* t = std::getenv("DS_EDGE_TRACE")) std::sscanf(t, "%d,%d", &trx, &try_); }
-  if (y == try_ && trx >= 0 && trx < 256) {
-    const u32 a = row + trx;
-    auto px = [&](const char* tag, u32 n) { std::fprintf(stderr, "  %s id %3u z %08x attr %08x flags %x cov %2u tr %d fog %d colour %08x\n", tag, attr_[n] >> 24, depth_[n], attr_[n], attr_[n] & 0xF, (attr_[n] >> 8) & 0x1F, (attr_[n] >> 22) & 1, (attr_[n] >> 15) & 1, color_[n]); };
-    std::fprintf(stderr, "edge-trace frame %llu (%d,%d) line_touched %d\n", (unsigned long long)frame_tag_, trx, try_, (int)line_touched_[y]);
-    px("self ", a); px("left ", a - 1); px("right", a + 1); px("up   ", ub + 1 + trx); px("down ", db + 1 + trx);
-    const u32 attr = attr_[a], cov = (attr >> 8) & 0x1F;
-    const char* why = !(attr & 0xF) ? "no edge flags" : cov == 0x1F ? "full coverage" : !outside(attr, depth_[a], (attr & 0x2000) ? ub + 1 + trx : a - 1, (attr & 0x2000) ? db + 1 + trx : a + 1) ? "no partner" : "edge";
-    std::fprintf(stderr, "  -> %s (axis %s, side %s, forced %d)\n", why, (attr & 0x2000) ? "vertical" : "horizontal", (attr & 0x4000) ? "up/left" : "down/right", (attr >> 5) & 3);
-    if (cut_trace_) { std::fprintf(stderr, "  last poly (of %u): fmt %u polyalpha %u cutout %u exempt %u texel alpha %u z %08x part %u alpha0 %u\n", trace_n_, trace_last_[0], trace_last_[1], trace_last_[2], trace_last_[3], trace_last_[4], trace_last_[5], trace_last_[6], trace_last_[7]); trace_n_ = 0;
-      if (trown_last_[0]) { std::fprintf(stderr, "  translucent outline (%s): part %u xcov %u cov %u alpha/m8 %u own/attr %08x\n", trown_last_[0] == 1 ? "scalar" : "neon", trown_last_[1], trown_last_[2], trown_last_[3], trown_last_[4], trown_last_[5]); std::memset(trown_last_, 0, sizeof trown_last_); }
-      if (seam_last_[0]) { std::fprintf(stderr, "  seam test (%s, %u tests): part %u dst attr %08x dst z %08x new z %08x seam %u new flags %x pass %u\n", seam_last_[0] == 1 ? "scalar" : "neon", seam_n_, seam_last_[1], seam_last_[2], seam_last_[3], seam_last_[4], seam_last_[5] & 1, (seam_last_[5] >> 8) & 0xF, (seam_last_[5] >> 16) & 1); std::memset(seam_last_, 0, sizeof seam_last_); seam_n_ = 0; } }
-  }
-  for (int x = 0; x < 256; ++x) {
-    if (!(x & 7)) {   // skip eight pixels without edge flags at once
-      u64 f0, f1; std::memcpy(&f0, &attr_[row + x], 8); std::memcpy(&f1, &attr_[row + x + 2], 8);
-      u64 f2, f3; std::memcpy(&f2, &attr_[row + x + 4], 8); std::memcpy(&f3, &attr_[row + x + 6], 8);
-      if (!((f0 | f1 | f2 | f3) & (cut_diag_ ? 0x0080000F0080000Full : 0x0000000F0000000Full))) { x += 7; continue; }
-    }
-    const u32 addr = row + x;
-    const u32 attr = attr_[addr];
-    if (eb && (attr & (1u << 23))) eb[x] = 0x08;   // DS_CUT_DIAG: cut-out polygon pixel, no candidate (overwritten below by an edge)
-    if (!(attr & 0xF)) continue;
-    u32 cov = (attr >> 8) & 0x1F;
-    if (cov == 0x1F) continue;
-    // Exported byte: bits 0-3 the coverage's upper four bits, bit 4 an
-    // alpha-to-coverage edge (cutout_coverage stamps the forced side with
-    // the top-edge flag; a depth crossing stamps flag 0 alone).
-    const u32 kind = ((attr & 0x24) == 0x24) ? 0x10u : 0u;
-    u32 bot;
-    // A seam between two polygons of one surface (skybox panels, a mesh's
-    // triangle diagonals) continues the same colour across the edge: with
-    // nothing to see there, no edge is placed (the resample would blur it).
-    // A translucent polygon's own outline (bit 7) is worth cutting only
-    // where its blend leaves a visible step: within 4 of 63 it is skipped.
-    const int ctol = (attr & 0x80) ? 4 : 1;
-    auto same_colour = [&](u32 own, u32 other) {
-      const u32 d = (own ^ other) & 0x003F3F3Fu;
-      if (!d) return true;
-      const int dr = static_cast<int>(own & 0x3F) - static_cast<int>(other & 0x3F), dg = static_cast<int>((own >> 8) & 0x3F) - static_cast<int>((other >> 8) & 0x3F), dbb = static_cast<int>((own >> 16) & 0x3F) - static_cast<int>((other >> 16) & 0x3F);
-      return dr >= -ctol && dr <= ctol && dg >= -ctol && dg <= ctol && dbb >= -ctol && dbb <= ctol;
-    };
-    if (attr & 0x2000) {
-      const u32 n = outside(attr, depth_[addr], ub + 1 + x, db + 1 + x);
-      if (!n) continue;
-      if (same_colour(raw_y[x + 1], n == ub + 1 + x ? raw_up[n - ub] : raw_dn[n - db])) continue;
-      if (eb) { eb[x] = static_cast<u8>(0xA0 | (n == ub + 1 + x ? 0x40 : 0) | (cov >> 1) | kind); continue; }   // panel cut: unblended, the byte says where
-      bot = n == ub + 1 + x ? partner(n, raw_up, ub) : partner(n, raw_dn, db);
-    } else {
-      const u32 n = outside(attr, depth_[addr], addr - 1, addr + 1);
-      if (!n) continue;
-      if (same_colour(raw_y[x + 1], raw_y[n - rb])) continue;
-      if (eb) { eb[x] = static_cast<u8>(0x80 | (n == addr - 1 ? 0x40 : 0) | (cov >> 1) | kind); continue; }
-      bot = partner(n, raw_y, rb);
-    }
-    if (cov == 0) { color_[addr] = bot; continue; }
-    const u32 top = color_[addr];
-    u32 tr = top & 0x3F, tg = (top >> 8) & 0x3F, tb = (top >> 16) & 0x3F, ta = (top >> 24) & 0x1F;
-    const u32 br = bot & 0x3F, bg = (bot >> 8) & 0x3F, bb = (bot >> 16) & 0x3F, ba = (bot >> 24) & 0x1F;
-    ++cov;
-    if (ba > 0) {
-      tr = ((tr * cov) + (br * (32 - cov))) >> 5;
-      tg = ((tg * cov) + (bg * (32 - cov))) >> 5;
-      tb = ((tb * cov) + (bb * (32 - cov))) >> 5;
-    }
-    ta = ((ta * cov) + (ba * (32 - cov))) >> 5;
-    color_[addr] = tr | (tg << 8) | (tb << 16) | (ta << 24);
-  }
-}
-
 void Renderer3D::final_pass_ref(s32 y) {
   const u32 dispcnt = dispcnt_;
   // Edge marking and anti-aliasing act on polygon pixels (edge flags); fog
@@ -3220,8 +2278,6 @@ void Renderer3D::final_pass_ref(s32 y) {
     const bool clear_fog = (rs_->dispcnt & (1 << 14)) || (rs_->clear_attr1 & 0x8000);
     work = (dispcnt & (1 << 7)) && clear_fog;
   }
-  if (out_edge_dst_) std::memset(out_edge_dst_ + y * 256, 0, 256);   // enhanced_aa_line fills the edge bytes
-  if (game_aa_ && !under_layer_) save_raw_row(y);   // enhanced AA: the line before this pass touches it
   if (!work) { std::memcpy(&out_dst_[y * 256], &color_[row_of(y) + 1], 256 * sizeof(u32)); return; }
   if (dispcnt & (1 << 5)) {
     // Edge marking on the topmost pixels, against the four neighbours.
@@ -3236,7 +2292,7 @@ void Renderer3D::final_pass_ref(s32 y) {
           (id != (attr_[up + x] >> 24) && z < depth_[up + x]) || (id != (attr_[dn + x] >> 24) && z < depth_[dn + x])) {
         u32 r, g, b; rgb15_to_666(rs_->edge[id >> 3], r, g, b);
         color_[addr] = r | (g << 8) | (b << 16) | (color_[addr] & 0xFF000000);
-        attr_[addr] = (attr & 0xFFFFE0FF) | mark_cov_;    // coverage broken for the AA pass (0x10; solid under forced AA)
+        attr_[addr] = (attr & 0xFFFFE0FF) | 0x00001000;    // coverage broken for the AA pass
       }
     }
   }
@@ -3257,7 +2313,7 @@ void Renderer3D::final_pass_ref(s32 y) {
       a = ((fa * d) + (a * (128 - d))) >> 7;
       color_[addr] = r | (g << 8) | (b << 16) | (a << 24);
     };
-    const bool under = under_layer_;   // the lower pixel is only read by the AA blend
+    const bool under = dispcnt & (1 << 4);   // the lower pixel is only read by the AA blend
     for (int x = 0; x < 256; ++x) {
       u32 addr = row_of(y) + 1 + x;
       const u32 attr = attr_[addr];
@@ -3268,28 +2324,25 @@ void Renderer3D::final_pass_ref(s32 y) {
     }
   }
   if (game_aa_) {
-    if (!under_layer_) enhanced_aa_line(y);
-    else {
-      // Anti-aliasing: blend edge pixels with the pixel underneath by coverage.
-      for (int x = 0; x < 256; ++x) {
-        const u32 addr = row_of(y) + 1 + x;
-        const u32 attr = attr_[addr];
-        if (!(attr & 0xF)) continue;
-        u32 cov = (attr >> 8) & 0x1F;
-        if (cov == 0x1F) continue;
-        if (cov == 0) { color_[addr] = color_[addr + RSIZE]; continue; }
-        const u32 top = color_[addr], bot = color_[addr + RSIZE];
-        u32 tr = top & 0x3F, tg = (top >> 8) & 0x3F, tb = (top >> 16) & 0x3F, ta = (top >> 24) & 0x1F;
-        const u32 br = bot & 0x3F, bg = (bot >> 8) & 0x3F, bb = (bot >> 16) & 0x3F, ba = (bot >> 24) & 0x1F;
-        ++cov;
-        if (ba > 0) {
-          tr = ((tr * cov) + (br * (32 - cov))) >> 5;
-          tg = ((tg * cov) + (bg * (32 - cov))) >> 5;
-          tb = ((tb * cov) + (bb * (32 - cov))) >> 5;
-        }
-        ta = ((ta * cov) + (ba * (32 - cov))) >> 5;
-        color_[addr] = tr | (tg << 8) | (tb << 16) | (ta << 24);
+    // Anti-aliasing: blend edge pixels with the pixel underneath by coverage.
+    for (int x = 0; x < 256; ++x) {
+      const u32 addr = row_of(y) + 1 + x;
+      const u32 attr = attr_[addr];
+      if (!(attr & 0xF)) continue;
+      u32 cov = (attr >> 8) & 0x1F;
+      if (cov == 0x1F) continue;
+      if (cov == 0) { color_[addr] = color_[addr + RSIZE]; continue; }
+      const u32 top = color_[addr], bot = color_[addr + RSIZE];
+      u32 tr = top & 0x3F, tg = (top >> 8) & 0x3F, tb = (top >> 16) & 0x3F, ta = (top >> 24) & 0x1F;
+      const u32 br = bot & 0x3F, bg = (bot >> 8) & 0x3F, bb = (bot >> 16) & 0x3F, ba = (bot >> 24) & 0x1F;
+      ++cov;
+      if (ba > 0) {
+        tr = ((tr * cov) + (br * (32 - cov))) >> 5;
+        tg = ((tg * cov) + (bg * (32 - cov))) >> 5;
+        tb = ((tb * cov) + (bb * (32 - cov))) >> 5;
       }
+      ta = ((ta * cov) + (ba * (32 - cov))) >> 5;
+      color_[addr] = tr | (tg << 8) | (tb << 16) | (ta << 24);
     }
   }
   std::memcpy(&out_dst_[y * 256], &color_[row_of(y) + 1], 256 * sizeof(u32));
@@ -3297,7 +2350,6 @@ void Renderer3D::final_pass_ref(s32 y) {
 
 #if DSPERATE_NEON
 void Renderer3D::final_pass(s32 y) {
-  if (aa_debug()) { final_pass_debug(y); return; }
   const u32 dispcnt = dispcnt_;
   // Edge marking and anti-aliasing act on polygon pixels (edge flags); fog
   // on the fog bit, which the clear can set too. A line nothing touched
@@ -3307,8 +2359,6 @@ void Renderer3D::final_pass(s32 y) {
     const bool clear_fog = (rs_->dispcnt & (1 << 14)) || (rs_->clear_attr1 & 0x8000);
     work = (dispcnt & (1 << 7)) && clear_fog;
   }
-  if (out_edge_dst_) std::memset(out_edge_dst_ + y * 256, 0, 256);   // enhanced_aa_line fills the edge bytes
-  if (game_aa_ && !under_layer_) save_raw_row(y);   // enhanced AA: the line before this pass touches it
   if (!work) { std::memcpy(&out_dst_[y * 256], &color_[row_of(y) + 1], 256 * sizeof(u32)); return; }
   // Three passes as 16-pixel byte-plane kernels (ld4/st4), matching the
   // scalar loops below bit for bit.
@@ -3348,7 +2398,7 @@ void Renderer3D::final_pass(s32 y) {
       c.val[2] = vbslq_u8(mark, compat::tbl1q_u8(ebl, idx), c.val[2]);
       vst4q_u8(cb + addr * 4, c);
       // attr = (attr & 0xFFFFE0FF) | 0x1000: byte 1 keeps bits 5-7, coverage 0x10.
-      at.val[1] = vbslq_u8(mark, vorrq_u8(vandq_u8(at.val[1], vdupq_n_u8(0xE0)), vdupq_n_u8(static_cast<u8>(mark_cov_ >> 8))), at.val[1]);
+      at.val[1] = vbslq_u8(mark, vorrq_u8(vandq_u8(at.val[1], vdupq_n_u8(0xE0)), vdupq_n_u8(0x10)), at.val[1]);
       vst4q_u8(ab + addr * 4, at);
     }
   }
@@ -3414,7 +2464,7 @@ void Renderer3D::final_pass(s32 y) {
       c.val[3] = vbslq_u8(m, mix(vandq_u8(c.val[3], vdupq_n_u8(0x1F)), vfa, d, inv), c.val[3]);
       vst4q_u8(cb + addr * 4, c);
     };
-    const bool under = under_layer_;   // the lower pixel is only read by the AA blend
+    const bool under = dispcnt & (1 << 4);   // the lower pixel is only read by the AA blend
     for (u32 x = 0; x < 256; x += 16) {
       const u32 addr = base + x;
       const uint8x16x4_t at = vld4q_u8(ab + addr * 4);
@@ -3428,8 +2478,7 @@ void Renderer3D::final_pass(s32 y) {
       if (compat::maxv_u8(ufog)) apply16(under, ufog);
     }
   }
-  if (game_aa_ && !under_layer_) enhanced_aa_line(y);   // enhanced: scalar, shared with final_pass_ref
-  else if (game_aa_) {
+  if (game_aa_) {
     // Anti-aliasing: blend edge pixels with the pixel underneath by coverage.
     // Coverage 31 keeps the top pixel, 0 takes the one underneath whole;
     // otherwise (cov + 1) / 32 of the top over the rest of the bottom, the
@@ -3460,7 +2509,7 @@ void Renderer3D::final_pass(s32 y) {
   std::memcpy(&out_dst_[y * 256], &color_[row_of(y) + 1], 256 * sizeof(u32));
 }
 #else
-void Renderer3D::final_pass(s32 y) { if (aa_debug()) final_pass_debug(y); else final_pass_ref(y); }
+void Renderer3D::final_pass(s32 y) { final_pass_ref(y); }
 #endif
 
 // Randomised buffers through final_pass and final_pass_ref with every pass
@@ -3477,7 +2526,7 @@ u32 Renderer3D::selftest_final_pass(u32 seed, u32 dispcnt) {
   rs.fog_offset = rnd() & 0x7FFF; rs.fog_shift = rnd() & 0xF;
   const RenderState* saved = rs_;
   const u32 saved_dispcnt = dispcnt_;
-  rs_ = &rs; dispcnt_ = dispcnt; game_aa_ = dispcnt & (1u << 4); under_layer_ = game_aa_;
+  rs_ = &rs; dispcnt_ = dispcnt; game_aa_ = dispcnt & (1u << 4);
   expand_toon();   // the edge colour planes come from rs_
   u32 diffs = 0;
   for (s32 y = 0; y < 8; ++y) {
@@ -3664,7 +2713,6 @@ void Renderer3D::gpu_dump(const Gpu3D& gx, const Polygon* const* polys, u32 npol
 }
 
 void Renderer3D::render(const Gpu3D& gx) {
-
   // Before anything: the previous frame's bands read the texture cache and
   // this object's state, and the identical-frame path below mutates the cache
   // even when it renders nothing.
@@ -3681,13 +2729,8 @@ void Renderer3D::render(const Gpu3D& gx) {
   { u64 sum = 0; for (u32 w = 0; w < last_nb_ && w < 8; ++w) sum += band_ns_[w]; band_sum_ns_[1] = band_sum_ns_[0]; band_sum_ns_[0] = sum; }
   rs_frame_ = gx.render_state();
   rs_ = &rs_frame_;
-  // Trace frame tag: this render's number, handed to the bands before they
-  // start (nds_.frame_count moves on while they still run).
-  frame_tag_ = nds_.frame_count;
-  for (auto& b : bands_) if (b) b->frame_tag_ = frame_tag_;
-  for (auto& sb : steal_) if (sb.band) sb.band->frame_tag_ = frame_tag_;
-  set_frame_aa();
-  if (aa_debug()) { aa_debug_frame(rs_->dispcnt); game_aa_ = true; dispcnt_ |= 1u << 4; }
+  game_aa_ = aa_ && (rs_->dispcnt & (1u << 4));
+  dispcnt_ = rs_->dispcnt & (aa_ ? ~0u : ~(1u << 4));
   expand_toon();
   vm_ = &nds_.bus.vram_map();
   texv_ = &vm_->texture;
@@ -3744,7 +2787,6 @@ void Renderer3D::render(const Gpu3D& gx) {
   }
   // Buffer the display isn't reading; becomes the displayed one after dispatch.
   u32* const dst = out_[display_ ^ 1].data();
-  u8* const edst = edge_export_ ? edge_[display_ ^ 1].data() : nullptr;
   // DS_DEBUG_R3D_BINS=fwd|each: with DS_HOST_CORES=1, draw inline as 8 bins in ascending order, on this
   // one instance (fwd) or a fresh one per bin (each) -- the band path's seeding and overlap, reproducibly.
   // Must equal one band. DS_DEBUG_R3D_BINS_LOG=1 prints the cuts.
@@ -3753,29 +2795,29 @@ void Renderer3D::render(const Gpu3D& gx) {
     pending_bands_ = 0; build_edges();
     compute_bins(8, 1);
     static const bool log = std::getenv("DS_DEBUG_R3D_BINS_LOG") != nullptr;
-    if (log) { std::fprintf(stderr, "[bins] frame %llu", (unsigned long long)frame_tag_); for (u32 b = 0; b <= 8; ++b) std::fprintf(stderr, " %d", bin_y_[b]); std::fputc('\n', stderr); }
+    if (log) { std::fprintf(stderr, "[bins] frame %llu", (unsigned long long)nds_.frame_count); for (u32 b = 0; b <= 8; ++b) std::fprintf(stderr, " %d", bin_y_[b]); std::fputc('\n', stderr); }
     static std::unique_ptr<Renderer3D> fresh;
     for (u32 b = 0; b < 8; ++b) {
       if (bin_y_[b] >= bin_y_[b + 1]) continue;
       Renderer3D* r = this;
       if (dbg_bins[0] == 'e' && b > 0) {
         if (!fresh) fresh = std::make_unique<Renderer3D>(nds_);
-        fresh->aa_ = aa_; fresh->edge_export_ = edge_export_;
+        fresh->aa_ = aa_;
         fresh->prepare_worker(gx, list_polys_, list_count_, &poly_texels_, &rs_frame_);
         r = fresh.get();
       }
-      r->render_band(bin_y_[b], bin_y_[b + 1], dst, edst);
+      r->render_band(bin_y_[b], bin_y_[b + 1], dst);
     }
     display_ ^= 1; return;
   }
-  if (nb == 0) { pending_bands_ = 0; build_edges(); render_band(0, 192, dst, edst); display_ ^= 1; return; }
+  if (nb == 0) { pending_bands_ = 0; build_edges(); render_band(0, 192, dst); display_ ^= 1; return; }
 
   // Pool is never shrunk; only `nb` gets work, so the lag cut costs a
   // dispatch flag rather than creating/joining threads mid-scene.
   if (bands_.size() < nb - 1) {
     while (bands_.size() < nb - 1) bands_.push_back(std::make_unique<Renderer3D>(nds_));
   }
-  for (auto& b : bands_) { b->aa_ = aa_; b->edge_export_ = edge_export_; }
+  for (auto& b : bands_) b->aa_ = aa_;
   // Never replaced once big enough: the compositor may still be waiting on it
   // for the previous frame's bands (sync_line). Sized for 3 by default (the
   // usual max); unused workers are never woken (Pool::dispatch).
@@ -3787,7 +2829,7 @@ void Renderer3D::render(const Gpu3D& gx) {
   const Gpu3D& gxr = gx;
   // job_fn_ is a member since the job outlives this call. Workers claim bins
   // until exhausted (not one band each), so an uneven split costs nothing.
-  job_fn_ = [this, &gxr, dst, edst](u32 w) {
+  job_fn_ = [this, &gxr, dst](u32 w) {
     const u64 t0 = prof::now_ns();
     Renderer3D* r = this;
     if (w != 0) { r = bands_[w - 1].get(); r->prepare_worker(gxr, list_polys_, list_count_, &poly_texels_, &rs_frame_); }
@@ -3796,7 +2838,7 @@ void Renderer3D::render(const Gpu3D& gx) {
       const u32 b = pool_->claim();
       if (b >= nbins_) break;
       const s32 y0 = bin_y_[b], y1 = bin_y_[b + 1];
-      if (y0 < y1) r->render_band(y0, y1, dst, edst);
+      if (y0 < y1) r->render_band(y0, y1, dst);
       pool_->mark_done(b);
     }
     // Per worker, own slot, no synchronisation; read next frame after sync_all.
@@ -3810,7 +2852,7 @@ void Renderer3D::render(const Gpu3D& gx) {
     // Next generation's slot; sync_all above guarantees no thief two back is still reading it.
     DispatchCtx& c = ctx_[(gen_ + 1) & 1];
     c.gx = &gx; c.polys = list_polys_; c.npoly = list_count_; c.texels = poly_texels_; c.rs = rs_frame_;
-    c.bin_y = bin_y_; c.nbins = nbins_; c.dst = dst; c.edst = edst; c.aa = aa_; c.edge_export = edge_export_;
+    c.bin_y = bin_y_; c.nbins = nbins_; c.dst = dst; c.aa = aa_;
   }
   gen_ = pool_->dispatch(job_fn_, nb, nbins_);
   display_ ^= 1;
@@ -3903,15 +2945,21 @@ Renderer3D::FrameRef Renderer3D::frame_ref(bool allow_lag) const {
   if (gpu_frame_ && lean_ && lean_->has_frame()) {
     // A GPU frame: no bands to wait for; the record (the newest the GPU has
     // finished, or, allowed, the one before) is picked at the first line
-    // read. Edge planes are a CPU-raster feature.
-    f.nbins = 0; f.gpu = true; f.allow_lag = allow_lag; f.out = nullptr; f.edges = nullptr;
+    // read.
+    f.nbins = 0; f.gpu = true; f.allow_lag = allow_lag; f.out = nullptr;
     return f;
   }
   f.nbins = pending_bands_;
   if (pending_bands_) f.bin_y = bin_y_;
   f.out = out_[display_].data();
-  f.edges = edge_export_ ? edge_[display_].data() : nullptr;
   return f;
+}
+
+void Renderer3D::set_aa(bool on) {
+  if (aa_ == on) return;
+  aa_ = on;
+  // The GPU raster's MSAA is fixed at its creation: rebuild it for the new setting.
+  if (gpu_on_ && lean_ && lean_->msaa() != on) { set_gpu(false); gpu_job_wait(); lean_.reset(); set_gpu(true); }
 }
 
 bool Renderer3D::set_gpu(bool on, std::string* why) {
@@ -3920,7 +2968,7 @@ bool Renderer3D::set_gpu(bool on, std::string* why) {
   std::string reason;
   if (!vk_dev_) vk_dev_ = vk::Device::shared(&reason);
   if (!vk_dev_) { if (why) *why = reason; return false; }
-  if (!lean_) lean_ = vk::Lean::create(*vk_dev_, &reason);
+  if (!lean_) lean_ = vk::Lean::create(*vk_dev_, aa_, &reason);
   if (!lean_ || !lean_->ready()) { lean_.reset(); if (why) *why = reason; return false; }
   lean_->wait_all(); gpu_resident_.clear(); gpu_arena_top_ = 0;
   gpu_job_start();
@@ -4096,12 +3144,12 @@ bool Renderer3D::steal_bins(u64 gen, u32 upto) {
     if (c >= cx.nbins) { result = pool_->done(gen, mask); break; }
     if (sb->gen != gen) {
       if (!sb->band) sb->band = std::make_unique<Renderer3D>(nds_);
-      sb->band->aa_ = cx.aa; sb->band->edge_export_ = cx.edge_export;
+      sb->band->aa_ = cx.aa;
       sb->band->prepare_worker(*cx.gx, cx.polys, cx.npoly, &cx.texels, &cx.rs);
       sb->gen = gen;
     }
     const s32 y0 = cx.bin_y[c], y1 = cx.bin_y[c + 1];
-    if (y0 < y1) sb->band->render_band(y0, y1, cx.dst, cx.edst);
+    if (y0 < y1) sb->band->render_band(y0, y1, cx.dst);
     pool_->thief_done(c);
     prof::add(prof::C_R3D_STOLEN, 1);
   }
@@ -4127,8 +3175,8 @@ void Renderer3D::prepare_worker(const Gpu3D& gx, const Polygon* const* polys, u3
   gx_ = &gx;
   list_polys_ = polys; list_count_ = npoly;
   rs_ = rs;
-  set_frame_aa();
-  if (aa_debug()) { game_aa_ = true; dispcnt_ |= 1u << 4; }
+  game_aa_ = aa_ && (rs_->dispcnt & (1u << 4));
+  dispcnt_ = rs_->dispcnt & (aa_ ? ~0u : ~(1u << 4));
   expand_toon();
   vm_ = &nds_.bus.vram_map();
   texv_ = &vm_->texture;
@@ -4189,9 +3237,8 @@ void Renderer3D::seed_active(s32 y) {
 // Rasterise output lines [y0, y1) into dst. The final pass of a line reads
 // the lines either side of it, so one extra line above is rasterised (and
 // the border row stands in at the top and bottom of the screen).
-void Renderer3D::render_band(s32 y0, s32 y1, u32* dst, u8* edst) {
-  out_dst_ = dst; out_edge_dst_ = edst;
-  raw_line_ = -100;   // enhanced AA: no raw row of this frame saved yet (the marker must not carry over from the last frame's lines)
+void Renderer3D::render_band(s32 y0, s32 y1, u32* dst) {
+  out_dst_ = dst;
   const s32 first = y0 > 0 ? y0 - 1 : 0;
   const s32 last = y1 + 1 < 192 ? y1 + 1 : 192;
   // Bins overlap by the line or two final_pass needs either side of a

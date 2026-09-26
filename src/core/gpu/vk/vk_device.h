@@ -74,7 +74,7 @@ public:
   // nonCoherentAtomSize as vkFlushMappedMemoryRanges requires.
   void flush(const Buffer& b, size_t offset, size_t size);
 
-  // The dispatch table and handles, for vk_raster.cpp only.
+  // The dispatch table and handles, for the Vulkan backends (vk_lean.cpp, the presenters) only.
   const DeviceInternal* internal() const;
   // Held around every vkQueueSubmit/vkQueuePresentKHR/vkQueueWaitIdle by
   // code that may run beside another thread's use of the queue (the video

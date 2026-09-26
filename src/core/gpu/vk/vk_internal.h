@@ -2,7 +2,7 @@
 // DSperate - Nintendo DS emulator. Copyright (C) 2026 DSperate contributors.
 #pragma once
 // The backend's view of the Vulkan context: dispatch table and handles
-// vk_raster.cpp needs. Kept out of vk_device.h, which must stay free of
+// the Vulkan backends need. Kept out of vk_device.h, which must stay free of
 // vulkan.h. All functions resolved through vkGetInstanceProcAddr, so nothing
 // links against libvulkan and a driverless machine is not a failure to start.
 #define VK_NO_PROTOTYPES

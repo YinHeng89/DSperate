@@ -21,66 +21,6 @@ bool grid_seam(int v, int d, int axis) {
   return ((tab[v * 64 + axis * 32 + (d >> 5)] >> uint(d & 31)) & 1u) != 0u;
 }
 
-// Enhanced AA at panel density (core/gpu/edge_cut.h is the reference): the
-// slot holds both screens' edge bytes after the two frames, four a word.
-// Bit 7 edge, bit 5 the covered fraction runs vertically (outside above or
-// below), bit 6 the outside is the negative neighbour (left / up), bits 0-4
-// the polygon's coverage. The block is cut along the edge line: its position
-// across the run's axis from the coverage, its tilt from the next edge pixel
-// along the run on the panel pixel's side. Each panel pixel takes the pixel's
-// own colour or the outside neighbour's, never a mix.
-uint edge_byte(int scr, int x, int y) {
-  uint i = uint(y * 256 + x);
-  return (src[pc.b.w + 2u * 49152u + uint(scr) * 12288u + (i >> 2)] >> (8u * (i & 3u))) & 255u;
-}
-// Bit 4: an alpha-to-coverage edge; bits 0-3 the coverage's upper four bits.
-float cut_pos(uint e) {
-  float f = float((e & 15u) + 1u) / 16.0;
-  return (e & 64u) != 0u ? 1.0 - f : f;
-}
-uint src_px(int scr, int x, int y) { return src[pc.b.w + uint(scr) * 49152u + uint(y) * 256u + uint(x)]; }
-vec3 rgb(uint s) { return vec3(float((s >> 16) & 255u), float((s >> 8) & 255u), float(s & 255u)); }
-// The 1x anti-aliased colour of a pixel: its own mixed with the outside neighbour's by the coverage.
-vec3 blend_1x(int scr, int x, int y, uint e) {
-  vec3 own = rgb(src_px(scr, x, y));
-  if ((e & 128u) == 0u) return own;
-  bool vert = (e & 32u) != 0u, neg = (e & 64u) != 0u;
-  int px = vert ? x : (neg ? x - 1 : x + 1), py = vert ? (neg ? y - 1 : y + 1) : y;
-  if (px < 0 || px > 255 || py < 0 || py > 191) return own;
-  float c = float(((e & 15u) << 1) + 1u) / 32.0;
-  return mix(rgb(src_px(scr, px, py)), own, c);
-}
-// Soft modes (pc.b.z bits 9-10: polygon edges, alpha-to-coverage edges):
-// a panel pixel whose 2x2 source taps hold such an edge is the bilinear
-// mix of the taps at their 1x anti-aliased colours (edge_cut.h).
-bool soft_tap(uint e, uint mode) { return (e & 128u) != 0u && (mode & (((e & 16u) != 0u) ? 2u : 1u)) != 0u; }
-bool edge_soft(int scr, int sx, int sy, float u, float v, uint mode, out vec3 col) {
-  float du = u - 0.5, dv = v - 0.5;
-  int x1 = du < 0.0 ? sx - 1 : sx + 1, y1 = dv < 0.0 ? sy - 1 : sy + 1;
-  if (x1 < 0 || x1 > 255) x1 = sx;
-  if (y1 < 0 || y1 > 191) y1 = sy;
-  uint e00 = edge_byte(scr, sx, sy), e10 = edge_byte(scr, x1, sy), e01 = edge_byte(scr, sx, y1), e11 = edge_byte(scr, x1, y1);
-  if (!(soft_tap(e00, mode) || soft_tap(e10, mode) || soft_tap(e01, mode) || soft_tap(e11, mode))) return false;
-  float wu = abs(du), wv = abs(dv);
-  col = mix(mix(blend_1x(scr, sx, sy, e00), blend_1x(scr, x1, sy, e10), wu), mix(blend_1x(scr, sx, y1, e01), blend_1x(scr, x1, y1, e11), wu), wv);
-  return true;
-}
-uint edge_cut(int scr, int sx, int sy, float u, float v, uint s) {
-  uint e = edge_byte(scr, sx, sy);
-  if ((e & 128u) == 0u) return s;
-  bool vert = (e & 32u) != 0u, neg = (e & 64u) != 0u;
-  float t = vert ? v : u, along = (vert ? u : v) - 0.5;
-  int nx = sx + (vert ? (along < 0.0 ? -1 : 1) : 0), ny = sy + (vert ? 0 : (along < 0.0 ? -1 : 1));
-  float pos = cut_pos(e), pn = pos;
-  if (nx >= 0 && nx < 256 && ny >= 0 && ny < 192) { uint n = edge_byte(scr, nx, ny); if ((n & 224u) == (e & 224u)) pn = cut_pos(n); }
-  float line = pos + (pn - pos) * abs(along);
-  bool inside = neg ? (t >= line) : (t < line);
-  if (inside) return s;
-  int px = vert ? sx : (neg ? sx - 1 : sx + 1), py = vert ? (neg ? sy - 1 : sy + 1) : sy;
-  if (px < 0 || px > 255 || py < 0 || py > 191) return s;
-  return src[pc.b.w + uint(scr) * 49152u + uint(py) * 256u + uint(px)];
-}
-
 void main() {
   uvec2 p = gl_GlobalInvocationID.xy;
   if (p.x >= pc.a.x || p.y >= pc.a.y) return;
@@ -96,10 +36,7 @@ void main() {
     if (vi.y == 0 || lx < r.x || ly < r.y || lx >= r.x + r.z || ly >= r.y + r.w) continue;
     int sx = (lx - r.x) * 256 / r.z, sy = (ly - r.y) * 192 / r.w;
     uint s = src[pc.b.w + uint(vi.x) * 49152u + uint(sy) * 256u + uint(sx)];
-    float fu = (float(lx - r.x) + 0.5) * 256.0 / float(r.z) - float(sx), fv = (float(ly - r.y) + 0.5) * 192.0 / float(r.w) - float(sy);
-    uint soft = (pc.b.z >> 9) & 3u;
-    vec3 col;
-    if (soft == 0u || !edge_soft(vi.x, sx, sy, fu, fv, soft, col)) col = rgb(edge_cut(vi.x, sx, sy, fu, fv, s));
+    vec3 col = vec3(float((s >> 16) & 255u), float((s >> 8) & 255u), float(s & 255u));
     uint gf = (pc.b.z >> 16) & 0x1FFu;
     if (gf < 256u && vi.w != 0 && (grid_seam(v, lx - r.x, 0) || grid_seam(v, ly - r.y, 1))) col = floor(col * (float(gf) / 256.0));
     col /= 255.0;

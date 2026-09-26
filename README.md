@@ -139,10 +139,10 @@ hardware. No DraStic code is in this tree. See [docs/techniques](docs/techniques
 - **Scaling filters** applied per scanline straight into the presented buffer:
   nearest, bilinear, LCD grid, box-filter seams (sharp, shimmer-free), and
   chunky 2x2 cells; optional integer scaling (letterbox or crop).
-- **3D anti-aliasing** (`video.aa`, `--aa`, the ANTI-ALIASING menu row):
-  OFF, ACCURATE (the hardware's own edge blend, pixel-exact with melonDS) or
-  ENHANCED: that blend in every game, plus silhouettes the DS leaves jagged
-  where a surface covers its own edge (more of the DS's misses in progress).
+- **3D anti-aliasing** (`video.aa`, `--aa`, the ANTI-ALIASING menu row): on
+  the CPU raster the hardware's own edge blend (pixel-exact with melonDS); on
+  the GPU raster (`video.gpu3d`, `--gpu3d`: the 3D layer drawn by Vulkan at 1x,
+  one frame of lag allowed under load) 4x MSAA.
 - **Fastest path to the panel, chosen automatically:** the display engine's
   hardware scaler on Allwinner handhelds (Miyoo A30), fbdev on the H700 boards,
   zero-copy dmabuf under Wayland with direct scanout where allowed, our own page

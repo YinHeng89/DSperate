@@ -66,18 +66,10 @@ public:
 
   // Anti-aliasing (DISP3DCNT bit 4). Off clears the bit frame-wide: no
   // coverage, pixel-stack push, under-layer depth test, or AA blend.
-  // video.aa: 0 off, 1 accurate (the hardware blend, when the game asks), 2 enhanced
-  // (forced AA, and a surface doesn't stack on itself: see same_owner).
-  void set_aa(int level) { aa_ = static_cast<u8>(level); }
-  int aa() const { return aa_; }
-  // Enhanced AA at panel density: instead of blending an edge pixel with its
-  // outside neighbour at 1x, the final pass leaves the pixel unblended and
-  // writes an edge byte beside the frame (FrameRef::edges) for the present
-  // stage to cut the panel block along the edge: bit 7 edge, bit 5 the run's
-  // axis (1: the covered fraction is vertical, the outside above or below),
-  // bit 6 the outside is the negative neighbour (left / up), bits 0-4 the
-  // coverage (the polygon's share of the pixel, (cov + 1) / 32).
-  void set_edge_export(bool on) { edge_export_ = on; }
+  // video.aa: the hardware's edge blend on the CPU raster (when the game asks
+  // for it), 4x MSAA on the GPU raster. Coordinator only.
+  void set_aa(bool on);
+  bool aa() const { return aa_; }
   // --dump-gpu-frame: write NDS frame `frame`'s polygon list in the GPU raster's layout
   // (vk_dump.h) to `path`; the frame is drawn on the CPU as usual.
   void set_gpu_dump(const char* path, u64 frame) { gpu_dump_path_ = path; gpu_dump_frame_ = frame; }
@@ -87,7 +79,6 @@ public:
   // May decline (no Vulkan); `why` takes the reason. Coordinator only.
   bool set_gpu(bool on, std::string* why = nullptr);
   bool gpu_active() const { return gpu_on_; }
-  bool edge_export() const { return edge_export_; }
 private:
   NDS& nds_;
   // Holds a whole chunk of scanlines at once (render_chunk draws chunk at a
@@ -164,10 +155,6 @@ public:
     bool opaque;
     // Edges all fill under AA, edge marking, blended translucency or wireframe; fixed per polygon.
     bool always_fill;
-    bool aa_plus;   // video.aa = enhanced: the resolve's same-surface rule
-    bool aa_exempt; // enhanced: 3D used as 2D (a screen-aligned quad mapped one texel per pixel), left unblended
-    bool cutout;    // enhanced: an opaque polygon whose texture cuts pixels out (alpha-to-coverage on the cut edges)
-    s32 dsdx, dtdx, dsdy, dtdy;   // cutout: texcoord step per screen pixel and line from the polygon's plane (12.4), independent of what is staged
     bool attrs_constant, rgb_constant;   // uniform across the polygon; checked once
   };
 private:
@@ -229,18 +216,7 @@ private:
   const Gpu3D* gx_ = nullptr;
   const RenderState* rs_ = nullptr;
   bool game_aa_ = false;                  // AA blend runs (game asked and aa_ allows)
-  // The second pixel layer (the pixel underneath) is kept: accurate AA with
-  // the game's AA on. Enhanced blends an edge with its outside neighbour in
-  // the final pass instead, so it computes coverage but keeps no under layer:
-  // no push, under-layer depth test, translucent under plot, fog under, or
-  // shadow stencil bit 2.
-  bool under_layer_ = false;
-  bool edge_export_ = false;                            // see set_edge_export
-  std::array<u8, 256 * 192> edge_[2]{};                 // beside out_[2]
-  u8* out_edge_dst_ = nullptr;                          // this band's edge plane (null: not exporting)
-  u8 aa_ = 1, aa_rendered_ = 1;           // aa_rendered_: the setting the kept frame was drawn with
-  u32 mark_cov_ = 0x1000;                 // coverage edge marking leaves on a pixel (set_frame_aa)
-  void set_frame_aa();
+  bool aa_ = true, aa_rendered_ = true;   // aa_rendered_: the setting the kept frame was drawn with
   // rs_->dispcnt with bit 4 cleared when AA is off: kills the whole under
   // layer for the frame (AA blend, under-layer depth test, translucent plot,
   // fog, shadow stencil bit 2's under-layer writes).
@@ -276,12 +252,6 @@ private:
     alignas(16) u32 tcol[BATCH_CAP];     // texels for the span (textured polygons), colour15 and
     alignas(16) u32 talp[BATCH_CAP];     // 5-bit alpha, gathered once per span
     alignas(16) u32 col[BATCH_CAP];      // shaded pixel records (18-bit colour, alpha 24-28)
-    // Enhanced AA, cut-out textures (cutout_coverage): per pixel, 0xFF for
-    // none, else coverage bits 0-4 | 0x20 vertical axis | 0x40 outside on the
-    // negative side, the layout of the edge byte without its edge bit.
-    alignas(16) u8 ccov[BATCH_CAP];
-    alignas(16) u8 seam[BATCH_CAP + 16];        // enhanced: seam_pass's per-lane flag (edge-run lanes)
-    u8 gath[BATCH_CAP / 16 + 1];         // per sixteen-pixel group: texels gathered (span_texels' live runs, or cutout_coverage's own sampling)
   };
 
   SpanBuf spanbuf_;   // one per renderer; staged across calls before pixel stages run over it once
@@ -291,7 +261,6 @@ private:
     s32 y, ca, cb; u32 off;
     s32 xdraw, lim0, lim1, lim2;
     s32 l_cov, r_cov;
-    u32 l_dir, r_dir;
     int yedge;
     bool l_fill, r_fill, wf_skip;
   };
@@ -306,7 +275,6 @@ private:
     s32 wl, wr, zl, zr;      // endpoint w / z, swapped-edge order applied
     s32 al[5], ar[5];        // endpoint r g b s t, swapped-edge order applied
     s32 l_len, r_len, l_cov, r_cov;
-    u32 l_dir, r_dir;        // enhanced AA: attr bits 13-14, which neighbour the edge run blends toward (see precompute_lines)
     s32 xa, xb;              // the clipped screen range [xa, xb)
     int yedge;
     bool l_fill, r_fill, wf_skip;
@@ -321,16 +289,16 @@ private:
   void stage_line(Edge& e, s32 y, const LineSpan& ls);   // depth pre-pass, attribute staging, batch job
   u32  texture_sample(const Shade& sh, s32 s, s32 t, u32* alpha) const;
   template <bool textured> u32 shade_pixel(const Shade& sh, u32 vr, u32 vg, u32 vb, s32 s, s32 t) const;
-  void plot_translucent(u32 addr, u32 color, u32 z, u32 polyattr, bool shadow, u32 own = 0);
+  void plot_translucent(u32 addr, u32 color, u32 z, u32 polyattr, bool shadow);
   template <int mode> bool depth_pass(u32 addr, s32 z, u32 dstattr) const;
   // One contiguous range of a span; called only from batch kernels and the
   // vector kernel's scalar fallback so it inlines into them.
-  template <int mode, bool textured, int aa, bool shadow> void resolve_span(const Shade& sh, const SpanBuf& sb, s32 y, s32 xa, s32 xb, int part, int edge, s32 l_cov, s32 r_cov, s32& xcov);
-  template <int mode, bool textured, int aa, bool shadow> void resolve_batch(const Shade& sh, const SpanJob* jobs, u32 n);
+  template <int mode, bool textured, bool aa, bool shadow> void resolve_span(const Shade& sh, const SpanBuf& sb, s32 y, s32 xa, s32 xb, int part, int edge, s32 l_cov, s32 r_cov, s32& xcov);
+  template <int mode, bool textured, bool aa, bool shadow> void resolve_batch(const Shade& sh, const SpanJob* jobs, u32 n);
 #if DSPERATE_NEON
   // Four pixels per step, same results as resolve_span; polygons without shadow/wireframe/toon only.
-  template <int mode, bool textured, int aa, bool opq> [[gnu::always_inline]] inline void resolve_span_vec(const Shade& sh, const SpanBuf& sb, s32 y, s32 xa, s32 xb, int part, int edge, s32 l_cov, s32 r_cov, s32& xcov);
-  template <int mode, bool textured, int aa, bool opq> void resolve_batch_vec(const Shade& sh, const SpanJob* jobs, u32 n);
+  template <int mode, bool textured, bool aa, bool opq> [[gnu::always_inline]] inline void resolve_span_vec(const Shade& sh, const SpanBuf& sb, s32 y, s32 xa, s32 xb, int part, int edge, s32 l_cov, s32 r_cov, s32& xcov);
+  template <int mode, bool textured, bool aa, bool opq> void resolve_batch_vec(const Shade& sh, const SpanJob* jobs, u32 n);
   // DS_PROFILE census: per 8-pixel group, is the resolve kind code uniform among drawing lanes?
   void rk_census(u64 kinds, u64 p8);
   u32 rk_or_ = 0, rk_groups_ = 0;
@@ -362,7 +330,6 @@ private:
   template <typename Range> [[gnu::always_inline]] inline void walk_span(const SpanJob& j, Range&& range);
   void render_shadow_mask_line(Edge& e, s32 y);
   void flush_batch(const Shade& sh);
-  void seam_pass(const Shade& sh, const SpanJob* jobs, u32 n);
   // Rasterises [ya, yb) polygon at a time, not line at a time: active set
   // merged once per chunk, each polygon draws its whole covered run before
   // the next starts. Per-pixel order unchanged (list order), so blend/stencil
@@ -377,7 +344,7 @@ private:
   // range it emits, since the final pass reads two neighbours.
   void build_edges();   // from list_polys_ / list_count_, latched by render() or prepare_worker
   void seed_active(s32 y);
-  void render_band(s32 y0, s32 y1, u32* dst, u8* edst);
+  void render_band(s32 y0, s32 y1, u32* dst);
   void prepare_worker(const Gpu3D& gx, const Polygon* const* polys, u32 npoly, const std::vector<const u32*>* texels, const RenderState* rs);
   RenderState rs_frame_;   // coordinator's copy; the engine's own may be rewritten at the next VBlank mid-raster
   static u32 band_count(u32 polygons);
@@ -404,8 +371,6 @@ public:
     // before the compositor's batch as well (see sync_line).
     mutable const u32* out = nullptr;
     bool gpu = false, allow_lag = true;
-    const u8* edges = nullptr;   // enhanced AA edge plane (set_edge_export), or null
-    const u8* edge_line(u32 y) const { return edges ? edges + y * 256 : nullptr; }
     u64 gen = 0;
     u32 nbins = 0;
     std::array<s32, MAX_BINS + 1> bin_y{};
@@ -477,9 +442,7 @@ private:
     std::array<s32, MAX_BINS + 1> bin_y{};
     u32 nbins = 0;
     u32* dst = nullptr;
-    u8* edst = nullptr;
-    u8 aa = 0;
-    bool edge_export = false;
+    bool aa = false;
   };
   DispatchCtx ctx_[2];
   struct StealBand { std::unique_ptr<Renderer3D> band; std::atomic<bool> busy{false}; u64 gen = ~u64{0}; };
@@ -490,16 +453,6 @@ private:
   u32  fog_density(u32 addr) const;
   void final_pass(s32 y);
   void final_pass_ref(s32 y);
-  // Enhanced AA: the line's blend with outside neighbours (both final passes), and the raw-row copies it reads.
-  void enhanced_aa_line(s32 y);
-  void stamp_intersections(s32 y);
-  void cutout_coverage(const Shade& sh, SpanBuf& sb, const SpanJob* jobs, u32 n);
-  void save_raw_row(s32 y);
-  u32 raw_rows_[4][W]{};
-  s32 raw_line_ = -100;
-  u32 trace_last_[8] = {}; u32 trace_n_ = 0; u32 trown_last_[6] = {}; u32 seam_last_[6] = {}; u32 seam_n_ = 0; u64 frame_tag_ = 0;   // DS_CUT_TRACE: the last polygon that plotted the traced pixel, for the DS_EDGE_TRACE line
-  bool raw_prev_ok_ = false;
-  void final_pass_debug(s32 y);   // DS_AA_DEBUG: the final pass with each 3D edge pixel painted by what the AA does with it
 public:
   // final_pass against final_pass_ref on random buffers; 0 when identical.
   u32  selftest_final_pass(u32 seed, u32 dispcnt);

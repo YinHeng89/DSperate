@@ -85,11 +85,7 @@ public:
   void vram_remap_end(bool trapped);  // after: re-arm it
   void set_lazy(bool on) { lazy_enabled_ = on; }   // off: per-line rendering (tests)
 
-  const u32* framebuffer(int screen) const { return fb_store_[fb_cur_][screen].data(); }   // 0 = top, 1 = bottom
-  // Enhanced AA at panel density: the screen's edge plane (Renderer3D::set_edge_export), zero where no 3D edge shows.
-  const u8* edge_plane(int screen) const { return edge_store_[fb_cur_][screen].data(); }
-  void set_edge_export(bool on);
-  bool edge_export() const { return edge_export_; }
+  const u32* framebuffer(int screen) const { return fb_[screen].data(); }   // 0 = top, 1 = bottom
 
   // A screen the frontend does not show. Its driving engine skips drawing but
   // keeps journal/latches/windows/lazy-2D bookkeeping running so it's exact
@@ -208,23 +204,7 @@ private:
   u8 fifo_rd_ = 0, fifo_wr_ = 0;
   alignas(16) std::array<u16, 256> fifo_line_{};
   bool run_fifo_ = false;
-  // Two sets of frame buffers: while the enhanced AA edge planes are exported
-  // the sets alternate per frame (begin_frame), so last frame's lines and edge
-  // bytes stay in place for the unchanged-line rule below with no copying.
-  std::array<std::array<u32, SCREEN_W * SCREEN_H>, 2> fb_store_[2]{};
-  int fb_cur_ = 0;
-  std::array<u8, SCREEN_W * SCREEN_H> edge_store_[2][2]{};   // enhanced AA edge bytes per screen (edge_plane), per set
-  bool edge_export_ = false;
-  // Edge bytes of captured pixels, one per 16-bit VRAM pixel of banks A-D:
-  // display capture fills them beside the colour, VRAM display reads them
-  // back, so a game that shows its 3D through a capture (GS:DD every frame,
-  // Spirit Tracks on alternate frames per screen) keeps its edges. CPU
-  // writes into a captured image are not tracked (stale bytes cut wrong).
-  std::vector<u8> edge_vram_;
-  // A line shown again unchanged (a game copying its captured frame around
-  // with the CPU, as GS:DD does for its other screen) keeps its edge bytes,
-  // since the edges are a function of the picture: compared against the
-  // other set's line, last frame's.
+  std::array<std::array<u32, SCREEN_W * SCREEN_H>, 2> fb_{};
   ScaleTarget scale_[2];
   static constexpr u32 SCALED_ROW_MAX = 4096;
   alignas(16) u32 chunk_even_[2][SCREEN_W];   // chunky: the even line, held until the odd one completes the block

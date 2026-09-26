@@ -3,7 +3,6 @@
 //
 // Headless frontend: boots the BIOS/firmware (and optionally a ROM), runs N
 // frames, optionally tracing instructions or dumping frames/audio.
-#include "core/gpu/edge_cut.h"
 #include "core/nds.h"
 #include "core/cpu/timing_mode.h"
 #include "core/pc_sampler.h"
@@ -248,8 +247,6 @@ int main(int argc, char** argv) {
   int stats_from = 0;   // --stats-from N: first frame counted in the timing statistics
   const char* pc_profile = nullptr;
   int dump_from = 0, dump_count = 0;   // --dump-from/--dump-count: window of a large dump
-  int cut_n = 0; const char* cut_path = nullptr;   // --dump-cut
-  const char* edges_path = nullptr; FILE* edges_out = nullptr;   // --dump-edges
   long gpu_dump_frame = -1; const char* gpu_dump_path = nullptr;   // --dump-gpu-frame
   const char* rec3d_path = nullptr;   // --dump-3d
   bool gpu3d = false;   // --gpu3d
@@ -262,7 +259,7 @@ int main(int argc, char** argv) {
   TraceState ts;
   bool rtc_host = false;              // --rtc-host: free-running clock seeded from the wall
   const char* fw_override = nullptr;  // --firmware-override: sidecar of changed firmware pages
-  bool no_aa = false, aa_enhanced = false;
+  bool no_aa = false;
   bool frames_given = false;
   const char* cheat_db = nullptr;      // a usrcheat.dat to load this ROM's codes from
   const char* bios9i = nullptr; const char* bios7i = nullptr; const char* dsi_boot = nullptr; const char* dsi_nand = nullptr; bool dsi_nand_boot = false; bool dsi_nand_write = false; const char* dsi_persist = nullptr; const char* dsi_install = nullptr; bool dsi_hide_installed = false; const char* dsi_tmd = nullptr; bool dsi_offline = false; bool dsi_autoload = false; bool dsi_hle = false; ds::u32 dsi_title_lo = 0; ds::bios::UserSettings user; const char* dsi_font = nullptr; const char* dsi_sd = nullptr; ds::u64 dsi_autoload_id = 0; const char* dsi_shortcuts = nullptr; bool dsi_shortcuts_on = true;
@@ -327,10 +324,9 @@ int main(int argc, char** argv) {
     else if (arg("--trace")) trace = argv[++i];
     else if (arg("--max")) ts.max = std::strtoull(argv[++i], nullptr, 0);
     else if (arg("--dump-frames")) dump = argv[++i];
-    else if (arg("--dump-cut")) { cut_n = std::atoi(argv[++i]); cut_path = argv[++i]; }
     else if (arg("--dump-3d")) rec3d_path = argv[++i];   // FILE: the 3D layer record as the compositor reads it (256x192 words: RGB666 + 5-bit alpha in 24-28), for the --dump-from/--dump-count frames
     else if (arg("--dump-gpu-frame")) { gpu_dump_frame = std::atol(argv[++i]); gpu_dump_path = argv[++i]; }   // N FILE: frame N's polygon list in the GPU raster's layout (vk_dump.h)
-    else if (arg("--dump-edges")) edges_path = argv[++i];   // FILE: the enhanced AA edge bytes (Gpu::edge_plane), both screens, 256x192 each per frame   // N FILE: enhanced AA cut at Nx (edge bytes exported, 1x unblended), both screens, raw 0xAARRGGBB
+
     else if (arg("--hash-frames")) hash_frames = argv[++i];   // FILE: "frame top bottom" per frame, FNV-1a 64 of each screen's 0xAARRGGBB (the video golden hashes)
     else if (arg("--dump-scaled")) { scaled_n = std::atoi(argv[++i]); scaled_path = argv[++i]; }   // N FILE: both screens through the scanline scaler at Nx, raw BGRA
     else if (arg("--dump-from")) dump_from = std::atoi(argv[++i]);    // first frame to dump
@@ -348,8 +344,7 @@ int main(int argc, char** argv) {
     else if (flag("--rtc-host")) rtc_host = true;                            // INEXACT by construction: runs stop being reproducible
     else if (arg("--firmware-override")) fw_override = argv[++i];            // load it, and write back what the firmware changed
     else if (flag("--no-aa")) no_aa = true;                                  // 3D anti-aliasing off (Renderer3D::set_aa); inexact, for measurement
-    else if (flag("--enhanced")) aa_enhanced = true;
-    else if (flag("--gpu3d")) gpu3d = true;   // the 3D layer on the GPU (Renderer3D::set_gpu, vk_lean.h); declines to the CPU without Vulkan                         // video.aa = enhanced: forced coverage, blended with the outside neighbour (Renderer3D::set_aa)
+    else if (flag("--gpu3d")) gpu3d = true;   // the 3D layer on the GPU (Renderer3D::set_gpu, vk_lean.h); declines to the CPU without Vulkan
     else if (arg("--load-state")) load_state = argv[++i];                   // restore a save state before running
     else if (arg("--frameskip")) frameskip = std::atoi(argv[++i]);          // skip drawing N of every N+1 frames (Gpu::set_frame_skip); a dump of a skipped frame is stale
     else if (flag("--frameskip-capture")) frameskip_capture = true;          // INEXACT: skip frames that display-capture too
@@ -516,7 +511,7 @@ int main(int argc, char** argv) {
       std::fprintf(stderr, "note: DSi-capable ROM without --bios9i/--bios7i: running as a DS\n");
     }
   }
-  nds.gpu3d.renderer().set_aa(no_aa ? 0 : aa_enhanced ? 2 : 1);
+  nds.gpu3d.renderer().set_aa(!no_aa);
   std::vector<ds::u32> scaled_px[2]; std::vector<ds::u16> scaled_xrun; FILE* scaled_out = nullptr;
   if (scaled_n > 0 && scaled_path) {
     const ds::u32 W = ds::SCREEN_W * scaled_n, H = ds::SCREEN_H * scaled_n;
@@ -617,16 +612,8 @@ int main(int argc, char** argv) {
   FILE* dump_out = dump ? std::fopen(dump, "wb") : nullptr;
   FILE* rec3d_out = rec3d_path ? std::fopen(rec3d_path, "wb") : nullptr;
   if (dump && !dump_out) { std::fprintf(stderr, "could not open %s\n", dump); return 1; }
-  FILE* cut_out = nullptr; std::vector<ds::u32> cut_px;
-  if (cut_n > 0 && cut_path) {
-    cut_out = std::fopen(cut_path, "wb");
-    if (!cut_out) { std::fprintf(stderr, "could not open %s\n", cut_path); return 1; }
-    cut_px.resize(static_cast<size_t>(256 * cut_n) * static_cast<size_t>(192 * cut_n));
-    nds.gpu.set_edge_export(true);
-  }
   if (gpu_dump_path && gpu_dump_frame >= 0) nds.gpu3d.renderer().set_gpu_dump(gpu_dump_path, static_cast<ds::u64>(gpu_dump_frame));
   if (gpu3d) { std::string why; if (!nds.gpu3d.renderer().set_gpu(true, &why)) std::fprintf(stderr, "gpu3d: unavailable (%s), drawing on the CPU\n", why.c_str()); }
-  if (edges_path) { edges_out = std::fopen(edges_path, "wb"); if (!edges_out) { std::fprintf(stderr, "could not open %s\n", edges_path); return 1; } nds.gpu.set_edge_export(true); }
   FILE* hash_out = hash_frames ? std::fopen(hash_frames, "w") : nullptr;
   if (hash_frames && !hash_out) { std::fprintf(stderr, "could not open %s\n", hash_frames); return 1; }
   ds::input::Log log;
@@ -834,13 +821,6 @@ int main(int argc, char** argv) {
     }
     if (scaled_out && i >= dump_from && (dump_count <= 0 || i < dump_from + dump_count))
       for (int k = 0; k < 2; ++k) std::fwrite(scaled_px[k].data(), 4, scaled_px[k].size(), scaled_out);
-    if (edges_out && i >= dump_from && (dump_count <= 0 || i < dump_from + dump_count))
-      for (int k = 0; k < 2; ++k) std::fwrite(nds.gpu.edge_plane(k), 1, ds::SCREEN_W * ds::SCREEN_H, edges_out);
-    if (cut_out && i >= dump_from && (dump_count <= 0 || i < dump_from + dump_count))
-      for (int k = 0; k < 2; ++k) {
-        ds::gpu::edge_cut_screen(nds.gpu.framebuffer(k), nds.gpu.edge_plane(k), cut_n, cut_px.data(), ds::gpu::edge_soft_mode_env());
-        std::fwrite(cut_px.data(), 4, cut_px.size(), cut_out);
-      }
     if (dump_out && i >= dump_from && (dump_count <= 0 || i < dump_from + dump_count)) {
       // raw 0xAARRGGBB, top screen then bottom, 256x192 each, one record per frame
       std::fwrite(nds.gpu.framebuffer(0), 4, ds::SCREEN_W * ds::SCREEN_H, dump_out);

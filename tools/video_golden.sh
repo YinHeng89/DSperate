@@ -11,8 +11,6 @@
 # with the JIT and with --interp when the binary has a JIT. Hashes are FNV-1a
 # 64 of each screen's 0xAARRGGBB (headless --hash-frames). The CPU timing model
 # is DS_TIMING (default exact here); DS_TIMING=fast needs a golden directory of its own.
-# 64 of each screen's 0xAARRGGBB (headless --hash-frames). ENHANCED=1 checks
-# video.aa = enhanced (--enhanced) instead, in a golden directory of its own.
 # HEADLESS=path overrides the binary (default build/host); DS_RUNNER=qemu-aarch64-static
 # runs a cross-built one. JOBS=N sets the parallelism (default nproc).
 # The JIT runs with DS_JIT_STRICT=1 (per-instruction budget checks: the mode in
@@ -52,11 +50,9 @@ SCENES=(
   "ph|1500||Legend of Zelda, The - Phantom Hourglass.nds"
 )
 MODES=("aa|" "noaa|--no-aa")
-[ -n "${ENHANCED:-}" ] && MODES=("enh|--enhanced")
 banner=$($R "$G" --frames 0 /dev/null 2>&1 | head -1 || true)   # captured first: grep -q under pipefail would SIGPIPE the run
 if [[ $banner == *"(jit"* ]]; then
-  if [ -n "${ENHANCED:-}" ]; then MODES+=("enh-interp|--enhanced --interp")
-  else MODES+=("aa-interp|--interp" "noaa-interp|--no-aa --interp"); fi
+  MODES+=("aa-interp|--interp" "noaa-interp|--no-aa --interp")
 fi
 
 mkdir -p "$dir"

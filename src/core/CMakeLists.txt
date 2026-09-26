@@ -129,7 +129,7 @@ if(DSPERATE_VULKAN)
     find_path(DSPERATE_VULKAN_INCLUDE vulkan/vulkan.h NO_CMAKE_FIND_ROOT_PATH)
   endif()
   if(DSPERATE_VULKAN_INCLUDE)
-    target_sources(dsperate_core PRIVATE gpu/vk/vk_device.cpp gpu/vk/vk_raster.cpp gpu/vk/vk_shaders.cpp gpu/vk/vk_lean.cpp)
+    target_sources(dsperate_core PRIVATE gpu/vk/vk_device.cpp gpu/vk/vk_shaders.cpp gpu/vk/vk_lean.cpp)
     # GPU 3D raster (gpu-raster branch): SPIR-V is checked in and .incbin'd by
     # vk_shaders.cpp (no shader compiler needed at build time); re-link when a blob changes.
     set_property(SOURCE gpu/vk/vk_shaders.cpp APPEND PROPERTY COMPILE_DEFINITIONS

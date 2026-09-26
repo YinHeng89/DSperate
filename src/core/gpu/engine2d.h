@@ -76,15 +76,6 @@ public:
 
   // Engine A: 256 RGB666 with 5-bit alpha in bits 24-28 (0 = transparent), or null.
   void set_3d_line(const Pixel* line) { line3d_ = line; }
-  // Enhanced AA edge bytes of the 3D line (null: none), and the line's edge
-  // bytes where the 3D layer is what shows (the top selected layer is BG0
-  // as the 3D layer), zero elsewhere.
-  void set_3d_edges(const u8* e) { edge3d_ = e; }
-  // The edge bytes of captured pixels in VRAM banks A-D (Gpu::edge_vram_,
-  // one per 16-bit pixel; null: none): a direct-colour bitmap BG showing a
-  // captured frame carries them (bg_edge_).
-  void set_edge_vram(const u8* v) { edge_vram_ = v; }
-  void edge_mask(u8* out) const;
 
   u32 bldcnt() const { return regs_.bldcnt(); }
   u32 eva() const { return regs_.eva(); }
@@ -148,14 +139,6 @@ private:
   alignas(16) std::array<u8, 256> top_id_{}, top_kind_{}, top_alpha_{}, second_id_{};
   alignas(16) std::array<Pixel, 256> out_{};
   const Pixel* line3d_ = nullptr;
-  const u8* edge3d_ = nullptr;
-  const u8* edge_vram_ = nullptr;
-  alignas(16) u8 bg_edge_[4][256]{};   // per BG, the edge bytes its bitmap row carried this line (bg_edge_any_)
-  bool bg_edge_any_[4] = {};
-  alignas(16) u8 obj_edge_[256]{};     // the OBJ layer's carried edge bytes this line (bitmap sprites showing a capture)
-  bool obj_edge_any_ = false;
-  enum : u8 { TOP_NONE, TOP_ALL, TOP_TIDS } top_mode_ = TOP_NONE;   // how render_line decided the top layer (edge_mask)
-  int top_all_bg_ = -1;                                              // TOP_ALL: the one layer
 
   const VramMap& vram() const;
   const VramMap* vm_override_ = nullptr;
@@ -170,7 +153,7 @@ private:
   void draw_bg_extended(u32 line, int bg);
   void draw_bg_large(u32 line);
   // Rotscale fast path for pa = 1.0, pc = 0.
-  void bitmap_row_degenerate(int bg, Layer& plane, u32 base, u32 xmask, u32 ymask, u32 yshift, bool wrap, bool direct, s32 rx, s32 ry);
+  void bitmap_row_degenerate(Layer& plane, u32 base, u32 xmask, u32 ymask, u32 yshift, bool wrap, bool direct, s32 rx, s32 ry);
   void tile_row_degenerate(Layer& plane, u32 tilemap, u32 tileset, u32 coordmask, u32 yshift, bool wrap, bool map16, bool ext, int bg, s32 rx, s32 ry);
   void draw_bg_3d();
   void draw_sprite_normal(const u16* attr, int w, int h, s32 x, s32 y, bool window);

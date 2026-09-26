@@ -14,22 +14,7 @@ struct Spirv {
   size_t     bytes = 0;      // vkCreateShaderModule wants a byte count
 };
 
-Spirv shader_bin();      // binning pass: polygons -> per-tile lists
-Spirv shader_span();     // span pass: the Y stage, once per (polygon, scanline)
-Spirv shader_raster();   // raster pass: one workgroup per tile
-Spirv shader_post();     // final pass: edge marking then fog
-Spirv shader_vis();      // visibility pass: the order-free prefix, one fragment at a time
-Spirv shader_raster_vis();   // raster pass seeded from the visibility pass (needs shaderInt64)
-Spirv shader_tri_vert();     // triangle path: polygons as fans through the hardware rasteriser
-Spirv shader_tri_opaque();   // ... its opaque-prefix fragment stage
-Spirv shader_tri_tail();     // ... and the ordered translucent tail
-Spirv shader_downsample();   // native plane from the hi-res layer (S >= 2)
-Spirv shader_tri_mask();     // shadow-mask draw: run id into the shadow plane where the depth test fails
-Spirv shader_tri_opaque_ms();   // 4x MSAA: the opaque prefix with alpha to coverage
-Spirv shader_tri_tail_ms();  // ... the tail and the mask once per sample
-Spirv shader_tri_mask_ms();
-Spirv shader_tri_resolve();  // ... and the resolve subpass (four samples into the 1x planes)
-Spirv shader_tri_fs();       // its fullscreen triangle
+Spirv shader_tri_fs();       // a fullscreen triangle (the resolve subpass)
 Spirv shader_lean_vert();    // lean path (vk_lean.cpp): fans at 1x, MSAA vertex placement
 Spirv shader_lean_frag();    // ... its one fragment stage
 Spirv shader_lean_frag_early();   // ... without the alpha test (early depth test) for polygons that cannot fail it

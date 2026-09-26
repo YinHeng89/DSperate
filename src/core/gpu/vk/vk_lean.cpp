@@ -119,7 +119,7 @@ u32 Lean::draws() const { return d_->last_draws; }
 Lean::Stats Lean::stats(bool reset) { std::lock_guard<std::mutex> lk(d_->m); Stats s = d_->st; if (reset) d_->st = Stats{}; return s; }
 static double now_ms() { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 
-std::unique_ptr<Lean> Lean::create(Device& dev, std::string* why) {
+std::unique_ptr<Lean> Lean::create(Device& dev, bool msaa, std::string* why) {
   auto fail_null = [&](const char* m) { if (why) *why = m; return nullptr; };
   const DeviceInternal* vk = dev.internal();
   if (!vk || !vk->api) return fail_null("no Vulkan context");
@@ -130,7 +130,7 @@ std::unique_ptr<Lean> Lean::create(Device& dev, std::string* why) {
   Impl& d = *self->d_;
   d.vk = vk; d.api = &a; d.dev = &dev;
   auto fail = [&](const char* m) { if (why) *why = m; return nullptr; };
-  d.msaa = dev.limits().msaa4 && !(std::getenv("DS_LEAN_MSAA") && std::atoi(std::getenv("DS_LEAN_MSAA")) == 0);
+  d.msaa = msaa && dev.limits().msaa4 && !(std::getenv("DS_LEAN_MSAA") && std::atoi(std::getenv("DS_LEAN_MSAA")) == 0);   // DS_LEAN_MSAA=0: off regardless (debug)
   const VkSampleCountFlagBits samples = d.msaa ? VK_SAMPLE_COUNT_4_BIT : VK_SAMPLE_COUNT_1_BIT;
 
   // Buffers.

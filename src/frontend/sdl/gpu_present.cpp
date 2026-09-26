@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // DSperate - Nintendo DS emulator. Copyright (C) 2026 DSperate contributors.
 #include "frontend/sdl/gpu_present.h"
-#include "core/gpu/edge_cut.h"
 
 #include <cstdio>
 #include <algorithm>
@@ -31,8 +30,7 @@ __asm__(".section .rodata\n.balign 4\n.globl ds_present_spv_data\nds_present_spv
 extern "C" const unsigned char ds_present_spv_data[], ds_present_spv_end[];
 
 constexpr u32 kFrameWords = 256 * 192;     // one screen
-constexpr u32 kEdgeWords = 256 * 192 / 4;  // one screen's edge bytes, four a word
-constexpr u32 kSlotWords = 2 * kFrameWords + 2 * kEdgeWords;  // both screens, then both screens' edge bytes
+constexpr u32 kSlotWords = 2 * kFrameWords;  // both screens
 constexpr int kSlots = 2;                  // frames in flight + the one being written
 constexpr int kMaxBufs = 8;
 constexpr u32 kBindings = 4;               // dst image, source frames, overlay, grid table
@@ -330,7 +328,7 @@ bool GpuPresent::reimport(ScanoutOut& out) {
 
 void GpuPresent::flush(ScanoutOut& out) { d_->retire(out); }
 
-bool GpuPresent::present(ScanoutOut& out, const u32* const fb[2], const u8* const edges[2], const View* views, int nviews, int rot, int lw, int lh, u8 inset_alpha,
+bool GpuPresent::present(ScanoutOut& out, const u32* const fb[2], const View* views, int nviews, int rot, int lw, int lh, u8 inset_alpha,
                          SDL_Rect drawn, u32 grid) {
   Impl& d = *d_;
   const Api& a = *d.a;
@@ -350,10 +348,6 @@ bool GpuPresent::present(ScanoutOut& out, const u32* const fb[2], const u8* cons
 
   u32* dst = static_cast<u32*>(d.src.ptr) + static_cast<size_t>(slot) * kSlotWords;
   for (int s = 0; s < 2; ++s) std::memcpy(dst + static_cast<size_t>(s) * kFrameWords, fb[s], sizeof(u32) * kFrameWords);
-  for (int s = 0; s < 2; ++s) {
-    u32* e = dst + 2 * kFrameWords + static_cast<size_t>(s) * kEdgeWords;
-    if (edges && edges[s]) std::memcpy(e, edges[s], sizeof(u32) * kEdgeWords); else std::memset(e, 0, sizeof(u32) * kEdgeWords);
-  }
   d.dev->flush(d.src, static_cast<size_t>(slot) * kSlotWords * sizeof(u32), kSlotWords * sizeof(u32));
   u64 t3 = now(); d.t_upload += t3 - t2;
 
@@ -386,8 +380,7 @@ bool GpuPresent::present(ScanoutOut& out, const u32* const fb[2], const u8* cons
     const int y0 = std::max(0, drawn.y), y1 = std::min(lh, drawn.y + drawn.h);
     if (y1 > y0) d.dev->flush(d.over[slot], static_cast<size_t>(y0) * lw * sizeof(u32), static_cast<size_t>(y1 - y0) * lw * sizeof(u32));
   }
-  static const u32 soft = static_cast<u32>(ds::gpu::edge_soft_mode_env());   // DS_GEOM_SOFT / DS_CUT_SOFT / DS_ALL_SOFT: bilinear ramps at the edges (edge_cut.h)
-  pc.b[0] = static_cast<u32>(rot); pc.b[1] = static_cast<u32>(nviews > 2 ? 2 : nviews); pc.b[2] = inset_alpha | (has_over ? 0x100u : 0u) | (soft << 9) | (std::min<u32>(grid, 256) << 16);
+  pc.b[0] = static_cast<u32>(rot); pc.b[1] = static_cast<u32>(nviews > 2 ? 2 : nviews); pc.b[2] = inset_alpha | (has_over ? 0x100u : 0u) | (std::min<u32>(grid, 256) << 16);
   pc.b[3] = static_cast<u32>(slot) * kSlotWords;
   for (int v = 0; v < static_cast<int>(pc.b[1]); ++v) {
     pc.rect[v][0] = views[v].rect.x; pc.rect[v][1] = views[v].rect.y; pc.rect[v][2] = views[v].rect.w; pc.rect[v][3] = views[v].rect.h;

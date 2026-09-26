@@ -19,7 +19,6 @@ const Choice kSkipMode[] = {{"adaptive", "ADAPTIVE"}, {"fixed", "FIXED"}};
 const Choice kLimiter[] = {{"auto", "CONSOLE (59.8)"}, {"30", "30"}, {"60", "60"}, {"120", "120"},
                            {"144", "144"}, {"240", "240"}, {"off", "UNLIMITED"}};
 const Choice kIntScale[] = {{"off", "OFF"}, {"under", "UNDER"}, {"over", "OVER"}};
-const Choice kAa[]       = {{"off", "OFF"}, {"accurate", "ACCURATE"}, {"enhanced", "ENHANCED"}};
 const Choice kSeam[]     = {{"dark", "DARK"}, {"blend", "BLEND"}, {"blend_linear", "BLEND LINEAR"}};
 const Choice kChunky[]   = {{"false", "OFF"}, {"mean", "DEFAULT"}, {"extreme", "ADAPTIVE"},
                             {"mode", "COMMON"}, {"tl", "FIRST"}, {"min", "DARKEST"}, {"max", "LIGHTEST"}};
@@ -122,8 +121,10 @@ const Setting kVideoSettings[] = {
          "PANEL PIXELS PER CELL", "auto", "AUTO"),
   number("video.screen_gap", "SCREEN GAP", 0, 128, 4, "0", FlagDeferred, Dep::OneWindow,
          "PANEL PIXELS BETWEEN THE TWO SCREENS WHEN THEY ARE STACKED OR SIDE BY SIDE"),
-  pick("video.aa", "ANTI-ALIASING", kAa, 3, "off", FlagLive, Dep::None,
-       "ACCURATE BLENDS 3D EDGES AS THE HARDWARE DID. ENHANCED ALSO SMOOTHS SILHOUETTES THE DS LEAVES JAGGED, IN EVERY GAME"),
+  boolean("video.aa", "ANTI-ALIASING", "false", FlagLive, Dep::None,
+          "3D EDGES: THE HARDWARE'S BLEND ON THE CPU RASTER, 4X MSAA ON THE GPU RASTER"),
+  boolean("video.gpu3d", "GPU 3D", "false", FlagLive, Dep::None,
+          "DRAW THE 3D LAYER ON THE GPU. NEEDS VULKAN; THE CPU DRAWS IT OTHERWISE"),
   boolean("video.gpu_present", "GPU PRESENT", "true", FlagDeferred, Dep::None,
           "SCALE AND LAY OUT THE SCREENS ON THE GPU. NEEDS VULKAN AND A DIRECT-TO-PANEL DISPLAY"),
   boolean("video.fps", "FPS COUNTER", "false", FlagLive, Dep::None,

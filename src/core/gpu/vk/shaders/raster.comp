@@ -1,5 +1,0 @@
-#version 450
-// glslc enables this implicitly; glslangValidator needs it spelled out.
-#extension GL_GOOGLE_include_directive : require
-// The raster without the visibility pass: see raster_body.glsl.
-#include "raster_body.glsl"

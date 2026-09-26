@@ -58,8 +58,7 @@ void Gpu::reset() {
   master_bright_g_[0] = master_bright_g_[1] = 0;
   capcnt_ = 0; capture_on_ = false;
   fifo_.fill(0); fifo_rd_ = fifo_wr_ = 0; fifo_line_.fill(0); run_fifo_ = false;
-  for (auto& set : fb_store_) for (auto& fb : set) fb.fill(0);
-  fb_cur_ = 0;
+  for (auto& fb : fb_) fb.fill(0);
   engine[0].reset(); engine[1].reset();
   set_powcnt(nds_.io.powcnt1);
   nds_.io.set_vcount(0);
@@ -557,8 +556,6 @@ void Gpu::begin_frame() {
   }
   // Frameskip: what line 215 assumed, re-checked now the capture bit is known.
   skip_frame_ = skip_next_ && skippable();
-  // Exporting edge planes: the frame buffers alternate per drawn frame (see fb_store_).
-  if (edge_export_ && !skip_frame_) fb_cur_ ^= 1;
   if (g_dbg_skip)
     std::fprintf(stderr, "[skip] frame %llu req %d raster %d capture %d/%u fifo %d period %u -> %s\n",
                  static_cast<unsigned long long>(nds_.frame_count), skip_req_ ? 1 : 0, skip_next_ ? 1 : 0,
@@ -793,7 +790,7 @@ void Gpu::step_engine(int e, u32 line) {
   const bool draw = !skip_frame_ && !(e == 1 && !screen_visible_[en.screen()]);
   if (!draw) skipped_[e] = true; else if (skipped_[e]) { skipped_[e] = false; en.render_sprites(line); }
   // Reading the 3D line joins the raster bands: skip it when the raster never ran.
-  if (e == 0 && (draw || capture_render_)) { prof::Scope l3(prof::R3D_LINE); line3d_ = nds_.gpu3d.line(ref3d_, line); en.set_3d_line(line3d_); en.set_3d_edges(edge_export_ ? nds_.gpu3d.edge_line(ref3d_, line) : nullptr); }
+  if (e == 0 && (draw || capture_render_)) { prof::Scope l3(prof::R3D_LINE); line3d_ = nds_.gpu3d.line(ref3d_, line); en.set_3d_line(line3d_); }
   if (draw) { en.render_line(line); output_engine(e, line); }
   if (e == 0 && capture_render_ && !skip_frame_) { DS_PROF(CAPTURE); capture(line); }
   // Sprites are rendered one line ahead of the backgrounds.
@@ -807,22 +804,12 @@ void Gpu::step_engine(int e, u32 line) {
 // The output stage for one engine's line: display mode, master brightness,
 // 6->8 bit expansion, into the screen POWCNT1 bit 15 gives it (or scaled
 // straight into the frontend's buffer).
-void Gpu::set_edge_export(bool on) {
-  edge_export_ = on;
-  nds_.gpu3d.renderer().set_edge_export(on);
-  for (int k = 0; k < 2; ++k) { edge_store_[k][0].fill(0); edge_store_[k][1].fill(0); }
-  if (!on) { edge_vram_.clear(); edge_vram_.shrink_to_fit(); }
-  else { edge_vram_.assign(4 * 65536, 0); fb_store_[fb_cur_ ^ 1][0].fill(0xFFFFFFFFu); fb_store_[fb_cur_ ^ 1][1].fill(0xFFFFFFFFu); }
-  engine[0].set_edge_vram(on ? edge_vram_.data() : nullptr);
-  engine[1].set_edge_vram(on ? edge_vram_.data() : nullptr);
-}
-
 void Gpu::output_engine(int e, u32 line) {
   prof::Scope sc(prof::OUTPUT, e == 0);
   const Engine2D& en = engine[e];
   const int screen = en.screen();
   const bool scaled = scaling();
-  u32* dst = scaled ? line_out_[e].data() : fb_store_[fb_cur_][screen].data() + line * SCREEN_W;
+  u32* dst = scaled ? line_out_[e].data() : fb_[screen].data() + line * SCREEN_W;
   if (screens_on_) {
     if (e == 0) {
       const u32 mode = (en.dispcnt() >> 16) & 3;
@@ -834,22 +821,6 @@ void Gpu::output_engine(int e, u32 line) {
       else { output_b(dst); expand_colours(dst); }
     }
   } else { for (u32 i = 0; i < 256; ++i) dst[i] = 0xFF000000; }
-  if (edge_export_ && !scaled) {
-    u8* const edst = edge_store_[fb_cur_][screen].data() + line * SCREEN_W;
-    const u32 dmode = e == 0 ? (en.dispcnt() >> 16) & 3 : ((en.dispcnt() >> 16) & 1);
-    if (screens_on_ && dmode == 1) en.edge_mask(edst);
-    else if (screens_on_ && e == 0 && dmode == 2) {   // VRAM display: the captured image's edge bytes
-      const u32 bank = (en.dispcnt() >> 18) & 3;
-      if (lcdc_mask_render_ & (1u << bank)) std::memcpy(edst, edge_vram_.data() + bank * 65536 + line * 256, SCREEN_W);
-      else std::memset(edst, 0, SCREEN_W);
-    } else std::memset(edst, 0, SCREEN_W);
-    if (!scaled) {
-      // Same line as last frame (the other set) and nothing new known about it: keep its edge bytes.
-      u64 any = 0; for (u32 i = 0; i < SCREEN_W; i += 8) { u64 w; std::memcpy(&w, edst + i, 8); any |= w; }
-      if (!any && std::memcmp(dst, fb_store_[fb_cur_ ^ 1][screen].data() + line * SCREEN_W, SCREEN_W * sizeof(u32)) == 0)
-        std::memcpy(edst, edge_store_[fb_cur_ ^ 1][screen].data() + line * SCREEN_W, SCREEN_W);
-    }
-  }
   if (scaled) {
     if (e == 1 && bscale_defer_ && bscale_n_ < SCREEN_H) {
       StashedLine& st = bscale_[bscale_n_++];
@@ -1243,28 +1214,6 @@ void Gpu::capture(u32 line) {
     }
   }
 
-  if (edge_export_) {
-    // The edge bytes of what is captured, beside the colour (edge_vram_).
-    u8* const edst = edge_vram_.data() + dst_bank * 65536 + (((((cnt >> 18) & 3) << 14) + line * width) & 0xFFFF);
-    const u8* ea = nullptr; u8 tmp[256];
-    if (cnt & (1 << 24)) ea = nds_.gpu3d.edge_line(ref3d_, line);
-    else { engine[0].edge_mask(tmp); ea = tmp; }
-    const u8* eb = nullptr;
-    if (!(cnt & (1 << 25))) {
-      const u32 dispcnt = engine[0].dispcnt();
-      const u32 src_bank = (dispcnt >> 18) & 3;
-      if (lcdc & (1u << src_bank)) {
-        u32 off = line * 256;
-        if (((dispcnt >> 16) & 3) != 2) off += ((cnt >> 26) & 3) << 14;
-        eb = edge_vram_.data() + src_bank * 65536 + (off & 0xFFFF);
-      }
-    }
-    const u32 mode = (cnt >> 29) & 3;
-    const u32 eva = std::min<u32>(cnt & 0x1F, 16), evb = std::min<u32>((cnt >> 8) & 0x1F, 16);
-    const u8* pick = mode == 0 ? ea : mode == 1 ? eb : (eva >= evb ? ea : eb);   // a blend keeps the stronger source's edges
-    if (pick && pick != edst) std::memcpy(edst, pick, width);
-    else if (!pick) std::memset(edst, 0, width);
-  }
   switch ((cnt >> 29) & 3) {
   case 0:
     kern::active::capture_a15(src_a, width, dst);
@@ -1309,7 +1258,7 @@ void Gpu::prepare_load() {
 template <class S> void Gpu::sync_state(S& s) {
   s.begin("GPU ");
   s.fields(line_, hblank_done_, frame_begun_, screens_on_, master_bright_g_, capcnt_, capture_on_, fifo_, fifo_rd_, fifo_wr_, fifo_line_, run_fifo_);
-  s.fields(fb_store_[fb_cur_]);   // what the display shows until the next frame (and the thumbnail)
+  s.fields(fb_);   // what the display shows until the next frame (and the thumbnail)
   s.end();
   engine[0].sync_state(s);
   engine[1].sync_state(s);

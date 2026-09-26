@@ -176,9 +176,10 @@ const char* kUsage =
     "  --interp        interpreter instead of the recompiler\n"
     "  --timing M      CPU cycle model: fast (default: constant memory and jump costs, much cheaper)\n"
     "                  | exact (melonDS's per-access model); emu.timing\n"
-    "  --aa [off|accurate|enhanced] / --no-aa  3D edges; video.aa, off by default. accurate (bare --aa):\n"
-    "                  the hardware's blend. enhanced: the hardware's coverage in every game, blended with\n"
-    "                  the neighbour outside the edge (no second pixel layer: about as cheap as off)\n"
+    "  --aa / --no-aa  3D anti-aliasing (video.aa, off by default): the hardware's edge blend on the\n"
+    "                  CPU raster, 4x MSAA on the GPU raster\n"
+    "  --gpu3d / --no-gpu3d  the 3D layer drawn on the GPU (video.gpu3d, off by default); the CPU\n"
+    "                  raster where there is no Vulkan\n"
     "  --frameskip N   skip drawing up to N frames in N+1 (0 = off); emu.frameskip. Skipping runs\n"
     "                  in whole display periods, so on a game that drives its screens on\n"
     "                  alternate frames the limit counts pairs (DS_DEBUG_SKIP=1 shows the period)\n"
@@ -284,19 +285,11 @@ std::string save_path(const std::string& rom, const std::string& dir) {
   return dir.empty() ? rom_stem(rom) + ".sav" : dir + "/" + base_name(rom_stem(rom)) + ".sav";
 }
 
-// video.aa: 0 off, 1 accurate (hw AA), 2 enhanced (Renderer3D::set_aa).
-// Old boolean config reads as accurate/off, the retired smooth as enhanced.
-constexpr const char* kAaNames[3] = {"off", "accurate", "enhanced"};
-int aa_mode(const std::string& v) {
-  if (v == "enhanced" || v == "smooth") return 2;
-  if (v == "accurate" || v == "true" || v == "1" || v == "yes" || v == "on") return 1;
-  return 0;
+// video.aa: true / false. The older mode words still read: accurate / enhanced / smooth as on, off as off.
+bool aa_on(const std::string& v) {
+  return v == "true" || v == "1" || v == "yes" || v == "on" || v == "accurate" || v == "enhanced" || v == "smooth";
 }
-int g_aa_mode = 0;   // the video.aa in effect (edge export follows it)
-void apply_aa(NDS& nds, int mode) {
-  g_aa_mode = mode;
-  nds.gpu3d.renderer().set_aa(mode);
-}
+void apply_aa(NDS& nds, bool on) { nds.gpu3d.renderer().set_aa(on); }
 
 void load_save(NDS& nds, const std::string& path) {
   if (!nds.cart) return;
@@ -1110,13 +1103,10 @@ static int run(int argc, char** argv) {
     else if (arg("--frameskip-mode")) cli.set("emu.frameskip_mode", argv[++i]);
     else if (flag("--frameskip-capture")) cli.set("emu.frameskip_capture", "true");
     else if (flag("--no-frameskip-capture")) cli.set("emu.frameskip_capture", "false");
-    else if (flag("--aa")) {
-      // Bare --aa is the hardware blend; a mode word may follow.
-      const char* m = i + 1 < argc ? argv[i + 1] : "";
-      if (!std::strcmp(m, "off") || !std::strcmp(m, "smooth") || !std::strcmp(m, "accurate") || !std::strcmp(m, "enhanced")) { cli.set("video.aa", m); ++i; }
-      else cli.set("video.aa", "accurate");
-    }
-    else if (flag("--no-aa")) cli.set("video.aa", "off");
+    else if (flag("--aa")) cli.set("video.aa", "true");
+    else if (flag("--no-aa")) cli.set("video.aa", "false");
+    else if (flag("--gpu3d")) cli.set("video.gpu3d", "true");
+    else if (flag("--no-gpu3d")) cli.set("video.gpu3d", "false");
     else if (flag("--version")) { std::printf("DSperate %s (%s)\n", kDsperateVersion, kDsperateCommit); return 0; }
     else if (flag("--help")) { std::fputs(kUsage, stderr); return 0; }
     else if (argv[i][0] == '-' && argv[i][1] == '-') { std::fprintf(stderr, "unknown option %s\n", argv[i]); std::fputs(kUsage, stderr); return 2; }
@@ -1154,7 +1144,7 @@ static int run(int argc, char** argv) {
   }
   auto apply_cli = [&] { for (const char* k : {"paths.bios9", "paths.bios7", "paths.firmware", "video.scale", "video.dual_window", "video.layout", "video.screen", "video.pip_alpha", "video.screen_gap", "video.dominant_ratio", "video.dominant_threshold", "video.integer_scale",
                                               "video.fullscreen", "video.linear", "video.lcd_grid", "video.chunky", "video.chunky_threshold", "video.chunky_cell", "video.seam", "video.sink", "video.disp", "video.fbdev", "video.gpu_present", "video.vsync", "audio.enabled", "audio.volume",
-                                              "audio.mic", "emu.jit", "emu.timing", "emu.speed", "emu.limiter", "emu.pacing", "audio.buffer_size", "audio.latency_frames", "emu.frameskip", "emu.frameskip_mode", "emu.frameskip_capture", "video.aa", "emu.autosave_png", "emu.autoload", "cheevos.enabled", "cheevos.token_file", "cheevos.username"}) if (cli.has(k)) cfg.set(k, cli.str(k)); };
+                                              "audio.mic", "emu.jit", "emu.timing", "emu.speed", "emu.limiter", "emu.pacing", "audio.buffer_size", "audio.latency_frames", "emu.frameskip", "emu.frameskip_mode", "emu.frameskip_capture", "video.aa", "video.gpu3d", "emu.autosave_png", "emu.autoload", "cheevos.enabled", "cheevos.token_file", "cheevos.username"}) if (cli.has(k)) cfg.set(k, cli.str(k)); };
   apply_cli();
   const std::string bios9 = cfg.str("paths.bios9"), bios7 = cfg.str("paths.bios7");
   const std::string dsi_fw = cfg.str("paths.dsi_firmware");
@@ -1497,10 +1487,14 @@ sdl_ready:
     }
   }
   if (!open_displays(vs, display, display2)) { SDL_Quit(); return 1; }
-  // DS_GPU3D=1: the 3D layer on the GPU (Renderer3D::set_gpu); a config key
-  // follows once it has proven itself. After the displays: the Vulkan device
-  // opens the DRM node, and under direct KMS the display must take master first.
-  if (const char* g = std::getenv("DS_GPU3D"); g && std::atoi(g) != 0) { std::string why; if (!nds.gpu3d.renderer().set_gpu(true, &why)) std::fprintf(stderr, "gpu3d: unavailable (%s), drawing on the CPU\n", why.c_str()); else std::fprintf(stderr, "gpu3d: on\n"); }
+  // video.gpu3d (DS_GPU3D=1 overrides): the 3D layer on the GPU (Renderer3D::set_gpu).
+  // After the displays: the Vulkan device opens the DRM node, and under direct
+  // KMS the display must take master first.
+  {
+    const char* g = std::getenv("DS_GPU3D");
+    const bool want = g ? std::atoi(g) != 0 : cfg.flag("video.gpu3d", false);
+    if (want) { std::string why; if (!nds.gpu3d.renderer().set_gpu(true, &why)) std::fprintf(stderr, "gpu3d: unavailable (%s), drawing on the CPU\n", why.c_str()); else std::fprintf(stderr, "gpu3d: on\n"); }
+  }
   // Let fullscreen windows take their final size before the ROM loads (see
   // Display::settle_step); bounded, in case no configure comes.
   {
@@ -1716,8 +1710,8 @@ sdl_ready:
   Session session;
   session.open(nds, cfg, rom_path, save_arg);
 
-  cfg.set("video.aa", kAaNames[aa_mode(cfg.str("video.aa", "off"))]);
-  apply_aa(nds, aa_mode(cfg.str("video.aa", "off")));
+  cfg.set("video.aa", aa_on(cfg.str("video.aa", "false")) ? "true" : "false");
+  apply_aa(nds, aa_on(cfg.str("video.aa", "false")));
   if (!boot_firmware || nds.dsi) nds.setup_direct_boot();   // on a DSi this is the NAND boot
   if (nds.dsi && dsi_title_lo && !dsi_menu) nds.dsi_autoload(dsi_title_lo);
   // Off in the core by default for reproducibility. Not under --replay: a
@@ -2495,7 +2489,8 @@ sdl_ready:
     if (is("emu.ff_speed")) { ff_speed = std::atoi(v.c_str()); return; }
     if (is("emu.ff_skip")) { ff_skip = std::atoi(v.c_str()); return; }
     if (is("emu.autosave")) { autosave = on; return; }
-    if (is("video.aa")) { apply_aa(nds, aa_mode(v)); return; }
+    if (is("video.aa")) { apply_aa(nds, aa_on(v)); return; }
+    if (is("video.gpu3d")) { std::string why; if (!nds.gpu3d.renderer().set_gpu(on, &why)) std::fprintf(stderr, "gpu3d: unavailable (%s), drawing on the CPU\n", why.c_str()); return; }
     if (is("video.gpu_present")) { host.reopen_wanted = true; return; }
     if (is("video.fps")) { fps_osd = on; if (on && !show_fps) { fps_mark = SDL_GetPerformanceCounter(); emu_ticks = draw_ticks = wait_ticks = 0; } return; }
     if (is("video.pip_touch_hold")) { pip_touch_hold = std::max(0, std::atoi(v.c_str())); return; }
@@ -3683,16 +3678,10 @@ sdl_ready:
         // A GPU present goes to the present thread on the aux core
         // (present_thread.h); DS_PRESENT_SYNC=1 keeps it here.
         static const bool present_sync = std::getenv("DS_PRESENT_SYNC") != nullptr;
-        // Enhanced AA at panel density (Renderer3D::set_edge_export): only the
-        // GPU presenter cuts the panel block, so the 1x blend stays for the
-        // others. DS_EDGE_CUT=0 keeps the 1x blend on the GPU path too.
-        static const bool edge_cut_allowed = !(std::getenv("DS_EDGE_CUT") && std::atoi(std::getenv("DS_EDGE_CUT")) == 0);
-        const bool want_edges = edge_cut_allowed && g_aa_mode == 2 && !present_sync && display.gpu_present() && (!dual_window || display2.gpu_present()) && !nds.gpu3d.renderer().gpu_active();
-        if (want_edges != nds.gpu.edge_export()) nds.gpu.set_edge_export(want_edges);
-        const u8* const edges[2] = {want_edges ? nds.gpu.edge_plane(0) : nullptr, want_edges ? nds.gpu.edge_plane(1) : nullptr};
+
         if (!present_sync && display.gpu_present() && (!dual_window || display2.gpu_present())) {
           ds::sdl::Display* const ds_[2] = {&display, &display2};
-          ds::sdl::Display::draw_async(ds_, dual_window ? 2 : 1, fb, edges);
+          ds::sdl::Display::draw_async(ds_, dual_window ? 2 : 1, fb);
         } else {
           // Pinned (thread layout), the emulation thread presents here as a
           // normal task: the kernel work a present queues on this core (a

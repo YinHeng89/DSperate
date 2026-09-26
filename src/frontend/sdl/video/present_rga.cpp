@@ -12,8 +12,8 @@
 // The frontend's overlay (OSD, pause menu) is blended by the CPU into the
 // finished buffer over the rectangle it drew, after the RGA jobs.
 // Not done here: the LCD grid, the inset's alpha (the PiP view is drawn
-// opaque), the enhanced AA edge cut, rotation (the presenter refuses to
-// open; the scanline scaler handles rotated panels).
+// opaque), rotation (the presenter refuses to open; the scanline scaler
+// handles rotated panels).
 #include "frontend/sdl/video/presenter.h"
 #include "frontend/sdl/scanout.h"
 #include "frontend/sdl/dmaheap.h"
@@ -93,8 +93,7 @@ public:
     return Fit::Lost;
   }
 
-  bool present(const u32* const fb[2], const u8* const edges[2], const View* views, int nviews, const Params& p) override {
-    (void)edges;
+  bool present(const u32* const fb[2], const View* views, int nviews, const Params& p) override {
     if (p.rot != 0) return false;
     u32* px = sink_.begin_frame();
     if (!px) return false;

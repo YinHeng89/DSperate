@@ -53,8 +53,7 @@ public:
   // frame is copied out, so `fb` may change straight after. The others draw
   // here, as draw() does. Every other call on a window waits for its present
   // first, so none of them sees one half done.
-  // edges: per screen, the enhanced AA edge bytes (Gpu::edge_plane) for the GPU presenter's panel-density cut, or null.
-  static void draw_async(Display* const ds[], int n, const u32* const fb[SCREENS], const u8* const edges[SCREENS] = nullptr);
+  static void draw_async(Display* const ds[], int n, const u32* const fb[SCREENS]);
 
   // Per-scanline scaling: the core scales each line into place as it's
   // produced, straight into the window surface or a scanout tier's buffer
@@ -256,7 +255,7 @@ private:
   // the overlay's rect) so it can be presented on another.
   struct GpuFrame { FramePresenter* p = nullptr; FramePresenter::View v[SCREENS]; int n = 0; FramePresenter::Params params; };
   bool prepare_gpu(GpuFrame& f);        // false: nothing to present (the presenter was lost)
-  void draw_gpu(const u32* const fb[SCREENS], const u8* const edges[SCREENS] = nullptr);
+  void draw_gpu(const u32* const fb[SCREENS]);
   mutable u64       job_ = 0;             // present thread ticket of this window's last frame; 0 once waited for
   void sync() const;                    // wait for it
   SDL_Surface*      surf_ = nullptr;    // window surface; owned by SDL

@@ -20,7 +20,8 @@ namespace ds::gpu::vk {
 
 class Lean {
 public:
-  static std::unique_ptr<Lean> create(Device& dev, std::string* why = nullptr);
+  // `msaa`: 4x MSAA where the device has it (video.aa on the GPU raster); else 1 sample.
+  static std::unique_ptr<Lean> create(Device& dev, bool msaa, std::string* why = nullptr);
   ~Lean();
   Lean(const Lean&) = delete;
   Lean& operator=(const Lean&) = delete;
