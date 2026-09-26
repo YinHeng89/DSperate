@@ -248,7 +248,9 @@ R"(# DSperate settings. Command-line flags override this file. Two files next
                                 # "upper=1,lower=0:goodix" (touch by name substring or #N; "none=<touch>"
                                 # ignores one). Touch devices' names are printed on first touch
 # screen_gap = 0                # pixels between the two screens (vertical, horizontal, dominant_*); the menu offers
-                                # 0-128, the file takes any whole number and a negative one overlaps them
+                                # 0-128 and auto, the file takes any whole number and a negative one overlaps
+                                # them. auto: the pair is fitted with no gap and pushed to the panel's edges, the
+                                # spare room along the pair going between the screens
 # integer_scale = off           # off | under | over: whole panel pixels per DS pixel -- under letterboxes at the
                                 # largest that fits, over crops at the smallest that covers (the edge between
                                 # the screens is kept: a stacked pair crops its outer edges, a dual-window top

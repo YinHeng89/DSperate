@@ -1188,18 +1188,23 @@ void test_disabled_rows_are_skipped() {
   for (int i = 0; i < 3; ++i) m.input(press(B::BTN_DOWN));
   m.input(press(B::BTN_A));                                    // Options
   m.input(press(B::BTN_A));                                    // Emulation
-  // Down lands on the last row, skipping every disabled one between.
+  // Down lands on the first disabled row: it can be highlighted (its reason
+  // shows in the note) but stepping it changes nothing.
   m.input(press(B::BTN_DOWN));
   const size_t before = h.writes.size();
-  m.input(press(B::BTN_RIGHT));                                // steps the row it is on
+  m.input(press(B::BTN_RIGHT));
+  CHECK(h.writes.size() == before);
+  // Down through every disabled row to the last, which steps.
+  for (int i = 2; i < n; ++i) m.input(press(B::BTN_DOWN));
+  m.input(press(B::BTN_RIGHT));
   CHECK(h.writes.size() == before + 1);
   CHECK(h.writes.back() == t[n - 1].key);
   // Down again has nowhere to go and must leave the selection alone.
   m.input(press(B::BTN_DOWN));
   m.input(press(B::BTN_RIGHT));
   CHECK(h.writes.back() == t[n - 1].key);
-  // And back up to the first, over the same gap.
-  m.input(press(B::BTN_UP));
+  // And back up to the first, one row at a time over the disabled ones.
+  for (int i = 1; i < n; ++i) m.input(press(B::BTN_UP));
   m.input(press(B::BTN_RIGHT));
   CHECK(h.writes.back() == t[0].key);
   m.input(press(B::BTN_UP));                                   // nothing above it

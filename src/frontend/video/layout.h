@@ -29,6 +29,8 @@ struct Layout {
   double dominant_min = 0.25;  // auto: the smallest secondary the primary may leave
   double pip_alpha = 1.0;      // inset opacity at rest, 0..1
   int    gap = 0;              // video.screen_gap: pixels between the two screens of a pair (negative overlaps)
+  bool   gap_auto = false;     // video.screen_gap = auto: the pair is fitted with no gap, then the screens
+                               // are pushed to the output's edges along the pair, the spare room between them
 };
 // Forced integer scaling of full-size views (PiP inset / dominant secondary
 // keep their own ratio). Under: largest whole scale that fits, letterboxed.

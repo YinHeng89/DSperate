@@ -131,7 +131,8 @@ const char* kUsage =
     "  --layout L      vertical (default) | horizontal | single | pip | dominant_v | dominant_h\n"
     "  --screen S      top (default) or bottom: the screen shown alone, large or dominant\n"
     "  --screen-gap N  pixels between the two screens in the stacked, side-by-side and dominant layouts\n"
-    "                  (video.screen_gap; any whole number, a negative one overlaps them)\n"
+    "                  (video.screen_gap; any whole number, a negative one overlaps them; auto pushes\n"
+    "                  the screens to the edges when the panel leaves room along the pair)\n"
     "  --pip-alpha X   opacity of the PiP inset at rest, 0..1 (default 1; it comes up to opaque\n"
     "                  while the bottom screen is touched)\n"
     "  --dominant-ratio R  the dominant layouts' secondary, relative to the dominant screen: auto\n"
@@ -334,7 +335,7 @@ bool write_png(NDS& nds, const std::string& path, const ds::sdl::Display::Layout
   using Disp = ds::sdl::Display;
   int w = 0, h = 0;
   Disp::Layout layout = shown;
-  layout.gap = 0;   // screen_gap is a panel distance, not part of the game's picture
+  layout.gap = 0; layout.gap_auto = false;   // screen_gap is a panel distance, not part of the game's picture
   Disp::natural_size(layout, 1.0, w, h);
   Disp::View views[Disp::SCREENS];
   Disp::place(layout, w, h, views);
@@ -869,7 +870,8 @@ bool parse_video(const ds::sdl::Config& cfg, VideoSetup& vs) {
     if (vs.layout_cycle.empty()) vs.layout_cycle.push_back(vs.layout.mode);
     vs.layout.pip = std::clamp(cfg.real("video.pip_scale", 1.0 / 3.0), 0.1, 0.9);
     vs.layout.pip_alpha = std::clamp(cfg.real("video.pip_alpha", 1.0), 0.0, 1.0);
-    vs.layout.gap = cfg.num("video.screen_gap", 0);   // menu bounds it; file/CLI take anything, overlap included
+    vs.layout.gap_auto = cfg.str("video.screen_gap", "0") == "auto";   // the pair pushed to the edges
+    vs.layout.gap = vs.layout.gap_auto ? 0 : cfg.num("video.screen_gap", 0);   // menu bounds it; file/CLI take anything, overlap included
     const std::string dr = cfg.str("video.dominant_ratio", "auto");
     vs.layout.dominant_auto = dr == "auto";
     if (!vs.layout.dominant_auto) {
@@ -2038,7 +2040,7 @@ sdl_ready:
   Disp::Layout loaded_layout = layout; bool got_layout = false;   // from `layout`: a state carries no pip_alpha, the config's stays
   auto apply_loaded_layout = [&] {
     if (!got_layout || dual_window) return;
-    loaded_layout.gap = display.current_layout().gap;   // not in a state either, and the menu may have moved it since
+    loaded_layout.gap = display.current_layout().gap; loaded_layout.gap_auto = display.current_layout().gap_auto;   // not in a state either, and the menu may have moved it since
     display.set_layout(loaded_layout);
     apply_visibility();
     menu_dirty = true;

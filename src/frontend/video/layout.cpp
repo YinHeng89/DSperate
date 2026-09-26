@@ -50,9 +50,9 @@ void natural_size(const Layout& l, double scale, int& w, int& h) {
     case Mode::DominantH:  fw = sw * (1 + (l.dominant_auto ? l.dominant_min : l.dominant)); break;
     case Mode::Count: break;
   }
-  // The gap is not scaled: a distance on the glass, not part of the DS.
-  if (l.mode == Mode::Vertical || l.mode == Mode::DominantV) fh += l.gap;
-  if (l.mode == Mode::Horizontal || l.mode == Mode::DominantH) fw += l.gap;
+  // The gap is not scaled: a distance on the glass, not part of the DS. An auto gap is spare room, none here.
+  if (!l.gap_auto && (l.mode == Mode::Vertical || l.mode == Mode::DominantV)) fh += l.gap;
+  if (!l.gap_auto && (l.mode == Mode::Horizontal || l.mode == Mode::DominantH)) fw += l.gap;
   w = std::max(1, static_cast<int>(fw)); h = std::max(1, static_cast<int>(fh));
 }
 
@@ -71,7 +71,9 @@ void dominant_auto(const Layout& l, int w, int h, bool across, IntScale snap, do
   for (int k = static_cast<int>(std::floor(std::min(along, side) + 1e-9)); k >= 1; --k) {
     double rest = std::min(along - k, side);          // the secondary's fit in the leftover
     rest = std::min(rest, static_cast<double>(k));
-    if (snap != IntScale::Off && rest >= 1.0) rest = std::floor(rest + 1e-9);
+    // The integer-scale setting applies to the secondary too: under floors
+    // it, over takes the next whole scale (cropped at the edge, as over does).
+    if (snap != IntScale::Off && rest >= 1.0) rest = std::min(snap_scale(rest, snap), static_cast<double>(k));
     if (rest + 1e-9 >= k * l.dominant_min) { s = k; s2 = rest; return; }
   }
   const double r = l.dominant_min;
@@ -90,9 +92,12 @@ void place(const Layout& l, int w, int h, View out[SCREENS], IntScale snap) {
   // have no pair to part.
   const bool pair_across = l.mode == Mode::Horizontal || l.mode == Mode::DominantH;
   const bool pair = pair_across || l.mode == Mode::Vertical || l.mode == Mode::DominantV;
-  const int gap = pair ? l.gap : 0;
+  // An auto gap: the pair is fitted with none, and whatever room is left
+  // along it goes between the screens, which puts them at the edges.
+  int gap = pair && !l.gap_auto ? l.gap : 0;
   const int fw = pair_across ? std::max(1, w - gap) : w, fh = pair && !pair_across ? std::max(1, h - gap) : h;
   auto fit = [&](double cols, double rows) { return snap_scale(std::min(fw / (sw * cols), fh / (sh * rows)), snap); };
+  auto auto_gap = [&](double along_px) { if (pair && l.gap_auto) gap = std::max(0, static_cast<int>((pair_across ? w : h) - along_px)); };
   auto rect = [&](double x, double y, double s) { return Rect{static_cast<int>(x), static_cast<int>(y), static_cast<int>(sw * s), static_cast<int>(sh * s)}; };
   const int p = l.primary, q = 1 - p;
   switch (l.mode) {
@@ -100,6 +105,7 @@ void place(const Layout& l, int w, int h, View out[SCREENS], IntScale snap) {
       const bool across = l.mode == Mode::Horizontal;
       const double s = across ? fit(2, 1) : fit(1, 2);
       const double dw = sw * s, dh = sh * s;
+      auto_gap(across ? 2 * dw : 2 * dh);
       const double x = (w - dw * (across ? 2 : 1) - (across ? gap : 0)) / 2, y = (h - dh * (across ? 1 : 2) - (across ? 0 : gap)) / 2;
       for (int i = 0; i < SCREENS; ++i) {
         const int screen = i == 0 ? p : q;
@@ -127,6 +133,7 @@ void place(const Layout& l, int w, int h, View out[SCREENS], IntScale snap) {
       double s = 0, s2 = 0;    // the primary's and the secondary's scale
       if (!l.dominant_auto) { s = across ? fit(1 + l.dominant, 1) : fit(1, 1 + l.dominant); s2 = s * l.dominant; }
       else dominant_auto(l, fw, fh, across, snap, s, s2);
+      auto_gap(across ? sw * (s + s2) : sh * (s + s2));
       const double sc[2] = {p == 0 ? s : s2, p == 1 ? s : s2};
       if (!across) {
         double y = (h - sh * (s + s2) - gap) / 2;

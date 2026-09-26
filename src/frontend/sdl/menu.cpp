@@ -975,20 +975,17 @@ int Menu::table_slot() const {
   }
 }
 
-// Walks past rows the host has switched off, and stops at the ends rather than wrapping.
+// Stops at the ends rather than wrapping. A row the host has switched off
+// can still be highlighted, so its reason shows in the note; it just
+// does not step.
 bool Menu::move_setting_row(int delta) {
   const Setting* t = table();
   const int n = settings_count(t);
   const int slot = table_slot();
-  int at = set_row_[slot];
-  for (int step = 0; step < n; ++step) {
-    at += delta > 0 ? 1 : -1;
-    if (at < 0 || at >= n) return false;
-    if (!host_->enabled(t[at])) continue;
-    set_row_[slot] = at;
-    return true;
-  }
-  return false;
+  const int at = set_row_[slot] + (delta > 0 ? 1 : -1);
+  if (at < 0 || at >= n) return false;
+  set_row_[slot] = at;
+  return true;
 }
 
 void Menu::step_setting(int dir) {
@@ -1024,10 +1021,7 @@ Menu::Result Menu::handle_options(u32 presses) {
     reset_armed_ = false;
     return Result::None;
   }
-  // Land on something selectable: the first row of a page can be switched off.
-  const int slot = table_slot();
-  set_row_[slot] = 0;
-  if (!host_->enabled(table()[0]) && !move_setting_row(+1)) set_row_[slot] = 0;
+  set_row_[table_slot()] = 0;
   return Result::None;
 }
 

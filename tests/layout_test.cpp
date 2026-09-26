@@ -68,12 +68,12 @@ static std::string sweep() {
   for (int m = 0; m < static_cast<int>(Mode::Count); ++m)
     for (int primary = 0; primary < 2; ++primary)
       for (int corner = 0; corner < (m == static_cast<int>(Mode::Pip) ? 4 : 1); ++corner)
-        for (int gap : {0, 16, -8})
+        for (int gap : {0, 16, -8, 1000})   // 1000: the auto gap (the pair pushed to the edges)
           for (int autod = 0; autod < 2; ++autod)
             for (int snap = 0; snap < 3; ++snap)
               for (const auto& sz : sizes) {
                 Layout l; l.mode = static_cast<Mode>(m); l.primary = primary; l.corner = static_cast<Corner>(corner);
-                l.gap = gap; l.dominant_auto = autod != 0; l.dominant = 0.6; l.pip = 0.3;
+                l.gap = gap == 1000 ? 0 : gap; l.gap_auto = gap == 1000; l.dominant_auto = autod != 0; l.dominant = 0.6; l.pip = 0.3;
                 View v[SCREENS];
                 place(l, sz[0], sz[1], v, static_cast<IntScale>(snap));
                 int nw = 0, nh = 0; natural_size(l, 1.5, nw, nh);
@@ -99,7 +99,7 @@ int main(int argc, char** argv) {
   u64 h = 1469598103934665603ull;
   for (unsigned char c : s) h = (h ^ c) * 1099511628211ull;
   // The sweep as placement stood when layout moved out of Display (video overhaul P3).
-  constexpr u64 kSweep = 0xeb989f21e890612bull;
+  constexpr u64 kSweep = 0xea2a86071452114aull;
   if (h != kSweep) { std::fprintf(stderr, "FAIL layout sweep hash %016llx, expected %016llx (test_layout --print to compare)\n", (unsigned long long)h, (unsigned long long)kSweep); ++failures; }
   std::printf("layout: %s\n", failures ? "FAIL" : "ok");
   return failures ? 1 : 0;
