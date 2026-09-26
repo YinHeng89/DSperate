@@ -53,6 +53,15 @@ hardware. No DraStic code is in this tree. See [docs/techniques](docs/techniques
   shadows, fog, edge marking, anti-aliasing) that matches melonDS pixel for
   pixel. Runs asynchronously on three worker threads with a decoded-texture
   cache and a skip for resubmitted frames.
+- **GPU 3D** (`video.gpu3d`, `--gpu3d`, the GPU 3D menu row, off by default):
+  the same polygon lists drawn by Vulkan instead, at the DS's resolution with
+  4x MSAA, the DS's depth, stencil, shadow and translucency rules on the
+  hardware pipeline, and the finished layer read back for the 2D compositor.
+  The frame may be one behind under load (never on a frame the game captures).
+  The software rasteriser stays the exact reference and the fallback: what the
+  GPU draws may differ from it within reason, never in what is on screen. On
+  the RG DS Plus it takes the heaviest scenes (Golden Sun: Dark Dawn, Spirit
+  Tracks) from a few hundred frames over budget per minute to a handful.
 - **Sound.** All sixteen SPU channels (PCM8/16, ADPCM, PSG, noise) and capture
   units, mixed at the console's real 32728.5 Hz. The frontend paces from its own
   frame limiter at the console's rate, not from the audio queue, and keeps the
@@ -139,14 +148,24 @@ hardware. No DraStic code is in this tree. See [docs/techniques](docs/techniques
 - **Scaling filters** applied per scanline straight into the presented buffer:
   nearest, bilinear, LCD grid, box-filter seams (sharp, shimmer-free), and
   chunky 2x2 cells; optional integer scaling (letterbox or crop).
-- **3D anti-aliasing** (`video.aa`, `--aa`, the ANTI-ALIASING menu row): on
-  the CPU raster the hardware's own edge blend (pixel-exact with melonDS); on
-  the GPU raster (`video.gpu3d`, `--gpu3d`: the 3D layer drawn by Vulkan at 1x,
-  one frame of lag allowed under load) 4x MSAA.
+- **3D anti-aliasing** (`video.aa`, `--aa`, the ANTI-ALIASING menu row): the
+  hardware's own edge blend on the software rasteriser (pixel-exact with
+  melonDS), 4x MSAA on the GPU one, which also smooths the creases and cut-out
+  edges the DS leaves stepped.
+- **Screen gap** (`video.screen_gap`, `--screen-gap`): a distance in panel
+  pixels between the two screens of a stacked, side-by-side or dominant pair,
+  or `auto`, which pushes them to the panel's edges when the fit leaves room.
 - **Fastest path to the panel, chosen automatically:** the display engine's
   hardware scaler on Allwinner handhelds (Miyoo A30), fbdev on the H700 boards,
   zero-copy dmabuf under Wayland with direct scanout where allowed, our own page
   flips under KMSDRM, and SDL's renderer only where nothing else applies.
+- **Scaling off the CPU** (`video.gpu_present`, on by default where it works):
+  the DS-resolution frames are scaled and laid out into the scanout buffer by
+  the Rockchip RGA (the RK3566's 2D accelerator, through V4L2) where the
+  device has one, else by a Vulkan compute pass. The RGA leaves the GPU to the
+  3D layer alone; its filter is bilinear, it draws the LCD grid and a fading
+  PiP inset, and the menu greys out what it cannot do (nearest, seams, chunky
+  cells). Rotated panels and everything else fall back to the scanline scaler.
 - **Dual-window mode** for dual-panel handhelds: one fullscreen window per
   display, one DS screen each.
 - **On-screen overlays:** FPS counter, state slot number, screenshot flash,
