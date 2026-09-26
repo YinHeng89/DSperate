@@ -340,7 +340,7 @@ void Display::layout() {
 bool Display::try_gpu_present() {
   if (!gpu_wanted_ || !out_) return false;
   std::string why;
-  gpu_ = open_vk_import_presenter(*out_, &why);
+  gpu_ = rga_wanted_ ? open_rga_presenter(*out_, &why) : open_vk_import_presenter(*out_, &why);
   if (!gpu_) { std::fprintf(stderr, "video.gpu_present: %s; scanline scaling instead\n", why.c_str()); return false; }
   scaled_ = false;
   layout();

@@ -280,7 +280,9 @@ R"(# DSperate settings. Command-line flags override this file. Two files next
                                 # renderer. Or name one: disp | fbdev | kms | dmabuf | surface | renderer
                                 # (one that won't open falls back to the renderer). The older disp = and
                                 # fbdev = keys are still read, and say so
-# gpu_present = true            # scale and compose the panel on the GPU (Vulkan, into the scanout
+# gpu_present = true            # true | false | rga. rga: the Rockchip 2D accelerator (V4L2 rockchip-rga)
+                                # scales into the scanout buffer instead, leaving the GPU to the 3D layer.
+                                # true: scale and compose the panel on the GPU (Vulkan, into the scanout
                                 # dma-buf) instead of on the CPU scanline scaler. Default on where the
                                 # device has it; declines cleanly and falls back to the scanline tier
                                 # where it does not (no Vulkan, no DRM or no dma-heap). Measured on the

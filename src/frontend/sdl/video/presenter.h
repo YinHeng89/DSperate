@@ -57,5 +57,8 @@ protected:
 // sink's own buffers (Wayland dma-buf or KMS), which the sink presents.
 // `sink` stays owned by the caller and must outlive the presenter.
 std::unique_ptr<FramePresenter> open_vk_import_presenter(ScanoutOut& sink, std::string* why);
+// The RGA presenter (present_rga.cpp): the Rockchip 2D accelerator scales the
+// frames into the sink's dma-buf through V4L2 mem2mem; no GPU involved.
+std::unique_ptr<FramePresenter> open_rga_presenter(ScanoutOut& sink, std::string* why);
 
 } // namespace ds::sdl

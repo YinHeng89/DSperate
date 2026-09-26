@@ -123,7 +123,8 @@ public:
   // GPU present stage (gpu_present.h): on a dma-buf scanout tier, a compute
   // dispatch lays 256x192 frames into the tier's buffer via Vulkan, replacing
   // the scanline scaler where the import works. Set before open().
-  void set_gpu_present(bool on) { gpu_wanted_ = on; }
+  // `rga`: the Rockchip 2D accelerator instead of Vulkan (video.gpu_present = rga).
+  void set_gpu_present(bool on, bool rga = false) { gpu_wanted_ = on; rga_wanted_ = rga; }
   bool gpu_present() const { return gpu_ != nullptr; }
   const void* cell_map(int screen) const { return cells_[screen].x.cells ? &cells_[screen] : nullptr; }
   // Locks the panel-sized texture and fills in one target per screen. False
@@ -248,6 +249,7 @@ private:
   bool              page_ = false;
   std::unique_ptr<ScanoutOut> out_;     // tier 1; null on the surface tier
   bool              gpu_wanted_ = false;
+  bool              rga_wanted_ = false;
   std::unique_ptr<FramePresenter> gpu_; // a GPU presenter (on top of out_ for the import one); null: software
   bool try_gpu_present();               // after out_ opened: import its buffers, switch draw() over
   // One frame for gpu_, taken on this thread (the window's size, the views,
