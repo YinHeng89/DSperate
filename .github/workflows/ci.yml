@@ -19,7 +19,11 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build libsdl2-dev
+          # libvulkan-dev: the headers only; nothing links libvulkan (it is
+          # dlopen'd on the device). Without them the build silently has no
+          # GPU 3D raster and no Vulkan present -- the configure check below
+          # refuses that.
+          sudo apt-get install -y ninja-build libsdl2-dev libvulkan-dev
       # Profile-guided, from the profile committed under pgo/aarch64/ (made on a
       # developer machine with the ROMs by tools/pgo_refresh.sh). The configure
       # fails if the runner's compiler or the flags no longer match the
@@ -27,7 +31,8 @@ jobs:
       # build. STRICT keeps the per-function mismatch warnings in the log.
       - name: Build and test
         run: |
-          cmake --preset host -DDSPERATE_PGO=use -DDSPERATE_PGO_STRICT=ON
+          cmake --preset host -DDSPERATE_PGO=use -DDSPERATE_PGO_STRICT=ON | tee configure.log
+          grep -q "Vulkan presenter and 3D raster enabled" configure.log || { echo "::error::Vulkan headers not found: the build would ship without GPU 3D and the Vulkan present"; exit 1; }
           # "source locations ... have changed" is benign (the checkout path is
           # in the checksum; the counts still apply) and one per function, so it
           # is filtered; "control flow ... does not match" is a dropped profile.
