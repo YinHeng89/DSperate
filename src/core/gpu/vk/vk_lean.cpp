@@ -27,7 +27,7 @@ constexpr u32 kMaxDraws = 4096;
 // with more than 31 such ids folds them (id & 31: rare, and only a wrong
 // same-id refusal).
 constexpr u32 S_DRAWN = 0x80, S_MASK = 0x40, S_T = 0x20, S_CODE = 0x1F;
-enum Pipe : u32 { P_OPAQUE = 0, P_TRANS_A, P_TRANS_B, P_TRANS_A_DW, P_TRANS_B_DW, P_MASK, P_SHADOW, P_SHADOW_PREP, P_MASK_CLEAR, P_OPAQUE_EARLY, P_COUNT };
+enum Pipe : u32 { P_OPAQUE = 0, P_TRANS_A, P_TRANS_B, P_TRANS_A_DW, P_TRANS_B_DW, P_MASK, P_SHADOW, P_SHADOW_PREP, P_MASK_CLEAR, P_OPAQUE_EARLY, P_TRANS_OPQ, P_COUNT };
 }
 
 struct Lean::Impl {
@@ -53,7 +53,7 @@ struct Lean::Impl {
   struct Img { VkImage img = VK_NULL_HANDLE; VkDeviceMemory mem = VK_NULL_HANDLE; VkImageView view = VK_NULL_HANDLE; };
   Img col_ms, ds_ms, fog_ms, res;   // multisampled colour, depth/stencil and fog flag (transient); the 1x resolved record
   VkImageView ds_depth_view = VK_NULL_HANDLE;   // the depth aspect alone, for the resolve's input attachment
-  VkShaderModule mod_vert = VK_NULL_HANDLE, mod_frag = VK_NULL_HANDLE, mod_frag_early = VK_NULL_HANDLE, mod_res = VK_NULL_HANDLE, mod_fs = VK_NULL_HANDLE;
+  VkShaderModule mod_vert = VK_NULL_HANDLE, mod_frag = VK_NULL_HANDLE, mod_frag_early = VK_NULL_HANDLE, mod_frag_opq = VK_NULL_HANDLE, mod_frag_trans = VK_NULL_HANDLE, mod_res = VK_NULL_HANDLE, mod_fs = VK_NULL_HANDLE;
   bool nostencil = false;   // DS_LEAN_NOSTENCIL=1: translucent pass B alone, always (debug)
   std::vector<std::pair<s64, u32>> key;   // the opaque prefix's sort keys (front to back, alpha-tested last)
   VkDescriptorSetLayout dsl = VK_NULL_HANDLE, dsl_in = VK_NULL_HANDLE;
@@ -99,7 +99,7 @@ struct Lean::Impl {
     if (layout) a.vkDestroyPipelineLayout(vk->dev, layout, nullptr);
     if (dsl) a.vkDestroyDescriptorSetLayout(vk->dev, dsl, nullptr);
     if (dsl_in) a.vkDestroyDescriptorSetLayout(vk->dev, dsl_in, nullptr);
-    for (VkShaderModule* m : {&mod_vert, &mod_frag, &mod_frag_early, &mod_res, &mod_fs}) if (*m) a.vkDestroyShaderModule(vk->dev, *m, nullptr);
+    for (VkShaderModule* m : {&mod_vert, &mod_frag, &mod_frag_early, &mod_frag_opq, &mod_frag_trans, &mod_res, &mod_fs}) if (*m) a.vkDestroyShaderModule(vk->dev, *m, nullptr);
     if (texel_view) a.vkDestroyBufferView(vk->dev, texel_view, nullptr);
     if (texels) dev->free(texels);
     for (u32 i = 0; i < kSlots; ++i) for (Buffer* b : {&polys[i], &verts[i], &post[i], &out[i]}) if (*b) dev->free(*b);
@@ -155,7 +155,7 @@ std::unique_ptr<Lean> Lean::create(Device& dev, std::string* why) {
     VkShaderModuleCreateInfo ci{}; ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO; ci.codeSize = s.bytes; ci.pCode = s.code;
     return a.vkCreateShaderModule(vk->dev, &ci, nullptr, out) == VK_SUCCESS;
   };
-  if (!shader(shader_lean_vert(), &d.mod_vert) || !shader(shader_lean_frag(), &d.mod_frag) || !shader(shader_lean_frag_early(), &d.mod_frag_early) || !shader(shader_lean_resolve(), &d.mod_res) || !shader(shader_tri_fs(), &d.mod_fs))
+  if (!shader(shader_lean_vert(), &d.mod_vert) || !shader(shader_lean_frag(), &d.mod_frag) || !shader(shader_lean_frag_early(), &d.mod_frag_early) || !shader(shader_lean_frag_opq(), &d.mod_frag_opq) || !shader(shader_lean_frag_trans(), &d.mod_frag_trans) || !shader(shader_lean_resolve(), &d.mod_res) || !shader(shader_tri_fs(), &d.mod_fs))
     return fail("lean shaders rejected by the driver");
   d.nostencil = std::getenv("DS_LEAN_NOSTENCIL") && std::atoi(std::getenv("DS_LEAN_NOSTENCIL")) != 0;
 
@@ -280,7 +280,8 @@ std::unique_ptr<Lean> Lean::create(Device& dev, std::string* why) {
     st[0].sType = st[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     // The mask clear is a full-screen triangle; it and the shadow prep touch the stencil only (no fragment stage).
     st[0].stage = VK_SHADER_STAGE_VERTEX_BIT; st[0].module = kind == P_MASK_CLEAR ? d.mod_fs : d.mod_vert; st[0].pName = "main";
-    st[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; st[1].module = kind == P_OPAQUE_EARLY ? d.mod_frag_early : d.mod_frag; st[1].pName = "main";
+    const bool trans_pass = kind == P_TRANS_A || kind == P_TRANS_B || kind == P_TRANS_A_DW || kind == P_TRANS_B_DW;
+    st[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; st[1].module = kind == P_OPAQUE_EARLY ? d.mod_frag_early : kind == P_TRANS_OPQ ? d.mod_frag_opq : trans_pass ? d.mod_frag_trans : d.mod_frag; st[1].pName = "main";
     const bool stencil_only = kind == P_MASK_CLEAR || kind == P_SHADOW_PREP;
     VkPipelineVertexInputStateCreateInfo vin{}; vin.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
     VkPipelineInputAssemblyStateCreateInfo ia{}; ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO; ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
@@ -291,12 +292,12 @@ std::unique_ptr<Lean> Lean::create(Device& dev, std::string* why) {
     VkPipelineDepthStencilStateCreateInfo dss{}; dss.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
     dss.depthTestEnable = stencil_only ? VK_FALSE : VK_TRUE;
     dss.depthCompareOp = wbuf ? (eq ? VK_COMPARE_OP_GREATER_OR_EQUAL : VK_COMPARE_OP_GREATER) : (eq ? VK_COMPARE_OP_LESS_OR_EQUAL : VK_COMPARE_OP_LESS);
-    dss.depthWriteEnable = (kind == P_OPAQUE || kind == P_OPAQUE_EARLY || kind == P_TRANS_A_DW || kind == P_TRANS_B_DW) ? VK_TRUE : VK_FALSE;
+    dss.depthWriteEnable = (kind == P_OPAQUE || kind == P_OPAQUE_EARLY || kind == P_TRANS_OPQ || kind == P_TRANS_A_DW || kind == P_TRANS_B_DW) ? VK_TRUE : VK_FALSE;
     dss.stencilTestEnable = VK_TRUE;
     VkStencilOpState so{};
     so.failOp = VK_STENCIL_OP_KEEP; so.depthFailOp = VK_STENCIL_OP_KEEP; so.passOp = VK_STENCIL_OP_KEEP; so.compareOp = VK_COMPARE_OP_ALWAYS; so.compareMask = 0; so.writeMask = 0; so.reference = 0;
     switch (kind) {
-      case P_OPAQUE: case P_OPAQUE_EARLY:   // drawn, not translucent, this code (reference = drawn | code, set per draw)
+      case P_OPAQUE: case P_OPAQUE_EARLY: case P_TRANS_OPQ:   // drawn, not translucent, this code (reference = drawn | code, set per draw)
         so.passOp = VK_STENCIL_OP_REPLACE; so.writeMask = S_DRAWN | S_T | S_CODE; break;
       case P_TRANS_A: case P_TRANS_A_DW:   // over an undrawn pixel: written as is, now drawn, translucent, this code. The reference
         // (drawn | T | code, set per draw) serves the compare and the replace both, so the "undrawn" test is NOT_EQUAL on the drawn bit.
@@ -515,6 +516,8 @@ bool Lean::submit(u32 npoly, u32 nvert, u32 ntexels, const GpuFrame& fin) {
       if (!no_prep) { use(pipes[P_SHADOW_PREP]); a.vkCmdSetStencilReference(cb, VK_STENCIL_FACE_FRONT_AND_BACK, c); draw(i, n); }
       use(pipes[P_SHADOW]); a.vkCmdSetStencilReference(cb, VK_STENCIL_FACE_FRONT_AND_BACK, S_T | c); draw(i, n);
     } else if (trans) {
+      // The run's alpha-31 pixels first, as opaque (depth written, no translucent flag), then the rest.
+      use(pipes[P_TRANS_OPQ]); a.vkCmdSetStencilReference(cb, VK_STENCIL_FACE_FRONT_AND_BACK, S_DRAWN | c); draw(i, n);
       if (!d.nostencil) { use(pipes[dw ? P_TRANS_A_DW : P_TRANS_A]); a.vkCmdSetStencilReference(cb, VK_STENCIL_FACE_FRONT_AND_BACK, S_DRAWN | S_T | c); draw(i, n); }
       use(pipes[dw ? P_TRANS_B_DW : P_TRANS_B]); a.vkCmdSetStencilReference(cb, VK_STENCIL_FACE_FRONT_AND_BACK, S_DRAWN | S_T | c); draw(i, n);
     } else {

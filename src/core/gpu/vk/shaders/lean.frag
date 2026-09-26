@@ -38,7 +38,11 @@ vec2 st_bounds_hi(GpuPoly p) { return vec2(float(int(p.row_base >> 16) - 32768),
 void main() {
   GpuPoly p = polys[v_poly];
   vec3 rgb = clamp(interpolateAtOffset(v_rgb, vec2(-0.5)), vec3(0.0), vec3(511.0));
+#ifdef DS_CENTROID
+  vec2 st = clamp(interpolateAtCentroid(v_st), st_bounds_lo(p), st_bounds_hi(p));
+#else
   vec2 st = clamp(interpolateAtOffset(v_st, vec2(-0.5)), st_bounds_lo(p), st_bounds_hi(p));
+#endif
   uint blendmode = (p.attr >> 4) & 3u;
   uint polyalpha = (p.attr >> 16) & 0x1Fu;
   bool textured = (p.flags & DS_PF_TEXTURED) != 0u;
@@ -47,6 +51,15 @@ void main() {
   uint alpha = src >> 24;
 #ifndef DS_EARLY
   if (alpha <= pc.f.alpha_ref) discard;
+#endif
+  // A translucent polygon's pixels are opaque where their final alpha is 31
+  // (written with depth, no translucent flag, so a later polygon of the
+  // same id draws over them) and translucent elsewhere. The run is drawn
+  // twice: DS_ALPHA_SEL 1 keeps the opaque pixels, 2 the translucent ones.
+#if DS_ALPHA_SEL == 1
+  if (alpha != 31u) discard;
+#elif DS_ALPHA_SEL == 2
+  if (alpha == 31u) discard;
 #endif
   uint r = src & 0x3Fu, g = (src >> 8) & 0x3Fu, b = (src >> 16) & 0x3Fu;
   // Fog is the resolve's (once per pixel by the pixel's depth, as the DS does

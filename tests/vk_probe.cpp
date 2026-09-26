@@ -132,6 +132,9 @@ int main(int argc, char** argv) {
     const u32* out = lean ? L->output() : (S > 1 ? r->output_hires() : r->output());
     std::FILE* o = std::fopen(ppm, "wb");
     if (!o) { std::fprintf(stderr, "cannot write %s\n", ppm); return 1; }
+    if (std::strlen(ppm) > 4 && !std::strcmp(ppm + std::strlen(ppm) - 4, ".raw")) {   // the record itself: RGB666 + 5-bit alpha words
+      std::fwrite(out, sizeof(u32), 256 * 192 * S * S, o); std::fclose(o); return 0;
+    }
     std::fprintf(o, "P6\n%u %u\n255\n", 256 * S, 192 * S);
     for (u32 i = 0; i < 256 * 192 * S * S; ++i) {
       const u32 c = out[i];

@@ -251,6 +251,7 @@ int main(int argc, char** argv) {
   int cut_n = 0; const char* cut_path = nullptr;   // --dump-cut
   const char* edges_path = nullptr; FILE* edges_out = nullptr;   // --dump-edges
   long gpu_dump_frame = -1; const char* gpu_dump_path = nullptr;   // --dump-gpu-frame
+  const char* rec3d_path = nullptr;   // --dump-3d
   bool gpu3d = false;   // --gpu3d
   int frames = 60; bool direct = false;
 #if DSPERATE_JIT
@@ -327,6 +328,7 @@ int main(int argc, char** argv) {
     else if (arg("--max")) ts.max = std::strtoull(argv[++i], nullptr, 0);
     else if (arg("--dump-frames")) dump = argv[++i];
     else if (arg("--dump-cut")) { cut_n = std::atoi(argv[++i]); cut_path = argv[++i]; }
+    else if (arg("--dump-3d")) rec3d_path = argv[++i];   // FILE: the 3D layer record as the compositor reads it (256x192 words: RGB666 + 5-bit alpha in 24-28), for the --dump-from/--dump-count frames
     else if (arg("--dump-gpu-frame")) { gpu_dump_frame = std::atol(argv[++i]); gpu_dump_path = argv[++i]; }   // N FILE: frame N's polygon list in the GPU raster's layout (vk_dump.h)
     else if (arg("--dump-edges")) edges_path = argv[++i];   // FILE: the enhanced AA edge bytes (Gpu::edge_plane), both screens, 256x192 each per frame   // N FILE: enhanced AA cut at Nx (edge bytes exported, 1x unblended), both screens, raw 0xAARRGGBB
     else if (arg("--hash-frames")) hash_frames = argv[++i];   // FILE: "frame top bottom" per frame, FNV-1a 64 of each screen's 0xAARRGGBB (the video golden hashes)
@@ -613,6 +615,7 @@ int main(int argc, char** argv) {
   const char* per_frame = std::getenv("TRACE_PER_FRAME");
   unsigned long long last9 = 0, last7 = 0;
   FILE* dump_out = dump ? std::fopen(dump, "wb") : nullptr;
+  FILE* rec3d_out = rec3d_path ? std::fopen(rec3d_path, "wb") : nullptr;
   if (dump && !dump_out) { std::fprintf(stderr, "could not open %s\n", dump); return 1; }
   FILE* cut_out = nullptr; std::vector<ds::u32> cut_px;
   if (cut_n > 0 && cut_path) {
@@ -842,6 +845,10 @@ int main(int argc, char** argv) {
       // raw 0xAARRGGBB, top screen then bottom, 256x192 each, one record per frame
       std::fwrite(nds.gpu.framebuffer(0), 4, ds::SCREEN_W * ds::SCREEN_H, dump_out);
       std::fwrite(nds.gpu.framebuffer(1), 4, ds::SCREEN_W * ds::SCREEN_H, dump_out);
+    }
+    if (rec3d_out && i >= dump_from && (dump_count <= 0 || i < dump_from + dump_count)) {
+      const auto ref = nds.gpu3d.frame_ref(false);
+      for (int y = 0; y < static_cast<int>(ds::SCREEN_H); ++y) std::fwrite(nds.gpu3d.line(ref, static_cast<ds::u32>(y)), 4, ds::SCREEN_W, rec3d_out);
     }
     if (hash_out) {
       auto fnv = [](const ds::u32* p) { ds::u64 h = 1469598103934665603ull; for (ds::u32 k = 0; k < ds::SCREEN_W * ds::SCREEN_H; ++k) h = (h ^ p[k]) * 1099511628211ull; return h; };

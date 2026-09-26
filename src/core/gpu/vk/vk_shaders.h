@@ -33,6 +33,8 @@ Spirv shader_tri_fs();       // its fullscreen triangle
 Spirv shader_lean_vert();    // lean path (vk_lean.cpp): fans at 1x, MSAA vertex placement
 Spirv shader_lean_frag();    // ... its one fragment stage
 Spirv shader_lean_frag_early();   // ... without the alpha test (early depth test) for polygons that cannot fail it
+Spirv shader_lean_frag_opq();     // ... a translucent polygon's alpha-31 pixels only (drawn as opaque)
+Spirv shader_lean_frag_trans();   // ... its other pixels only (the translucent passes)
 Spirv shader_lean_resolve(); // ... and the resolve into the 3D layer record
 
 } // namespace ds::gpu::vk
