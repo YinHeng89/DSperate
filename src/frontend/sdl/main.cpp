@@ -795,7 +795,7 @@ struct VideoSetup {
   ds::frontend::Sink panel_sink = ds::frontend::Sink::Count;   // Disp/Fbdev when one owns the panel (frontend/video/select.h)
   ds::frontend::Sink want_sink = ds::frontend::Sink::Count;    // explicit video.sink among the window sinks
   bool   gpu_present = false;
-  bool   gpu_rga = false;        // video.gpu_present = rga: the Rockchip 2D accelerator presents
+  ds::sdl::Display::GpuPresentMode gpu_mode = ds::sdl::Display::GpuPresentMode::Auto;   // video.gpu_present: true (auto: RGA, else Vulkan) | rga | vulkan
   int    upper_display = 0, lower_display = 1;   // dual-window: SDL display per physical panel
 };
 
@@ -895,7 +895,7 @@ bool sync_dual_modes(ds::sdl::Display& a, ds::sdl::Display& b) {
 // Split from parse_video so a settings change can close the windows and
 // come back through here with new values.
 bool open_displays(const VideoSetup& vs, ds::sdl::Display& display, ds::sdl::Display& display2) {
-  display.set_gpu_present(vs.gpu_present, vs.gpu_rga); display2.set_gpu_present(vs.gpu_present, vs.gpu_rga);
+  display.set_gpu_present(vs.gpu_present, vs.gpu_mode); display2.set_gpu_present(vs.gpu_present, vs.gpu_mode);
   if (vs.dual_window) {
     display.set_sinks(ds::frontend::Sink::Count, vs.want_sink); display2.set_sinks(ds::frontend::Sink::Count, vs.want_sink);
     display.set_chunky(vs.chunky != 0, vs.chunky_cell); display2.set_chunky(vs.chunky != 0, vs.chunky_cell);
@@ -1441,7 +1441,11 @@ static int run(int argc, char** argv) {
 
   // GPU present stage, default on. Display falls back to the scanline scaler
   // without dma-buf import, and GpuPresent::open() declines without Vulkan.
-  { const std::string g = cfg.str("video.gpu_present", "true"); vs.gpu_rga = g == "rga"; vs.gpu_present = vs.gpu_rga || g == "true" || g == "on" || g == "1"; }
+  {
+    const std::string g = cfg.str("video.gpu_present", "true");
+    vs.gpu_mode = g == "rga" ? ds::sdl::Display::GpuPresentMode::Rga : g == "vulkan" ? ds::sdl::Display::GpuPresentMode::Vulkan : ds::sdl::Display::GpuPresentMode::Auto;
+    vs.gpu_present = g == "rga" || g == "vulkan" || g == "true" || g == "auto" || g == "on" || g == "1";
+  }
 
   u32 init = SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER;
   if (audio_on || mic_on) init |= SDL_INIT_AUDIO;

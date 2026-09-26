@@ -340,7 +340,12 @@ void Display::layout() {
 bool Display::try_gpu_present() {
   if (!gpu_wanted_ || !out_) return false;
   std::string why;
-  gpu_ = rga_wanted_ ? open_rga_presenter(*out_, &why) : open_vk_import_presenter(*out_, &why);
+  if (gpu_mode_ != GpuPresentMode::Vulkan) gpu_ = open_rga_presenter(*out_, &why);
+  if (!gpu_ && gpu_mode_ != GpuPresentMode::Rga) {
+    std::string why2;
+    gpu_ = open_vk_import_presenter(*out_, &why2);
+    if (!gpu_) why = gpu_mode_ == GpuPresentMode::Vulkan ? why2 : why + "; " + why2;
+  }
   if (!gpu_) { std::fprintf(stderr, "video.gpu_present: %s; scanline scaling instead\n", why.c_str()); return false; }
   scaled_ = false;
   layout();
