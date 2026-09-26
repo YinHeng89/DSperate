@@ -1,0 +1,79 @@
+#version 450
+// glslc enables this implicitly; glslangValidator needs it spelled out.
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_atomic_int64 : require
+// Visibility pass: the order-free prefix of the list, one invocation per
+// DRAWN pixel of each span, no per-pixel polygon loop.
+//
+// May ignore draw order because for an opaque-group polygon the pixel's
+// final owner is a MINIMUM under a total order (commutative): depth mode 0
+// is strict less-than so ties favour the earlier polygon; mode 1 lets front
+// pass ties only against opaque back-facing, so ties still resolve the same
+// regardless of order; every alpha such a polygon produces is 0 or 31, so it
+// either writes outright or is alpha-tested away, never blends; an opaque
+// write replaces colour/depth/attribute whole. Key is (z, back-facing, list
+// index), smallest wins, atomicMin'd as one 64-bit int; the clear is the
+// key's initial value and never competes.
+//
+// The order-DEPENDENT tail (translucency, shadow masks/shadows) is walked by
+// raster.comp from first_ordered on, seeded from this pass's output.
+#define DS_GLSL 1
+#include "vk_layout.h"
+
+// DS_VIS_ROWS rows per workgroup, one DS_VIS_LANES-wide subgroup per row,
+// lanes taking the row's pixels in stride.
+layout(local_size_x = DS_VIS_LANES, local_size_y = DS_VIS_ROWS) in;
+
+layout(std430, binding = 0)  readonly buffer Polys  { GpuPoly polys[]; };
+layout(std430, binding = 1)  readonly buffer Verts  { GpuVert verts[]; };
+layout(std430, binding = 3)  readonly buffer Texels { uint texels[]; };
+layout(std430, binding = 5)  readonly buffer Post   { GpuPost ps; };
+layout(std430, binding = 9)  readonly buffer Rows   { GpuRow rows[]; };
+layout(std430, binding = 10)          buffer Keys   { uint64_t keys[]; };
+layout(push_constant) uniform Push { GpuFrame f; } pc;
+
+#include "ds_span.glsl"
+#include "ds_shade.glsl"
+
+void main() {
+  uint ri = gl_WorkGroupID.x * uint(DS_VIS_ROWS) + gl_LocalInvocationID.y;
+  if (ri >= pc.f.opaque_rows) return;
+  GpuRow rw = rows[ri];
+  if ((rw.fl & 1u) == 0u) return;
+  GpuPoly p = polys[rw.poly];
+  int py = max(p.ytop, 0) + int(ri - p.row_base);   // rows allocated from max(ytop,0)
+  int W = 256 * int(pc.f.scale);
+
+  bool front = (p.flags & DS_PF_FRONTFACING) != 0u;
+  bool wbuf = (rw.fl & 8u) != 0u;
+  // Alpha test can only fail under modulate combine (decal always takes the
+  // polygon's own alpha, 31 here), so only a modulated texture needs sampling.
+  bool test_tex = (p.flags & (DS_PF_TEXTURED | DS_PF_TEX_ALPHA)) == (DS_PF_TEXTURED | DS_PF_TEX_ALPHA)
+                  && ((p.attr >> 4) & 1u) == 0u;
+  uint64_t base_key = (front ? 0ul : (1ul << 11)) | uint64_t(rw.poly);
+
+  int xa = max(rw.xstart, 0), xb = min(rw.xend, W - 1);
+  for (int px = xa + int(gl_LocalInvocationID.x); px <= xb; px += DS_VIS_LANES) {
+    if (px < rw.lim0)       { if ((rw.fl & 2u) == 0u) continue; }
+    else if (px >= rw.lim1) { if ((rw.fl & 4u) == 0u) continue; }
+
+    Interp ix = row_interp(rw);
+    // Per-pixel division only for W-buffered depth or texcoords of an
+    // alpha-tested texel; Z-buffered depth uses the row's reciprocal.
+    if (wbuf || test_tex) interp_set_x(ix, px);
+    else ix.x = px - ix.x0;
+
+    int z = interp_z(ix, rw.zl, rw.zr);
+    if (z >= int(pc.f.clear_depth)) continue;
+
+    if (test_tex) {
+      int sc = interp_val(ix, unpack_s(rw.lst), unpack_s(rw.rst));
+      int tc = interp_val(ix, unpack_t(rw.lst), unpack_t(rw.rst));
+      if (((sample_tex(p, sc, tc) >> 16) & 0x1Fu) == 0u) continue;
+    }
+
+    // Depth test is SIGNED on both rasters; flipping the sign bit maps signed order onto the unsigned key.
+    atomicMin(keys[uint(py * W + px)], (uint64_t(uint(z) ^ 0x80000000u) << 12) | base_key);
+  }
+}

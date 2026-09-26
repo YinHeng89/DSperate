@@ -1,0 +1,56 @@
+#version 450
+// glslc enables this implicitly; glslangValidator needs it spelled out.
+#extension GL_GOOGLE_include_directive : require
+// Binning pass: build each tile's polygon list, IN DRAW ORDER.
+//
+// One invocation per tile scans the whole polygon list, rather than one
+// invocation per polygon appending atomically: atomic append would shuffle
+// the list, but draw order decides translucency and polygon ids on the DS.
+// Scanning costs more but the reads are cache hits and the list arrives
+// sorted, deleting sort/cull/shared-list from the raster.
+//
+// Overflow (a tile exceeding DS_TILE_POLYS) sets `overflow`, sending the
+// whole frame to the CPU; the host's upload-time check is the backstop.
+#define DS_GLSL 1
+#include "vk_layout.h"
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer Polys { GpuPoly polys[]; };
+layout(std430, binding = 2)          buffer Tiles {
+  uint count[DS_TILE_COUNT];
+  uint overflow;
+  uint pad_[3];
+  uint list[DS_TILE_COUNT * DS_TILE_POLYS];
+  // Lets the raster reach its span row without loading the polygon first:
+  // row index for scanline y is bias + y, yrng is the covered range.
+  uint bias[DS_TILE_COUNT * DS_TILE_POLYS];
+  uint yrng[DS_TILE_COUNT * DS_TILE_POLYS];
+} tiles;
+layout(push_constant) uniform Push { GpuFrame f; } pc;
+
+void main() {
+  uint t = gl_GlobalInvocationID.x;
+  if (t >= uint(DS_TILE_COUNT)) return;
+
+  int w = int(DS_TILE_W) * int(pc.f.scale), h = int(DS_TILE_H) * int(pc.f.scale);
+  int tx0 = int(t % uint(DS_TILES_X)) * w, tx1 = tx0 + w - 1;
+  int ty0 = int(t / uint(DS_TILES_X)) * h, ty1 = ty0 + h - 1;
+
+  uint m = 0u;
+  uint base = t * uint(DS_TILE_POLYS);
+  // Only the ordered tail is binned; the prefix before first_ordered was drawn by the visibility pass.
+  for (uint p = pc.f.first_ordered; p < pc.f.npoly; ++p) {
+    GpuPoly poly = polys[p];
+    if (poly.nverts < 3u) continue;
+    if (poly.ytop > ty1 || poly.ybot < ty0 || poly.xmax < tx0 || poly.xmin > tx1) continue;
+    if (m < uint(DS_TILE_POLYS)) {
+      tiles.list[base + m] = p;
+      int ry0 = max(poly.ytop, 0), ry1 = min(poly.ybot, int(192u * pc.f.scale) - 1);
+      tiles.bias[base + m] = poly.row_base - uint(ry0);
+      tiles.yrng[base + m] = uint(ry0) | (uint(ry1) << 8);
+    } else atomicOr(tiles.overflow, 1u);
+    ++m;
+  }
+  tiles.count[t] = min(m, uint(DS_TILE_POLYS));
+}

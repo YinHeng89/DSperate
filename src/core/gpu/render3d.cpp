@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // DSperate - Nintendo DS emulator. Copyright (C) 2026 DSperate contributors.
 #include "core/gpu/render3d.h"
+#include "core/gpu/vk/vk_dump.h"
+#include <unordered_map>
 #include "core/handoff_stats.h"
 #include "core/div64.h"
 #include "core/state/state.h"
@@ -3537,6 +3539,94 @@ void Renderer3D::clear_line(s32 y) {
   }
 }
 
+// The frame in the GPU raster's layout (vk_layout.h), the conversion the
+// GPU dispatch will do: polygons, flattened vertices, the decoded textures in
+// one arena, shadow-mask runs per scanline, the span-row -> polygon table.
+void Renderer3D::gpu_dump(const Gpu3D& gx, const Polygon* const* polys, u32 npoly) {
+  using namespace ds::gpu::vk;
+  std::FILE* f = std::fopen(gpu_dump_path_, "wb");
+  if (!f) { std::fprintf(stderr, "gpu dump: could not open %s\n", gpu_dump_path_); return; }
+  std::vector<GpuPoly> gp; std::vector<GpuVert> gv; std::vector<u32> tex, shrun, rowpoly;
+  std::vector<u8> line_mask(192, 0); std::vector<u32> line_run(192, 0);
+  std::unordered_map<const u32*, u32> arena;   // decoded texture -> word offset
+  bool any_mask = false;
+  for (u32 i = 0; i < npoly; ++i) any_mask = any_mask || (polys[i]->shadow_mask && !polys[i]->degenerate);
+  u32 first_ordered = ~0u, opaque_rows = 0, nrows = 0;
+  const bool alpha_all_fail = rs_->alpha_ref >= 31;
+  for (u32 i = 0; i < npoly; ++i) {
+    const Polygon& p = *polys[i];
+    if (p.degenerate) continue;
+    if (first_ordered == ~0u && (alpha_all_fail || p.translucent || p.shadow_mask || p.shadow)) { first_ordered = static_cast<u32>(gp.size()); opaque_rows = nrows; }
+    GpuPoly o{};
+    o.first_vert = static_cast<u32>(gv.size()); o.nverts = p.nverts; o.attr = p.attr; o.texparam = p.texparam;
+    o.ytop = p.ytop; o.ybot = p.ybot; o.vtop = p.vtop; o.vbot = p.vbot;
+    o.flags = (p.translucent ? DS_PF_TRANSLUCENT : 0u) | (p.wbuffer ? DS_PF_WBUFFER : 0u) | (p.facing ? DS_PF_FRONTFACING : 0u) |
+              (p.shadow_mask ? DS_PF_SHADOW_MASK : 0u) | (p.shadow ? DS_PF_SHADOW : 0u);
+    std::vector<u32> run(DS_SHRUN_LINES, 0);
+    if (any_mask) {
+      const s32 y0 = p.ytop < 0 ? 0 : p.ytop, y1 = p.ybot > 191 ? 191 : p.ybot;
+      if (p.shadow_mask) { for (s32 y = y0; y <= y1; ++y) { const u32 u = static_cast<u32>(y); if (!line_mask[u]) { ++line_run[u]; line_mask[u] = 1; } run[u] = line_run[u]; } }
+      else for (s32 y = y0; y <= y1; ++y) line_mask[static_cast<u32>(y)] = 0;
+    }
+    s32 xmin = 0x7FFFFFFF, xmax = -0x7FFFFFFF;
+    for (u32 j = 0; j < p.nverts; ++j) {
+      const Vertex& v = gx.vertex(p.vtx[j]);
+      GpuVert d{}; d.sx = v.sx; d.sy = v.sy; d.z = p.z[j]; d.w = p.w[j]; d.r = v.fcol[0]; d.g = v.fcol[1]; d.b = v.fcol[2]; d.s = v.tex[0]; d.t = v.tex[1];
+      gv.push_back(d);
+      xmin = std::min(xmin, d.sx); xmax = std::max(xmax, d.sx);
+    }
+    o.xmin = xmin; o.xmax = xmax;
+    const s32 ry0 = p.ytop < 0 ? 0 : p.ytop, ry1 = p.ybot > 191 ? 191 : p.ybot;
+    const u32 rows = ry1 >= ry0 ? static_cast<u32>(ry1 - ry0) + 1 : 0;
+    o.row_base = nrows;
+    for (u32 r = 0; r < rows; ++r) rowpoly.push_back(static_cast<u32>(gp.size()));
+    nrows += rows;
+    const u32 fmt = (p.texparam >> 26) & 7;
+    if ((dispcnt_ & 1) && fmt != 0) {
+      Shade sh; texture_fields(sh, p);
+      const TextureCache::Ref r = texcache_.lookup_ref(*vm_, sh.fmt, sh.base, static_cast<u32>(sh.width), static_cast<u32>(sh.height), sh.texpal, sh.alpha0);
+      if (r.texels) {
+        auto it = arena.find(r.texels);
+        u32 off;
+        if (it == arena.end()) { off = static_cast<u32>(tex.size()); tex.insert(tex.end(), r.texels, r.texels + r.words); arena.emplace(r.texels, off); }
+        else off = it->second;
+        o.tex_offset = off; o.tex_w = static_cast<u32>(sh.width); o.tex_h = static_cast<u32>(sh.height); o.flags |= DS_PF_TEXTURED;
+        const bool may_alpha = (p.texparam & (1u << 29)) || fmt == 5 || fmt == 7;
+        if (may_alpha && r.transparent) o.flags |= DS_PF_TEX_ALPHA;
+      }
+    }
+    gp.push_back(o);
+    shrun.insert(shrun.end(), run.begin(), run.end());
+  }
+  if (first_ordered == ~0u) { first_ordered = static_cast<u32>(gp.size()); opaque_rows = nrows; }
+  GpuDumpHeader h;
+  h.npoly = static_cast<u32>(gp.size()); h.nvert = static_cast<u32>(gv.size()); h.ntexels = static_cast<u32>(tex.size()); h.nrows = nrows; h.frame = nds_.frame_count;
+  h.f.npoly = h.npoly; h.f.scale = 1; h.f.dispcnt = dispcnt_; h.f.alpha_ref = rs_->alpha_ref;
+  h.f.first_ordered = first_ordered; h.f.opaque_rows = opaque_rows; h.f.nrows = nrows;
+  for (u32 i = 0; i < npoly; ++i) if (!polys[i]->degenerate) { if (polys[i]->wbuffer) h.f.flags |= DS_FF_WBUFFER; break; }
+  {
+    const u16 c = static_cast<u16>(rs_->clear_attr1);
+    auto ch = [](u16 v, u32 shift) { u32 x = (shift == 0 ? (v << 1) : (v >> shift)) & 0x3E; return x ? x + 1 : x; };
+    h.f.clear_color = ch(c, 0) | (ch(c, 4) << 8) | (ch(c, 9) << 16) | (((rs_->clear_attr1 >> 16) & 0x1F) << 24);
+    h.f.clear_depth = ((rs_->clear_attr2 & 0x7FFF) * 0x200) + 0x1FF;
+    h.f.clear_attr = (rs_->clear_attr1 & 0x3F000000) | (rs_->clear_attr1 & 0x8000);
+  }
+  h.post.fog_color = rs_->fog_color; h.post.fog_offset = rs_->fog_offset; h.post.fog_shift = rs_->fog_shift;
+  for (u32 i = 0; i < rs_->fog_density.size() && i < 34; ++i) h.post.density[i] = rs_->fog_density[i];
+  for (u32 i = 0; i < rs_->edge.size() && i < 8; ++i) h.post.edge[i] = rs_->edge[i];
+  for (u32 i = 0; i < rs_->toon.size() && i < 32; ++i) h.post.toon[i] = rs_->toon[i];
+  std::fwrite(&h, sizeof h, 1, f);
+  std::fwrite(gp.data(), sizeof(GpuPoly), gp.size(), f);
+  std::fwrite(gv.data(), sizeof(GpuVert), gv.size(), f);
+  std::fwrite(tex.data(), sizeof(u32), tex.size(), f);
+  std::fwrite(shrun.data(), sizeof(u32), shrun.size(), f);
+  std::fwrite(rowpoly.data(), sizeof(u32), rowpoly.size(), f);
+  std::fclose(f);
+  std::fprintf(stderr, "gpu dump: frame %llu -> %s: %u polygons (%u opaque prefix), %u vertices, %u texel words, %u span rows\n",
+               (unsigned long long)nds_.frame_count, gpu_dump_path_, h.npoly, first_ordered, h.nvert, h.ntexels, nrows);
+  gpu_dump_path_ = nullptr;
+}
+
 void Renderer3D::render(const Gpu3D& gx) {
 
   // Before anything: the previous frame's bands read the texture cache and
@@ -3603,6 +3693,7 @@ void Renderer3D::render(const Gpu3D& gx) {
     }
   }
   texels_in_ = &poly_texels_;
+  if (gpu_dump_path_ && nds_.frame_count == gpu_dump_frame_) gpu_dump(gx, polys, npoly);
   if (prof::enabled && !prep_done) { prof::add_timed(prof::R3D_PREP, prof::now_ns() - t_prep0); prep_done = true; }
 
   u32 nb = band_count(live);

@@ -129,11 +129,17 @@ if(DSPERATE_VULKAN)
     find_path(DSPERATE_VULKAN_INCLUDE vulkan/vulkan.h NO_CMAKE_FIND_ROOT_PATH)
   endif()
   if(DSPERATE_VULKAN_INCLUDE)
-    target_sources(dsperate_core PRIVATE gpu/vk/vk_device.cpp)
+    target_sources(dsperate_core PRIVATE gpu/vk/vk_device.cpp gpu/vk/vk_raster.cpp gpu/vk/vk_shaders.cpp)
+    # GPU 3D raster (gpu-raster branch): SPIR-V is checked in and .incbin'd by
+    # vk_shaders.cpp (no shader compiler needed at build time); re-link when a blob changes.
+    set_property(SOURCE gpu/vk/vk_shaders.cpp APPEND PROPERTY COMPILE_DEFINITIONS
+                 DSPERATE_VK_SHADER_DIR="${CMAKE_CURRENT_SOURCE_DIR}/gpu/vk/shaders")
+    file(GLOB DSPERATE_VK_SPV "${CMAKE_CURRENT_SOURCE_DIR}/gpu/vk/shaders/*.spv")
+    set_property(SOURCE gpu/vk/vk_shaders.cpp APPEND PROPERTY OBJECT_DEPENDS ${DSPERATE_VK_SPV})
     target_include_directories(dsperate_core PRIVATE ${DSPERATE_VULKAN_INCLUDE})
     target_compile_definitions(dsperate_core PUBLIC DSPERATE_VULKAN=1)
     # No link against libvulkan on purpose: vk_device.cpp dlopens it.
-    message(STATUS "DSperate: Vulkan presenter enabled (headers at ${DSPERATE_VULKAN_INCLUDE})")
+    message(STATUS "DSperate: Vulkan presenter and 3D raster enabled (headers at ${DSPERATE_VULKAN_INCLUDE})")
   else()
     set(DSPERATE_VULKAN OFF)
     message(STATUS "DSperate: Vulkan headers not found, Vulkan presenter disabled")

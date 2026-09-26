@@ -75,6 +75,9 @@ public:
   // bit 6 the outside is the negative neighbour (left / up), bits 0-4 the
   // coverage (the polygon's share of the pixel, (cov + 1) / 32).
   void set_edge_export(bool on) { edge_export_ = on; }
+  // --dump-gpu-frame: write NDS frame `frame`'s polygon list in the GPU raster's layout
+  // (vk_dump.h) to `path`; the frame is drawn on the CPU as usual.
+  void set_gpu_dump(const char* path, u64 frame) { gpu_dump_path_ = path; gpu_dump_frame_ = frame; }
   bool edge_export() const { return edge_export_; }
 private:
   NDS& nds_;
@@ -415,6 +418,8 @@ private:
   s32  rendered_upto_ = 0;    // lines this instance has already rasterised this frame
   u32  setup_poly_ = 0;                                 // polygon index during build_edges
   std::vector<const u32*> poly_texels_;
+  const char* gpu_dump_path_ = nullptr; u64 gpu_dump_frame_ = ~u64{0};
+  void gpu_dump(const Gpu3D& gx, const Polygon* const* polys, u32 npoly);
   std::vector<std::unique_ptr<Renderer3D>> bands_;      // workers 1..n-1 (band 0 is this)
   u64 band_ns_[8] = {};                                 // last frame's per-band wall time (workers write their own slot)
   u64 band_sum_ns_[2] = {0, 0};                         // summed band time (serial raster cost) of the last two frames

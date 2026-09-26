@@ -250,6 +250,7 @@ int main(int argc, char** argv) {
   int dump_from = 0, dump_count = 0;   // --dump-from/--dump-count: window of a large dump
   int cut_n = 0; const char* cut_path = nullptr;   // --dump-cut
   const char* edges_path = nullptr; FILE* edges_out = nullptr;   // --dump-edges
+  long gpu_dump_frame = -1; const char* gpu_dump_path = nullptr;   // --dump-gpu-frame
   int frames = 60; bool direct = false;
 #if DSPERATE_JIT
   bool jit = true;                    // both CPUs; --interp clears it
@@ -325,6 +326,7 @@ int main(int argc, char** argv) {
     else if (arg("--max")) ts.max = std::strtoull(argv[++i], nullptr, 0);
     else if (arg("--dump-frames")) dump = argv[++i];
     else if (arg("--dump-cut")) { cut_n = std::atoi(argv[++i]); cut_path = argv[++i]; }
+    else if (arg("--dump-gpu-frame")) { gpu_dump_frame = std::atol(argv[++i]); gpu_dump_path = argv[++i]; }   // N FILE: frame N's polygon list in the GPU raster's layout (vk_dump.h)
     else if (arg("--dump-edges")) edges_path = argv[++i];   // FILE: the enhanced AA edge bytes (Gpu::edge_plane), both screens, 256x192 each per frame   // N FILE: enhanced AA cut at Nx (edge bytes exported, 1x unblended), both screens, raw 0xAARRGGBB
     else if (arg("--hash-frames")) hash_frames = argv[++i];   // FILE: "frame top bottom" per frame, FNV-1a 64 of each screen's 0xAARRGGBB (the video golden hashes)
     else if (arg("--dump-scaled")) { scaled_n = std::atoi(argv[++i]); scaled_path = argv[++i]; }   // N FILE: both screens through the scanline scaler at Nx, raw BGRA
@@ -617,6 +619,7 @@ int main(int argc, char** argv) {
     cut_px.resize(static_cast<size_t>(256 * cut_n) * static_cast<size_t>(192 * cut_n));
     nds.gpu.set_edge_export(true);
   }
+  if (gpu_dump_path && gpu_dump_frame >= 0) nds.gpu3d.renderer().set_gpu_dump(gpu_dump_path, static_cast<ds::u64>(gpu_dump_frame));
   if (edges_path) { edges_out = std::fopen(edges_path, "wb"); if (!edges_out) { std::fprintf(stderr, "could not open %s\n", edges_path); return 1; } nds.gpu.set_edge_export(true); }
   FILE* hash_out = hash_frames ? std::fopen(hash_frames, "w") : nullptr;
   if (hash_frames && !hash_out) { std::fprintf(stderr, "could not open %s\n", hash_frames); return 1; }

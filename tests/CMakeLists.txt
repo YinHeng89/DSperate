@@ -150,3 +150,10 @@ add_test(NAME nand_fs COMMAND test_nand_fs)
 add_executable(test_sd_card sd_card_test.cpp)
 target_link_libraries(test_sd_card PRIVATE dsperate_core)
 add_test(NAME sd_card COMMAND test_sd_card)
+
+# GPU raster probe (gpu-raster branch): times a recorded frame on the Vulkan raster. Not a test.
+if(DSPERATE_VULKAN)
+  add_executable(vk_probe vk_probe.cpp)
+  target_link_libraries(vk_probe PRIVATE dsperate_core)
+  target_include_directories(vk_probe PRIVATE ${DSPERATE_VULKAN_INCLUDE})
+endif()
