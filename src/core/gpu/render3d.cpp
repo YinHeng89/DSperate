@@ -1099,7 +1099,7 @@ void Renderer3D::resolve_span(const Shade& sh, const SpanBuf& sb, s32 y, s32 xa,
         // The translucent polygon's outline coverage, read without advancing
         // the ramp (the ramp counts opaque plots only, as in the vector path).
         static const bool no_trown = std::getenv("DS_NO_TROWN") != nullptr;
-        if (!shadow && part != 1 && !no_trown) {
+        if (!shadow && part != 1 && !no_trown && sh.polyalpha >= 4) {   // an almost invisible polygon leaves no step to cut
           s32 cov = part == 0 ? l_cov : r_cov;
           if (cov & static_cast<s32>(0x80000000u)) cov = part == 0 ? std::min(xcov >> 5, 31) : std::max(0x1F - (xcov >> 5), 0);
           cov &= 0x1F;
@@ -1887,7 +1887,7 @@ template <int mode, bool textured, int aa, bool opq>
           const uint8x8x4_t src = vld4_u8(reinterpret_cast<const u8*>(sb.col + i));
           if (kinds & 0x0202020202020202ull) {
             static const bool no_trown = std::getenv("DS_NO_TROWN") != nullptr;
-            plot8(addr, mt1, src, z, (aa == 2 && part != 1 && !sh.shadow && !no_trown) ? attr : nullptr);
+            plot8(addr, mt1, src, z, (aa == 2 && part != 1 && !sh.shadow && !no_trown && sh.polyalpha >= 4) ? attr : nullptr);
             if (kinds & 0x0404040404040404ull) plot8(under, mb, src, z, nullptr);
           }
           if constexpr (two) { if (kinds & 0x1010101010101010ull) plot8(under, mt2, src, z, nullptr); }
@@ -2970,11 +2970,27 @@ void Renderer3D::stamp_intersections(s32 y) {
   auto opaque_plain = [&](u32 n) { const u32 a = attr_[n]; return (color_[n] >> 24) != 0 && !(a & 0xF); };
   // Crossing from P's centre toward N's in 1/32 (-1: same surface), with
   // P's slope from L beyond it and N's from R beyond it (0 = none).
-  auto crossing = [&](u32 P, u32 N, u32 L, u32 R) -> int {
+  // A fold: P and N on one surface by depth, but the depth slope on P's
+  // side (from L) and on N's side (to R) disagree by more than half the
+  // larger slope, so two planes meet between them (an intersection right
+  // at its line, where the depths agree by definition; a wall on a floor).
+  // The fixed part of the tolerance grows with depth (z >> 8): far terrain's
+  // interpolation kinks are single-pixel noise, not folds worth an edge.
+  auto fold = [](s64 a, s64 b, s64 z) { const s64 d = a > b ? a - b : b - a, aa = a < 0 ? -a : a, bb = b < 0 ? -b : b; return d > ((aa > bb ? aa : bb) >> 1) + 0x40 + (z >> 8); };
+  // Crossing from P's centre toward N's in 1/32 (-1: same surface), with
+  // P's slope from L beyond it and N's from R beyond it (0 = none).
+  // `strength` ranks the pair: the depth jump, or a fold's slope difference.
+  auto crossing = [&](u32 P, u32 N, u32 L, u32 R, s64& strength) -> int {
     const s64 zp = depth_[P], zn = depth_[N];
-    if (same_surface(static_cast<s32>(zp), static_cast<s32>(zn))) return -1;
-    const s64 dzA = (L && (color_[L] >> 24) && same_surface(static_cast<s32>(zp), static_cast<s32>(depth_[L]))) ? zp - static_cast<s64>(depth_[L]) : 0;
-    const s64 dzB = (R && (color_[R] >> 24) && same_surface(static_cast<s32>(zn), static_cast<s32>(depth_[R]))) ? static_cast<s64>(depth_[R]) - zn : 0;
+    const bool same = same_surface(static_cast<s32>(zp), static_cast<s32>(zn));
+    const bool lok = L && (color_[L] >> 24) && same_surface(static_cast<s32>(zp), static_cast<s32>(depth_[L]));
+    const bool rok = R && (color_[R] >> 24) && same_surface(static_cast<s32>(zn), static_cast<s32>(depth_[R]));
+    const s64 dzA = lok ? zp - static_cast<s64>(depth_[L]) : 0;
+    const s64 dzB = rok ? static_cast<s64>(depth_[R]) - zn : 0;
+    if (same) {
+      if (!lok || !rok || !fold(dzA, dzB, zp)) return -1;
+      strength = dzA > dzB ? dzA - dzB : dzB - dzA;
+    } else strength = zn > zp ? zn - zp : zp - zn;
     const s64 den = dzA - dzB;
     s64 t32 = 16;
     if (den != 0) { t32 = ((zn - zp - dzB) * 32) / den; if (t32 < 0 || t32 > 32) t32 = 16; }
@@ -2988,6 +3004,7 @@ void Renderer3D::stamp_intersections(s32 y) {
     auto differ = [](u32 za, u32 zb) { const u32 d = za > zb ? za - zb : zb - za; return d > ((za < zb ? za : zb) >> 6) + 0x200; };
 #if DSPERATE_NEON
     const uint32x4_t v200 = vdupq_n_u32(0x200);
+    const int32x4_t v40 = vdupq_n_s32(0x40);
     for (int x = 0; x < 256; x += 4) {
       const uint32x4_t zp = vld1q_u32(&depth_[row + x]);
       auto test = [&](const u32* q) -> uint32x4_t {
@@ -2995,14 +3012,24 @@ void Renderer3D::stamp_intersections(s32 y) {
         const uint32x4_t d = vabdq_u32(zp, zq), tol = vaddq_u32(vshrq_n_u32(vminq_u32(zp, zq), 6), v200);
         return vcgtq_u32(d, tol);
       };
+      // A fold (see fold() below): the slopes on the two sides disagree.
+      auto foldv = [&](const u32* a, const u32* b) -> uint32x4_t {
+        const int32x4_t za = vreinterpretq_s32_u32(vld1q_u32(a)), zb = vreinterpretq_s32_u32(vld1q_u32(b)), zc = vreinterpretq_s32_u32(zp);
+        const int32x4_t sa = vsubq_s32(zc, za), sb = vsubq_s32(zb, zc);
+        const int32x4_t d = vabdq_s32(sa, sb), tol = vaddq_s32(vaddq_s32(vshrq_n_s32(vmaxq_s32(vabsq_s32(sa), vabsq_s32(sb)), 1), v40), vshrq_n_s32(zc, 8));
+        return vcgtq_s32(d, tol);
+      };
       uint32x4_t f = vorrq_u32(vorrq_u32(test(&depth_[row + x + 1]), test(&depth_[row + x - 1])), vorrq_u32(test(&depth_[dn + x]), test(&depth_[up + x])));
+      f = vorrq_u32(f, vorrq_u32(foldv(&depth_[row + x - 1], &depth_[row + x + 1]), foldv(&depth_[up + x], &depth_[dn + x])));
       const uint16x4_t f16 = vmovn_u32(f);
       vst1_lane_u32(reinterpret_cast<u32*>(flag + x), vreinterpret_u32_u8(vmovn_u16(vcombine_u16(f16, f16))), 0);
     }
 #else
+    auto folds = [&](u32 a, u32 c, u32 b) { const s64 sa = static_cast<s64>(c) - a, sb = static_cast<s64>(b) - c; return fold(sa, sb, c); };
     for (int x = 0; x < 256; ++x) {
       const u32 zp = depth_[row + x];
-      flag[x] = differ(zp, depth_[row + x + 1]) || differ(zp, depth_[row + x - 1]) || differ(zp, depth_[dn + x]) || differ(zp, depth_[up + x]);
+      flag[x] = differ(zp, depth_[row + x + 1]) || differ(zp, depth_[row + x - 1]) || differ(zp, depth_[dn + x]) || differ(zp, depth_[up + x]) ||
+                folds(depth_[row + x - 1], zp, depth_[row + x + 1]) || folds(depth_[up + x], zp, depth_[dn + x]);
     }
 #endif
     (void)differ;
@@ -3016,9 +3043,9 @@ void Renderer3D::stamp_intersections(s32 y) {
     int best_t = -1; s64 best_jump = -1; bool best_vertical = false, best_neg = false;
     auto consider = [&](u32 N, u32 L, u32 R, bool vertical, bool neg) {
       if (!N || !opaque_plain(N) || depth_[P] > depth_[N]) return;
-      const int t = crossing(P, N, L, R);
+      s64 jump = 0;
+      const int t = crossing(P, N, L, R, jump);
       if (t < 0) return;
-      s64 jump = static_cast<s64>(depth_[N]) - depth_[P]; if (jump < 0) jump = -jump;
       // The horizontal axis wins unless the vertical jump is clearly larger.
       const bool take = best_t < 0 || (vertical ? jump > (best_jump * 5) / 4 : (best_vertical ? jump * 5 >= best_jump * 4 : jump > best_jump));
       if (take) { best_t = t; best_jump = jump; best_vertical = vertical; best_neg = neg; }
@@ -3108,11 +3135,14 @@ void Renderer3D::enhanced_aa_line(s32 y) {
     // A seam between two polygons of one surface (skybox panels, a mesh's
     // triangle diagonals) continues the same colour across the edge: with
     // nothing to see there, no edge is placed (the resample would blur it).
+    // A translucent polygon's own outline (bit 7) is worth cutting only
+    // where its blend leaves a visible step: within 4 of 63 it is skipped.
+    const int ctol = (attr & 0x80) ? 4 : 1;
     auto same_colour = [&](u32 own, u32 other) {
       const u32 d = (own ^ other) & 0x003F3F3Fu;
       if (!d) return true;
       const int dr = static_cast<int>(own & 0x3F) - static_cast<int>(other & 0x3F), dg = static_cast<int>((own >> 8) & 0x3F) - static_cast<int>((other >> 8) & 0x3F), dbb = static_cast<int>((own >> 16) & 0x3F) - static_cast<int>((other >> 16) & 0x3F);
-      return dr >= -1 && dr <= 1 && dg >= -1 && dg <= 1 && dbb >= -1 && dbb <= 1;
+      return dr >= -ctol && dr <= ctol && dg >= -ctol && dg <= ctol && dbb >= -ctol && dbb <= ctol;
     };
     if (attr & 0x2000) {
       const u32 n = outside(attr, depth_[addr], ub + 1 + x, db + 1 + x);
