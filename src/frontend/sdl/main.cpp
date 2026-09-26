@@ -8,6 +8,7 @@
 // key opens a blitted menu over the held frame (menu.h).
 #include "core/cpu/timing_mode.h"
 #include "core/nds.h"
+#include "core/cart/rom_source.h"
 #include "core/handoff_stats.h"
 #include "core/host_cores.h"
 #include "core/cart/zip.h"
@@ -168,6 +169,9 @@ const char* kUsage =
     "  --gpu-present / --no-gpu-present  scale and lay out the picture off the CPU, into the\n"
     "                  scanout buffer: the Rockchip RGA where the device has one, else a Vulkan\n"
     "                  compute pass (video.gpu_present = true | rga | vulkan | false; on by default)\n"
+    "  --preload-rom / --no-preload-rom  read the whole ROM into memory at load, or page it in as\n"
+    "                  the game reads it (cart.preload = auto | true | false; auto preloads a ROM on a\n"
+    "                  network share that fits in memory, where a page read mid-frame is a round trip)\n"
     "  --no-audio      run without sound\n"
     "  --volume N      0..100\n"
     "  --audio-buffer X  how much sound is held ahead: auto (the default) or milliseconds;\n"
@@ -1109,6 +1113,8 @@ static int run(int argc, char** argv) {
     else if (flag("--aa")) cli.set("video.aa", "true");
     else if (flag("--no-aa")) cli.set("video.aa", "false");
     else if (flag("--gpu3d")) cli.set("video.gpu3d", "true");
+    else if (flag("--preload-rom")) cli.set("cart.preload", "true");
+    else if (flag("--no-preload-rom")) cli.set("cart.preload", "false");
     else if (flag("--no-gpu3d")) cli.set("video.gpu3d", "false");
     else if (flag("--version")) { std::printf("DSperate %s (%s)\n", kDsperateVersion, kDsperateCommit); return 0; }
     else if (flag("--help")) { std::fputs(kUsage, stderr); return 0; }
@@ -1147,7 +1153,7 @@ static int run(int argc, char** argv) {
   }
   auto apply_cli = [&] { for (const char* k : {"paths.bios9", "paths.bios7", "paths.firmware", "video.scale", "video.dual_window", "video.layout", "video.screen", "video.pip_alpha", "video.screen_gap", "video.dominant_ratio", "video.dominant_threshold", "video.integer_scale",
                                               "video.fullscreen", "video.linear", "video.lcd_grid", "video.chunky", "video.chunky_threshold", "video.chunky_cell", "video.seam", "video.sink", "video.disp", "video.fbdev", "video.gpu_present", "video.vsync", "audio.enabled", "audio.volume",
-                                              "audio.mic", "emu.jit", "emu.timing", "emu.speed", "emu.limiter", "emu.pacing", "audio.buffer_size", "audio.latency_frames", "emu.frameskip", "emu.frameskip_mode", "emu.frameskip_capture", "video.aa", "video.gpu3d", "emu.autosave_png", "emu.autoload", "cheevos.enabled", "cheevos.token_file", "cheevos.username"}) if (cli.has(k)) cfg.set(k, cli.str(k)); };
+                                              "audio.mic", "emu.jit", "emu.timing", "emu.speed", "emu.limiter", "emu.pacing", "audio.buffer_size", "audio.latency_frames", "emu.frameskip", "emu.frameskip_mode", "emu.frameskip_capture", "video.aa", "video.gpu3d", "cart.preload", "emu.autosave_png", "emu.autoload", "cheevos.enabled", "cheevos.token_file", "cheevos.username"}) if (cli.has(k)) cfg.set(k, cli.str(k)); };
   apply_cli();
   const std::string bios9 = cfg.str("paths.bios9"), bios7 = cfg.str("paths.bios7");
   const std::string dsi_fw = cfg.str("paths.dsi_firmware");
@@ -1556,6 +1562,10 @@ sdl_ready:
   input.configure(cfg);
   input.open_controllers();
   std::vector<u32> menu_fb[2] = {std::vector<u32>(ds::SCREEN_W * ds::SCREEN_H), std::vector<u32>(ds::SCREEN_W * ds::SCREEN_H)};
+  {
+    const std::string pl = cfg.str("cart.preload", "auto");
+    ds::cart::RomSource::set_preload(pl == "true" || pl == "on" || pl == "1" ? ds::cart::RomSource::Preload::On : pl == "false" || pl == "off" || pl == "0" ? ds::cart::RomSource::Preload::Off : ds::cart::RomSource::Preload::Auto);
+  }
   nds.rom_cache_dir = cfg.str("paths.cache", "");
   nds.rom_cache_max_bytes = static_cast<u64>(std::max(0, cfg.num("cart.cache_mb", 2048))) << 20;
   const bool cache_session = cfg.str("cart.cache", "keep") == "session";

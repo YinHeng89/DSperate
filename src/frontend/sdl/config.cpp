@@ -335,6 +335,11 @@ R"(# DSperate settings. Command-line flags override this file. Two files next
                                 # launched go first when a new one would not fit. 0 = keep all
 # cache = keep                  # keep: unpacked games stay for the next launch | session: deleted at
                                 # exit, for a card with no room to spare
+# preload = auto                # auto | true | false: read the whole ROM into memory when it loads
+                                # (pages stay reclaimable) instead of as the game touches it. auto does
+                                # it for a ROM on a network share (NFS, SMB, sshfs and other FUSE
+                                # mounts) that fits with 128 MB to spare, where a page read mid-frame
+                                # is a round trip and shows as a hitch; local storage stays demand-paged
 
 [emu]
 # realtime = rr                 # rr | fifo | off: real-time scheduling for the emulator's threads

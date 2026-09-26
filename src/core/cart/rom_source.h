@@ -26,6 +26,16 @@ class RomSource {
 public:
   static constexpr u32 PAGE = 0x1000;
 
+  // cart.preload: whether a mapped image is read in whole at load (the map
+  // populated: pages resident up front, still reclaimable) instead of on
+  // first touch. Auto does it for a file on a network filesystem that fits
+  // in available memory with room to spare -- there a demand fault is a
+  // round trip mid-frame -- and leaves local storage demand-paged, where a
+  // populate measured as a loss (a hitch at frame 0 for nothing gained).
+  enum class Preload : u8 { Auto, On, Off };
+  static void set_preload(Preload p);
+  static Preload preload();
+
   ~RomSource();
   RomSource(const RomSource&) = delete;
   RomSource& operator=(const RomSource&) = delete;

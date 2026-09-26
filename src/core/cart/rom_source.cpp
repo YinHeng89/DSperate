@@ -3,11 +3,15 @@
 #include "core/cart/rom_source.h"
 
 #include <cerrno>
+#include <cstdio>
 #include <cstring>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#if defined(__linux__)
+#include <sys/vfs.h>
+#endif
 
 namespace ds::cart {
 
@@ -42,6 +46,43 @@ std::unique_ptr<RomSource> RomSource::from_memory(std::vector<u8> bytes) {
   return s;
 }
 
+namespace {
+RomSource::Preload g_preload = RomSource::Preload::Auto;
+
+// The filesystem behind `fd` is a network one (NFS, SMB/CIFS, 9p, AFS, Coda,
+// or anything through FUSE, which is how sshfs and most share clients mount).
+bool on_network_fs(int fd) {
+#if defined(__linux__)
+  struct statfs sf{};
+  if (fstatfs(fd, &sf) != 0) return false;
+  switch (static_cast<unsigned long>(sf.f_type)) {
+    case 0x6969UL: case 0x517BUL: case 0xFF534D42UL: case 0xFE534D42UL: case 0x65735546UL:
+    case 0x01021997UL: case 0x5346414FUL: case 0x73757245UL: case 0x564CUL:
+      return true;
+    default: return false;
+  }
+#else
+  (void)fd; return false;
+#endif
+}
+
+// MemAvailable, or 0 when unknown.
+u64 mem_available() {
+#if defined(__linux__)
+  if (std::FILE* f = std::fopen("/proc/meminfo", "r")) {
+    char line[128]; u64 kb = 0;
+    while (std::fgets(line, sizeof line, f)) if (std::sscanf(line, "MemAvailable: %llu kB", reinterpret_cast<unsigned long long*>(&kb)) == 1) break;
+    std::fclose(f);
+    return kb << 10;
+  }
+#endif
+  return 0;
+}
+} // namespace
+
+void RomSource::set_preload(Preload p) { g_preload = p; }
+RomSource::Preload RomSource::preload() { return g_preload; }
+
 std::unique_ptr<RomSource> RomSource::map_file(const std::string& path, u64 offset, u64 size,
                                                std::string& err) {
   err.clear();
@@ -60,7 +101,22 @@ std::unique_ptr<RomSource> RomSource::map_file(const std::string& path, u64 offs
   const u64 align = static_cast<u64>(ps > 0 ? ps : 4096);
   const u64 base = offset & ~(align - 1);
   const size_t len = static_cast<size_t>(offset - base + size);
-  void* m = mmap(nullptr, len, PROT_READ, MAP_PRIVATE, fd, static_cast<off_t>(base));
+  // Read in whole now (cart.preload), or page by page as the game touches it.
+  bool populate = g_preload == Preload::On;
+  if (g_preload == Preload::Auto && on_network_fs(fd)) {
+    const u64 avail = mem_available();
+    populate = avail == 0 || avail >= len + (128ull << 20);
+    if (!populate) std::fprintf(stderr, "rom: on a network filesystem, but %llu MB free is too little to preload %llu MB\n", (unsigned long long)(avail >> 20), (unsigned long long)(len >> 20));
+  }
+  int flags = MAP_PRIVATE;
+#if defined(MAP_POPULATE)
+  if (populate) flags |= MAP_POPULATE;
+#endif
+  void* m = mmap(nullptr, len, PROT_READ, flags, fd, static_cast<off_t>(base));
+#if !defined(MAP_POPULATE)
+  if (populate && m != MAP_FAILED) { volatile u8 sink = 0; for (size_t i = 0; i < len; i += 4096) sink += static_cast<const u8*>(m)[i]; (void)sink; }
+#endif
+  if (populate && m != MAP_FAILED) std::fprintf(stderr, "rom: preloaded %llu MB%s\n", (unsigned long long)((len + (1 << 20) - 1) >> 20), g_preload == Preload::Auto ? " (network filesystem)" : "");
   close(fd);
   if (m == MAP_FAILED) { err = std::string("mmap: ") + std::strerror(errno); return nullptr; }
 
