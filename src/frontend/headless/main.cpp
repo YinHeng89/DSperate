@@ -829,7 +829,7 @@ int main(int argc, char** argv) {
       for (int k = 0; k < 2; ++k) std::fwrite(nds.gpu.edge_plane(k), 1, ds::SCREEN_W * ds::SCREEN_H, edges_out);
     if (cut_out && i >= dump_from && (dump_count <= 0 || i < dump_from + dump_count))
       for (int k = 0; k < 2; ++k) {
-        ds::gpu::edge_cut_screen(nds.gpu.framebuffer(k), nds.gpu.edge_plane(k), cut_n, cut_px.data());
+        ds::gpu::edge_cut_screen(nds.gpu.framebuffer(k), nds.gpu.edge_plane(k), cut_n, cut_px.data(), ds::gpu::edge_soft_mode_env());
         std::fwrite(cut_px.data(), 4, cut_px.size(), cut_out);
       }
     if (dump_out && i >= dump_from && (dump_count <= 0 || i < dump_from + dump_count)) {

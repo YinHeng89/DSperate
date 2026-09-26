@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // DSperate - Nintendo DS emulator. Copyright (C) 2026 DSperate contributors.
 #include "frontend/sdl/gpu_present.h"
+#include "core/gpu/edge_cut.h"
 
 #include <cstdio>
 #include <algorithm>
@@ -383,7 +384,8 @@ bool GpuPresent::present(ScanoutOut& out, const u32* const fb[2], const u8* cons
     const int y0 = std::max(0, drawn.y), y1 = std::min(lh, drawn.y + drawn.h);
     if (y1 > y0) d.dev->flush(d.over[slot], static_cast<size_t>(y0) * lw * sizeof(u32), static_cast<size_t>(y1 - y0) * lw * sizeof(u32));
   }
-  pc.b[0] = static_cast<u32>(rot); pc.b[1] = static_cast<u32>(nviews > 2 ? 2 : nviews); pc.b[2] = inset_alpha | (has_over ? 0x100u : 0u) | (std::min<u32>(grid, 256) << 16);
+  static const u32 soft = static_cast<u32>(ds::gpu::edge_soft_mode_env());   // DS_GEOM_SOFT / DS_CUT_SOFT / DS_ALL_SOFT: bilinear ramps at the edges (edge_cut.h)
+  pc.b[0] = static_cast<u32>(rot); pc.b[1] = static_cast<u32>(nviews > 2 ? 2 : nviews); pc.b[2] = inset_alpha | (has_over ? 0x100u : 0u) | (soft << 9) | (std::min<u32>(grid, 256) << 16);
   pc.b[3] = static_cast<u32>(slot) * kSlotWords;
   for (int v = 0; v < static_cast<int>(pc.b[1]); ++v) {
     pc.rect[v][0] = views[v].rect.x; pc.rect[v][1] = views[v].rect.y; pc.rect[v][2] = views[v].rect.w; pc.rect[v][3] = views[v].rect.h;
