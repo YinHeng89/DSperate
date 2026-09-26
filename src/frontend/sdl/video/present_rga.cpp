@@ -30,6 +30,9 @@
 #include <string>
 #include <vector>
 
+#if DSPERATE_NEON
+#include <arm_neon.h>
+#endif
 #if defined(__linux__)
 #include <dirent.h>
 #include <fcntl.h>
@@ -229,9 +232,11 @@ private:
   // pixel / line darkened to gf/256, for runs at least ceil(scale) wide,
   // every source pixel (or every other at exactly 2x) -- the scanline
   // scaler's placement (kern::scale_row_grid). `r` is the clipped rect on
-  // the buffer, `full` the view's rect the runs are laid out in.
+  // the buffer, `full` the view's rect the runs are laid out in. One sweep
+  // over the rect with a per-column factor table (NEON where built): the
+  // buffer is read and written once, which is what the pass costs.
   void grid_view(u32* px, const ScanoutOut::DmabufPlane& plane, const frontend::Rect& r, const frontend::Rect& full, u32 gf) {
-    const int dim[2] = {full.w, full.h}, srcn[2] = {static_cast<int>(ds::SCREEN_W), static_cast<int>(ds::SCREEN_H)}, org[2] = {full.x, full.y};
+    const int dim[2] = {full.w, full.h}, srcn[2] = {static_cast<int>(ds::SCREEN_W), static_cast<int>(ds::SCREEN_H)};
     std::vector<u8>* marks[2] = {&grid_col_, &grid_row_};
     for (int axis = 0; axis < 2; ++axis) {
       const u32 n = static_cast<u32>(std::max(0, dim[axis])), sn = static_cast<u32>(srcn[axis]);
@@ -244,14 +249,40 @@ private:
         if (x1 - x0 >= min_run && s % pitch == 0 && x0 < n) m[x0] = 1;
       }
     }
-    auto dim_px = [gf](u32 v) { return 0xFF000000u | ((((v & 0xFF00FF) * gf) >> 8) & 0xFF00FF) | ((((v & 0xFF00) * gf) >> 8) & 0xFF00); };
+    // Per buffer column of the clipped rect: the factor (256 = untouched), 16-bit for the vector multiply.
+    grid_fac_.assign(static_cast<size_t>(r.w) + 8, 256);
+    for (int x = 0; x < r.w; ++x) { const int lx = r.x + x - full.x; if (lx >= 0 && lx < static_cast<int>(grid_col_.size()) && grid_col_[static_cast<size_t>(lx)]) grid_fac_[static_cast<size_t>(x)] = static_cast<u16>(gf); }
     dmaheap::sync_begin_write(plane.fd);
     const u32 pitch = plane.stride_bytes / 4;
     for (int y = r.y; y < r.y + r.h; ++y) {
-      u32* d = px + static_cast<size_t>(y) * pitch;
-      const int ly = y - org[1];
-      if (ly >= 0 && ly < static_cast<int>(grid_row_.size()) && grid_row_[static_cast<size_t>(ly)]) { for (int x = r.x; x < r.x + r.w; ++x) d[x] = dim_px(d[x]); continue; }
-      for (int x = r.x; x < r.x + r.w; ++x) { const int lx = x - org[0]; if (lx >= 0 && lx < static_cast<int>(grid_col_.size()) && grid_col_[static_cast<size_t>(lx)]) d[x] = dim_px(d[x]); }
+      u32* d = px + static_cast<size_t>(y) * pitch + r.x;
+      const int ly = y - full.y;
+      const bool seam_row = ly >= 0 && ly < static_cast<int>(grid_row_.size()) && grid_row_[static_cast<size_t>(ly)];
+      const u16* fac = grid_fac_.data();
+      int x = 0;
+#if DSPERATE_NEON
+      const uint16x8_t gfv = vdupq_n_u16(static_cast<u16>(gf));
+      for (; x + 8 <= r.w; x += 8) {
+        // Two 4-pixel vectors; per-lane factors: the row's, or the column table's.
+        uint8x16_t p0 = vld1q_u8(reinterpret_cast<const u8*>(d + x)), p1 = vld1q_u8(reinterpret_cast<const u8*>(d + x + 4));
+        uint16x8_t f8 = seam_row ? gfv : vld1q_u16(fac + x);
+        // Factor per pixel -> per byte (B G R X): widen each pixel's factor to its 4 bytes.
+        uint16x4_t fa = vget_low_u16(f8), fb = vget_high_u16(f8);
+        uint16x8_t f0lo = vcombine_u16(vdup_lane_u16(fa, 0), vdup_lane_u16(fa, 1)), f0hi = vcombine_u16(vdup_lane_u16(fa, 2), vdup_lane_u16(fa, 3));
+        uint16x8_t f1lo = vcombine_u16(vdup_lane_u16(fb, 0), vdup_lane_u16(fb, 1)), f1hi = vcombine_u16(vdup_lane_u16(fb, 2), vdup_lane_u16(fb, 3));
+        uint16x8_t m0lo = vshrq_n_u16(vmulq_u16(vmovl_u8(vget_low_u8(p0)), f0lo), 8), m0hi = vshrq_n_u16(vmulq_u16(vmovl_u8(vget_high_u8(p0)), f0hi), 8);
+        uint16x8_t m1lo = vshrq_n_u16(vmulq_u16(vmovl_u8(vget_low_u8(p1)), f1lo), 8), m1hi = vshrq_n_u16(vmulq_u16(vmovl_u8(vget_high_u8(p1)), f1hi), 8);
+        uint8x16_t o0 = vcombine_u8(vmovn_u16(m0lo), vmovn_u16(m0hi)), o1 = vcombine_u8(vmovn_u16(m1lo), vmovn_u16(m1hi));
+        const uint8x16_t xmask = vreinterpretq_u8_u32(vdupq_n_u32(0xFF000000u));
+        vst1q_u8(reinterpret_cast<u8*>(d + x), vorrq_u8(o0, xmask)); vst1q_u8(reinterpret_cast<u8*>(d + x + 4), vorrq_u8(o1, xmask));
+      }
+#endif
+      for (; x < r.w; ++x) {
+        const u32 f = seam_row ? gf : fac[x];
+        if (f == 256) continue;
+        const u32 v = d[x];
+        d[x] = 0xFF000000u | ((((v & 0xFF00FF) * f) >> 8) & 0xFF00FF) | ((((v & 0xFF00) * f) >> 8) & 0xFF00);
+      }
     }
     dmaheap::sync_end_write(plane.fd);
   }
@@ -344,6 +375,7 @@ private:
   Src src_[kSlots];
   int scratch_fd_ = -1; u32* scratch_px_ = nullptr; size_t scratch_bytes_ = 0;
   std::vector<u8> grid_col_, grid_row_;
+  std::vector<u16> grid_fac_;
   Over over_[kSlots];
   std::vector<bool> cleared_;   // per sink buffer: letterbox blacked for this layout
   u64 frame_ = 0, layout_sig_ = 0;

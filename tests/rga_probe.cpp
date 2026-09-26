@@ -168,6 +168,27 @@ int main(int argc, char** argv) {
     std::printf("cell edge %06x | %06x (%s)\n", e0, e1, (e0 == (dst[8 * sx - 2] & 0xFFFFFF) && e1 == (dst[8 * sx + 1] & 0xFFFFFF)) ? "nearest-like" : "blended");
   }
 
+  // 1b. DS_RGA_BLEND=1: does the driver blend an ARGB source over the destination
+  // (per-pixel alpha)? Source AR24 at alpha 0x80 (red) over a white destination:
+  // blended gives ~(255,128,128), replaced gives (255,0,0) or the alpha byte ignored.
+  if (std::getenv("DS_RGA_BLEND")) {
+    stream(fd, V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE, false); stream(fd, V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE, false);
+    v4l2_requestbuffers rb{}; rb.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE; rb.memory = V4L2_MEMORY_DMABUF; rb.count = 0; xioctl(fd, VIDIOC_REQBUFS, &rb);
+    uint32_t s2, sz2;
+    const uint32_t argb = v4l2_fourcc('A', 'R', '2', '4');
+    if (!set_fmt(fd, V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE, sw, sh, argb, &s2, &sz2)) return 1;
+    reqbufs(fd, V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE, 1);
+    stream(fd, V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE, true); stream(fd, V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE, true);
+    for (uint32_t i = 0; i < sw * sh; ++i) src[i] = 0x80FF0000u;   // A=0x80 R=0xFF
+    for (uint32_t i = 0; i < dw * dh; ++i) dst[i] = 0xFFFFFFFFu;
+    set_sel(fd, V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE, V4L2_SEL_TGT_CROP, 0, 0, static_cast<int>(sw), static_cast<int>(sh));
+    set_sel(fd, V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE, V4L2_SEL_TGT_COMPOSE, 0, 0, static_cast<int>(dw), static_cast<int>(dh));
+    if (!run_job(fd, sfd, sz2, dfd, dsize)) return 1;
+    const uint32_t p = dst[(dh / 2) * (dstride / 4) + dw / 2];
+    std::printf("ARGB source alpha 0x80 over white: dst = %08x (%s)\n", p, ((p >> 8) & 0xFF) > 0x40 && ((p >> 8) & 0xFF) < 0xC0 ? "BLENDED" : "not blended");
+    return 0;
+  }
+
   // 2. Two-screen frame: source crop rectangles into compose rectangles (top / bottom halves).
   {
     const int hh = static_cast<int>(dh) / 2;
