@@ -1658,7 +1658,7 @@ void test_no_page_draws_chinese_with_english_set() {
   std::vector<ds::cheat::Group> groups;
   { ds::cheat::Group g; g.name = "GROUP"; groups.push_back(g); }
   ds::cheat::Code c;
-  c.name = "金手指";
+  c.name = "CHEATS";
   c.group = 0;
   c.words = {0x02000000, 1};
   c.enabled = true;                                     // the heading counts it
@@ -1732,25 +1732,14 @@ void test_no_page_draws_chinese_with_english_set() {
   ds::sdl::g_i18n_leaks = 0;
 }
 
-// The other direction, and the one the walk above cannot see: a value left in
-// English is a value the player reads in English with Chinese set, and on the
-// screen it is indistinguishable from one that is meant to be -- WIIMMFI and
-// DNS are names, GREY and UNLIMITED are not. What makes a row translatable is
-// that the table has an English for it, so this asks the table rather than
-// looking at the row.
-//
-// It also asks the one thing that makes the two directions work at all: a row
-// is written in Chinese and tr_text resolves by strcmp against what the source
-// wrote, so a row written in English is a row that can never be translated --
-// in either direction.
-void test_every_settings_string_has_an_english_entry() {
-  const auto has_han = [](const char* s) {
-    if (!s) return false;
-    for (const unsigned char* p = reinterpret_cast<const unsigned char*>(s); *p; ++p)
-      if (*p >= 0xE3) return true;         // CJK, its punctuation, fullwidth forms
-    return false;
-  };
-  // A word that is the word in any language: a server's name, a checkbox.
+// The direction the walk above cannot see. The rows are written in English now,
+// so the string without an entry is the one the player reads in English with
+// Chinese set -- and on screen that is indistinguishable from one that is
+// meant to be English: WIIMMFI and DNS are names, GREY and UNLIMITED are not.
+// What makes a string translatable is that the table holds a Chinese for it, so
+// this asks the table rather than looking at the row.
+void test_every_settings_string_has_a_chinese_entry() {
+  // A word that is the word in any language: a number, a checkbox glyph.
   const auto neutral = [](const char* s) {
     if (!s || !*s) return true;
     for (const char* p = s; *p; ++p)
@@ -1765,38 +1754,41 @@ void test_every_settings_string_has_an_english_entry() {
     return std::strcmp(s, "WIIMMFI") == 0 || std::strcmp(s, "DNS") == 0
         || std::strcmp(s, "[ ]") == 0 || std::strcmp(s, "[X]") == 0;
   };
-  const auto resolvable = [](const char* s) {
-    return std::strcmp(ds::sdl::tr_text(s), s) != 0;   // the table has the other language
+  // Asked in Chinese mode, because that is the only mode that resolves: tr_text
+  // returns the string unchanged when the table holds no Chinese for it, which
+  // is exactly the row this is looking for. English mode resolves nothing at
+  // all, so it cannot answer the question either way.
+  const auto covered = [](const char* s) {
+    return std::strcmp(ds::sdl::tr_text(s), s) != 0;
   };
   const ds::sdl::Setting* tables[] = {ds::sdl::kEmuSettings, ds::sdl::kVideoSettings,
                                       ds::sdl::kLayoutSettings, ds::sdl::kUserSettings};
-  ds::sdl::g_ui_lang = ds::sdl::UiLang::En;
+  ds::sdl::g_ui_lang = ds::sdl::UiLang::Zh;
   for (const ds::sdl::Setting* t : tables) {
     for (int i = 0; t[i].key; ++i) {
       const ds::sdl::Setting& s = t[i];
-      CHECK(has_han(s.label) || neutral(s.label) || named(s.label));
-      if (has_han(s.label)) CHECK(resolvable(s.label));
-      if (s.note) { CHECK(has_han(s.note)); CHECK(resolvable(s.note)); }
-      if (s.sentinel_label) { CHECK(has_han(s.sentinel_label)); CHECK(resolvable(s.sentinel_label)); }
-      for (int c = 0; c < s.nchoices; ++c) {
-        CHECK(has_han(s.choices[c].label) || neutral(s.choices[c].label) || named(s.choices[c].label));
-        if (has_han(s.choices[c].label)) CHECK(resolvable(s.choices[c].label));
-      }
+      CHECK(covered(s.label) || neutral(s.label) || named(s.label));
+      if (s.note) CHECK(covered(s.note) || neutral(s.note) || named(s.note));
+      if (s.sentinel_label)
+        CHECK(covered(s.sentinel_label) || neutral(s.sentinel_label) || named(s.sentinel_label));
+      for (int c = 0; c < s.nchoices; ++c)
+        CHECK(covered(s.choices[c].label) || neutral(s.choices[c].label) || named(s.choices[c].label));
     }
   }
+  ds::sdl::g_ui_lang = ds::sdl::UiLang::En;   // leave the suite the way we found it
 }
 
 // The one tag on the slot row that does not come from a table of choices: the
 // emulator writes the config value REJECTED into the notice, and the row
-// translates it on the way into its own format. Without the pair, the row read
-// 存档槽 < 0 > REJECTED -- a Chinese line with an English word in it -- and no
-// walk could see it, because the notice is set only after a state is refused.
+// resolves it on the way into its own format. Without the pair the row read
+// SAVE SLOT < 0 > REJECTED with Chinese set -- an English word on a Chinese
+// line -- and no walk could see it, because the notice is set only after a
+// state is refused.
 void test_the_refused_state_tag_has_both_languages() {
-  ds::sdl::g_ui_lang = ds::sdl::UiLang::En;
-  CHECK(std::strcmp(ds::sdl::tr_text("已拒绝"), "REJECTED") == 0);
   ds::sdl::g_ui_lang = ds::sdl::UiLang::Zh;
   CHECK(std::strcmp(ds::sdl::tr_text("REJECTED"), "已拒绝") == 0);
   ds::sdl::g_ui_lang = ds::sdl::UiLang::En;
+  CHECK(std::strcmp(ds::sdl::tr_text("REJECTED"), "REJECTED") == 0);
 }
 
 // The account page's status line: what the achievement client is doing, in the
@@ -1805,30 +1797,29 @@ void test_the_refused_state_tag_has_both_languages() {
 // a wrapped fragment is an entry the table holds, so every one of these has to
 // be resolved before any of that, which is the whole reason they are here.
 void test_the_account_status_lines_have_both_languages() {
-  static const char* const kZh[] = {
-    "此构建不支持", "已关闭", "未登录", "正在登录...", "已登录为 ", "正在加载成就...",
-    "此游戏尚未发布成就", "此 ROM 没有成就 - HASH ", "由 Leaf 管理", " - 由 Leaf 管理",
-  };
+  // Keyed by the English the frontend writes, paired with the Chinese the table
+  // has to hold for it.
   static const char* const kEn[] = {
     "NOT AVAILABLE IN THIS BUILD", "TURNED OFF", "NOT SIGNED IN", "SIGNING IN...", "SIGNED IN AS ",
     "LOADING ACHIEVEMENTS...", "NO ACHIEVEMENTS PUBLISHED FOR THIS GAME YET",
     "NO ACHIEVEMENTS FOR THIS ROM - HASH ", "MANAGED BY LEAF", " - MANAGED BY LEAF",
   };
-  constexpr int kN = static_cast<int>(sizeof(kZh) / sizeof(kZh[0]));
-  static_assert(sizeof(kZh) / sizeof(kZh[0]) == sizeof(kEn) / sizeof(kEn[0]),
-                "one English for every Chinese");
-  ds::sdl::g_ui_lang = ds::sdl::UiLang::En;
-  for (int i = 0; i < kN; ++i)
-    CHECK(std::strcmp(ds::sdl::tr_text(kZh[i]), kEn[i]) == 0);
+  static const char* const kZh[] = {
+    "此构建不支持", "已关闭", "未登录", "正在登录...", "已登录为 ", "正在加载成就...",
+    "此游戏尚未发布成就", "此 ROM 没有成就 - HASH ", "由 Leaf 管理", " - 由 Leaf 管理",
+  };
+  constexpr int kN = static_cast<int>(sizeof(kEn) / sizeof(kEn[0]));
+  static_assert(sizeof(kEn) / sizeof(kEn[0]) == sizeof(kZh) / sizeof(kZh[0]),
+                "one Chinese for every English");
   ds::sdl::g_ui_lang = ds::sdl::UiLang::Zh;
   for (int i = 0; i < kN; ++i)
     CHECK(std::strcmp(ds::sdl::tr_text(kEn[i]), kZh[i]) == 0);
   // And it is resolved whole, before the name goes on: a name joined to a
   // resolved line rides along in the line's language, which a line resolved
   // after the join cannot do.
-  CHECK(std::string(ds::sdl::tr_text("已登录为 ")) + "yinheng" == "已登录为 yinheng");
+  CHECK(std::string(ds::sdl::tr_text("SIGNED IN AS ")) + "yinheng" == "已登录为 yinheng");
   ds::sdl::g_ui_lang = ds::sdl::UiLang::En;
-  CHECK(std::string(ds::sdl::tr_text("已登录为 ")) + "yinheng" == "SIGNED IN AS yinheng");
+  CHECK(std::string(ds::sdl::tr_text("SIGNED IN AS ")) + "yinheng" == "SIGNED IN AS yinheng");
 }
 
 // The auto state's row, only when there is an auto state to put on it. Empty it
@@ -1954,7 +1945,7 @@ int main() {
   test_chinese_draws_from_the_embedded_face();
   test_chinese_page_draws();
   test_no_page_draws_chinese_with_english_set();
-  test_every_settings_string_has_an_english_entry();
+  test_every_settings_string_has_a_chinese_entry();
   test_the_refused_state_tag_has_both_languages();
   test_the_account_status_lines_have_both_languages();
   test_auto_row_shown_only_when_the_auto_state_exists();

@@ -957,9 +957,9 @@ bool open_displays(const VideoSetup& vs, ds::sdl::Display& display, ds::sdl::Dis
 // value beside each is the same name as the key bound to it, so translating
 // either side would put one word on both and say nothing.
 constexpr const char* const kActionLabels[static_cast<int>(ds::sdl::Action::Count)] = {
-  "退出", "暂停游戏", "快进", "快进开关", "保存存档", "读取存档", "下个槽位", "上个槽位",
-  "音量+", "音量-", "静音", "下个布局", "上个布局", "交换屏幕", "小窗位置", "全屏", "截图",
-  "合盖", "麦克风", "帧数",
+  "QUIT", "PAUSE", "FAST FORWARD", "FAST FORWARD TOGGLE", "SAVE STATE", "LOAD STATE", "NEXT SLOT", "PREV SLOT",
+  "VOLUME UP", "VOLUME DOWN", "MUTE", "NEXT LAYOUT", "PREV LAYOUT", "SWAP SCREENS", "PIP CORNER NEXT", "FULLSCREEN", "SCREENSHOT",
+  "LID", "MICROPHONE", "FPS",
 };
 static_assert(sizeof(kActionLabels) / sizeof(kActionLabels[0]) == static_cast<int>(ds::sdl::Action::Count),
               "one label for every hotkey");
@@ -973,22 +973,22 @@ static_assert(sizeof(kActionLabels) / sizeof(kActionLabels[0]) == static_cast<in
 // is however the row reads.
 struct Extra { const char* key_keys; const char* key_pad; const char* label; };
 constexpr Extra kExtras[] = {
-  {"hotkeys.modifier", "padhotkeys.modifier", "修饰键"},
-  {nullptr,            "pad.stylus_button",   "触摸笔"},
-  {nullptr,            "pad.stylus_button.alt", "触摸笔 (2)"},
-  {nullptr,            "pad.stylus_axis",     "触摸笔摇杆"},
-  {nullptr,            "pad.stylus_dpad",     "触摸笔方向键"},
-  {nullptr,            "pad.stick_dpad",      "摇杆方向键"},
-  {nullptr,            "pad.stick_face",      "摇杆按键"},
+  {"hotkeys.modifier", "padhotkeys.modifier", "MODIFIER"},
+  {nullptr,            "pad.stylus_button",   "STYLUS TAP"},
+  {nullptr,            "pad.stylus_button.alt", "STYLUS TAP (2)"},
+  {nullptr,            "pad.stylus_axis",     "STYLUS STICK"},
+  {nullptr,            "pad.stylus_dpad",     "STYLUS DPAD"},
+  {nullptr,            "pad.stick_dpad",      "STICK DPAD"},
+  {nullptr,            "pad.stick_face",      "STICK ABXY"},
   // Axis remapping: each row is set by pushing the control the way that axis
   // reads positive -- a stick right for X, down for Y, a trigger pressed --
   // and stores the physical axis that went, inverted if it went negative.
-  {nullptr,            "pad.axis_leftx",      "左摇杆 右"},
-  {nullptr,            "pad.axis_lefty",      "左摇杆 下"},
-  {nullptr,            "pad.axis_rightx",     "右摇杆 右"},
-  {nullptr,            "pad.axis_righty",     "右摇杆 下"},
-  {nullptr,            "pad.axis_lefttrigger", "L2 轴"},
-  {nullptr,            "pad.axis_righttrigger", "R2 轴"},
+  {nullptr,            "pad.axis_leftx",      "L STICK RIGHT"},
+  {nullptr,            "pad.axis_lefty",      "L STICK DOWN"},
+  {nullptr,            "pad.axis_rightx",     "R STICK RIGHT"},
+  {nullptr,            "pad.axis_righty",     "R STICK DOWN"},
+  {nullptr,            "pad.axis_lefttrigger", "L2 AXIS"},
+  {nullptr,            "pad.axis_righttrigger", "R2 AXIS"},
 };
 // Rows holding a stick rather than a single control.
 bool extra_is_stick(const char* key) { return std::strcmp(key, "pad.stylus_axis") == 0 || std::strcmp(key, "pad.stick_dpad") == 0 || std::strcmp(key, "pad.stick_face") == 0; }
@@ -999,17 +999,17 @@ std::string axis_remap_label(const std::string& v0) {
   // on the console and stay as they are. "反向" is joined after the stick has
   // been resolved, for the reason the hotkey rows' " (2)" is: the joined
   // string is not an entry, so each half has to reach the table on its own.
-  if (v0 == "none") return ds::sdl::tr_text("无");
+  if (v0 == "none") return ds::sdl::tr_text("NONE");
   const bool inv = !v0.empty() && v0[0] == '-';
   const std::string v = !v0.empty() && (v0[0] == '-' || v0[0] == '+') ? v0.substr(1) : v0;
   const bool known = v == "leftx" || v == "lefty" || v == "rightx" || v == "righty" || v == "lefttrigger" || v == "righttrigger";
-  const char* n = v == "leftx" ? "左摇杆 X" : v == "lefty" ? "左摇杆 Y" : v == "rightx" ? "右摇杆 X" : v == "righty" ? "右摇杆 Y"
+  const char* n = v == "leftx" ? "L STICK X" : v == "lefty" ? "L STICK Y" : v == "rightx" ? "R STICK X" : v == "righty" ? "R STICK Y"
                 : v == "lefttrigger" ? "L2" : v == "righttrigger" ? "R2" : v.c_str();
   std::string out = ds::sdl::tr_text(n);
   // A name the table has never heard is a file's own spelling, shown as it
   // stands -- upper-cased because the font has no lower case.
   if (!known) for (char& ch : out) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
-  return inv ? out + " " + ds::sdl::tr_text("反向") : out;
+  return inv ? out + " " + ds::sdl::tr_text("INV") : out;
 }
 bool extra_in_column(const Extra& e, bool pad) { return pad || e.key_keys; }
 int extra_count(bool pad) {
@@ -2303,7 +2303,7 @@ sdl_ready:
       // wording, not the file's, and the file keeps "left"/"right" whatever
       // the page reads.
       if (extra_is_stick(key))   // true/false: stick_dpad's old spellings (Input::parse_stick)
-        return ds::sdl::tr_text(v == "left" || v == "true" || v == "1" ? "左摇杆" : v == "right" ? "右摇杆" : "无");
+        return ds::sdl::tr_text(v == "left" || v == "true" || v == "1" ? "LEFT STICK" : v == "right" ? "RIGHT STICK" : "NONE");
       return pad ? ds::sdl::Input::pad_label(v) : upper(v);
     }
 
@@ -2422,7 +2422,7 @@ sdl_ready:
     bool user_in_firmware() const { return !nds.firmware_synthetic; }
 
     const char* user_settings_note() const override {
-      return user_in_firmware() ? "保存在固件中" : nullptr;
+      return user_in_firmware() ? "IN THE FIRMWARE" : nullptr;
     }
 
     static bool is_user_key(const char* key) { return std::strncmp(key, "user.", 5) == 0; }
@@ -2510,56 +2510,56 @@ sdl_ready:
         // Frameskip itself is forced to 0 for a session, so its mode is moot
         // there too -- and the config may still say otherwise, which is what
         // this test would read.
-        if (net_live && *net_live) return "\u8054\u7f51\u4f1a\u8bdd\u4e2d\u4e0d\u53ef\u7528";
-        return cfg.num("emu.frameskip", 0) > 0 ? "" : "\u4ec5\u5728\u5f00\u542f\u8df3\u5e27\u540e";
+        if (net_live && *net_live) return "NOT DURING A NETWORK SESSION";
+        return cfg.num("emu.frameskip", 0) > 0 ? "" : "ONLY WITH FRAMESKIP ON";
       case ds::sdl::Dep::PanelEffects:
-        if (display.rga_present()) return "RGA \u59cb\u7ec8\u6309\u7ebf\u6027\u8fc7\u6ee4\u7f29\u653e";
-        return panel_effects() ? "" : "\u6b64\u5c4f\u5e55\u7531\u786c\u4ef6\u7f29\u653e";
+        if (display.rga_present()) return "THE RGA ALWAYS SCALES BILINEAR";
+        return panel_effects() ? "" : "THIS SCREEN SCALES IN HARDWARE";
       case ds::sdl::Dep::GridSeam:
-        if (display.rga_present()) return std::strcmp(s.key, "video.seam") == 0 ? "RGA \u53ea\u7ed8\u5236\u6697\u8272\u7f51\u683c" : "";
-        if (!panel_effects()) return "\u6b64\u5c4f\u5e55\u7531\u786c\u4ef6\u7f29\u653e";
-        return flag("video.linear", false) ? "\u7ebf\u6027\u8fc7\u6ee4\u5df2\u5f00\u542f" : "";
+        if (display.rga_present()) return std::strcmp(s.key, "video.seam") == 0 ? "THE RGA DRAWS THE DARK GRID ONLY" : "";
+        if (!panel_effects()) return "THIS SCREEN SCALES IN HARDWARE";
+        return flag("video.linear", false) ? "BILINEAR IS ON" : "";
       case ds::sdl::Dep::Chunky:
-        if (display.rga_present()) return "RGA \u4e0d\u652f\u6301\u50cf\u7d20\u5757";
-        return flag("video.linear", false) ? "\u7ebf\u6027\u8fc7\u6ee4\u5df2\u5f00\u542f" : "";
+        if (display.rga_present()) return "NOT ON THE RGA PRESENT";
+        return flag("video.linear", false) ? "BILINEAR IS ON" : "";
       case ds::sdl::Dep::ChunkyCell:
-        if (display.rga_present()) return "RGA \u4e0d\u652f\u6301\u50cf\u7d20\u5757";
-        if (flag("video.linear", false)) return "\u7ebf\u6027\u8fc7\u6ee4\u5df2\u5f00\u542f";
-        return cfg.str("video.chunky", "false") == "false" ? "\u4ec5\u5728\u5f00\u542f\u50cf\u7d20\u5757\u540e" : "";
+        if (display.rga_present()) return "NOT ON THE RGA PRESENT";
+        if (flag("video.linear", false)) return "BILINEAR IS ON";
+        return cfg.str("video.chunky", "false") == "false" ? "ONLY WITH CHUNKY ON" : "";
       case ds::sdl::Dep::Windowed:
         // A tier that owns the panel is already filling it; there is no
         // window to make bigger.
-        return display.scaling() && !display.window() ? "\u6b64\u5c4f\u5e55\u59cb\u7ec8\u5168\u5c4f" : "";
+        return display.scaling() && !display.window() ? "THIS SCREEN IS ALWAYS FULL" : "";
       case ds::sdl::Dep::OneWindow:
         // Two windows show one screen each; there is nothing to lay out.
-        return vs.dual_window ? "\u53cc\u7a97\u53e3\u4e0b\u4e0d\u53ef\u7528" : "";
+        return vs.dual_window ? "NOT WITH TWO WINDOWS" : "";
       case ds::sdl::Dep::Pip:
-        return pip ? "" : "仅画中画布局";
+        return pip ? "" : "PIP LAYOUT ONLY";
       case ds::sdl::Dep::PipTouchHold:
-        if (!pip) return "仅画中画布局";
-        return l.pip_alpha < 1.0 ? "" : "仅在小窗口会淡出时";
+        if (!pip) return "PIP LAYOUT ONLY";
+        return l.pip_alpha < 1.0 ? "" : "ONLY WHEN THE PIP FADES";
       case ds::sdl::Dep::Dominant:
-        return dominant ? "" : "仅主次布局";
+        return dominant ? "" : "DOMINANT LAYOUTS ONLY";
       case ds::sdl::Dep::DominantThreshold:
-        if (!dominant) return "仅主次布局";
-        return cfg.str("video.dominant_ratio", "auto") == "auto" ? "" : "仅比例为自动时";
+        if (!dominant) return "DOMINANT LAYOUTS ONLY";
+        return cfg.str("video.dominant_ratio", "auto") == "auto" ? "" : "ONLY WHEN THE RATIO IS AUTO";
       case ds::sdl::Dep::Net:
 #if DSPERATE_NET
         return "";
 #else
-        return "此构建未含网络功能";
+        return "THIS BUILD HAS NO NETWORKING";
 #endif
       case ds::sdl::Dep::NetInternet:
         // Reads the config, not the session: the row is restart-only, so what
         // it hangs off is the value being edited above it, not what this run
         // happens to be doing.
-        return cfg.str("net.mode", "off") == "internet" ? "" : "仅网络功能为互联网时";
+        return cfg.str("net.mode", "off") == "internet" ? "" : "ONLY WITH NETWORK FEATURES ON INTERNET";
       case ds::sdl::Dep::NetSession:
-        return (net_live && *net_live) ? "联网会话中不可用" : "";
+        return (net_live && *net_live) ? "NOT DURING A NETWORK SESSION" : "";
       case ds::sdl::Dep::ShortcutsPath:
-        return shortcuts_dir(cfg).empty() ? "\u9700\u8981 PATHS.DSI_GAMES \u6216 PATHS.GAMES" : "";
+        return shortcuts_dir(cfg).empty() ? "NEEDS PATHS.DSI_GAMES OR PATHS.GAMES" : "";
       case ds::sdl::Dep::Turbo:
-        return flag("input.turbo", false) ? "" : "\u4ec5\u5728\u5f00\u542f\u8fde\u53d1\u540e";
+        return flag("input.turbo", false) ? "" : "ONLY WITH TURBO ON";
       }
       return "";
     }
@@ -2930,28 +2930,28 @@ sdl_ready:
       // Resolved here, before the value is joined to a name or a hash and
       // before the page wraps it: tr_text matches a whole entry, and neither
       // a half-joined line nor a wrapped fragment is one.
-      if (!c) return ds::sdl::tr_text("此构建不支持");
+      if (!c) return ds::sdl::tr_text("NOT AVAILABLE IN THIS BUILD");
       std::string base;
       switch (c->state()) {
       case ds::cheevos::State::Off:
-        base = c->unavailable_reason().empty() ? ds::sdl::tr_text("已关闭") : c->unavailable_reason();
+        base = c->unavailable_reason().empty() ? ds::sdl::tr_text("TURNED OFF") : c->unavailable_reason();
         break;
-      case ds::cheevos::State::SignedOut:   base = ds::sdl::tr_text("未登录"); break;
-      case ds::cheevos::State::SigningIn:   base = ds::sdl::tr_text("正在登录..."); break;
-      case ds::cheevos::State::SignedIn:    base = std::string(ds::sdl::tr_text("已登录为 ")) + c->username(); break;
-      case ds::cheevos::State::LoadingGame: base = ds::sdl::tr_text("正在加载成就..."); break;
-      case ds::cheevos::State::Playing:     base = std::string(ds::sdl::tr_text("已登录为 ")) + c->username(); break;
+      case ds::cheevos::State::SignedOut:   base = ds::sdl::tr_text("NOT SIGNED IN"); break;
+      case ds::cheevos::State::SigningIn:   base = ds::sdl::tr_text("SIGNING IN..."); break;
+      case ds::cheevos::State::SignedIn:    base = std::string(ds::sdl::tr_text("SIGNED IN AS ")) + c->username(); break;
+      case ds::cheevos::State::LoadingGame: base = ds::sdl::tr_text("LOADING ACHIEVEMENTS..."); break;
+      case ds::cheevos::State::Playing:     base = std::string(ds::sdl::tr_text("SIGNED IN AS ")) + c->username(); break;
       // The dump is recognised; the game simply has no set yet. Said plainly
       // so nobody goes looking for a list that does not exist.
       case ds::cheevos::State::EmptySet:
-        base = ds::sdl::tr_text("此游戏尚未发布成就");
+        base = ds::sdl::tr_text("NO ACHIEVEMENTS PUBLISHED FOR THIS GAME YET");
         break;
       case ds::cheevos::State::NoSet:
         // The hash is the actionable part: RetroAchievements identifies a dump,
         // so a ROM from your own cart often is not one it knows even when the
         // game has a set. With the hash the player can ask for theirs to be
         // added; without it this line is a dead end.
-        base = std::string(ds::sdl::tr_text("此 ROM 没有成就 - HASH ")) + c->game_hash();
+        base = std::string(ds::sdl::tr_text("NO ACHIEVEMENTS FOR THIS ROM - HASH ")) + c->game_hash();
         break;
       }
       // UMRK: say plainly that Leaf owns the account, so the missing manual
@@ -2959,9 +2959,9 @@ sdl_ready:
       if (ds::cheevos::ra_account::isManaged() || ds::cheevos::ra_account::isSuppressed()) {
         const std::string why = ds::cheevos::ra_account::statusLine();
         if (signed_in()) {
-          base += ds::sdl::tr_text(" - 由 Leaf 管理");
+          base += ds::sdl::tr_text(" - MANAGED BY LEAF");
         } else {
-          base = ds::sdl::tr_text("由 Leaf 管理");
+          base = ds::sdl::tr_text("MANAGED BY LEAF");
           if (!why.empty()) base += " - " + why;
         }
       }
