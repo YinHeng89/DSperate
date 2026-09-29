@@ -72,6 +72,8 @@ struct NDS {
   // be written (cart/zip_cache.h), and a progress callback. Set before load_rom.
   std::string rom_cache_dir;
   u64 rom_cache_max_bytes = 0;                 // 0: no limit
+  bool rom_cache_require_root = false;         // the configured cache root is the only one
+  bool rom_single_entry = false;               // refuse an archive with several image entries
   cart::ZipProgress rom_progress = nullptr;
   void* rom_progress_user = nullptr;
   std::atomic<bool>* rom_cancel = nullptr;     // set from another thread to abandon the extraction

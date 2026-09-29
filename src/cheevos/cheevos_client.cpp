@@ -15,6 +15,7 @@
 #include <unistd.h>
 
 #include "core/nds.h"
+#include "cheevos/ra_account.h"
 #include "rc_client.h"
 
 namespace ds::cheevos {
@@ -242,6 +243,15 @@ void Client::post(Message::Kind kind, std::string text, std::string detail, u32 
 }
 
 std::vector<Message> Client::take_messages() {
+  // UMRK: the Leaf account bridge's problems (a marker or token write that
+  // failed, an unusable handoff) come out through this same queue, as the
+  // native sign-in failure does, so they reach the same pop-up.
+  for (ra_account::Notice& n : ra_account::takeNotices()) {
+    Message m{Message::Kind::Problem, std::move(n.text), std::move(n.detail), 0};
+    m.account = true;
+    std::lock_guard<std::mutex> lk(mu_);
+    messages_.push_back(std::move(m));
+  }
   std::lock_guard<std::mutex> lk(mu_);
   std::vector<Message> out;
   out.swap(messages_);
@@ -435,6 +445,8 @@ void load_done(int result, const char* error_message, rc_client_t* c, void* user
 
 void Client::sign_in(const std::string& username, const std::string& password) {
   if (!client_) return;
+  login_kind_ = LoginKind::Password;
+  login_retried_ = false;
   state_ = State::SigningIn;
   rc_client_begin_login_with_password(static_cast<rc_client_t*>(client_), username.c_str(),
                                       password.c_str(), &login_done, nullptr);
@@ -442,6 +454,8 @@ void Client::sign_in(const std::string& username, const std::string& password) {
 
 void Client::sign_in_with_token(const std::string& username, const std::string& token) {
   if (!client_) return;
+  login_kind_ = LoginKind::Token;
+  login_retried_ = false;
   state_ = State::SigningIn;
   rc_client_begin_login_with_token(static_cast<rc_client_t*>(client_), username.c_str(),
                                    token.c_str(), &login_done, nullptr);
@@ -506,14 +520,33 @@ u32 Client::game_id() const {
 
 void Client::on_signed_in(const std::string& display_name) {
   state_ = State::SignedIn;
+  // UMRK: a verified managed sign-in is persisted here: a checked token write,
+  // then the accepted marker. A failure is reported through the pop-up queue
+  // and does not undo the session. An unmanaged sign-in stays session-only,
+  // as upstream's is.
+  ra_account::commitLogin(username(), token());
   post(Message::Kind::Info, "Signed in to RetroAchievements",
        display_name.empty() ? std::string{} : display_name);
   CLOG("signed in as %s\n", display_name.c_str());
 }
 
 void Client::on_sign_in_failed(const std::string& why) {
+  // UMRK: a rejected or expired managed token gets exactly one native password
+  // retry with the current imported credentials. The import path never lands
+  // here twice: takeTokenRetry answers at most once.
+  if (login_kind_ == LoginKind::Token && !login_retried_) {
+    std::string user;
+    std::string password;
+    if (ra_account::takeTokenRetry(user, password)) {
+      login_retried_ = true;
+      sign_in(user, password);
+      return;
+    }
+  }
+  if (ra_account::isManaged()) ra_account::reportLoginFailure("login-failed", why);
   state_ = State::SignedOut;
-  post(Message::Kind::Problem, "RetroAchievements sign-in failed", why);
+  if (!ra_account::isManaged())
+    post(Message::Kind::Problem, "RetroAchievements sign-in failed", why);
 }
 
 void Client::on_game_loaded(const std::string& title, u32 id) {

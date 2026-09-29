@@ -81,8 +81,19 @@ bool file_size(const std::string& path, u64& size) {
   return true;
 }
 
-// Beside the archive if writable, else the override. `path` comes back as the image path.
-bool choose_cache(const std::string& zip_path, const std::string& fallback, std::string& path, std::string& err) {
+// Picks the directory the image goes in: beside the archive if that can be
+// written, else the override. With `require_root` the override is the only
+// candidate, so a configured cache root is authoritative. `path` comes back as
+// the image path.
+bool choose_cache(const std::string& zip_path, const std::string& fallback, bool require_root,
+                  std::string& path, std::string& err) {
+  if (require_root) {
+    if (fallback.empty()) { err = "no cache directory is configured"; return false; }
+    mkdir(fallback.c_str(), 0755);   // may exist; the access check below is the test
+    if (access(fallback.c_str(), W_OK | X_OK) != 0) { err = "cannot write the cache directory " + fallback; return false; }
+    path = fallback + "/" + stem_of(zip_path) + ".nds";
+    return true;
+  }
   for (const std::string& dir : {dir_of(zip_path) + "/.dsperate", fallback}) {
     if (dir.empty()) continue;
     mkdir(dir.c_str(), 0755);   // may exist; the access check below is the test
@@ -191,8 +202,10 @@ std::unique_ptr<RomSource> open_zip(const std::string& path, ZipOpen& how, std::
   const u8* zip = archive->page(0);
   const size_t size = archive->size();
   ZipEntry e;
-  if (!find_rom(zip, size, e, err)) return nullptr;
-  // A CIA must be unwrapped to its SRL first (io/dsi_title_install.h).
+  if (!find_rom(zip, size, e, err, how.single_entry)) return nullptr;
+  // The cart maps what comes out of here, so a container is no use: a CIA
+  // has to be unwrapped to its SRL first (io/dsi_title_install.h), which the
+  // DSi path does before the cart is ever asked for one.
   if (e.cia) { err = cia_refusal(e.name); return nullptr; }
   how.chosen = e.name;
 
@@ -205,7 +218,7 @@ std::unique_ptr<RomSource> open_zip(const std::string& path, ZipOpen& how, std::
   const std::string tag = make_tag(canonical(path), zst, e);
 
   std::string image;
-  if (!choose_cache(path, how.fallback_dir, image, err)) return nullptr;
+  if (!choose_cache(path, how.fallback_dir, how.require_root, image, err)) return nullptr;
   const std::string tag_path = image + ".tag", part = image + ".part";
   how.cache_path = image;
   sweep_cache(dir_of(image));

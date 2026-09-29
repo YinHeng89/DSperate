@@ -29,6 +29,7 @@
 #include "cheevos/cheevos_client.h"
 #include "cheevos/cheevos_hash.h"
 #include "cheevos/cheevos_http.h"
+#include "cheevos/ra_account.h"
 #endif
 #if DSPERATE_NET
 #include "net/lan_mp.h"
@@ -41,6 +42,7 @@
 #include "input.h"
 #include "lid.h"
 #include "loader_cart.h"
+#include "i18n.h"
 #include "menu.h"
 #include "cpu_gov.h"
 #include "pacer.h"
@@ -67,6 +69,7 @@
 #include <cstring>
 #include <fstream>
 #include <functional>
+#include <memory>
 #include <thread>
 #include <atomic>
 #include <ctime>
@@ -238,7 +241,10 @@ const char* kUsage =
     "  --save F        battery save to start from, instead of <rom>.sav\n"
     "                  (a --replay never writes the save back, so a scene repeats)\n"
     "  --clear-cache   delete every unpacked zipped game (the .dsperate directories beside the\n"
-    "                  games and paths.cache) except the one being launched, then run as usual\n";
+    "                  games and paths.cache) except the one being launched, then run as usual\n"
+    "  --cache-root-only  unpack a zipped game only under paths.cache, never beside the archive\n"
+    "  --single-rom    refuse an archive holding more than one image file instead of picking one\n"
+    "  --inspect-cart F  print what loading F would need (kind, extract, bytes, entry) and exit\n";
 
 std::string rom_dir_of(const std::string& rom) {
   const size_t slash = rom.find_last_of('/');
@@ -322,15 +328,35 @@ void load_save(NDS& nds, const std::string& path) {
   }
 }
 
-void write_save(NDS& nds, const std::string& path) {
-  if (!nds.cart || nds.cart->sram().empty()) return;
-  // Write-then-rename: a power cut mid-write leaves the previous file.
+// Write `size` bytes to `path` durably: to a temporary beside it, flushed and
+// synchronized to the disk, then renamed over the target. False with the
+// reason in `err` when any step fails, leaving the previous file in place.
+//
+// Every step is checked because a short fwrite does not catch a buffered write
+// that only fails when the kernel flushes it: on a full or read-only card
+// fwrite can report success and the data still never reaches the disk. A
+// save reported as successful must actually be on the card.
+bool write_file_durable(const std::string& path, const void* data, size_t size, std::string& err) {
   const std::string tmp = path + ".tmp";
   FILE* f = std::fopen(tmp.c_str(), "wb");
-  if (!f) { std::fprintf(stderr, "save: cannot write %s\n", tmp.c_str()); return; }
-  const bool ok = std::fwrite(nds.cart->sram().data(), 1, nds.cart->sram().size(), f) == nds.cart->sram().size();
-  std::fclose(f);
-  if (!ok || std::rename(tmp.c_str(), path.c_str()) != 0) { std::fprintf(stderr, "save: cannot write %s\n", path.c_str()); return; }
+  if (!f) { err = "cannot open " + tmp; return false; }
+  bool ok = std::fwrite(data, 1, size, f) == size;
+  if (ok) ok = std::fflush(f) == 0 && fsync(fileno(f)) == 0;
+  if (std::fclose(f) != 0) ok = false;
+  if (!ok) { err = "cannot write " + tmp; std::remove(tmp.c_str()); return false; }
+  if (std::rename(tmp.c_str(), path.c_str()) != 0) { err = "cannot replace " + path; std::remove(tmp.c_str()); return false; }
+  return true;
+}
+
+void write_save(NDS& nds, const std::string& path) {
+  if (!nds.cart || nds.cart->sram().empty()) return;
+  std::string err;
+  if (!write_file_durable(path, nds.cart->sram().data(), nds.cart->sram().size(), err)) {
+    // Still dirty: the next flush tries again, and the previous committed file
+    // is untouched.
+    std::fprintf(stderr, "save: %s\n", err.c_str());
+    return;
+  }
   nds.cart->clear_sram_dirty();
 }
 
@@ -490,12 +516,10 @@ bool save_state_file(NDS& nds, const std::string& path, const ds::sdl::Display::
   if (!nds.save_state(w, err)) { std::fprintf(stderr, "state: cannot save: %s\n", err.c_str()); return false; }
   write_layout_chunk(w, layout);
   write_cheevos_chunk(w);
-  const std::string tmp = path + ".tmp";
-  FILE* f = std::fopen(tmp.c_str(), "wb");
-  if (!f) { std::fprintf(stderr, "state: cannot write %s\n", tmp.c_str()); return false; }
-  const bool ok = std::fwrite(w.data().data(), 1, w.data().size(), f) == w.data().size();
-  std::fclose(f);
-  if (!ok || std::rename(tmp.c_str(), path.c_str()) != 0) { std::fprintf(stderr, "state: cannot write %s\n", path.c_str()); return false; }
+  if (!write_file_durable(path, w.data().data(), w.data().size(), err)) {
+    std::fprintf(stderr, "state: %s\n", err.c_str());
+    return false;
+  }
   std::fprintf(stderr, "state: saved %s (%zu KB)\n", path.c_str(), w.data().size() >> 10);
   return true;
 }
@@ -924,37 +948,68 @@ bool open_displays(const VideoSetup& vs, ds::sdl::Display& display, ds::sdl::Dis
   return display.open("DSperate", vs.scale, vs.fullscreen, vs.linear, vs.vsync, vs.layout);
 }
 
-// Controls page rows that are neither a DS button nor a hotkey.
+// What a hotkey row is called, in the order Input lists the actions. An
+// action's own name is the config key and stays English; this is the row's
+// wording, and the table carries the other language.
+//
+// A DS button's row is not here. A, B, X, Y, L, R, START, SELECT and the d-pad
+// are the names printed on the console, the same in every language -- and the
+// value beside each is the same name as the key bound to it, so translating
+// either side would put one word on both and say nothing.
+constexpr const char* const kActionLabels[static_cast<int>(ds::sdl::Action::Count)] = {
+  "退出", "暂停游戏", "快进", "快进开关", "保存存档", "读取存档", "下个槽位", "上个槽位",
+  "音量+", "音量-", "静音", "下个布局", "上个布局", "交换屏幕", "小窗位置", "全屏", "截图",
+  "合盖", "麦克风", "帧数",
+};
+static_assert(sizeof(kActionLabels) / sizeof(kActionLabels[0]) == static_cast<int>(ds::sdl::Action::Count),
+              "one label for every hotkey");
+
+// The Controls page's rows that are neither a DS button nor a hotkey: the
+// modifier a pad chord is built on, and the pen's tap button and stick. The
+// modifier exists in both columns; the pen is the pad's, so its two rows are
+// only offered there.
+// A row's label is written in the menu's own language and the table carries
+// the other one: the key beside it is the config file's, and that stays as it
+// is however the row reads.
 struct Extra { const char* key_keys; const char* key_pad; const char* label; };
 constexpr Extra kExtras[] = {
-  {"hotkeys.modifier", "padhotkeys.modifier", "MODIFIER"},
-  {nullptr,            "pad.stylus_button",   "STYLUS TAP"},
-  {nullptr,            "pad.stylus_button.alt", "STYLUS TAP (2)"},
-  {nullptr,            "pad.stylus_axis",     "STYLUS STICK"},
-  {nullptr,            "pad.stylus_dpad",     "STYLUS DPAD"},
-  {nullptr,            "pad.stick_dpad",      "STICK DPAD"},
-  {nullptr,            "pad.stick_face",      "STICK ABXY"},
-  // Axis remap: push the control the positive direction reads (stick
-  // right/down, trigger pressed); stores physical axis + inverted flag.
-  {nullptr,            "pad.axis_leftx",      "L STICK RIGHT"},
-  {nullptr,            "pad.axis_lefty",      "L STICK DOWN"},
-  {nullptr,            "pad.axis_rightx",     "R STICK RIGHT"},
-  {nullptr,            "pad.axis_righty",     "R STICK DOWN"},
-  {nullptr,            "pad.axis_lefttrigger", "L2 AXIS"},
-  {nullptr,            "pad.axis_righttrigger", "R2 AXIS"},
+  {"hotkeys.modifier", "padhotkeys.modifier", "修饰键"},
+  {nullptr,            "pad.stylus_button",   "触摸笔"},
+  {nullptr,            "pad.stylus_button.alt", "触摸笔 (2)"},
+  {nullptr,            "pad.stylus_axis",     "触摸笔摇杆"},
+  {nullptr,            "pad.stylus_dpad",     "触摸笔方向键"},
+  {nullptr,            "pad.stick_dpad",      "摇杆方向键"},
+  {nullptr,            "pad.stick_face",      "摇杆按键"},
+  // Axis remapping: each row is set by pushing the control the way that axis
+  // reads positive -- a stick right for X, down for Y, a trigger pressed --
+  // and stores the physical axis that went, inverted if it went negative.
+  {nullptr,            "pad.axis_leftx",      "左摇杆 右"},
+  {nullptr,            "pad.axis_lefty",      "左摇杆 下"},
+  {nullptr,            "pad.axis_rightx",     "右摇杆 右"},
+  {nullptr,            "pad.axis_righty",     "右摇杆 下"},
+  {nullptr,            "pad.axis_lefttrigger", "L2 轴"},
+  {nullptr,            "pad.axis_righttrigger", "R2 轴"},
 };
 // Rows holding a stick rather than a single control.
 bool extra_is_stick(const char* key) { return std::strcmp(key, "pad.stylus_axis") == 0 || std::strcmp(key, "pad.stick_dpad") == 0 || std::strcmp(key, "pad.stick_face") == 0; }
 bool extra_is_axis_remap(const char* key) { return std::strncmp(key, "pad.axis_", 9) == 0; }
 // e.g. "-righty" -> physical control + whether inverted.
 std::string axis_remap_label(const std::string& v0) {
-  if (v0 == "none") return "NONE";
+  // The stick's name is a word and goes into the table; "L2"/"R2" are printed
+  // on the console and stay as they are. "反向" is joined after the stick has
+  // been resolved, for the reason the hotkey rows' " (2)" is: the joined
+  // string is not an entry, so each half has to reach the table on its own.
+  if (v0 == "none") return ds::sdl::tr_text("无");
   const bool inv = !v0.empty() && v0[0] == '-';
   const std::string v = !v0.empty() && (v0[0] == '-' || v0[0] == '+') ? v0.substr(1) : v0;
-  std::string n = v == "leftx" ? "L STICK X" : v == "lefty" ? "L STICK Y" : v == "rightx" ? "R STICK X" : v == "righty" ? "R STICK Y"
-                : v == "lefttrigger" ? "L2" : v == "righttrigger" ? "R2" : v;
-  for (char& ch : n) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
-  return inv ? n + " INV" : n;
+  const bool known = v == "leftx" || v == "lefty" || v == "rightx" || v == "righty" || v == "lefttrigger" || v == "righttrigger";
+  const char* n = v == "leftx" ? "左摇杆 X" : v == "lefty" ? "左摇杆 Y" : v == "rightx" ? "右摇杆 X" : v == "righty" ? "右摇杆 Y"
+                : v == "lefttrigger" ? "L2" : v == "righttrigger" ? "R2" : v.c_str();
+  std::string out = ds::sdl::tr_text(n);
+  // A name the table has never heard is a file's own spelling, shown as it
+  // stands -- upper-cased because the font has no lower case.
+  if (!known) for (char& ch : out) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+  return inv ? out + " " + ds::sdl::tr_text("反向") : out;
 }
 bool extra_in_column(const Extra& e, bool pad) { return pad || e.key_keys; }
 int extra_count(bool pad) {
@@ -987,6 +1042,27 @@ const char* extra_default(const char* key, bool pad, const ds::sdl::Config& cfg)
   return ds::sdl::Input::mod_default(pad);
 }
 
+// --inspect-cart FILE: what launching FILE would need, printed as key=value
+// lines, without booting anything. A launcher uses it to size and bound its
+// extraction cache and to refuse an unreadable archive before a window opens.
+// `single` refuses more than one eligible entry, as the emulator will.
+int inspect_cart(const char* path, bool single) {
+  std::string err;
+  std::unique_ptr<ds::cart::RomSource> src = ds::cart::RomSource::map_file(path, err);
+  if (!src) { std::fprintf(stderr, "dsperate: %s\n", err.c_str()); return 1; }
+  const ds::u8* data = src->page(0);
+  const size_t size = src->size();
+  if (!ds::cart::is_zip(data, size)) {
+    std::printf("kind=nds\nextract=no\nbytes=%llu\n", static_cast<unsigned long long>(size));
+    return 0;
+  }
+  ds::cart::ZipEntry e;
+  if (!ds::cart::find_rom(data, size, e, err, single)) { std::fprintf(stderr, "dsperate: %s\n", err.c_str()); return 1; }
+  std::printf("kind=zip\nextract=%s\nbytes=%llu\nentry=%s\n",
+              e.stored() ? "no" : "yes", static_cast<unsigned long long>(e.usize), e.name.c_str());
+  return 0;
+}
+
 } // namespace
 
 namespace {
@@ -995,12 +1071,19 @@ bool g_restart = false;
 }
 
 static int run(int argc, char** argv) {
+#if DSPERATE_CHEEVOS
+  // UMRK: copy the Leaf account snapshot into private memory and scrub it from
+  // the environment before anything else happens -- before a thread, a helper
+  // or a log line exists (standalone-ra-account-v1, consumer obligations).
+  ds::cheevos::ra_account::captureEnv();
+#endif
   const char* rom = nullptr;
   const char* config_arg = nullptr;
   long frame_limit = 0;
   const char *record = nullptr, *replay = nullptr, *save_arg = nullptr, *load_state = nullptr;
   bool clear_cache = false;
-  bool rtc_host = false;              // --rtc-host: real clock even under replay
+  const char* inspect_cart_arg = nullptr;
+  bool rtc_host = false;              // --rtc-host: a real clock even under a replay (the firmware menu needs one)
   const char* lan_host = nullptr; const char* lan_join = nullptr; const char* lan_name = "DSperate"; bool netplay = false;
   bool lan_guest = false;             // net.mode = guest: join only, never host
   bool lan_name_set = false;          // --lan-name given, so nickname must not override it
@@ -1068,6 +1151,12 @@ static int run(int argc, char** argv) {
     else if (flag("--internet")) internet = true;   // exclusive with local wireless
     else if (arg("--dns")) dns_arg = argv[++i];
     else if (flag("--clear-cache")) clear_cache = true;
+    else if (arg("--inspect-cart")) inspect_cart_arg = argv[++i];
+    // The two cache policies a launcher can pin for one launch. Set here rather
+    // than in the config so a pak owns them and --inspect-cart agrees with the
+    // load that follows.
+    else if (flag("--cache-root-only")) cli.set("cart.cache_root_only", "true");
+    else if (flag("--single-rom")) cli.set("cart.single_nds", "true");
     else if (arg("--record")) record = argv[++i];
     else if (arg("--replay")) replay = argv[++i];
     else if (arg("--save")) save_arg = argv[++i];
@@ -1079,6 +1168,10 @@ static int run(int argc, char** argv) {
     // Implies enabled, but a later --no-cheevos still wins (applied in order).
     else if (arg("--cheevos-token")) { cli.set("cheevos.token_file", argv[++i]); cli.set("cheevos.enabled", "true"); }
     else if (arg("--cheevos-user")) cli.set("cheevos.username", argv[++i]);
+    // UMRK: the non-secret managed account directory Leaf's wrapper resolved
+    // for an authorized DSperate launch (standalone-ra-account-v1). The account
+    // itself arrives in the UMRK_RA_ACCOUNT_* environment, never on argv.
+    else if (arg("--managed-account-dir")) cli.set("cheevos.managed_dir", argv[++i]);
 #endif
     else if (flag("--autoload")) cli.set("emu.autoload", "true");
     else if (flag("--no-autoload")) cli.set("emu.autoload", "false");
@@ -1153,8 +1246,9 @@ static int run(int argc, char** argv) {
   }
   auto apply_cli = [&] { for (const char* k : {"paths.bios9", "paths.bios7", "paths.firmware", "video.scale", "video.dual_window", "video.layout", "video.screen", "video.pip_alpha", "video.screen_gap", "video.dominant_ratio", "video.dominant_threshold", "video.integer_scale",
                                               "video.fullscreen", "video.linear", "video.lcd_grid", "video.chunky", "video.chunky_threshold", "video.chunky_cell", "video.seam", "video.sink", "video.disp", "video.fbdev", "video.gpu_present", "video.vsync", "audio.enabled", "audio.volume",
-                                              "audio.mic", "emu.jit", "emu.timing", "emu.speed", "emu.limiter", "emu.pacing", "audio.buffer_size", "audio.latency_frames", "emu.frameskip", "emu.frameskip_mode", "emu.frameskip_capture", "video.aa", "video.gpu3d", "cart.preload", "emu.autosave_png", "emu.autoload", "cheevos.enabled", "cheevos.token_file", "cheevos.username"}) if (cli.has(k)) cfg.set(k, cli.str(k)); };
+                                              "audio.mic", "emu.jit", "emu.quantum", "emu.speed", "emu.limiter", "emu.pacing", "audio.buffer_size", "audio.latency_frames", "emu.gx_worker", "emu.fast_load", "emu.frameskip", "emu.frameskip_mode", "emu.frameskip_capture", "video.aa", "video.gpu3d", "emu.autosave_png", "emu.autoload", "cart.cache_root_only", "cart.single_nds", "cart.preload", "cheevos.enabled", "cheevos.token_file", "cheevos.username", "cheevos.managed_dir"}) if (cli.has(k)) cfg.set(k, cli.str(k)); };
   apply_cli();
+  if (inspect_cart_arg) return inspect_cart(inspect_cart_arg, cfg.flag("cart.single_nds", false));
   const std::string bios9 = cfg.str("paths.bios9"), bios7 = cfg.str("paths.bios7");
   const std::string dsi_fw = cfg.str("paths.dsi_firmware");
   const bool have_dsi_fw = !dsi_fw.empty() && std::filesystem::exists(dsi_fw);
@@ -1567,6 +1661,8 @@ sdl_ready:
     ds::cart::RomSource::set_preload(pl == "true" || pl == "on" || pl == "1" ? ds::cart::RomSource::Preload::On : pl == "false" || pl == "off" || pl == "0" ? ds::cart::RomSource::Preload::Off : ds::cart::RomSource::Preload::Auto);
   }
   nds.rom_cache_dir = cfg.str("paths.cache", "");
+  nds.rom_cache_require_root = cfg.flag("cart.cache_root_only", false);
+  nds.rom_single_entry = cfg.flag("cart.single_nds", false);
   nds.rom_cache_max_bytes = static_cast<u64>(std::max(0, cfg.num("cart.cache_mb", 2048))) << 20;
   const bool cache_session = cfg.str("cart.cache", "keep") == "session";
   // Every unpacked image goes except the one this launch is about to use.
@@ -2200,8 +2296,11 @@ sdl_ready:
       const char* key = extra_key(e, pad);
       const std::string v = cfg.str(key, extra_default(key, pad, cfg));
       if (extra_is_axis_remap(key)) return axis_remap_label(v);
+      // Resolved here, the way a hotkey row's label is: these are the row's
+      // wording, not the file's, and the file keeps "left"/"right" whatever
+      // the page reads.
       if (extra_is_stick(key))   // true/false: stick_dpad's old spellings (Input::parse_stick)
-        return v == "left" || v == "true" || v == "1" ? "LEFT STICK" : v == "right" ? "RIGHT STICK" : "NONE";
+        return ds::sdl::tr_text(v == "left" || v == "true" || v == "1" ? "左摇杆" : v == "right" ? "右摇杆" : "无");
       return pad ? ds::sdl::Input::pad_label(v) : upper(v);
     }
 
@@ -2225,14 +2324,16 @@ sdl_ready:
           if (k >= extra_count(pad)) return out;   // past the end: no row
           const Extra& e = extra_at(pad, k);
           out.key = extra_key(e, pad);
-          out.label = e.label;
+          out.label = ds::sdl::tr_text(e.label);
           out.value = extra_value(e, pad);
           return out;                              // already in the page's terms
         }
         const char* name = ds::sdl::action_name(static_cast<ds::sdl::Action>(a));
         out.key = (pad ? "padhotkeys." : "hotkeys.") + std::string(name) + ds::sdl::Input::hot_suffix(slot);
-        // "FAST FORWARD TOGGLE" doesn't fit the row at the menu's size.
-        out.label = upper(std::strcmp(name, "fast_forward_toggle") == 0 ? "ff_toggle" : name) + (slot ? " (2)" : "");
+        // Resolved here rather than left to the drawing: a second slot's row
+        // carries a " (2)" the table has never heard of, so the label has to
+        // reach the table before the suffix joins it.
+        out.label = std::string(ds::sdl::tr_text(kActionLabels[a])) + (slot ? " (2)" : "");
         out.value = hot_value(pad, a, slot);
       }
       // Display only: the file keeps SDL's lower-case names; pad values also
@@ -2318,7 +2419,7 @@ sdl_ready:
     bool user_in_firmware() const { return !nds.firmware_synthetic; }
 
     const char* user_settings_note() const override {
-      return user_in_firmware() ? "IN THE FIRMWARE" : nullptr;
+      return user_in_firmware() ? "保存在固件中" : nullptr;
     }
 
     static bool is_user_key(const char* key) { return std::strncmp(key, "user.", 5) == 0; }
@@ -2403,51 +2504,59 @@ sdl_ready:
       switch (s.depends) {
       case ds::sdl::Dep::None: return "";
       case ds::sdl::Dep::FrameskipMode:
-        // Frameskip is forced to 0 for a session, so its mode is moot too.
-        if (net_live && *net_live) return "NOT DURING A NETWORK SESSION";
-        return cfg.num("emu.frameskip", 0) > 0 ? "" : "ONLY WITH FRAMESKIP ON";
+        // Frameskip itself is forced to 0 for a session, so its mode is moot
+        // there too -- and the config may still say otherwise, which is what
+        // this test would read.
+        if (net_live && *net_live) return "\u8054\u7f51\u4f1a\u8bdd\u4e2d\u4e0d\u53ef\u7528";
+        return cfg.num("emu.frameskip", 0) > 0 ? "" : "\u4ec5\u5728\u5f00\u542f\u8df3\u5e27\u540e";
       case ds::sdl::Dep::PanelEffects:
-        if (display.rga_present()) return "THE RGA ALWAYS SCALES BILINEAR";
-        return panel_effects() ? "" : "THIS SCREEN SCALES IN HARDWARE";
+        if (display.rga_present()) return "RGA \u59cb\u7ec8\u6309\u7ebf\u6027\u8fc7\u6ee4\u7f29\u653e";
+        return panel_effects() ? "" : "\u6b64\u5c4f\u5e55\u7531\u786c\u4ef6\u7f29\u653e";
       case ds::sdl::Dep::GridSeam:
-        if (display.rga_present()) return std::strcmp(s.key, "video.seam") == 0 ? "THE RGA DRAWS THE DARK GRID ONLY" : "";
-        if (!panel_effects()) return "THIS SCREEN SCALES IN HARDWARE";
-        return flag("video.linear", false) ? "BILINEAR IS ON" : "";
+        if (display.rga_present()) return std::strcmp(s.key, "video.seam") == 0 ? "RGA \u53ea\u7ed8\u5236\u6697\u8272\u7f51\u683c" : "";
+        if (!panel_effects()) return "\u6b64\u5c4f\u5e55\u7531\u786c\u4ef6\u7f29\u653e";
+        return flag("video.linear", false) ? "\u7ebf\u6027\u8fc7\u6ee4\u5df2\u5f00\u542f" : "";
       case ds::sdl::Dep::Chunky:
-        if (display.rga_present()) return "NOT ON THE RGA PRESENT";
-        return flag("video.linear", false) ? "BILINEAR IS ON" : "";
+        if (display.rga_present()) return "RGA \u4e0d\u652f\u6301\u50cf\u7d20\u5757";
+        return flag("video.linear", false) ? "\u7ebf\u6027\u8fc7\u6ee4\u5df2\u5f00\u542f" : "";
       case ds::sdl::Dep::ChunkyCell:
-        if (display.rga_present()) return "NOT ON THE RGA PRESENT";
-        if (flag("video.linear", false)) return "BILINEAR IS ON";
-        return cfg.str("video.chunky", "false") == "false" ? "ONLY WITH CHUNKY ON" : "";
+        if (display.rga_present()) return "RGA \u4e0d\u652f\u6301\u50cf\u7d20\u5757";
+        if (flag("video.linear", false)) return "\u7ebf\u6027\u8fc7\u6ee4\u5df2\u5f00\u542f";
+        return cfg.str("video.chunky", "false") == "false" ? "\u4ec5\u5728\u5f00\u542f\u50cf\u7d20\u5757\u540e" : "";
       case ds::sdl::Dep::Windowed:
-        // A tier that owns the panel is already filling it.
-        return display.scaling() && !display.window() ? "THIS SCREEN IS ALWAYS FULL" : "";
+        // A tier that owns the panel is already filling it; there is no
+        // window to make bigger.
+        return display.scaling() && !display.window() ? "\u6b64\u5c4f\u5e55\u59cb\u7ec8\u5168\u5c4f" : "";
       case ds::sdl::Dep::OneWindow:
-        return vs.dual_window ? "NOT WITH TWO WINDOWS" : "";
+        // Two windows show one screen each; there is nothing to lay out.
+        return vs.dual_window ? "\u53cc\u7a97\u53e3\u4e0b\u4e0d\u53ef\u7528" : "";
       case ds::sdl::Dep::Pip:
-        return pip ? "" : "PIP LAYOUT ONLY";
+        return pip ? "" : "仅画中画布局";
       case ds::sdl::Dep::PipTouchHold:
-        if (!pip) return "PIP LAYOUT ONLY";
-        return l.pip_alpha < 1.0 ? "" : "ONLY WHEN THE PIP FADES";
+        if (!pip) return "仅画中画布局";
+        return l.pip_alpha < 1.0 ? "" : "仅在小窗口会淡出时";
       case ds::sdl::Dep::Dominant:
-        return dominant ? "" : "DOMINANT LAYOUTS ONLY";
+        return dominant ? "" : "仅主次布局";
       case ds::sdl::Dep::DominantThreshold:
-        if (!dominant) return "DOMINANT LAYOUTS ONLY";
-        return cfg.str("video.dominant_ratio", "auto") == "auto" ? "" : "ONLY WHEN THE RATIO IS AUTO";
+        if (!dominant) return "仅主次布局";
+        return cfg.str("video.dominant_ratio", "auto") == "auto" ? "" : "仅比例为自动时";
       case ds::sdl::Dep::Net:
 #if DSPERATE_NET
         return "";
 #else
-        return "THIS BUILD HAS NO NETWORKING";
+        return "此构建未含网络功能";
 #endif
       case ds::sdl::Dep::NetInternet:
-        // Reads the config, not the session: the row is restart-only.
-        return cfg.str("net.mode", "off") == "internet" ? "" : "ONLY WITH NETWORK FEATURES ON INTERNET";
+        // Reads the config, not the session: the row is restart-only, so what
+        // it hangs off is the value being edited above it, not what this run
+        // happens to be doing.
+        return cfg.str("net.mode", "off") == "internet" ? "" : "仅网络功能为互联网时";
       case ds::sdl::Dep::NetSession:
-        return (net_live && *net_live) ? "NOT DURING A NETWORK SESSION" : "";
+        return (net_live && *net_live) ? "联网会话中不可用" : "";
       case ds::sdl::Dep::ShortcutsPath:
-        return shortcuts_dir(cfg).empty() ? "NEEDS PATHS.DSI_GAMES OR PATHS.GAMES" : "";
+        return shortcuts_dir(cfg).empty() ? "\u9700\u8981 PATHS.DSI_GAMES \u6216 PATHS.GAMES" : "";
+      case ds::sdl::Dep::Turbo:
+        return flag("input.turbo", false) ? "" : "\u4ec5\u5728\u5f00\u542f\u8fde\u53d1\u540e";
       }
       return "";
     }
@@ -2516,6 +2625,9 @@ sdl_ready:
     if (is("video.gpu_present")) { host.reopen_wanted = true; return; }
     if (is("video.fps")) { fps_osd = on; if (on && !show_fps) { fps_mark = SDL_GetPerformanceCounter(); emu_ticks = draw_ticks = wait_ticks = 0; } return; }
     if (is("video.pip_touch_hold")) { pip_touch_hold = std::max(0, std::atoi(v.c_str())); return; }
+    // Turbo is shaped in Input::frame() from the same keys, so it is enough to
+    // hand it the config again: a row stepped on the page is live at once.
+    if (std::strncmp(key, "input.turbo", 11) == 0) { host.reconfigure_input(); return; }
     // Everything below moves the picture, so it's applied on menu close (Host::commit).
     if (is("video.fullscreen")) { host.fullscreen_wanted = true; return; }
     if (is("video.layout_cycle")) {
@@ -2581,7 +2693,18 @@ sdl_ready:
   // RetroAchievements, Casual mode. Off unless asked for; every failure is
   // reported once and then ignored.
   ds::cheevos::Client cheevos;
-  const bool cheevos_on = cfg.flag("cheevos.enabled", false);
+  // UMRK: consume the Leaf account snapshot before anything can start the
+  // achievement client. An explicit "achievements off" -- cheevos.enabled =
+  // false in the global or per-game config, or --no-cheevos -- is decided
+  // first and wins: the snapshot is still consumed, but nothing signs in and
+  // nothing on disk changes. Otherwise a managed account (configured,
+  // suppressed or signed out) turns achievements on so the account page can
+  // report it, and import() decides whether anything authenticates.
+  const bool cheevos_setting = cfg.has("cheevos.enabled");
+  const bool cheevos_setting_on = cfg.flag("cheevos.enabled", false);
+  ds::cheevos::ra_account::setManagedDir(cfg.str("cheevos.managed_dir"));
+  ds::cheevos::ra_account::import(cheevos_setting && !cheevos_setting_on);
+  const bool cheevos_on = ds::cheevos::ra_account::achievementsOn(cheevos_setting, cheevos_setting_on);
 #endif
 #if DSPERATE_NET
   std::unique_ptr<ds::net::LanMp> lan;
@@ -2775,7 +2898,11 @@ sdl_ready:
       // toast, which is drawn onto the canvas afterwards.
       if (m.kind == ds::cheevos::Message::Kind::Unlock && cfg.flag("cheevos.auto_screenshot", false))
         shot_pending = true;
-      if (!cfg.flag("cheevos.toasts", true)) continue;
+      // UMRK: a Leaf account problem is shown even with toasts off.
+      if (!cfg.flag("cheevos.toasts", true) && !m.account) continue;
+      // cfg, not the menu host: both read the same key, and the host writes
+      // through cfg, so a switch flipped in the menu is live on the next
+      // message without any wiring between them.
       Toast t;
       t.header = m.kind == ds::cheevos::Message::Kind::Unlock ? "ACHIEVEMENT UNLOCKED"
                : m.kind == ds::cheevos::Message::Kind::Problem ? "RETROACHIEVEMENTS" : nullptr;
@@ -2797,21 +2924,48 @@ sdl_ready:
       sum = c->summary();
     }
     std::string status() const override {
-      if (!c) return "NOT AVAILABLE IN THIS BUILD";
+      // Resolved here, before the value is joined to a name or a hash and
+      // before the page wraps it: tr_text matches a whole entry, and neither
+      // a half-joined line nor a wrapped fragment is one.
+      if (!c) return ds::sdl::tr_text("此构建不支持");
+      std::string base;
       switch (c->state()) {
       case ds::cheevos::State::Off:
-        return c->unavailable_reason().empty() ? "TURNED OFF" : c->unavailable_reason();
-      case ds::cheevos::State::SignedOut:   return "NOT SIGNED IN";
-      case ds::cheevos::State::SigningIn:   return "SIGNING IN...";
-      case ds::cheevos::State::SignedIn:    return "SIGNED IN AS " + c->username();
-      case ds::cheevos::State::LoadingGame: return "LOADING ACHIEVEMENTS...";
-      case ds::cheevos::State::Playing:     return "SIGNED IN AS " + c->username();
+        base = c->unavailable_reason().empty() ? ds::sdl::tr_text("已关闭") : c->unavailable_reason();
+        break;
+      case ds::cheevos::State::SignedOut:   base = ds::sdl::tr_text("未登录"); break;
+      case ds::cheevos::State::SigningIn:   base = ds::sdl::tr_text("正在登录..."); break;
+      case ds::cheevos::State::SignedIn:    base = std::string(ds::sdl::tr_text("已登录为 ")) + c->username(); break;
+      case ds::cheevos::State::LoadingGame: base = ds::sdl::tr_text("正在加载成就..."); break;
+      case ds::cheevos::State::Playing:     base = std::string(ds::sdl::tr_text("已登录为 ")) + c->username(); break;
+      // The dump is recognised; the game simply has no set yet. Said plainly
+      // so nobody goes looking for a list that does not exist.
       case ds::cheevos::State::EmptySet:
-        return "NO ACHIEVEMENTS PUBLISHED FOR THIS GAME YET";
+        base = ds::sdl::tr_text("此游戏尚未发布成就");
+        break;
       case ds::cheevos::State::NoSet:
-        return "NO ACHIEVEMENTS FOR THIS ROM - HASH " + c->game_hash();
+        // The hash is the actionable part: RetroAchievements identifies a dump,
+        // so a ROM from your own cart often is not one it knows even when the
+        // game has a set. With the hash the player can ask for theirs to be
+        // added; without it this line is a dead end.
+        base = std::string(ds::sdl::tr_text("此 ROM 没有成就 - HASH ")) + c->game_hash();
+        break;
       }
-      return "";
+      // UMRK: say plainly that Leaf owns the account, so the missing manual
+      // sign-in does not read as a fault. The bridge's reason is the detail.
+      if (ds::cheevos::ra_account::isManaged() || ds::cheevos::ra_account::isSuppressed()) {
+        const std::string why = ds::cheevos::ra_account::statusLine();
+        if (signed_in()) {
+          base += ds::sdl::tr_text(" - 由 Leaf 管理");
+        } else {
+          base = ds::sdl::tr_text("由 Leaf 管理");
+          if (!why.empty()) base += " - " + why;
+        }
+      }
+      return base;
+    }
+    bool managed() const override {
+      return ds::cheevos::ra_account::isManaged() || ds::cheevos::ra_account::isSuppressed();
     }
     std::string progress() const override {
       if (!c || sum.total == 0) return {};
@@ -2943,8 +3097,31 @@ sdl_ready:
       // A password is never kept; an expired token fails and the player
       // signs in again from the menu.
       ds::cheevos::Credentials creds;
-      // A token file named on the command line overrides whatever is
-      // stored; nothing is written back, the file isn't ours.
+      // UMRK: a managed Leaf launch uses the bridge's transition. Import the
+      // account with the native password login exactly once, reuse the stored
+      // managed token only when the marker still agrees, and stay signed out
+      // when the launch is suppressed or signed out. The unmanaged paths below
+      // are untouched for a launch Leaf did not authorize.
+      if (ds::cheevos::ra_account::isManaged()) {
+        std::string managed_user, managed_password;
+        if (ds::cheevos::ra_account::takePendingLogin(managed_user, managed_password)) {
+          cheevos.sign_in(managed_user, managed_password);
+          managed_password.assign(managed_password.size(), '\0');
+        } else if (ds::cheevos::ra_account::loadManagedToken(creds.username, creds.token)) {
+          cheevos.sign_in_with_token(creds.username, creds.token);
+        } else {
+          std::fprintf(stderr, "cheevos: managed account not signed in this session\n");
+        }
+      } else if (ds::cheevos::ra_account::isSuppressed()) {
+        // Managed state exists but must not authenticate this session: never
+        // fall through to a stored native token or the CFW's sign-in.
+        std::fprintf(stderr, "cheevos: managed account suppressed (%s)\n",
+                     ds::cheevos::ra_account::statusLine().c_str());
+      } else {
+      // A token file named on the command line comes first: it is this run's
+      // explicit instruction, and the point of it is to override whatever is
+      // stored. Nothing is written back -- the file is not ours, and the run
+      // is as good as its token.
       const std::string token_file = cfg.str("cheevos.token_file");
       if (!token_file.empty()) {
         if (!ds::cheevos::read_token_file(token_file, creds, err)) {
@@ -2972,6 +3149,7 @@ sdl_ready:
       }
       if (!creds.empty()) cheevos.sign_in_with_token(creds.username, creds.token);
       else std::fprintf(stderr, "cheevos: not signed in\n");
+      }
 
       // Safe to hash the cart's source here: read_unpatched reads past the
       // secure-area rewrite Cart has already done by this point.

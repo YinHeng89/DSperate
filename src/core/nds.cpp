@@ -274,7 +274,10 @@ bool NDS::save_firmware_override(const std::string& path, std::string& err) {
       f.write(reinterpret_cast<const char*>(&page), 4);
       f.write(reinterpret_cast<const char*>(firmware.data() + page * FW_PAGE), FW_PAGE);
     }
+    f.flush();
     if (!f) { err = "write failed"; return false; }
+    f.close();
+    if (f.fail()) { err = "close failed"; return false; }
   }
   // Rename over the old one so an interrupted write can't leave a truncated override.
   if (std::rename(tmp.c_str(), path.c_str()) != 0) { err = "cannot replace"; std::remove(tmp.c_str()); return false; }
@@ -310,6 +313,8 @@ bool NDS::load_rom(const std::string& path) {
   if (zipped) {
     cart::ZipOpen how;
     how.fallback_dir = rom_cache_dir;
+    how.require_root = rom_cache_require_root;
+    how.single_entry = rom_single_entry;
     how.max_bytes = rom_cache_max_bytes;
     how.progress = rom_progress; how.progress_user = rom_progress_user;
     how.cancel = rom_cancel;
