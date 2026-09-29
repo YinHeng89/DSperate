@@ -112,7 +112,27 @@ bool is_zip(const u8* data, size_t size) {
   return size >= 4 && rd32(data) == SIG_LOCAL;
 }
 
-bool find_rom(const u8* zip, size_t size, ZipEntry& entry, std::string& err) {
+// A name we will not accept even though it is never used as a filesystem
+// path here (the extraction name is derived from the archive, not the entry):
+// an absolute or drive-absolute name, or one with a `..` component. A hostile
+// or malformed archive should fail loudly rather than be silently ignored.
+static bool unsafe_name(const char* name, size_t n) {
+  std::string s(name, n);
+  for (char& c : s) if (c == '\\') c = '/';
+  if (s.empty() || s[0] == '/') return true;
+  if (s.size() >= 2 && s[1] == ':') return true;
+  size_t start = 0;
+  while (start <= s.size()) {
+    const size_t end = s.find('/', start);
+    const std::string part = s.substr(start, end == std::string::npos ? std::string::npos : end - start);
+    if (part == "..") return true;
+    if (end == std::string::npos) break;
+    start = end + 1;
+  }
+  return false;
+}
+
+bool find_rom(const u8* zip, size_t size, ZipEntry& entry, std::string& err, bool single) {
   err.clear();
   // EOCD is last, but a trailing comment of up to 64 KB may follow it.
   if (size < 22) { err = "not a zip archive (too short)"; return false; }
@@ -132,7 +152,7 @@ bool find_rom(const u8* zip, size_t size, ZipEntry& entry, std::string& err) {
   std::vector<Entry> cands;
   size_t p = cd_off;
   const size_t cd_end = cd_off + cd_size;
-  size_t rom_seen = 0, skipped_zip64 = 0, skipped_crypt = 0, skipped_method = 0, skipped_huge = 0;
+  size_t rom_seen = 0, skipped_zip64 = 0, skipped_crypt = 0, skipped_method = 0, skipped_huge = 0, skipped_unsafe = 0;
   for (u32 i = 0; i < count && p + 46 <= cd_end; ++i) {
     const u8* h = zip + p;
     if (rd32(h) != SIG_CENTRAL) { err = "corrupt zip (bad central directory entry)"; return false; }
@@ -149,7 +169,9 @@ bool find_rom(const u8* zip, size_t size, ZipEntry& entry, std::string& err) {
     const Kind kind = entry_kind(reinterpret_cast<const char*>(zip + name_off), name_len);
     if (kind == Kind::Other) continue;
     ++rom_seen;
-    // Counted rather than fatal: a zip may hold one usable ROM beside another we can't read.
+    // Reasons an entry cannot be used. Counted rather than fatal: a zip may
+    // hold one usable ROM beside something we cannot read.
+    if (unsafe_name(reinterpret_cast<const char*>(zip + name_off), name_len)) { ++skipped_unsafe; continue; }
     if (flags & 1) { ++skipped_crypt; continue; }
     if (csize == 0xFFFFFFFFu || usize == 0xFFFFFFFFu || local_off == 0xFFFFFFFFu) { ++skipped_zip64; continue; }
     if (method != METHOD_STORE && method != METHOD_DEFLATE) { ++skipped_method; continue; }
@@ -170,9 +192,11 @@ bool find_rom(const u8* zip, size_t size, ZipEntry& entry, std::string& err) {
     else if (skipped_zip64) err = "the archive is zip64, which is not supported";
     else if (skipped_method) err = "the ROM uses an unsupported compression method";
     else if (skipped_huge) err = "the ROM in the archive is larger than any DS card";
+    else if (skipped_unsafe) err = "the entry in the archive has an unsafe path";
     else err = "the file in the archive is too small to be a ROM";
     return false;
   }
+  if (single && cands.size() > 1) { err = "the archive holds more than one .nds, .dsi, .srl or .cia file"; return false; }
 
   // A bare image is always preferred over a CIA, which must be unwrapped
   // before its header is readable. Only with no bare entry does a CIA win.

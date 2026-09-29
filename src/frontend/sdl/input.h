@@ -45,7 +45,30 @@ public:
   // State for the coming frame. A press+release both arrived since the last
   // frame still counts as held this frame; the release lands on the next one.
   input::Frame frame() {
-    const input::Frame f{static_cast<u16>(buttons_ | pressed_ | stick_ | face_stick_), static_cast<u8>(touch_x_), static_cast<u8>(touch_y_), touching_ || touched_ || stylus_down_ != 0};
+    u32 held = buttons_ | stick_ | face_stick_;
+    // Turbo: a button on the mask reaches the game as a square wave -- half a
+    // period down, half up -- so what the game sees is the button tapped
+    // `input.turbo_rate` times a second. Timed off the wall clock, not off the
+    // frame counter: fast forward and frameskip change how often there is a
+    // frame, and must not change how fast a button taps. `pressed_` is added
+    // after the wave, so a tap that begins in the silent half still lands.
+    // `input.turbo_mode` chooses which buttons are "active": in hold mode a
+    // button is active only while physically held; in toggle mode a press
+    // latches it on and it stays active -- firing continuously -- until the
+    // next press, so the button does not have to be kept down.
+    if (turbo_on_ && turbo_mask_) {
+      if (turbo_toggle_mode_) {
+        const u32 edges = pressed_ & turbo_mask_;   // a press toggles the latch
+        turbo_latched_ ^= edges;
+      }
+      const u32 lit = turbo_lit() ? turbo_mask_ : 0;
+      const u32 active = turbo_toggle_mode_
+          ? (turbo_latched_ & turbo_mask_)   // latched: fires until toggled off
+          : (held & turbo_mask_);            // held: fires only while down
+      held &= ~active;            // drop the raw bits of active buttons
+      held |= active & lit;       // put them back only on the lit half
+    }
+    const input::Frame f{static_cast<u16>(held | pressed_), static_cast<u8>(touch_x_), static_cast<u8>(touch_y_), touching_ || touched_ || stylus_down_ != 0};
     pressed_ = 0; stick_pressed_ = 0; touched_ = false;
     menu_fb_pressed_ = 0;   // menu fallback presses die with their frame
     return f;
@@ -240,8 +263,30 @@ private:
   u32  menu_faces_ = 0;
   // pad.face_fix: SDL face button -> the positional one the kernel says it is
   // (identity unless the mapping has a/b or x/y swapped); see pad_faces.h.
+  // Turbo (input.turbo): the DS buttons that are handed over as a square wave,
+  // the wave's rate, and whether a button must be held or just tapped to fire.
+  // Shaped in frame(); nothing below the frontend knows a wave is what it is
+  // looking at.
+  bool turbo_on_ = false;
+  int  turbo_rate_hz_ = 12;
+  u32  turbo_mask_ = 0;
+  // Turbo mode: false = hold (a button fires only while physically held),
+  // true = toggle (a press latches it on and it keeps firing until the next
+  // press). turbo_latched_ holds the per-button latch for toggle mode; bit i
+  // mirrors kButtonNames[i].
+  bool turbo_toggle_mode_ = false;
+  u32  turbo_latched_ = 0;
+  // The wave's lit half, from the wall clock: one phase for every turboed
+  // button, so buttons tapped together stay together.
+  bool turbo_lit() const {
+    const u32 period = 1000u / static_cast<u32>(turbo_rate_hz_ > 0 ? turbo_rate_hz_ : 1);
+    return (SDL_GetTicks() % period) < (period / 2);
+  }
   bool face_fix_ = true;
   u8   face_remap_[4] = {0, 1, 2, 3};
+  // True once face_remap_ is in force: face numbers reaching pad_down() are
+  // places already, so the menu must not map them a second time.
+  bool faces_by_place_ = false;
   void detect_faces();
   std::vector<TouchRoute> touch_routes_;
   std::vector<std::pair<SDL_TouchID, Panel>> touch_cache_;

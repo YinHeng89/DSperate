@@ -77,6 +77,11 @@ struct CheevosHost {
   virtual bool signed_in() const = 0;
   virtual bool has_set() const = 0;
 
+  // UMRK: true when the account is owned by Leaf (standalone-ra-account-v1).
+  // The account page then offers no manual SIGN IN, because doing so would
+  // silently replace the managed identity, and says the account is managed.
+  virtual bool managed() const { return false; }
+
   virtual int  row_count() const = 0;
   virtual Row  row(int i) const = 0;
 
@@ -196,7 +201,7 @@ private:
   // A page stack rather than a flat state, so B pops wherever pressed. Games
   // is pushed onto an empty stack, since it has nothing behind it and B does
   // not leave it.
-  enum class Page : u8 { Root, Slot, Cheats, Games, Options, Emulation, VisualFx, Layout, Controls, DsOptions, TextEdit, Cheevos, CheevosAccount };
+  enum class Page : u8 { Root, Slot, Cheats, Games, Options, Emulation, VisualFx, Layout, Controls, DsOptions, Turbo, TextEdit, Cheevos, CheevosAccount };
   static constexpr int kMaxDepth = 6;
   Page stack_[kMaxDepth] = {Page::Root};
   int  depth_ = 1;
@@ -256,8 +261,8 @@ private:
   // One row per page, kept while the menu is open so backing out and back in
   // lands where it was left.
   int  opt_row_ = 0;
-  int  set_row_[4] = {};         // Emulation, VisualFx, Layout, DsOptions
-  mutable int set_top_[4] = {};  // written by draw; scroll depends on canvas rows fitted
+  int  set_row_[5] = {};         // Emulation, VisualFx, Layout, DsOptions, Turbo
+  mutable int set_top_[5] = {};  // written by draw; scroll depends on canvas rows fitted
   bool have_options() const { return host_ != nullptr; }
   bool have_states() const { return !net_session_; }
   // The table a settings page shows, and where its row state lives.
@@ -317,7 +322,7 @@ private:
   // selection moved"; this is that selection.
   int  list_row() const;
   bool list_page() const { return page() == Page::Cheats || page() == Page::Games || settings_page() || controls_page(); }
-  bool settings_page() const { return page() == Page::Emulation || page() == Page::VisualFx || page() == Page::Layout || page() == Page::DsOptions; }
+  bool settings_page() const { return page() == Page::Emulation || page() == Page::VisualFx || page() == Page::Layout || page() == Page::DsOptions || page() == Page::Turbo; }
   bool controls_page() const { return page() == Page::Controls; }
   void toggle_cheat();
 };

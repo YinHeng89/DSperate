@@ -4,13 +4,23 @@
 #include "core/io/io.h"
 #include "core/cheat/database.h"
 #include "frontend/sdl/settings.h"
+#include "frontend/sdl/i18n.h"
 #include "check.h"
 
 #include <algorithm>
 #include <cstring>
+
 #include <map>
 #include <string>
 #include <vector>
+
+// display_value names a value with the label as written; the row paints it
+// resolved for the language being drawn, so what the player reads is
+// tr_text's answer. Every assertion here goes through the same step, so the
+// test checks the text the row shows and not the literal the table holds.
+std::string shown_value(const ds::sdl::Setting& s, const std::string& v) {
+  return ds::sdl::tr_text(ds::sdl::display_value(s, v).c_str());
+}
 
 using ds::u32;
 using ds::sdl::Menu;
@@ -177,6 +187,39 @@ void test_utf8_folds_to_ascii_glyphs() {
   draw_text(Canvas{z.data(), 200, 200, 20}, 0, 0, 2, 0xFFFFFFFF, "?");
   CHECK(q == z);
   CHECK(text_width(2, "\xE3\x81\x82") == text_width(2, "?"));
+}
+
+// A Han character the subset *does* carry. The check above that あ falls back
+// to '?' is about a code point the face has not heard of, so it says nothing
+// about a Chinese row: the face is asked about those and has an answer, and the
+// answer is the difference between a readable menu and one full of question
+// marks. This is the assertion whose absence let that ship.
+void test_chinese_draws_from_the_embedded_face() {
+  using ds::sdl::Canvas; using ds::sdl::text_width; using ds::sdl::draw_text;
+  // A square is kCjkAdvance's 9 pixels at this scale and a 5x7 cell is
+  // kAdvance's 6, so the measurement alone says which path a code point took.
+  CHECK(text_width(2, "A") == 10);                                  // 5 wide, no gap after the last
+  CHECK(text_width(2, "AA") == 22);
+  CHECK(text_width(2, "\xE4\xB8\xAD") == 16);                       // 中: 9 * 2 - 2
+  CHECK(text_width(2, "\xE4\xB8\xAD\xE4\xB8\xAD") == 34);
+  // And the pixels are the face's own rather than the grid's question mark.
+  std::vector<u32> han(400 * 60, 0), q(400 * 60, 0);
+  draw_text(Canvas{han.data(), 400, 400, 60}, 0, 0, 2, 0xFFFFFFFF, "\xE4\xB8\xAD\xE4\xB8\xAD");
+  draw_text(Canvas{q.data(), 400, 400, 60}, 0, 0, 2, 0xFFFFFFFF, "??");
+  CHECK(han != q);
+  // Two squares, two scales of the 7-pixel box wide, and nothing anywhere else:
+  // a glyph left to the 5x7 grid would be in the first 12 columns of the first
+  // row of squares and the rest of the canvas would be blank.
+  int inside = 0, outside = 0;
+  for (int y = 0; y < 60; ++y) {
+    for (int x = 0; x < 400; ++x) {
+      if (han[y * 400 + x] == 0) continue;
+      if (x < 36 && y < 14) ++inside;
+      else ++outside;
+    }
+  }
+  CHECK(inside > 0);                                                // something was drawn
+  CHECK(outside == 0);                                              // and only in its squares
 }
 
 void test_cheevos_row_hidden_without_a_host() {
@@ -977,11 +1020,11 @@ void test_setting_steps() {
   // range starts at 2, since 1X is real time and that is not fast forwarding.
   const ds::sdl::Setting& ff = find("emu.ff_speed");
   CHECK(ds::sdl::step_value(ff, "2", -1, h) == "0");
-  CHECK(ds::sdl::display_value(ff, "0") == "UNLIMITED");
+  CHECK(shown_value(ff, "0") == "UNLIMITED");
   CHECK(ds::sdl::step_value(ff, "0", -1, h) == "0");            // nothing below it
   CHECK(ds::sdl::step_value(ff, "0", +1, h) == "2");
   // A number says what it counts.
-  CHECK(ds::sdl::display_value(ff, "4") == "4X");
+  CHECK(shown_value(ff, "4") == "4X");
   // A boolean wraps, because a two-entry list has to.
   const ds::sdl::Setting& fl = find("emu.autosave");
   CHECK(ds::sdl::step_value(fl, "false", +1, h) == "true");
@@ -989,7 +1032,7 @@ void test_setting_steps() {
   // GAME SPEED is a whole percent in the file, as --speed and the frontend
   // read it. As a 0..1 percent row it showed 100 as 10000% and wrote 1.
   const ds::sdl::Setting& sp = find("emu.speed");
-  CHECK(ds::sdl::display_value(sp, "") == "100%");
+  CHECK(shown_value(sp, "") == "100%");
   CHECK(ds::sdl::step_value(sp, "100", -1, h) == "95");
   CHECK(ds::sdl::step_value(sp, "1", +1, h) == "25");           // a bad file value steps back into range
 }
@@ -1004,12 +1047,12 @@ void test_percent_round_trip() {
     if (!std::strcmp(t[i].key, "video.pip_alpha")) pip = &t[i];
   CHECK(pip != nullptr);
   std::string v = "1";
-  CHECK(ds::sdl::display_value(*pip, v) == "100%");
+  CHECK(shown_value(*pip, v) == "100%");
   // All the way down and back up again lands on the same string it started.
   for (int i = 0; i < 10; ++i) v = ds::sdl::step_value(*pip, v, -1, h);
-  CHECK(ds::sdl::display_value(*pip, v) == "0%");
+  CHECK(shown_value(*pip, v) == "0%");
   for (int i = 0; i < 10; ++i) v = ds::sdl::step_value(*pip, v, +1, h);
-  CHECK(ds::sdl::display_value(*pip, v) == "100%");
+  CHECK(shown_value(*pip, v) == "100%");
   CHECK(ds::sdl::step_value(*pip, v, +1, h) == v);   // clamped
 }
 
@@ -1021,15 +1064,15 @@ void test_layout_page_rows() {
   const int n = ds::sdl::settings_count(t);
   CHECK(!std::strcmp(t[0].key, "video.layout"));
   CHECK(t[0].type == ds::sdl::Setting::Type::Pick && t[0].nchoices == 6);
-  CHECK(ds::sdl::display_value(t[0], "dominant_h") == "DOMINANT H");
+  CHECK(shown_value(t[0], "dominant_h") == "DOMINANT H");
   const size_t pl = std::strlen(ds::sdl::kLayoutCyclePrefix);
   int boxes = 0;
   for (int i = 0; i < n; ++i)
     if (!std::strncmp(t[i].key, ds::sdl::kLayoutCyclePrefix, pl)) {
       ++boxes;
       CHECK(t[i].type == ds::sdl::Setting::Type::Bool);
-      CHECK(ds::sdl::display_value(t[i], "true") == "[X]");
-      CHECK(ds::sdl::display_value(t[i], "false") == "[ ]");
+      CHECK(shown_value(t[i], "true") == "[X]");
+      CHECK(shown_value(t[i], "false") == "[ ]");
     }
   CHECK(boxes == 6);
   // The host says which values a row may take; refusing "false" is how the
@@ -1069,8 +1112,8 @@ void test_network_features_row() {
   CHECK(ds::sdl::step_value(*net, "guest", +1, h) == "internet");
   CHECK(ds::sdl::step_value(*net, "internet", +1, h) == "off");
   CHECK(ds::sdl::step_value(*net, "off", -1, h) == "internet");
-  CHECK(ds::sdl::display_value(*net, "guest") == "GUEST");
-  CHECK(ds::sdl::display_value(*net, "internet") == "INTERNET");
+  CHECK(shown_value(*net, "guest") == "GUEST");
+  CHECK(shown_value(*net, "internet") == "INTERNET");
 
   // The DNS row hangs off INTERNET, and only off it: a value that means
   // nothing for local wireless must not be presented as if it did.
@@ -1086,7 +1129,7 @@ void test_network_features_row() {
   CHECK(ds::sdl::default_value(*dns) == "wiimmfi");
   CHECK(ds::sdl::step_value(*dns, "wiimmfi", +1, h) == "host");
   CHECK(ds::sdl::step_value(*dns, "host", +1, h) == "wiimmfi");
-  CHECK(ds::sdl::display_value(*dns, "wiimmfi") == "WIIMMFI");
+  CHECK(shown_value(*dns, "wiimmfi") == "WIIMMFI");
   // The DNS row is not one of the rows a session greys out: it is a setting
   // for the session, not one the session forbids.
   CHECK(dns->depends != ds::sdl::Dep::NetSession);
@@ -1141,7 +1184,7 @@ void test_out_of_range_value_is_kept() {
   for (int i = 0; i < ds::sdl::settings_count(t); ++i)
     if (!std::strcmp(t[i].key, "emu.frameskip")) fs = &t[i];
   CHECK(fs != nullptr);
-  CHECK(ds::sdl::display_value(*fs, "8") == "8");      // shown as the file wrote it
+  CHECK(shown_value(*fs, "8") == "8");      // shown as the file wrote it
   // Touching it brings it into the menu's range, from either direction: the
   // page offers 0..3, so once the player moves the row that is what it holds.
   CHECK(ds::sdl::step_value(*fs, "8", -1, h) == "3");
@@ -1152,7 +1195,7 @@ void test_out_of_range_value_is_kept() {
   for (int i = 0; i < ds::sdl::settings_count(ds::sdl::kVideoSettings); ++i)
     if (!std::strcmp(ds::sdl::kVideoSettings[i].key, "video.chunky")) ch = &ds::sdl::kVideoSettings[i];
   CHECK(ch != nullptr);
-  CHECK(ds::sdl::display_value(*ch, "wibble") == "wibble");
+  CHECK(shown_value(*ch, "wibble") == "wibble");
 }
 
 // Every table's stated default has to be one the table itself can represent,
@@ -1160,16 +1203,17 @@ void test_out_of_range_value_is_kept() {
 void test_defaults_are_reachable() {
   FakeHost h;
   for (const ds::sdl::Setting* t : {ds::sdl::kEmuSettings, ds::sdl::kVideoSettings,
-                                    ds::sdl::kLayoutSettings, ds::sdl::kUserSettings}) {
+                                    ds::sdl::kLayoutSettings, ds::sdl::kUserSettings,
+                                    ds::sdl::kInputSettings}) {
     for (int i = 0; i < ds::sdl::settings_count(t); ++i) {
       const ds::sdl::Setting& s = t[i];
       const std::string def = ds::sdl::default_value(s);
       // Shown as something, and stepping from it stays inside the range.
-      CHECK(!ds::sdl::display_value(s, def).empty());
+      CHECK(!shown_value(s, def).empty());
       if (s.type == ds::sdl::Setting::Type::Text) continue;
       const std::string up = ds::sdl::step_value(s, def, +1, h);
-      CHECK(!ds::sdl::display_value(s, up).empty());
-      CHECK(!ds::sdl::display_value(s, ds::sdl::step_value(s, up, -1, h)).empty());
+      CHECK(!shown_value(s, up).empty());
+      CHECK(!shown_value(s, ds::sdl::step_value(s, up, -1, h)).empty());
     }
   }
 }
@@ -1455,13 +1499,15 @@ void test_save_target_switch() {
   m.set_open(true);
   for (int i = 0; i < 3; ++i) m.input(press(B::BTN_DOWN));
   m.input(press(B::BTN_A));                                    // Options
-  for (int i = 0; i < 5; ++i) m.input(press(B::BTN_DOWN));     // the save row
+  // The save row is seven down: the options list is the six settings pages
+  // plus the language switch, and the save row comes after them.
+  for (int i = 0; i < 7; ++i) m.input(press(B::BTN_DOWN));     // the save row
   CHECK(!h.save_per_game());
   m.input(press(B::BTN_RIGHT));
   CHECK(h.save_per_game());
   m.input(press(B::BTN_LEFT));
   CHECK(!h.save_per_game());
-  // With no game the row is not there, so five downs wrap to a page row and
+  // With no game the row is not there, so seven downs wrap to a page row and
   // A opens a page rather than toggling anything.
   FakeHost h2;
   h2.game = false;
@@ -1470,7 +1516,7 @@ void test_save_target_switch() {
   m2.set_open(true);
   for (int i = 0; i < 3; ++i) m2.input(press(B::BTN_DOWN));
   m2.input(press(B::BTN_A));
-  for (int i = 0; i < 5; ++i) m2.input(press(B::BTN_DOWN));
+  for (int i = 0; i < 7; ++i) m2.input(press(B::BTN_DOWN));
   m2.input(press(B::BTN_A));
   CHECK(!h2.save_per_game());
 }
@@ -1547,6 +1593,308 @@ void test_canvas_sizes() {
   }
 }
 
+// Both hosts a menu can be given, on one object: the walk below needs a cheat
+// list to count in a heading, a game loaded so the options page has a save-to
+// row, and an achievement set to total, because a row drawn in the wrong
+// language still draws -- it only reads wrong.
+struct LeakHost final : ds::sdl::CheevosHost, ds::sdl::SettingsHost {
+  using Row = ds::sdl::CheevosHost::Row;
+  using Option = ds::sdl::CheevosHost::Option;
+  using Binding = ds::sdl::SettingsHost::Binding;
+
+  std::map<std::string, std::string> kv;
+  std::vector<Row> rows;
+  std::vector<Menu::GameEntry> games;
+
+  std::string status() const override { return "SIGNED IN"; }
+  std::string progress() const override { return "1/2 EARNED  5/15 POINTS"; }
+  bool signed_in() const override { return true; }
+  bool has_set() const override { return true; }
+  int row_count() const override { return static_cast<int>(rows.size()); }
+  Row row(int i) const override { return rows.at(static_cast<size_t>(i)); }
+  void sign_in(const std::string&, const std::string&) override {}
+  void sign_out() override {}
+  bool option(Option) const override { return false; }
+  void set_option(Option, bool) override {}
+
+  std::string get(const char* key) const override {
+    const auto it = kv.find(key);
+    return it == kv.end() ? "" : it->second;
+  }
+  // Kept, unlike the rest of this host: stepping a row has to move it, or the
+  // walk below only ever sees the value a row starts on and never the ones
+  // beside it -- and a choice that is only wrong in Chinese is wrong on a row
+  // the walk never reached.
+  void set(const char* k, const std::string& v) override { kv[k] = v; }
+  bool enabled(const ds::sdl::Setting&) const override { return true; }
+  const char* disabled_reason(const ds::sdl::Setting&) const override { return ""; }
+  bool value_allowed(const ds::sdl::Setting&, const char*) const override { return true; }
+  void commit() override {}
+  bool save_per_game() const override { return false; }
+  void set_save_per_game(bool) override {}
+  bool has_game() const override { return true; }
+
+  int binding_count(bool) const override { return 0; }
+  Binding binding(bool, int) const override { return {"", "", ""}; }
+  bool has_pad() const override { return false; }
+  void begin_capture(bool) override {}
+  void cancel_capture() override {}
+  bool capturing() const override { return false; }
+  std::string take_capture() override { return ""; }
+  void bind(const std::string&, const std::string&) override {}
+  void reset_bindings(bool) override {}
+  std::vector<std::string> collisions() const override { return {}; }
+  const char* user_settings_note() const override { return nullptr; }
+};
+
+// With English set, a row the table cannot translate is a row the player reads
+// in Chinese -- and on it looks exactly like a row that was drawn in English,
+// which is why the suite passed with five of them on screen and why no pixel
+// assertion could have caught them: there is nothing to assert on but the
+// count. Every page is walked rather than the five rows named, because a
+// sixth will not be found by reading the drawing path the way those were.
+void test_no_page_draws_chinese_with_english_set() {
+  std::vector<ds::cheat::Code> codes;
+  std::vector<ds::cheat::Group> groups;
+  { ds::cheat::Group g; g.name = "GROUP"; groups.push_back(g); }
+  ds::cheat::Code c;
+  c.name = "金手指";
+  c.group = 0;
+  c.words = {0x02000000, 1};
+  c.enabled = true;                                     // the heading counts it
+  codes.push_back(c);
+
+  LeakHost host;
+  host.rows.resize(3);                                  // and the achievements heading counts those
+  std::vector<u32> fb(ds::SCREEN_W * ds::SCREEN_H, 0);
+  const ds::sdl::Canvas d{fb.data(), ds::SCREEN_W, ds::SCREEN_W, ds::SCREEN_H};
+
+  ds::sdl::g_ui_lang = ds::sdl::UiLang::En;
+  ds::sdl::g_strict_i18n = true;
+  ds::sdl::g_i18n_leaks = 0;
+
+  Menu m;
+  m.set_settings_host(&host);
+  m.set_cheevos_host(&host);
+  m.set_cheats(&codes, &groups);
+  m.set_games(&host.games);
+  m.set_open(true);
+  // A state in the auto slot, so the slot page draws the row that hangs off
+  // it: with none, that row is not drawn at all and nothing on the walk reads
+  // it -- which is the whole reason a row can be wrong and the suite green.
+  m.set_slot_used(Menu::kAutoSlot, true);
+  m.set_slot_used(0, true);
+
+  // Walked by row, not by pressing until something happens: the root's rows
+  // are 保存存档, 读取存档, the slot row, 金手指, 选项, 成就 and the rest, and
+  // a walk that does not know which row it is on has no way of knowing which
+  // page it opened.
+  m.draw(d);                                                               // the root, on 保存存档
+  m.input(press(B::BTN_DOWN)); m.input(press(B::BTN_DOWN));                 // to the slot row
+  m.input(press(B::BTN_A)); m.draw(d);                                     // the slot page
+  m.input(press(B::BTN_Y)); m.draw(d);                                     // delete mode, where its auto row is
+  for (int i = 0; i < 7; ++i) { m.draw(d); m.input(press(B::BTN_DOWN)); }   // every cell of both columns
+  m.input(press(B::BTN_A)); m.draw(d);                                     // a used cell, armed: it reads 确认？
+  m.input(press(B::BTN_B)); m.draw(d);                                     // disarmed
+  m.input(press(B::BTN_B)); m.draw(d);                                     // out of the slot page
+  m.input(press(B::BTN_DOWN));                                             // to 金手指
+  m.input(press(B::BTN_A)); m.draw(d);                                     // the cheats page
+  for (int i = 0; i < 4; ++i) { m.draw(d); m.input(press(B::BTN_DOWN)); }
+  m.input(press(B::BTN_B)); m.draw(d);
+  m.input(press(B::BTN_DOWN));                                             // to 选项
+  m.input(press(B::BTN_A)); m.draw(d);                                     // Options, save-to row and all
+  // Every page Options opens, and on each one every row: the note under the
+  // list is the selected row's, so a walk that stopped at the top of a page
+  // would read one note out of fifteen. The last row of Options is the
+  // language switch, which is why this stops one short of it.
+  for (int page = 0; page < 6; ++page) {
+    m.input(press(B::BTN_A)); m.draw(d);                                   // in
+    for (int row = 0; row < 20; ++row) {
+      m.draw(d);
+      // And every value a row can hold, not just the one it starts on: a
+      // choice is a string the row draws, and the one that is missing from the
+      // table is only ever seen once the row has been stepped onto it.
+      for (int step = 0; step < 8; ++step) { m.input(press(B::BTN_RIGHT)); m.draw(d); }
+      m.input(press(B::BTN_DOWN));
+    }
+    m.input(press(B::BTN_B)); m.draw(d);                                   // out
+    m.input(press(B::BTN_DOWN));                                           // the next row of Options
+  }
+  m.input(press(B::BTN_B)); m.draw(d);                                     // out of Options
+  m.input(press(B::BTN_DOWN));                                             // to 成就
+  m.input(press(B::BTN_A)); m.draw(d);                                     // the achievements page
+  m.input(press(B::BTN_B)); m.draw(d);
+  m.open_games(); m.draw(d);                                               // the game list
+
+  CHECK(ds::sdl::g_i18n_leaks == 0);
+
+  ds::sdl::g_strict_i18n = false;                       // leave the suite off it
+  ds::sdl::g_i18n_leaks = 0;
+}
+
+// The other direction, and the one the walk above cannot see: a value left in
+// English is a value the player reads in English with Chinese set, and on the
+// screen it is indistinguishable from one that is meant to be -- WIIMMFI and
+// DNS are names, GREY and UNLIMITED are not. What makes a row translatable is
+// that the table has an English for it, so this asks the table rather than
+// looking at the row.
+//
+// It also asks the one thing that makes the two directions work at all: a row
+// is written in Chinese and tr_text resolves by strcmp against what the source
+// wrote, so a row written in English is a row that can never be translated --
+// in either direction.
+void test_every_settings_string_has_an_english_entry() {
+  const auto has_han = [](const char* s) {
+    if (!s) return false;
+    for (const unsigned char* p = reinterpret_cast<const unsigned char*>(s); *p; ++p)
+      if (*p >= 0xE3) return true;         // CJK, its punctuation, fullwidth forms
+    return false;
+  };
+  // A word that is the word in any language: a server's name, a checkbox.
+  const auto neutral = [](const char* s) {
+    if (!s || !*s) return true;
+    for (const char* p = s; *p; ++p)
+      if ((*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z')) return false;
+    return true;
+  };
+  // A name that is the name in any language -- a server's, a protocol's -- and
+  // the two states of a checkbox, which are drawn rather than read.
+  const auto named = [](const char* s) {
+    // A server or protocol name reads the same in either language; "3D" and
+    // the two checkbox glyphs are ASCII the 5x7 grid draws as itself.
+    return std::strcmp(s, "WIIMMFI") == 0 || std::strcmp(s, "DNS") == 0
+        || std::strcmp(s, "[ ]") == 0 || std::strcmp(s, "[X]") == 0;
+  };
+  const auto resolvable = [](const char* s) {
+    return std::strcmp(ds::sdl::tr_text(s), s) != 0;   // the table has the other language
+  };
+  const ds::sdl::Setting* tables[] = {ds::sdl::kEmuSettings, ds::sdl::kVideoSettings,
+                                      ds::sdl::kLayoutSettings, ds::sdl::kUserSettings};
+  ds::sdl::g_ui_lang = ds::sdl::UiLang::En;
+  for (const ds::sdl::Setting* t : tables) {
+    for (int i = 0; t[i].key; ++i) {
+      const ds::sdl::Setting& s = t[i];
+      CHECK(has_han(s.label) || neutral(s.label) || named(s.label));
+      if (has_han(s.label)) CHECK(resolvable(s.label));
+      if (s.note) { CHECK(has_han(s.note)); CHECK(resolvable(s.note)); }
+      if (s.sentinel_label) { CHECK(has_han(s.sentinel_label)); CHECK(resolvable(s.sentinel_label)); }
+      for (int c = 0; c < s.nchoices; ++c) {
+        CHECK(has_han(s.choices[c].label) || neutral(s.choices[c].label) || named(s.choices[c].label));
+        if (has_han(s.choices[c].label)) CHECK(resolvable(s.choices[c].label));
+      }
+    }
+  }
+}
+
+// The one tag on the slot row that does not come from a table of choices: the
+// emulator writes the config value REJECTED into the notice, and the row
+// translates it on the way into its own format. Without the pair, the row read
+// 存档槽 < 0 > REJECTED -- a Chinese line with an English word in it -- and no
+// walk could see it, because the notice is set only after a state is refused.
+void test_the_refused_state_tag_has_both_languages() {
+  ds::sdl::g_ui_lang = ds::sdl::UiLang::En;
+  CHECK(std::strcmp(ds::sdl::tr_text("已拒绝"), "REJECTED") == 0);
+  ds::sdl::g_ui_lang = ds::sdl::UiLang::Zh;
+  CHECK(std::strcmp(ds::sdl::tr_text("REJECTED"), "已拒绝") == 0);
+  ds::sdl::g_ui_lang = ds::sdl::UiLang::En;
+}
+
+// The account page's status line: what the achievement client is doing, in the
+// words the player reads. It is built in the frontend, where a name or a hash
+// is joined onto it and the page then wraps it -- and neither a joined line nor
+// a wrapped fragment is an entry the table holds, so every one of these has to
+// be resolved before any of that, which is the whole reason they are here.
+void test_the_account_status_lines_have_both_languages() {
+  static const char* const kZh[] = {
+    "此构建不支持", "已关闭", "未登录", "正在登录...", "已登录为 ", "正在加载成就...",
+    "此游戏尚未发布成就", "此 ROM 没有成就 - HASH ", "由 Leaf 管理", " - 由 Leaf 管理",
+  };
+  static const char* const kEn[] = {
+    "NOT AVAILABLE IN THIS BUILD", "TURNED OFF", "NOT SIGNED IN", "SIGNING IN...", "SIGNED IN AS ",
+    "LOADING ACHIEVEMENTS...", "NO ACHIEVEMENTS PUBLISHED FOR THIS GAME YET",
+    "NO ACHIEVEMENTS FOR THIS ROM - HASH ", "MANAGED BY LEAF", " - MANAGED BY LEAF",
+  };
+  constexpr int kN = static_cast<int>(sizeof(kZh) / sizeof(kZh[0]));
+  static_assert(sizeof(kZh) / sizeof(kZh[0]) == sizeof(kEn) / sizeof(kEn[0]),
+                "one English for every Chinese");
+  ds::sdl::g_ui_lang = ds::sdl::UiLang::En;
+  for (int i = 0; i < kN; ++i)
+    CHECK(std::strcmp(ds::sdl::tr_text(kZh[i]), kEn[i]) == 0);
+  ds::sdl::g_ui_lang = ds::sdl::UiLang::Zh;
+  for (int i = 0; i < kN; ++i)
+    CHECK(std::strcmp(ds::sdl::tr_text(kEn[i]), kZh[i]) == 0);
+  // And it is resolved whole, before the name goes on: a name joined to a
+  // resolved line rides along in the line's language, which a line resolved
+  // after the join cannot do.
+  CHECK(std::string(ds::sdl::tr_text("已登录为 ")) + "yinheng" == "已登录为 yinheng");
+  ds::sdl::g_ui_lang = ds::sdl::UiLang::En;
+  CHECK(std::string(ds::sdl::tr_text("已登录为 ")) + "yinheng" == "SIGNED IN AS yinheng");
+}
+
+// The auto state's row, only when there is an auto state to put on it. Empty it
+// cannot be loaded -- there is nothing behind it -- and it cannot be deleted,
+// so the row had nothing to say for itself but AUTO EMPTY, in a slot the
+// player never made.
+void test_auto_row_shown_only_when_the_auto_state_exists() {
+  // Without one: the column is five cells and walking off its foot wraps.
+  {
+    Menu m;
+    m.set_open(true);
+    m.input(press(B::BTN_DOWN)); m.input(press(B::BTN_DOWN));   // the slot row
+    m.input(press(B::BTN_A));                                   // the slot page, on 0
+    m.input(press(B::BTN_Y));                                   // delete mode, where the cell was
+    for (int i = 0; i < 4; ++i) m.input(press(B::BTN_DOWN));     // to the foot of the column
+    m.input(press(B::BTN_DOWN));                                 // and one past it
+    CHECK(m.doomed_slot() == 0);                                 // wrapped: there is nothing past it
+  }
+  // With one: the same walk lands on it, and it can be deleted there.
+  {
+    Menu m;
+    m.set_open(true);
+    m.set_slot_used(Menu::kAutoSlot, true);
+    m.input(press(B::BTN_DOWN)); m.input(press(B::BTN_DOWN));
+    m.input(press(B::BTN_A));
+    m.input(press(B::BTN_Y));
+    for (int i = 0; i < 4; ++i) m.input(press(B::BTN_DOWN));
+    m.input(press(B::BTN_DOWN));
+    CHECK(m.doomed_slot() == Menu::kAutoSlot);
+    m.input(press(B::BTN_A));
+    CHECK(m.input(press(B::BTN_A)) == Menu::Result::Delete);
+  }
+}
+
+// The same pages with the language switched, which is the state the CJK face
+// exists for: every row on a page is now text the 5x7 grid has no glyph for,
+// and the drawing goes to the embedded one for all of it.
+void test_chinese_page_draws() {
+  std::vector<ds::cheat::Code> codes;
+  std::vector<ds::cheat::Group> groups;
+  { ds::cheat::Group g; g.name = "GROUP"; groups.push_back(g); }
+  ds::cheat::Code c;
+  c.name = "金手指";
+  c.group = 0;
+  c.words.push_back(1);
+  codes.push_back(c);
+  FakeHost host;
+  std::vector<u32> fb(ds::SCREEN_W * ds::SCREEN_H, 0);
+  const ds::sdl::Canvas d{fb.data(), ds::SCREEN_W, ds::SCREEN_W, ds::SCREEN_H};
+
+  ds::sdl::g_ui_lang = ds::sdl::UiLang::Zh;
+  {
+    Menu m;
+    m.set_settings_host(&host);
+    m.set_cheats(&codes, &groups);
+    m.set_open(true);
+    m.draw(d);                                                      // the root, in Chinese
+    int ink = 0;
+    for (u32 v : fb) if (v != 0) ++ink;
+    CHECK(ink > 0);                                                 // not a blank panel
+    m.input(press(B::BTN_A)); m.draw(d);                            // Options
+    m.input(press(B::BTN_B)); m.draw(d);
+  }
+  ds::sdl::g_ui_lang = ds::sdl::UiLang::En;   // leave the suite the way we found it
+}
+
 int main() {
   test_root_rows();
   test_slot_delete();
@@ -1603,6 +1951,13 @@ int main() {
   test_ds_options_with_a_firmware_dump();
   test_save_target_switch();
   test_canvas_sizes();
+  test_chinese_draws_from_the_embedded_face();
+  test_chinese_page_draws();
+  test_no_page_draws_chinese_with_english_set();
+  test_every_settings_string_has_an_english_entry();
+  test_the_refused_state_tag_has_both_languages();
+  test_the_account_status_lines_have_both_languages();
+  test_auto_row_shown_only_when_the_auto_state_exists();
   std::printf("menu: ok\n");
   return 0;
 }

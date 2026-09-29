@@ -78,9 +78,33 @@ const PadName kPadNames[] = {
   {"dpright",       "RIGHT",      nullptr, nullptr},
 };
 
-// One token of a binding (no "mod+", no chord); axis sign is part of the
-// name ("+lefttrigger" is L2, "-lefttrigger" is not a thing any pad has).
+// Which of the two ways a pad may name x and y. SDL's own assumption, and
+// Xbox's, is that the names are places: x on the left of the diamond, y at the
+// top. The MLP1's mapping names them by the letter printed on the button
+// instead -- its SDL x is the X-labelled button, which sits at the top, and its
+// SDL y the Y-labelled one, on the left. Nothing about the binding changes: the
+// file stores SDL's name either way, and pad.x = x binds the same button. What
+// changes is which pip the menu draws for it, because a pip is a place, and a
+// row that points at the left button while the top one is bound is a row that
+// sends the player to the wrong button. Set from pad.xy_naming; position unless
+// the file says printed.
+static bool g_xy_by_printed = false;
+
+// Where each SDL face button sits on a pad that names x and y by the printed
+// letter: SDL x is the X-labelled button, at the north of the diamond, and SDL
+// y the Y-labelled one, at its west. a and b are named by place on such a pad
+// too, so they do not move. Used to hand the menu face presses by place.
+static constexpr u8 kPlaceOfFaceByPrinted[4] = {0, 1, 3, 2};
+
+// One token of a binding -- no "mod+", no chord, but the axis sign is part of
+// the name ("+lefttrigger" is L2, "-lefttrigger" is not a thing any pad has).
 std::string canon_pad_token(const std::string& s) {
+  // A compass alias names a place, so it follows the buttons: on a pad that
+  // names x and y by the printed letter, the button on the left is SDL y.
+  if (g_xy_by_printed) {
+    if (s == "west") return "y";
+    if (s == "north") return "x";
+  }
   for (const PadName& p : kPadNames) {
     if (s == p.sdl) return s;
     if ((p.alias1 && s == p.alias1) || (p.alias2 && s == p.alias2)) return p.sdl;
@@ -88,10 +112,20 @@ std::string canon_pad_token(const std::string& s) {
   return s;   // not an alias: hand it to SDL unchanged, errors and all
 }
 
-const char* pad_token_label(const std::string& s) {
+const char* pad_token_label_sdl(const std::string& s) {
   for (const PadName& p : kPadNames)
     if (s == p.sdl) return p.label;
   return nullptr;
+}
+
+const char* pad_token_label(const std::string& s) {
+  // Taken from the other row rather than written twice, so the pip and the word
+  // a row draws cannot drift from the ones the table already has.
+  if (g_xy_by_printed) {
+    if (s == "x") return pad_token_label_sdl("y");
+    if (s == "y") return pad_token_label_sdl("x");
+  }
+  return pad_token_label_sdl(s);
 }
 
 } // namespace
@@ -146,6 +180,27 @@ std::string Input::axis_remap_default(int i) {
 }
 
 void Input::configure(const Config& cfg) {
+  // Turbo: which DS buttons are handed to the game as a square wave, and how
+  // fast. Read here so a row stepped on the page takes effect at once; the
+  // keys are the ones kInputSettings writes.
+  turbo_on_ = cfg.flag("input.turbo", false);
+  turbo_toggle_mode_ = cfg.str("input.turbo_mode", "hold") == "toggle";
+  turbo_rate_hz_ = cfg.num("input.turbo_rate", 12);
+  if (turbo_rate_hz_ < 1) turbo_rate_hz_ = 1;
+  if (turbo_rate_hz_ > 60) turbo_rate_hz_ = 60;
+  turbo_mask_ = 0;
+  for (int i = 0; i < static_cast<int>(B::BTN_COUNT); ++i)
+    if (cfg.flag(std::string("input.turbo.") + kButtonNames[i], false)) turbo_mask_ |= 1u << i;
+  turbo_latched_ = 0;   // reconfigure clears any toggle latch
+  // First, because parse_pad resolves the compass aliases through it: a file
+  // written on a pad that names x and y by the printed letter has to read the
+  // same way the menu draws them.
+  {
+    const std::string xy = cfg.str("pad.xy_naming", "position");
+    g_xy_by_printed = xy == "printed";
+    if (xy != "position" && xy != "printed")
+      std::fprintf(stderr, "config: pad.xy_naming \"%s\" is not position | printed; keeping position\n", xy.c_str());
+  }
   for (int i = 0; i < SDL_CONTROLLER_AXIS_MAX; ++i) {
     const std::string v0 = cfg.str(axis_remap_key(i), axis_remap_default(i));
     std::string v = v0;
@@ -343,9 +398,11 @@ void Input::open_controllers() {
 
 void Input::detect_faces() {
   for (u8 f = 0; f < 4; ++f) face_remap_[f] = f;
+  faces_by_place_ = false;
   int phys[4];
   if (!face_fix_ || !face_positions(pad_, phys)) return;
   for (int f = 0; f < 4; ++f) face_remap_[f] = static_cast<u8>(phys[f]);
+  faces_by_place_ = true;
   std::fprintf(stderr, "controller: SDL mapping has %s swapped against the kernel's button positions; correcting (pad.face_fix = off to keep it)\n",
                phys[0] != 0 && phys[2] != 2 ? "a/b and x/y" : phys[0] != 0 ? "a/b" : "x/y");
 }
@@ -509,7 +566,20 @@ void Input::menu_fallback_key(SDL_Keycode k, bool down) {
 
 // Controller: `b` is the button or axis edge that just changed.
 bool Input::pad_down(const Bind& b, bool down) {
-  if (menu_open_ && down && b.kind == Bind::PadButton && b.code <= SDL_CONTROLLER_BUTTON_Y) menu_faces_ |= 1u << b.code;
+  // The menu reads face presses by place -- a bit per pip, south/east/west/
+  // north, which is what the Controls footer draws -- and it is the only thing
+  // that does: bindings keep SDL's own numbers either way. With pad.face_fix
+  // off nothing has renumbered the button yet, so the place comes from the
+  // naming the file declares, the same answer pad_token_label() gives the pip
+  // beside a bound row. On a pad that names x and y by the letter printed on
+  // them, SDL x sits north and SDL y west, so the two trade places here; left
+  // alone, the pip beside CLEAR points at the west button while the north one
+  // does the clearing, and the same swap hides DEFAULTS behind CLEAR.
+  if (menu_open_ && down && b.kind == Bind::PadButton && b.code <= SDL_CONTROLLER_BUTTON_Y) {
+    int f = b.code;
+    if (!faces_by_place_ && g_xy_by_printed && f < 4) f = kPlaceOfFaceByPrinted[f];
+    menu_faces_ |= 1u << f;
+  }
   // Anything else pressed under the modifier means it wasn't alone.
   if (down && pad_mod_down_ && !(b.kind == pad_mod_.kind && b.code == pad_mod_.code)) pad_mod_used_ = true;
   auto same = [&](const Bind& x) { return x.kind == b.kind && x.code == b.code && (x.kind != Bind::PadAxis || x.neg == b.neg); };
