@@ -635,7 +635,8 @@ void Gpu3D::exec_single(u8 cmd, const u32* p) {
       else if (matrix_mode_ == 3) { op(tex_.data()); }
       else {
         op(pos_.data());
-        if (matrix_mode_ == 2) op(vec_.data()); else clip_dirty_ = true;
+        if (matrix_mode_ == 2) op(vec_.data());
+        clip_dirty_ = true;   // the position matrix changed in both modes
       }
     };
     switch (cmd) {
