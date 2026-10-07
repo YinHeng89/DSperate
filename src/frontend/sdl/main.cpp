@@ -1884,7 +1884,8 @@ sdl_ready:
   bool net_live = false;
   int state_slot = 0;
   // Fast forward: ff_speed floors the limiter (0 = uncapped); ff_skip
-  // presents one frame in ff_skip+1, every frame still emulated exactly.
+  // presents one frame in ff_skip+1 and does not draw the rest (the frameskip
+  // blocks below); every frame is still emulated exactly.
   // Frameskip: emu.frameskip is the limit N. "fixed" always skips that
   // pattern; "adaptive" (default) skips only while behind real time (a debt
   // in ms, paid down by what a skipped frame saves).
@@ -1917,6 +1918,7 @@ sdl_ready:
   bool ff_toggle = cfg.flag("emu.fast_forward", false);
   int ff_speed = cfg.num("emu.ff_speed", 0), ff_skip = cfg.num("emu.ff_skip", 3);
   bool was_fast = false;
+  int ff_since = 0;           // frames since the last present, for fast forward's ff_skip
   std::vector<u32> cursor_fb(ds::SCREEN_W * ds::SCREEN_H);   // bottom screen with the pen crosshair
   std::vector<u32> osd_fb(ds::SCREEN_W * ds::SCREEN_H);      // primary screen with the slot digit / FPS counter
   std::vector<u32> flash_fb[2] = {std::vector<u32>(ds::SCREEN_W * ds::SCREEN_H), std::vector<u32>(ds::SCREEN_W * ds::SCREEN_H)};   // both screens under the screenshot flash
@@ -3433,16 +3435,23 @@ sdl_ready:
       if (!said) { said = true; std::fprintf(stderr, "fast forward: not during a network session\n"); }
       fast = false;
     }
-    if (fast != was_fast) { was_fast = fast; pacer.reset(); }
+    if (fast != was_fast) {
+      was_fast = fast;
+      pacer.reset();
+      fs_debt_ms = 0;   // fast forward leaves the debt frozen; the real-time one it left is stale
+    }
     // Policy decides for the frame after the one about to run; what the
     // core settled for this one governs the present.
-    if (fs_limit > 0) {
+    // Fast forward skips through the same blocks, by ff_skip rather than by
+    // the debt: its unpresented frames are not drawn at all, and the block
+    // ends in a drawn period that is presented.
+    if (fs_limit > 0 || fast) {
       const int period = nds.gpu.display_phase_period();
       // Limit counts blocks, not frames: on a game whose screens take a
       // whole period to come round, frameskip=3 skips three periods per
       // drawn one, the same ratio a period-1 game gets.
-      const int max_blocks = fs_limit;
-      if (period > 1 && !fs_period_warned) {
+      const int max_blocks = fast ? ff_skip : fs_limit;
+      if (fs_limit > 0 && period > 1 && !fs_period_warned) {
         fs_period_warned = true;
         std::fprintf(stderr, "frameskip: this game drives its screens over %d frames, so it skips %d of every %d\n",
                      period, fs_limit * period, (fs_limit + 1) * period);
@@ -3450,7 +3459,7 @@ sdl_ready:
       if (fs_left == 0) {                         // a block ended: pick the next one
         // Fixed skips its blocks whatever the clock says; adaptive skips only
         // while it is behind, and both stop at the limit and draw a period.
-        const bool want = !fs_adaptive || fs_debt_ms > frame_budget_ms * 0.5;
+        const bool want = fast || !fs_adaptive || fs_debt_ms > frame_budget_ms * 0.5;
         const bool skip = max_blocks > 0 && want && fs_blocks < max_blocks;
         fs_blocks = skip ? fs_blocks + 1 : 0;
         fs_in_skip = skip;
@@ -3458,19 +3467,27 @@ sdl_ready:
       }
       --fs_left;
       nds.gpu.set_frame_skip(fs_in_skip);
+    } else {
+      fs_in_skip = false; fs_left = 0; fs_blocks = 0;
+      nds.gpu.set_frame_skip(false);
     }
     const bool skipped = nds.gpu.will_skip_frame();
     // Games that render one screen per frame (the other via capture) show one
     // stale screen right after a skip; draw the block through and present its last frame.
-    const int fs_period = fs_limit > 0 ? nds.gpu.display_phase_period() : 1;
+    const int fs_period = fs_limit > 0 || fast ? nds.gpu.display_phase_period() : 1;
     if (skipped) { ++fs_skipped; fs_drawn_run = 0; } else ++fs_drawn_run;
     const bool fs_partial = fs_period > 1 && fs_drawn_run < fs_period;
     // Say why frameskip is doing nothing, once, rather than looking broken.
-    if (!skipped && fs_in_skip && ++fs_refused == 120 && !fs_capture)
+    if (!skipped && fs_in_skip && !fast && ++fs_refused == 120 && !fs_capture)
       std::fprintf(stderr, "frameskip: this game display-captures its frames, which cannot be skipped exactly;\n"
                            "           drop --no-frameskip-capture (or [emu] frameskip_capture = true) to skip them anyway\n");
+    // Fast forward counts frames since the last present instead of taking a
+    // modulus of the frame number, which a skip pattern could phase-lock
+    // against and never land on.
+    const bool ff_due = !fast || ff_skip <= 0 || ff_since >= ff_skip;
     const bool present = pause_pending || shot_pending ? !skipped
-                                       : (!skipped && !fs_partial && (!fast || ff_skip <= 0 || frames % static_cast<u64>(ff_skip + 1) == 0));
+                                       : (!skipped && !fs_partial && ff_due);
+    ff_since = present ? 0 : ff_since + 1;
     // Translucent PiP inset comes up to opaque while touched, holds
     // pip_touch_hold frames, then fades back. Only when the inset IS the bottom screen.
     {
