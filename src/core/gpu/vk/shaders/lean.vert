@@ -27,6 +27,16 @@ void main() {
   float cx = 0.5 * float(p.xmin + p.xmax);
   float sxf = float(vt.sx), syf = float(vt.sy);
   float ox = sxf > cx ? 1.0 : 0.0, oy = 0.0;
+  // A vertical right edge is the exception to "a right vertex is on its pixel's
+  // right edge": the DS ends such a span one pixel short (xend - 1), so the
+  // rows' pixels are [xl, x - 1] and the attributes run over exactly that
+  // width. Axis-aligned quads (text, sprites, UI) all have one; extending them
+  // by a pixel stretched their texcoords across width + 1.
+  if (ox > 0.0 && p.nverts > 2u) {
+    uint n = p.nverts;
+    float sxp = float(verts[p.first_vert + (vi + n - 1u) % n].sx), sxn = float(verts[p.first_vert + (vi + 1u) % n].sx);
+    if (sxp == sxf || sxn == sxf) ox = 0.0;
+  }
   // A zero-width/height polygon is a line to the DS but zero area here:
   // give it one pixel via the second/third vertex.
   if (p.xmax == p.xmin) ox = (vi == 1u || vi == 2u) ? 1.0 : 0.0;
