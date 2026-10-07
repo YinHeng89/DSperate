@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "dmaheap.h"
+#include "drm_uapi.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -99,11 +100,13 @@ struct ion_fd_data { int handle; int fd; };
 enum { ION_HEAP_TYPE_SYSTEM = 0, ION_HEAP_TYPE_SYSTEM_CONTIG = 1, ION_HEAP_TYPE_CARVEOUT = 2,
        ION_HEAP_TYPE_CHUNK = 3, ION_HEAP_TYPE_DMA = 4 };
 
-// `ion_mask` == 0 means a dma-heap at `path`.
+// `ion_mask` == 0 and `drm` == 0 means a dma-heap at `path`.
 struct Source {
   std::string path;               // dma-heap device, or "ion:<name>" for the log
   uint32_t ion_mask = 0;
   bool swept = false;             // blind id-bit candidate: quiet on failure
+  enum Drm { None, Msm, Dumb };   // GEM buffers exported by PRIME, for kernels with no heap
+  Drm drm = None;
 };
 
 std::string g_chosen;
@@ -152,7 +155,59 @@ int alloc_ion(const Source& s, size_t len) {
   return fd;
 }
 
+// A GEM buffer from the display driver itself, exported as a dmabuf. For
+// kernels built without CONFIG_DMABUF_HEAPS (the mainline Qualcomm handhelds):
+// the DRM driver is then the only allocator the scanout hardware is known to
+// accept. The handle is closed once exported; the fd keeps the buffer alive.
+int export_gem(int drm, uint32_t handle) {
+  drmu::prime_handle ph = {};
+  ph.handle = handle;
+  ph.flags = O_CLOEXEC | O_RDWR;
+  const int r = ioctl(drm, drmu::IOCTL_PRIME_HANDLE_TO_FD, &ph);
+  const int err = errno;
+  drmu::gem_close gc = {};
+  gc.handle = handle;
+  ioctl(drm, drmu::IOCTL_GEM_CLOSE, &gc);
+  errno = err;
+  return r < 0 ? -1 : ph.fd;
+}
+
+// msm: write-combined and scanout-capable, from the render node, so no DRM
+// master and no card-node permission. WC suits the write-once frame; the CPU
+// never reads it back.
+int alloc_drm_msm(const std::string& path, size_t len) {
+  const int drm = ::open(path.c_str(), O_RDWR | O_CLOEXEC);
+  if (drm < 0) return -1;
+  drmu::msm_gem_new n = {};
+  n.size = len;
+  n.flags = drmu::MSM_BO_WC | drmu::MSM_BO_SCANOUT;
+  int fd = -1;
+  if (ioctl(drm, drmu::IOCTL_MSM_GEM_NEW, &n) == 0) fd = export_gem(drm, n.handle);
+  const int err = errno;
+  ::close(drm);
+  errno = err;
+  return fd;
+}
+
+// Any KMS driver's dumb buffer (card node only: the ioctl is not render-allowed).
+// Only `len` is known, so ask for page-wide rows and enough of them.
+int alloc_drm_dumb(const std::string& path, size_t len) {
+  const int drm = ::open(path.c_str(), O_RDWR | O_CLOEXEC);
+  if (drm < 0) return -1;
+  drmu::mode_create_dumb c = {};
+  c.width = 1024;
+  c.bpp = 32;
+  c.height = static_cast<uint32_t>((len + 4095) / 4096);
+  int fd = -1;
+  if (ioctl(drm, drmu::IOCTL_MODE_CREATE_DUMB, &c) == 0) fd = export_gem(drm, c.handle);
+  const int err = errno;
+  ::close(drm);
+  errno = err;
+  return fd;
+}
+
 int alloc_from(const Source& s, size_t len) {
+  if (s.drm) return (s.drm == Source::Msm ? alloc_drm_msm : alloc_drm_dumb)(s.path.substr(s.path.find(':') + 1), len);
   return s.ion_mask ? alloc_ion(s, len) : alloc_dmaheap(s.path, len);
 }
 
@@ -220,10 +275,39 @@ void ion_heaps(std::vector<Source>& out) {
   for (unsigned b : order) out.push_back({"ion:id" + std::to_string(b), 1u << b, true});
 }
 
+// The msm ioctl is only safe to fire at an msm node (another driver may read
+// the same number as something else), so the driver is checked first.
+bool drm_driver_is_msm(const std::string& node) {
+  char link[256];
+  const std::string p = "/sys/class/drm/" + node + "/device/driver";
+  const ssize_t n = readlink(p.c_str(), link, sizeof link - 1);
+  if (n <= 0) return false;
+  link[n] = 0;
+  const char* base = std::strrchr(link, '/');
+  return !std::strncmp(base ? base + 1 : link, "msm", 3);
+}
+
+void drm_sources(std::vector<Source>& out) {
+  DIR* d = opendir("/dev/dri");
+  if (!d) return;
+  std::vector<std::string> render, cards;
+  while (dirent* e = readdir(d)) {
+    if (!std::strncmp(e->d_name, "renderD", 7)) render.emplace_back(e->d_name);
+    else if (!std::strncmp(e->d_name, "card", 4)) cards.emplace_back(e->d_name);
+  }
+  closedir(d);
+  std::sort(render.begin(), render.end());
+  std::sort(cards.begin(), cards.end());
+  for (const auto& n : render)
+    if (drm_driver_is_msm(n)) out.push_back({"drm-msm:/dev/dri/" + n, 0, false, Source::Msm});
+  for (const auto& n : cards) out.push_back({"drm-dumb:/dev/dri/" + n, 0, false, Source::Dumb});
+}
+
 std::vector<Source> candidates() {
   std::vector<Source> v;
   if (const char* e = std::getenv("DS_DMA_HEAP"); e && *e) {
     if (!std::strcmp(e, "ion")) { ion_heaps(v); return v; }
+    if (!std::strcmp(e, "drm")) { drm_sources(v); return v; }
     if (!std::strncmp(e, "ion:", 4)) {
       const uint32_t m = static_cast<uint32_t>(std::strtoul(e + 4, nullptr, 0));
       v.push_back({std::string("ion:") + (e + 4), m, false});
@@ -234,6 +318,7 @@ std::vector<Source> candidates() {
   }
   dma_heaps(v);
   ion_heaps(v);
+  drm_sources(v);   // last: only where the kernel offers no heap that works
   return v;
 }
 
@@ -256,7 +341,7 @@ int alloc(size_t len, const std::function<bool(int fd)>& usable, const char* tag
 
   const std::vector<Source> cands = candidates();
   if (cands.empty()) {
-    std::fprintf(stderr, "%s: no dmabuf allocator (no /dev/dma_heap/*, no /dev/ion)\n", tag);
+    std::fprintf(stderr, "%s: no dmabuf allocator (no /dev/dma_heap/*, no /dev/ion, no /dev/dri/*)\n", tag);
     return -1;
   }
   for (const Source& s : cands) {

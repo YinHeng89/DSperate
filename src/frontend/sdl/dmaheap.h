@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // dmabuf allocation for the scanout tiers: tries DS_DMA_HEAP, else every
-// /dev/dma_heap/* (contiguous-first), else ION (new/legacy ABI). The
+// /dev/dma_heap/* (contiguous-first), else ION (new/legacy ABI), else the DRM
+// driver's own GEM buffers (msm render node, then any card node's dumb buffer). The
 // caller's `usable` runs the real import against each candidate; the first
 // that passes is pinned for the rest of the process.
 //
 // DS_DMA_HEAP: a heap name (`cma-uncached`), an absolute path, `ion`
-// (skip dma-heap) or `ion:<mask>` (that heap_id_mask, no probing).
+// (skip dma-heap), `ion:<mask>` (that heap_id_mask, no probing) or `drm`
+// (only the DRM GEM sources).
 #pragma once
 
 #include <cstddef>

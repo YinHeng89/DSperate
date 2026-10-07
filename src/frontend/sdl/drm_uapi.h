@@ -68,6 +68,21 @@ struct prime_handle {
 
 struct gem_close { uint32_t handle, pad; };
 
+struct mode_create_dumb {
+  uint32_t height, width, bpp, flags;
+  uint32_t handle, pitch;
+  uint64_t size;
+};
+
+// drm_msm_gem_new (msm_drm.h): a driver-private ioctl, DRM_COMMAND_BASE + 0x02.
+struct msm_gem_new {
+  uint64_t size;
+  uint32_t flags;
+  uint32_t handle;
+};
+constexpr uint32_t MSM_BO_SCANOUT = 0x00000001;
+constexpr uint32_t MSM_BO_WC      = 0x00020000;
+
 struct event { uint32_t type, length; };
 struct event_vblank {
   event base;
@@ -84,7 +99,10 @@ constexpr uint32_t CONNECTOR_CONNECTED = 1;
 constexpr unsigned long IOCTL_SET_MASTER        = _IO('d', 0x1e);
 constexpr unsigned long IOCTL_DROP_MASTER       = _IO('d', 0x1f);
 constexpr unsigned long IOCTL_GEM_CLOSE         = _IOW('d', 0x09, gem_close);
+constexpr unsigned long IOCTL_PRIME_HANDLE_TO_FD = DS_DRM_IOWR(0x2d, prime_handle);
 constexpr unsigned long IOCTL_PRIME_FD_TO_HANDLE = DS_DRM_IOWR(0x2e, prime_handle);
+constexpr unsigned long IOCTL_MSM_GEM_NEW       = DS_DRM_IOWR(0x40 + 0x02, msm_gem_new);
+constexpr unsigned long IOCTL_MODE_CREATE_DUMB  = DS_DRM_IOWR(0xB2, mode_create_dumb);
 constexpr unsigned long IOCTL_MODE_GETRESOURCES = DS_DRM_IOWR(0xA0, mode_card_res);
 constexpr unsigned long IOCTL_MODE_GETCRTC      = DS_DRM_IOWR(0xA1, mode_crtc);
 constexpr unsigned long IOCTL_MODE_SETCRTC      = DS_DRM_IOWR(0xA2, mode_crtc);
