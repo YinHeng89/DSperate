@@ -403,6 +403,9 @@ private:
   void gpu_dump(const Gpu3D& gx, const Polygon* const* polys, u32 npoly);
   std::shared_ptr<vk::Device> vk_dev_;
   std::unique_ptr<vk::Lean> lean_;
+  std::unique_ptr<vk::Lean> lean_retired_;   // the Lean gpu_rebuild() replaced, kept one frame for readers of its record
+  bool lean_aa_ = false;   // the AA setting lean_ was created for (msaa() is what the device granted)
+  void gpu_rebuild();
   // The GPU submit (command recording + queue call, ~0.9 ms) runs on its own
   // thread, off the emulation thread: gpu_submit() fills the staging buffers
   // and the texel arena, then posts the Lean::submit call. gpu_job_wait()

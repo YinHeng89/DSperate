@@ -2773,6 +2773,8 @@ void Renderer3D::render(const Gpu3D& gx) {
   }
   texels_in_ = &poly_texels_;
   if (gpu_dump_path_ && nds_.frame_count == gpu_dump_frame_) gpu_dump(gx, polys, npoly);
+  lean_retired_.reset();
+  if (gpu_on_ && lean_ && lean_aa_ != aa_) gpu_rebuild();
   if (gpu_on_ && gpu_submit(gx, polys, npoly)) { gpu_frame_ = true; pending_bands_ = 0; return; }
   gpu_frame_ = false;
   if (prof::enabled && !prep_done) { prof::add_timed(prof::R3D_PREP, prof::now_ns() - t_prep0); prep_done = true; }
@@ -2958,8 +2960,27 @@ Renderer3D::FrameRef Renderer3D::frame_ref(bool allow_lag) const {
 void Renderer3D::set_aa(bool on) {
   if (aa_ == on) return;
   aa_ = on;
-  // The GPU raster's MSAA is fixed at its creation: rebuild it for the new setting.
-  if (gpu_on_ && lean_ && lean_->msaa() != on) { set_gpu(false); gpu_job_wait(); lean_.reset(); set_gpu(true); }
+  // The GPU raster's MSAA is fixed at its creation: render() swaps in a Lean for
+  // the new setting at the next frame (gpu_rebuild). Not here: the display still
+  // holds refs into this frame's record, and a fresh Lean has none to give.
+}
+
+// Replace the Lean whose MSAA no longer matches aa_. Runs at the top of a render,
+// where the new Lean is handed a frame at once, so no ref ever meets one without
+// a record. The old one is retired, not freed: the display may still be reading
+// the previous frame's record from it; the next render lets it go.
+void Renderer3D::gpu_rebuild() {
+  sync_all(); gpu_job_wait(); lean_->wait_all();
+  std::string why;
+  std::unique_ptr<vk::Lean> fresh = vk::Lean::create(*vk_dev_, aa_, &why);
+  lean_retired_ = std::move(lean_);
+  if (!fresh || !fresh->ready()) {
+    std::fprintf(stderr, "gpu3d: rebuild for AA %s failed (%s), drawing on the CPU\n", aa_ ? "on" : "off", why.c_str());
+    gpu_on_ = false;
+    return;
+  }
+  lean_ = std::move(fresh); lean_aa_ = aa_;
+  gpu_resident_.clear(); gpu_arena_top_ = 0;
 }
 
 bool Renderer3D::set_gpu(bool on, std::string* why) {
@@ -2968,7 +2989,7 @@ bool Renderer3D::set_gpu(bool on, std::string* why) {
   std::string reason;
   if (!vk_dev_) vk_dev_ = vk::Device::shared(&reason);
   if (!vk_dev_) { if (why) *why = reason; return false; }
-  if (!lean_) lean_ = vk::Lean::create(*vk_dev_, aa_, &reason);
+  if (!lean_) { lean_ = vk::Lean::create(*vk_dev_, aa_, &reason); lean_aa_ = aa_; }
   if (!lean_ || !lean_->ready()) { lean_.reset(); if (why) *why = reason; return false; }
   lean_->wait_all(); gpu_resident_.clear(); gpu_arena_top_ = 0;
   gpu_job_start();
@@ -3090,7 +3111,8 @@ void Renderer3D::sync_line(const FrameRef& f, s32 y) {
     if (!f.out) {
       const double t0 = g_gpu_trace.on ? now_ms() : 0;
       gpu_job_wait();
-      f.out = lean_->newest_ready(f.allow_lag);
+      f.out = lean_ ? lean_->newest_ready(f.allow_lag) : nullptr;
+      if (!f.out) f.out = out_[display_].data();   // a Lean with no frame yet: a stale picture, not a null read
       if (g_gpu_trace.on) { const double w = now_ms() - t0; g_gpu_trace.wait_ms += w; g_gpu_trace.wait_max = std::max(g_gpu_trace.wait_max, w); if (w > 0.2) ++g_gpu_trace.waited; }
     }
     return;
