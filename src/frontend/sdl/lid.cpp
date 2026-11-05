@@ -74,9 +74,13 @@ bool Lid::poll(bool& closed) {
     switch_state(fd_, closed_);
   }
 #endif
-  // No switch (or host froze before the event): clocks drifted >1s apart.
+  // A suspend the switch did not tell us about: the clocks drifted apart by
+  // more than a second. Only pulse a lid we already believe is closed. On a
+  // device with no switch (the MLP1) closed_ is never set, and fabricating a
+  // close on every resume blanks games that blank on lid-close and restore the
+  // screen only on an open they saw coming (Contra 4), so nothing happens.
   const s64 skew = clock_ns(CLOCK_BOOTTIME) - clock_ns(CLOCK_MONOTONIC);
-  if (skew - skew_ns_ > 1000000000 && fd_ < 0) { pulse_ = 1; std::fprintf(stderr, "lid: host resumed from suspend; pulsing the lid\n"); }
+  if (skew - skew_ns_ > 1000000000 && fd_ < 0 && closed_) { pulse_ = 6; std::fprintf(stderr, "lid: host resumed from suspend; pulsing the lid\n"); }
   skew_ns_ = skew;
   bool raw = closed_;
   if (pulse_ > 0) { --pulse_; raw = true; }

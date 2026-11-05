@@ -29,9 +29,14 @@ namespace ds::cheevos {
 struct Message {
   enum class Kind : u8 { Unlock, Info, Problem, };
   Kind kind = Kind::Info;
-  std::string text;
-  std::string detail;
-  u32 points = 0;   // unlock value; 0 for non-unlocks and 0-point achievements
+  std::string text;     // one line, already player-facing
+  std::string detail;   // may be empty
+  u32 points = 0;       // an unlock's value; 0 for everything else, and for
+                        // the 0-point achievements RetroAchievements has
+  // UMRK: an account problem from the Leaf account bridge. Shown even when
+  // ordinary achievement toasts are turned off, because the player has no
+  // other way to learn their account needs attention.
+  bool account = false;
 };
 
 enum class State : u8 {
@@ -141,6 +146,13 @@ private:
   bool encore_ = false;
   std::string hash_;                 // the identity of the dump in the slot
   std::string unavailable_;
+
+  // UMRK: which native login is in flight, so a rejected stored token can get
+  // the contract's one password retry and a failed import can be reported to
+  // the account bridge. Never lets a retry loop.
+  enum class LoginKind : u8 { Password, Token };
+  LoginKind login_kind_ = LoginKind::Password;
+  bool login_retried_ = false;
 
   std::thread worker_;
   mutable std::mutex mu_;

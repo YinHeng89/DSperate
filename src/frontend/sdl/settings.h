@@ -43,6 +43,7 @@ enum class Dep : u8 {
   // a peer or server instead of the emulator.
   NetSession,
   ShortcutsPath,      // a folder for NAND title shortcuts: paths.dsi_games, else paths.games
+  Turbo,              // input.turbo is on: the rate and the per-button rows mean nothing otherwise
   Slot2Link,          // the game reads GBA games (slot2/compat.h), and paths.gba_games is set
   RumblePak,          // the Rumble Pak is in slot 2 this session
   SolarSensor,        // a Boktai cartridge is in slot 2
@@ -114,6 +115,7 @@ extern const Setting kAnalogSettings[];
 extern const Setting kVideoSettings[];
 extern const Setting kLayoutSettings[];
 extern const Setting kUserSettings[];
+extern const Setting kInputSettings[];
 int settings_count(const Setting* table);
 
 std::string display_value(const Setting& s, const std::string& value);

@@ -20,6 +20,8 @@ add_library(dsperate_cheevos STATIC
   cheevos_memory.cpp
   cheevos_http.cpp
   cheevos_client.cpp
+  ra_account_contract.cpp
+  ra_account_bridge.cpp
   ${RC_DIR}/src/rc_client.c
   ${RC_API_SOURCES}
   ${RC_RUNTIME_SOURCES}

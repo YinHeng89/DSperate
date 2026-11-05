@@ -15,37 +15,62 @@ using T = Setting::Type;
 
 const Choice kOnOff[]   = {{"false", "OFF"}, {"true", "ON"}};
 const Choice kSkipMode[] = {{"adaptive", "ADAPTIVE"}, {"fixed", "FIXED"}};
-// Panel-typical rates, plus the console's own (auto, the default) and no limit.
+// The rates a panel comes in, plus the console's own and no limiter at all.
+// "auto" is the default and the only one that plays a game at the speed it was
+// written for; 60 is 0.29 % fast, which is what a player means by "60 fps"
+// and what lines up with a 60 Hz panel. Both ends are named in the row's own
+// language rather than left in English: the rest of the row is in the language
+// that is set, and a value in another one is the odd thing out on it.
 const Choice kLimiter[] = {{"auto", "CONSOLE (59.8)"}, {"30", "30"}, {"60", "60"}, {"120", "120"},
                            {"144", "144"}, {"240", "240"}, {"off", "UNLIMITED"}};
+// Named for what the player sees, not for how the scale gets there: "under"
+// leaves black bars around the picture and "over" cuts off its edges, and
+// those are the two things a row has to tell them apart.
 const Choice kIntScale[] = {{"off", "OFF"}, {"under", "UNDER"}, {"over", "OVER"}};
 const Choice kSeam[]     = {{"dark", "DARK"}, {"blend", "BLEND"}, {"blend_linear", "BLEND LINEAR"}};
+// The file's own words on the left. "mean" is the ordinary cell and reads as
+// DEFAULT; the rest are named for what they do rather than how they do it.
 const Choice kChunky[]   = {{"false", "OFF"}, {"mean", "DEFAULT"}, {"extreme", "ADAPTIVE"},
                             {"mode", "COMMON"}, {"tl", "FIRST"}, {"min", "DARKEST"}, {"max", "LIGHTEST"}};
 const Choice kAa[]       = {{"false", "OFF"}, {"true", "ON"}, {"enhanced", "ENHANCED"}};
 const Choice kScreen[]   = {{"top", "TOP"}, {"bottom", "BOTTOM"}};
-// GBATEK's order, matching the firmware.
+// GBATEK's order, which is what the firmware stores. Named the way the rest of
+// the row is: these are the colours the firmware offers and a player picks one
+// by its name, so it is the name that has to be in the language that is set.
 const Choice kColour[]   = {{"0", "GREY"}, {"1", "BROWN"}, {"2", "RED"}, {"3", "PINK"},
                             {"4", "ORANGE"}, {"5", "YELLOW"}, {"6", "LIME"}, {"7", "GREEN"},
                             {"8", "DARK GREEN"}, {"9", "TURQUOISE"}, {"10", "BLUE"}, {"11", "DARK BLUE"},
                             {"12", "PURPLE"}, {"13", "VIOLET"}, {"14", "MAGENTA"}, {"15", "DARK PINK"}};
+// The firmware stores the month as a number; the menu names it, because
+// "BIRTHDAY MONTH 11" takes a moment to read and "十一月" does not.
 const Choice kMonth[]    = {{"1", "JANUARY"}, {"2", "FEBRUARY"}, {"3", "MARCH"}, {"4", "APRIL"},
                             {"5", "MAY"}, {"6", "JUNE"}, {"7", "JULY"}, {"8", "AUGUST"},
                             {"9", "SEPTEMBER"}, {"10", "OCTOBER"}, {"11", "NOVEMBER"}, {"12", "DECEMBER"}};
-// AUTO is --netplay (join if heard, else host); HOST/GUEST fix the role up
-// front. Join address stays a command-line flag; discovery finds hosts itself.
+// Local wireless, as one row. AUTO is --netplay (join a session heard on the
+// LAN, else host one); HOST and GUEST are the same scan with the decision
+// already made, so a console meant to be the second one cannot quietly become
+// the session everyone joins. The address form stays a command-line flag:
+// a pick row has nowhere to put one, and discovery finds hosts on its own.
 const Choice kNetMode[]  = {{"off", "OFF"}, {"auto", "AUTO"}, {"host", "HOST"}, {"guest", "GUEST"},
                             {"internet", "INTERNET"}};
-// A plain-address DNS form also exists in the config but has nowhere in a
-// pick row. WIIMMFI is default since Nintendo WFC is gone; HOST resolves to
-// nothing unless pointed at a private server.
+// Where the game's DNS queries go once it is on the internet. Two values
+// here; the config takes a third form, a plain address, which a pick row has
+// nowhere to put (the same reason the LAN join address stayed a flag).
+//
+// WIIMMFI is the default because it is the only thing a DS can still reach:
+// Nintendo WFC was switched off in 2014, so HOST -- the host's own resolver,
+// which is what a real DS would have used -- resolves the game's servers to
+// nothing. HOST is there for a private server or a local test.
 const Choice kWifiDns[]  = {{"wiimmfi", "WIIMMFI"}, {"host", "HOST"}};
 const Choice kLanguage[] = {{"0", "JAPANESE"}, {"1", "ENGLISH"}, {"2", "FRENCH"},
                             {"3", "GERMAN"}, {"4", "ITALIAN"}, {"5", "SPANISH"}};
+// A checkbox: the same two values as kOnOff, drawn as a box. Rows that are
+// members of a set rather than switches read better that way.
 const Choice kCheck[]    = {{"false", "[ ]"}, {"true", "[X]"}};
 const Choice kRumble[]   = {{"auto", "AUTO"}, {"on", "ON"}, {"off", "OFF"}};
 const Choice kAnalog[]   = {{"auto", "AUTO"}, {"off", "OFF"}, {"left", "LEFT STICK"}, {"right", "RIGHT STICK"}, {"dual", "TWO STICKS"}};
 const Choice kAnalogLayout[] = {{"auto", "AUTO"}, {"packed", "PACKED"}, {"extended", "EXTENDED"}};
+// Display::mode_name's words, in Display::Mode order.
 const Choice kLayout[]   = {{"vertical", "VERTICAL"}, {"horizontal", "HORIZONTAL"}, {"single", "SINGLE"},
                             {"pip", "PIP"}, {"dominant_v", "DOMINANT V"}, {"dominant_h", "DOMINANT H"}};
 const Choice kCorner[]   = {{"tl", "TOP LEFT"}, {"tr", "TOP RIGHT"}, {"bl", "BOTTOM LEFT"}, {"br", "BOTTOM RIGHT"}};
@@ -79,19 +104,34 @@ const Setting kEmuSettings[] = {
          "DRAW FEWER FRAMES. THE GAME STILL RUNS IN FULL"),
   pick("emu.frameskip_mode", "FRAMESKIP MODE", kSkipMode, 2, "adaptive", FlagLive, Dep::FrameskipMode,
        "ADAPTIVE SKIPS ONLY WHILE BEHIND REAL TIME"),
+  // emu.cpu_tuning and emu.timing_oc are gone in v3.0.0: the CPU TUNING row
+  // and its kCpuOc table were dropped there, and the menu no longer steps it.
+  // emu.fast_load went the same way -- nothing reads the key any more, and a
+  // switch that does nothing but be switchable is worse than no switch. The
+  // three-way merge kept all three, because the v2.1.1 side had them and the
+  // merge took its CLI whitelist as a union.
   pick("emu.limiter", "FRAME LIMITER", kLimiter, 7, "auto", FlagLive, Dep::NetSession,
        "THE RATE THE GAME IS HELD TO. CONSOLE IS THE ONE THE GAME WAS WRITTEN FOR"),
-  // Whole percent in the file ("100"), so not a Percent row (0..1 fraction).
+  // A whole percent in the file ("100"), as --speed and the frontend read it --
+  // not a percent row, which keeps a 0..1 fraction: that showed the default as
+  // 10000% and wrote 1 (one percent) for what it displayed as 100%.
   number("emu.speed", "GAME SPEED", 25, 400, 5, "100", FlagLive, Dep::NetSession,
          "HOW FAST THE GAME RUNS AGAINST THE LIMITER", nullptr, nullptr, "%"),
-  // Multiple of real time (a floor), not of the limiter, so it never slows
-  // the game below this even on a fast limiter.
+  // From 2: "1X" is real time, which is what not fast-forwarding already is.
+  // A multiple of real time, not of the limiter: it is a floor, so holding
+  // fast forward on a 240 Hz limiter never slows the game down to it.
+  // UNLIMITED uncaps whatever the limiter says, which is why it is still
+  // here now that the limiter has an UNLIMITED of its own -- a 60 Hz game
+  // with a fast forward that goes as fast as the machine will.
   number("emu.ff_speed", "FAST FORWARD SPEED", 2, 16, 1, "0", FlagLive, Dep::NetSession,
          "AT LEAST THIS MANY TIMES REAL TIME WHILE FAST FORWARD IS HELD", "0", "UNLIMITED", "X"),
   number("emu.ff_skip", "FAST FORWARD SKIP", 0, 9, 1, "3", FlagLive, Dep::NetSession,
          "WHILE FAST FORWARDING, SHOW ONE FRAME IN THIS MANY PLUS ONE"),
-  // AUTO raises the buffer only when the machine keeps up yet still ran dry
-  // (a hitch, not a machine too slow to keep up at all).
+  // The one audio row, and it lives here rather than on an audio page of its
+  // own: a page for a single row is not worth the depth it adds. AUTO holds
+  // the default and raises it only when the machine is keeping up and still
+  // ran the queue dry -- a deeper buffer answers a hitch, never a machine
+  // that cannot keep up at all. docs/audio-buffer-scoping.md.
   number("audio.buffer_size", "AUDIO BUFFER", 20, 200, 10, "auto", FlagLive, Dep::None,
          "SOUND HELD AHEAD. LOWER IS LESS DELAY, LESS SLACK BEFORE A LATE FRAME IS HEARD",
          "auto", "AUTO", " MS"),
@@ -99,8 +139,10 @@ const Setting kEmuSettings[] = {
           "SAVE A STATE WHEN THE EMULATOR EXITS, TO RESUME FROM"),
   boolean("emu.autoload", "AUTOLOAD ON START", "false", FlagRestart, Dep::None,
           "WHEN A GAME STARTS, RESUME FROM ITS AUTOSAVED STATE IF THERE IS ONE"),
+  // Applied when the NAND is opened, so only a new DSi session sees it.
   boolean("emu.dsi_hide_installed", "HIDE NAND DSIWARE", "false", FlagRestart, Dep::None,
           "DSI MENU: HIDE THE NAND DUMP'S OWN TITLES. THE DUMP IS NOT CHANGED"),
+  // Live: switching it writes or clears the .dspr.nds files at once.
   boolean("emu.dsi_nand_shortcuts", "DSI NAND LINKS", "false", FlagLive, Dep::ShortcutsPath,
           "GAME LIST ENTRIES THAT START THE NAND'S DSIWARE WITHOUT THE DSI MENU"),
   // Always this game's own file: "don't ask again" wrote it there.
@@ -112,6 +154,12 @@ const Setting kEmuSettings[] = {
          "HOW HARD THE MOTOR RUNS WHEN THE GAME RUMBLES", nullptr, nullptr, "%"),
   number("slot2.solar", "SOLAR SENSOR", 0, 10, 1, "5", FlagLive, Dep::SolarSensor,
          "THE SUNLIGHT A BOKTAI CARTRIDGE SEES: 0 DARK, 10 FULL SUN"),
+  // Live, and it was not always: it used to need a restart because the MAC was
+  // only randomized into the firmware image for a run that asked for a session,
+  // and two instances sharing a dump's MAC is the fault that made PictoChat
+  // drop its own messages. The MAC is settled every run now, so the radio can
+  // go up and come down whenever -- a Pokemon player can trade and then carry
+  // on playing. docs/wifi-scoping.md.
   pick("net.mode", "NETWORK FEATURES", kNetMode, 5, "off", FlagLive, Dep::Net,
        "LOCAL WIRELESS, OR INTERNET. AUTO JOINS A SESSION, ELSE HOSTS ONE"),
   pick("wifi.dns", "DNS", kWifiDns, 2, "wiimmfi", FlagRestart, Dep::NetInternet,
@@ -166,7 +214,8 @@ const Setting kLayoutSettings[] = {
   pick("video.screen", "MAIN SCREEN", kScreen, 2, "top", FlagDeferred, Dep::None,
        "THE SCREEN SHOWN ALONE, LARGE OR FIRST"),
   number("video.screen_gap", "SCREEN GAP", 0, 128, 4, "0", FlagDeferred, Dep::OneWindow,
-         "PANEL PIXELS BETWEEN THE TWO SCREENS WHEN THEY ARE STACKED OR SIDE BY SIDE. AUTO PUSHES THEM TO THE EDGES", "auto", "AUTO"),
+         "PANEL PIXELS BETWEEN THE TWO SCREENS WHEN THEY ARE STACKED OR SIDE BY SIDE. AUTO PUSHES THEM TO THE EDGES",
+         "auto", "AUTO"),
   pick("video.pip_corner", "PIP CORNER", kCorner, 4, "br", FlagDeferred, Dep::Pip,
        "WHERE THE SMALL SCREEN SITS"),
   percent("video.pip_scale", "PIP SIZE", 10, 90, 5, "0.33", FlagDeferred, Dep::Pip,
@@ -179,6 +228,8 @@ const Setting kLayoutSettings[] = {
           "THE SMALLER SCREEN'S SIZE. AUTO FITS WHOLE PIXELS", "auto", "AUTO"),
   percent("video.dominant_threshold", "DOMINANT THRESHOLD", 10, 99, 5, "0.25", FlagDeferred, Dep::DominantThreshold,
           "THE SMALLEST SECONDARY AUTO WILL ACCEPT"),
+  // What the layout hotkeys step through, one box per layout. Live: the
+  // hotkeys read the list when pressed, and nothing on screen moves.
   check("video.layout_cycle.vertical", "CYCLE VERTICAL", "true", FlagLive, Dep::OneWindow,
         "THE LAYOUT HOTKEYS STEP THROUGH THE TICKED LAYOUTS"),
   check("video.layout_cycle.horizontal", "CYCLE HORIZONTAL", "true", FlagLive, Dep::OneWindow,
@@ -209,6 +260,47 @@ const Setting kUserSettings[] = {
          "NOT CHECKED AGAINST THE MONTH, AS THE CONSOLE DOES NOT EITHER"),
   pick("user.language", "LANGUAGE", kLanguage, 6, "1", FlagRestart, Dep::None,
        "THE LANGUAGE MULTI-LANGUAGE GAMES START IN"),
+  end(),
+};
+
+// [input]: turbo, one checkbox per DS button. A held button that is ticked
+// here is handed to the game as a square wave -- half a period down, half up
+// -- so holding it is the same as tapping it `input.turbo_rate` times a
+// second. Nothing below the frontend knows: Input::frame() is the only place
+// the mask is shaped, and the core sees an ordinary button that let go.
+//
+// The rate and the checkboxes hang off the switch (Dep::Turbo) because a rate
+// with the switch off reads as a knob that does nothing. The button rows are
+// checkboxes rather than switches for the reason video.layout_cycle is: they
+// are members of a set, and a set of boxes reads as a set where a column of
+// 关/开 does not.
+// Turbo mode: hold = the button must stay down to fire; tap = one press
+// latches it on and it keeps firing until the next press.
+const Choice kTurboMode[] = {{"hold", "HOLD"}, {"toggle", "TAP"}};
+const Setting kInputSettings[] = {
+  boolean("input.turbo", "TURBO", "false", FlagLive, Dep::None,
+          "WHEN ON, TICKED BUTTONS AUTOFIRE (SEE TURBO MODE)"),
+  // hold: the button fires only while held (the original behaviour). toggle:
+  // a single press latches it on and it keeps firing until pressed again, so
+  // you do not have to keep the button down.
+  pick("input.turbo_mode", "TURBO MODE", kTurboMode, 2, "hold", FlagLive, Dep::Turbo,
+       "HOLD: FIRES ONLY WHILE HELD. TAP: PRESS ONCE TO KEEP FIRING, PRESS AGAIN TO STOP"),
+  // HZ, not 次/秒: the suffix joins the number before tr_text sees the pair,
+  // so a Chinese unit here would be drawn in Chinese with English set.
+  number("input.turbo_rate", "TURBO RATE", 5, 30, 1, "12", FlagLive, Dep::Turbo,
+         "TAPS AND RELEASES PER SECOND. TOO FAST AND A GAME MAY MISS ONE", nullptr, nullptr, " HZ"),
+  check("input.turbo.a", "TURBO A", "false", FlagLive, Dep::Turbo, nullptr),
+  check("input.turbo.b", "TURBO B", "false", FlagLive, Dep::Turbo, nullptr),
+  check("input.turbo.select", "TURBO SELECT", "false", FlagLive, Dep::Turbo, nullptr),
+  check("input.turbo.start", "TURBO START", "false", FlagLive, Dep::Turbo, nullptr),
+  check("input.turbo.right", "TURBO RIGHT", "false", FlagLive, Dep::Turbo, nullptr),
+  check("input.turbo.left", "TURBO LEFT", "false", FlagLive, Dep::Turbo, nullptr),
+  check("input.turbo.up", "TURBO UP", "false", FlagLive, Dep::Turbo, nullptr),
+  check("input.turbo.down", "TURBO DOWN", "false", FlagLive, Dep::Turbo, nullptr),
+  check("input.turbo.r", "TURBO R", "false", FlagLive, Dep::Turbo, nullptr),
+  check("input.turbo.l", "TURBO L", "false", FlagLive, Dep::Turbo, nullptr),
+  check("input.turbo.x", "TURBO X", "false", FlagLive, Dep::Turbo, nullptr),
+  check("input.turbo.y", "TURBO Y", "false", FlagLive, Dep::Turbo, nullptr),
   end(),
 };
 
@@ -274,7 +366,12 @@ std::string display_value(const Setting& s, const std::string& value) {
   case T::Bool:
   case T::Pick: {
     const int i = choice_index(s, v);
-    return i >= 0 ? s.choices[i].label : v;   // unknown value: show as-is, not silently remapped
+    // A value the table does not know is shown as it stands rather than
+    // silently redrawn as something else: the file said it, and the player
+    // should see what the file said.
+    // The label is the text as written. draw_text resolves it for the language
+    // being drawn, so the row the player sees is in that language.
+    return i >= 0 ? s.choices[i].label : v;
   }
   case T::Int:
     if (s.sentinel_value && v == s.sentinel_value) return s.sentinel_label;

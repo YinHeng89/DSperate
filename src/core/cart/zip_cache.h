@@ -24,9 +24,22 @@
 namespace ds::cart {
 
 struct ZipOpen {
-  std::string fallback_dir;   // used when the archive's own directory isn't writable; empty = fail
-  u64 max_bytes = 0;          // cache directory cap before LRU eviction (0: no limit); image being opened is never evicted
-  ZipProgress progress = nullptr;   // called during extraction with bytes done/total; null for none
+  // Where to put the extracted image when the archive's own directory
+  // cannot be written. Empty: fail instead.
+  std::string fallback_dir;
+  // When true, `fallback_dir` is the only place the image may go: never the
+  // archive's own directory. A launcher that isolates game data wants every
+  // extraction under its own cache root, even when the ROM's card is writable.
+  bool require_root = false;
+  // When true, an archive holding more than one eligible image entry is
+  // refused. A launcher that wants one unambiguous game per archive sets it.
+  bool single_entry = false;
+  // The most the cache directory may hold, in bytes, before an extraction
+  // evicts the least recently launched images to make room (0: no limit).
+  // The image being opened is never evicted.
+  u64 max_bytes = 0;
+  // Called during an extraction with bytes done and total; null for none.
+  ZipProgress progress = nullptr;
   void* progress_user = nullptr;
   std::atomic<bool>* cancel = nullptr;   // set to abandon extraction; open_zip fails with "cancelled"
   // Filled in on success.

@@ -32,10 +32,15 @@ struct ZipEntry {
   bool stored() const { return method == 0; }
 };
 
-// Picks the image entry out of `zip`. False with a reason in `err`.
-// Extensions taken to hold an image: .nds, .dsi, .srl (bare ROM/SRL), .cia
-// (SRL in a CIA container). A bare entry is always preferred over a .cia.
-bool find_rom(const u8* zip, size_t size, ZipEntry& entry, std::string& err);
+// Picks the image entry out of `zip`, without reading its payload beyond the
+// header peek described below. False with a reason in `err`. With `single`, an
+// archive holding more than one eligible image entry is refused instead of
+// picked from; a launcher that wants one unambiguous game per archive sets it.
+//
+// The extensions taken to hold an image are .nds, .dsi and .srl (a bare ROM
+// or DSiWare SRL) and .cia (the same SRL in a CIA container). A bare entry is
+// always preferred over a .cia, since it needs no unwrapping.
+bool find_rom(const u8* zip, size_t size, ZipEntry& entry, std::string& err, bool single = false);
 
 // The first `n` uncompressed bytes of `entry` (fewer if shorter). CRC not
 // checked -- this is a peek; only inflate_entry vouches for a complete stream.

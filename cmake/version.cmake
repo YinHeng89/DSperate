@@ -3,22 +3,36 @@
 # configure: writes OUT with the nearest tag and the short commit hash, and
 # leaves the file alone when nothing changed so nothing relinks. A tree with no
 # git (a source tarball) says "unknown"; -DDSPERATE_VERSION=... overrides the tag.
+#
+# A packager that builds from corresponding source, or from a patched checkout
+# git would call dirty, exports the locked identity instead:
+#   DSPERATE_LOCK_VERSION  the release tag
+#   DSPERATE_LOCK_COMMIT   the exact short commit
+# When DSPERATE_LOCK_COMMIT is set it is used verbatim, so --version is the same
+# from a git checkout and from a source archive.
 set(_tag "${DSPERATE_VERSION}")
 set(_hash "unknown")
-find_package(Git QUIET)
-if(GIT_FOUND)
-  if(NOT _tag)
-    execute_process(COMMAND ${GIT_EXECUTABLE} describe --tags --abbrev=0 WORKING_DIRECTORY ${SRC}
-      OUTPUT_VARIABLE _tag OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
-  endif()
-  execute_process(COMMAND ${GIT_EXECUTABLE} rev-parse --short HEAD WORKING_DIRECTORY ${SRC}
-    OUTPUT_VARIABLE _h OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET RESULT_VARIABLE _rc)
-  if(_rc EQUAL 0 AND _h)
-    set(_hash "${_h}")
-    execute_process(COMMAND ${GIT_EXECUTABLE} status --porcelain --untracked-files=no WORKING_DIRECTORY ${SRC}
-      OUTPUT_VARIABLE _dirty OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
-    if(_dirty)
-      set(_hash "${_hash}-dirty")
+if(DEFINED ENV{DSPERATE_LOCK_VERSION} AND NOT "$ENV{DSPERATE_LOCK_VERSION}" STREQUAL "")
+  set(_tag "$ENV{DSPERATE_LOCK_VERSION}")
+endif()
+if(DEFINED ENV{DSPERATE_LOCK_COMMIT} AND NOT "$ENV{DSPERATE_LOCK_COMMIT}" STREQUAL "")
+  set(_hash "$ENV{DSPERATE_LOCK_COMMIT}")
+else()
+  find_package(Git QUIET)
+  if(GIT_FOUND)
+    if(NOT _tag)
+      execute_process(COMMAND ${GIT_EXECUTABLE} describe --tags --abbrev=0 WORKING_DIRECTORY ${SRC}
+        OUTPUT_VARIABLE _tag OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+    endif()
+    execute_process(COMMAND ${GIT_EXECUTABLE} rev-parse --short HEAD WORKING_DIRECTORY ${SRC}
+      OUTPUT_VARIABLE _h OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET RESULT_VARIABLE _rc)
+    if(_rc EQUAL 0 AND _h)
+      set(_hash "${_h}")
+      execute_process(COMMAND ${GIT_EXECUTABLE} status --porcelain --untracked-files=no WORKING_DIRECTORY ${SRC}
+        OUTPUT_VARIABLE _dirty OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+      if(_dirty)
+        set(_hash "${_hash}-dirty")
+      endif()
     endif()
   endif()
 endif()
