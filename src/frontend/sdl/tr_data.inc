@@ -351,5 +351,13 @@ static const TrPair kTr[] = {
   {"STOPPING", "正在停止"},
   {"WAITING ON THE CARD", "等待存储卡"},
   {"UNPACKING", "解压中"},
+  {"ANALOG", "模拟"},
+  {"ANALOG CHEATS", "模拟金手指"},
+  {"RUMBLE PAK", "震动包"},
+  {"RUMBLE STRENGTH", "震动强度"},
+  {"ANALOG PATCH", "模拟补丁"},
+  {"ANALOG DEADZONE", "模拟死区"},
+  {"ANALOG INVERT Y", "模拟 Y 反转"},
+  {"ANALOG LAYOUT", "模拟布局"},
 };
 static const int kTrN = static_cast<int>(sizeof(kTr) / sizeof(kTr[0]));
